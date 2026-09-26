@@ -27,7 +27,7 @@ pub mod exec;
 pub mod rpc;
 pub mod supervisor;
 
-pub use exec::{exec, exec_streaming, ExecOptions, ExecResult, StreamKind};
+pub use exec::{exec, exec_streaming, resolve_program, ExecOptions, ExecResult, StreamKind};
 pub use rpc::{RpcError, RpcMessage, RpcRequest, RpcResponse};
 pub use supervisor::{ChildSupervisor, SupervisorState};
 

@@ -634,8 +634,9 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "image.convert".into(),
         label: "图片格式转换".into(),
-        description: "在 PNG / JPEG / WebP / BMP / TIFF / GIF 之间互转。默认走纯 Rust 解码器，\
-                      检测到 libvips 时自动切换（速度与内存显著更优）。".into(),
+        description: "在 PNG / JPEG / WebP / BMP / TIFF / GIF 之间互转。\
+                      后端按 libvips → ImageMagick → 纯 Rust 依次降级（实际用的哪个写在输出值 `backend` 里）。\
+                      **纯 Rust 后端给不了有损压缩** —— 照片想按质量换体积就得有 libvips 或 ImageMagick。".into(),
         category: NodeCategory::Image,
         requires_engines: vec![],
         optional_engines: vec![engine("libvips"), engine("imagemagick")],
@@ -644,8 +645,9 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         params: vec![
             // 注意：默认构建里的纯 Rust 后端**不支持 AVIF**（需要 rav1e，编译数分钟，
             // 走 `toolforge-engines` 的 `avif` feature）。把 avif 列在枚举里会让用户
-            // 选到一个必然失败的值，所以这里不列；装了 libvips 后如需 avif，
-            // 应在 v0.2 里按引擎可用性动态生成这个枚举。
+            // 选到一个必然失败的值，所以这里不列。装了 libvips 后 avif 其实是能转的
+            // （`vips_save_option` 里已经给了 `Q=`），但枚举是按**最低可用后端**生成的，
+            // 这里保持保守 —— 动态枚举留给 v0.2。
             enum_param("format", "目标格式", "webp", &["png", "jpeg", "webp", "bmp", "tiff", "gif"]),
             range_param("quality", "质量", ParamType::Int, 90.0, 1.0, 100.0),
         ],
@@ -653,7 +655,9 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "image.resize".into(),
         label: "图片缩放".into(),
-        description: "高质量重采样（Lanczos3）。可只给宽或只给高，另一边按比例推导。".into(),
+        description: "高质量重采样。可只给宽或只给高，另一边按比例推导。\
+                      后端按 libvips → ImageMagick → 纯 Rust 降级（实际用的哪个写在输出值 `backend` 里）。\
+                      纯 Rust 路径用 Lanczos3，`filter` 参数只在它上面生效。".into(),
         category: NodeCategory::Image,
         requires_engines: vec![],
         optional_engines: vec![engine("libvips"), engine("imagemagick")],
@@ -662,13 +666,14 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         params: vec![
             range_param("width", "宽度（px，0=自动）", ParamType::Int, 0.0, 0.0, 100_000.0),
             range_param("height", "高度（px，0=自动）", ParamType::Int, 0.0, 0.0, 100_000.0),
-            enum_param("filter", "重采样算法", "lanczos3", &["nearest", "triangle", "catmullrom", "gaussian", "lanczos3"]),
+            enum_param("filter", "重采样算法（仅纯 Rust 后端）", "lanczos3", &["nearest", "triangle", "catmullrom", "gaussian", "lanczos3"]),
         ],
     });
     n.push(NodeDescriptor {
         name: "image.crop".into(),
         label: "裁剪 / 缩略图".into(),
-        description: "按坐标裁剪，或按目标尺寸做中心裁剪（cover）。".into(),
+        description: "按坐标裁剪，或按目标尺寸做中心裁剪（cover）。\
+                      裁剪矩形先算好再交给后端，所以三个后端切出来的**位置完全一致**。".into(),
         category: NodeCategory::Image,
         requires_engines: vec![],
         optional_engines: vec![engine("libvips"), engine("imagemagick")],
@@ -685,10 +690,12 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "image.rotate".into(),
         label: "旋转 / 翻转".into(),
-        description: "任意角度旋转、水平/垂直镜像，并可自动按 EXIF 方向校正。".into(),
+        description: "任意角度旋转、水平/垂直镜像。\
+                      90° 整数倍三个后端都能做；**任意角度必须有 libvips 或 ImageMagick**\
+                      （纯 Rust 需要重采样，装不了就是明确的报错，不会静默取整）。".into(),
         category: NodeCategory::Image,
         requires_engines: vec![],
-        optional_engines: vec![engine("imagemagick")],
+        optional_engines: vec![engine("libvips"), engine("imagemagick")],
         inputs: vec![in_file("src", "图片", &["image/*"])],
         outputs: vec![out_file("dst", "输出图片")],
         params: vec![

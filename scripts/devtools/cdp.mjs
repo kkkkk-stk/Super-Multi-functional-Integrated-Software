@@ -264,10 +264,15 @@ export function prepareOutDir(name) {
 }
 
 /**
- * 解析 WebP 容器，取出真实尺寸。
+ * 解析 WebP 容器，取出真实尺寸与**有损/无损**。
  *
  * **只看文件头 4 字节是不够的** —— 那只能证明"是 RIFF 容器"。
  * 尺寸解码能证明位流本身是完整的（截断的文件会在这里露馅）。
+ *
+ * 关于有损/无损：libvips 写出来的 WebP 外面套的是 `VP8X`（扩展容器，
+ * 用来放 ICC/EXIF/alpha 之类的元信息），**真正的编码块在它里面**。
+ * 所以遇到 `VP8X` 不能就此下结论，得继续往里找 `VP8 `（有损）或 `VP8L`（无损）——
+ * 否则"装了 libvips 之后是不是真的有损了"这件事就没法验证。
  */
 export function webpInfo(buf) {
   if (buf.length < 16) return null;
@@ -275,38 +280,51 @@ export function webpInfo(buf) {
   if (buf.subarray(8, 12).toString('ascii') !== 'WEBP') return null;
 
   let off = 12;
+  let container = null;
+  let codec = null;
+  let width = 0;
+  let height = 0;
+  let signature = null;
+
   while (off + 8 <= buf.length) {
     const fourcc = buf.subarray(off, off + 4).toString('ascii');
     const size = buf.readUInt32LE(off + 4);
     const body = buf.subarray(off + 8, off + 8 + size);
+
     if (fourcc === 'VP8L' && body.length >= 5) {
       const bits = body[1] | (body[2] << 8) | (body[3] << 16) | (body[4] << 24);
-      return {
-        format: 'VP8L(lossless)',
-        width: (bits & 0x3fff) + 1,
-        height: ((bits >> 14) & 0x3fff) + 1,
-        signature: body[0],
-      };
+      codec = 'VP8L';
+      width = (bits & 0x3fff) + 1;
+      height = ((bits >> 14) & 0x3fff) + 1;
+      signature = body[0];
+    } else if (fourcc === 'VP8 ' && body.length >= 10) {
+      codec = 'VP8';
+      width = body.readUInt16LE(6) & 0x3fff;
+      height = body.readUInt16LE(8) & 0x3fff;
+    } else if (fourcc === 'VP8X' && body.length >= 10) {
+      container = 'VP8X';
+      width = 1 + (body[4] | (body[5] << 8) | (body[6] << 16));
+      height = 1 + (body[7] | (body[8] << 8) | (body[9] << 16));
     }
-    if (fourcc === 'VP8 ' && body.length >= 10) {
-      return {
-        format: 'VP8(lossy)',
-        width: body.readUInt16LE(6) & 0x3fff,
-        height: body.readUInt16LE(8) & 0x3fff,
-        signature: null,
-      };
-    }
-    if (fourcc === 'VP8X' && body.length >= 10) {
-      return {
-        format: 'VP8X(extended)',
-        width: 1 + (body[4] | (body[5] << 8) | (body[6] << 16)),
-        height: 1 + (body[7] | (body[8] << 8) | (body[9] << 16)),
-        signature: null,
-      };
-    }
+
+    // 已经有编码块就不必再找了（VP8X 里的块紧跟在它后面）
+    if (codec) break;
     off += 8 + size + (size % 2);
   }
-  return { format: '(未知 chunk)', width: 0, height: 0, signature: null };
+
+  if (!codec && !container) {
+    return { format: '(未知 chunk)', codec: null, lossless: null, width: 0, height: 0, signature: null };
+  }
+  const label = container ? `${container}(${codec ?? '?'})` : `${codec}(${codec === 'VP8L' ? 'lossless' : 'lossy'})`;
+  return {
+    format: label,
+    codec,
+    // `null` = 没能确定（例如只看到 VP8X 却没找到里面的编码块）
+    lossless: codec === 'VP8L' ? true : codec === 'VP8' ? false : null,
+    width,
+    height,
+    signature,
+  };
 }
 
 /** 内置的示例插件 id —— 这些随应用分发，DevTools 用它们做真实任务测试 */

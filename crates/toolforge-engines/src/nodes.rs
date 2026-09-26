@@ -698,6 +698,138 @@ fn is_falsey_literal(s: &str) -> bool {
 }
 
 // ============================================================================
+// 图片节点 —— 三层后端
+// ============================================================================
+
+/// 图片处理实际使用的后端。
+///
+/// ## 为什么要有这个东西
+///
+/// `lib.rs` 的模块文档里画着一张"libvips → ImageMagick → 纯 Rust"的三层降级图，
+/// 而**在这之前那张图是假的**：`image.*` 一族全部走纯 Rust 的 `image` crate，
+/// libvips 与 ImageMagick 只是安静地登记在引擎目录里，没有一行代码去调它们。
+///
+/// 后果很具体：WebP 只能无损编码，一张 4K 照片转出来的 `.webp` **比 `.jpg` 还大**，
+/// 而 `image.convert` 只能写一句 warn 建议用户"装 libvips 会更好" ——
+/// 装了也不会更好，因为没人调它。
+///
+/// 现在真的会调了，并且**把用的是哪个后端报出去**（节点输出里的 `backend`、
+/// 以及一条 debug 日志）。理由：后端选择一旦不可观测，"到底走没走 libvips"
+/// 就只能靠猜 —— 而这个项目已经被"文档说有、实际没有"坑过好几次。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageBackend {
+    /// libvips：快、省内存，大图首选
+    Vips,
+    /// ImageMagick：格式覆盖最全
+    Magick,
+    /// 纯 Rust `image` crate：零依赖，永远可用，但能力最弱
+    Rust,
+}
+
+impl ImageBackend {
+    fn label(self) -> &'static str {
+        match self {
+            ImageBackend::Vips => "libvips",
+            ImageBackend::Magick => "imagemagick",
+            ImageBackend::Rust => "rust",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            ImageBackend::Vips => "libvips（快、省内存）",
+            ImageBackend::Magick => "ImageMagick（格式最全）",
+            ImageBackend::Rust => "纯 Rust image crate（零依赖，能力受限）",
+        }
+    }
+
+    /// 输出文件名里用的后端标识（会写进节点输出，供流程后续步骤引用）
+    fn id(self) -> &'static str {
+        self.label()
+    }
+}
+
+/// 挑一个后端 —— **顺序就是文档里那张图**。
+///
+/// 每次调用都会问一遍引擎注册表；`is_available` 读的是带缓存的状态，
+/// 不会每个文件都去 spawn 一个 `vips --version`。
+async fn pick_image_backend(ctx: &NodeCtx) -> ImageBackend {
+    if ctx.engines.is_available("libvips").await {
+        return ImageBackend::Vips;
+    }
+    if ctx.engines.is_available("imagemagick").await {
+        return ImageBackend::Magick;
+    }
+    ImageBackend::Rust
+}
+
+/// 跑一次 libvips 命令。失败时把 vips 自己的 stderr 原样带出来 ——
+/// vips 的报错信息质量很高（会指出是哪个 saver 的哪个 option 不认），
+/// 丢掉它等于让用户自己猜。
+async fn run_vips(ctx: &NodeCtx, args: Vec<String>) -> ToolforgeResult<()> {
+    let vips = ctx.engine("libvips").await?;
+    let result = toolforge_process::exec(
+        ExecOptions::new(vips)
+            .args(args)
+            .cancel(ctx.job.cancel.clone())
+            .timeout(Duration::from_secs(3600))
+            .quiet(true),
+    )
+    .await?;
+    if !result.success() {
+        return Err(result.into_error("libvips"));
+    }
+    Ok(())
+}
+
+/// 跑一次 ImageMagick。
+///
+/// `magick` 是 IM7 的统一入口；IM6 只有 `convert`，所以 `MANAGED_LAYOUT`
+/// 与系统探测都找 `magick`，找不到就说明这台机器没有可用的 IM7。
+async fn run_magick(ctx: &NodeCtx, args: Vec<String>) -> ToolforgeResult<()> {
+    let magick = ctx.engine("imagemagick").await?;
+    let result = toolforge_process::exec(
+        ExecOptions::new(magick)
+            .args(args)
+            .cancel(ctx.job.cancel.clone())
+            .timeout(Duration::from_secs(3600))
+            .quiet(true),
+    )
+    .await?;
+    if !result.success() {
+        return Err(result.into_error("imagemagick"));
+    }
+    Ok(())
+}
+
+/// libvips 保存选项：按目标格式给不同的参数。
+///
+/// 这里必须**按格式分派**，不能无脑塞 `Q=`：PNG 的 saver 虽然也接受 `Q`，
+/// 但它的含义与 JPEG/WebP 完全不同（PNG 的 `Q` 是量化质量，会直接损毁照片），
+/// 而无损格式（bmp / tiff / gif）根本不认这个 option，传了会直接报错。
+fn vips_save_option(fmt: &str, quality: u8) -> Option<String> {
+    match fmt.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "webp" | "avif" | "heic" | "heif" => Some(format!("Q={quality}")),
+        // PNG：用压缩级别（0-9）。9 最慢但最小，对"转换"这个动作是合理的默认。
+        "png" => Some("compression=9".into()),
+        _ => None,
+    }
+}
+
+fn magick_quality_flag(fmt: &str) -> bool {
+    matches!(
+        fmt.trim().trim_start_matches('.').to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "webp" | "avif" | "heic" | "heif" | "tif" | "tiff"
+    )
+}
+
+fn file_ext(p: &Path) -> String {
+    p.extension()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+// ============================================================================
 // 图片节点 —— 纯 Rust 路径（始终可用）
 // ============================================================================
 
@@ -825,7 +957,8 @@ async fn image_convert(
 ) -> ToolforgeResult<NodeOutput> {
     let src = resolve_path(ctx, "input", arg(args, "src")?)?;
     let dst = resolve_path(ctx, "output", arg(args, "dst")?)?;
-    let fmt = parse_format(&ctx.param_str("format", "webp"))?;
+    let format_str = ctx.param_str("format", "webp");
+    let fmt = parse_format(&format_str)?;
     let quality = ctx.param_i64("quality", 90).clamp(1, 100) as u8;
 
     ctx.job
@@ -834,16 +967,69 @@ async fn image_convert(
             file_label(&src)
         )));
 
-    let img = decode_image(&src)?;
+    let backend = pick_image_backend(ctx).await;
+    let dst_ext = file_ext(&dst);
+    ctx.job.log(
+        toolforge_core::job::LogLevel::Debug,
+        format!(
+            "image.convert：后端 = {}；{} → {}（质量 {quality}）",
+            backend.describe(),
+            file_label(&src),
+            file_label(&dst)
+        ),
+    );
 
-    if fmt == image::ImageFormat::WebP {
-        ctx.job
-            .warn("纯 Rust 后端的 WebP 编码只有无损模式，文件可能比预期大；安装 libvips 可获得有损压缩。");
+    match backend {
+        ImageBackend::Vips => {
+            // vips 的保存选项写在**输出文件名后面的方括号里**：
+            // `vips copy in.png "out.webp[Q=90]"`。这是 vips CLI 的约定，
+            // 不是什么可选优化 —— 写成命令行参数会被当成输入文件。
+            let target = match vips_save_option(&dst_ext, quality) {
+                Some(opt) => format!("{}[{opt}]", dst.display()),
+                None => dst.display().to_string(),
+            };
+            run_vips(
+                ctx,
+                vec!["copy".into(), src.display().to_string(), target],
+            )
+            .await?;
+        }
+        ImageBackend::Magick => {
+            let mut a = vec![src.display().to_string()];
+            if magick_quality_flag(&dst_ext) {
+                a.push("-quality".into());
+                a.push(quality.to_string());
+            }
+            a.push(dst.display().to_string());
+            run_magick(ctx, a).await?;
+        }
+        ImageBackend::Rust => {
+            if fmt == image::ImageFormat::WebP {
+                // 这条 warn 现在**只在真的没有更好的后端时**才出现 ——
+                // 以前无论装没装 libvips 都会出现，而装了也没用（没人调它）。
+                ctx.job.warn(
+                    "纯 Rust 后端的 WebP 编码只有无损模式，文件可能比预期大；\
+                     安装 libvips 可获得有损压缩。",
+                );
+            }
+            let img = decode_image(&src)?;
+            encode_image(&img, &dst, fmt, quality)?;
+        }
     }
 
-    encode_image(&img, &dst, fmt, quality)?;
+    // 后端可能"成功退出但没产出文件"（例如目标目录被删了），
+    // 所以这里显式确认一次 —— 报"成功但没有文件"比静默成功好得多。
+    if !dst.is_file() {
+        return Err(ToolforgeError::engine_failed(
+            backend.label(),
+            format!("转换结束但没有生成 {}", dst.display()),
+        )
+        .with_detail("后端进程返回成功，但目标文件不存在。请检查输出目录是否可写。"));
+    }
+
     Ok(NodeOutput::file(dst.display().to_string())
-        .with_value("path", dst.display().to_string()))
+        .with_value("path", dst.display().to_string())
+        .with_value("backend", backend.id().to_string()))
 }
 
 async fn image_resize(
@@ -883,15 +1069,63 @@ async fn image_resize(
         }
     };
 
-    let resized = img.resize_exact(nw, nh, filter);
-    let fmt = image::ImageFormat::from_path(&dst)
-        .or_else(|_| image::ImageFormat::from_path(&src))
-        .map_err(|_| ToolforgeError::invalid("无法从路径推断输出格式，请显式指定扩展名"))?;
-    encode_image(&resized, &dst, fmt, 92)?;
+    let backend = pick_image_backend(ctx).await;
+    ctx.job.log(
+        toolforge_core::job::LogLevel::Debug,
+        format!(
+            "image.resize：后端 = {}；{ow}x{oh} → {nw}x{nh}",
+            backend.describe()
+        ),
+    );
+
+    match backend {
+        ImageBackend::Vips => {
+            // `thumbnail_image` + `--size force` 是唯一能**精确**给出 WxH 的 vips 用法：
+            // 不带 `--size force` 时 vips 默认只缩不放（`down`），
+            // 于是"把小图放大到 1920"会静默返回原尺寸 —— 而 `image.resize` 的语义
+            // 是"就要这个尺寸"（纯 Rust 路径用的就是 `resize_exact`）。
+            run_vips(
+                ctx,
+                vec![
+                    "thumbnail_image".into(),
+                    src.display().to_string(),
+                    dst.display().to_string(),
+                    nw.to_string(),
+                    "--height".into(),
+                    nh.to_string(),
+                    "--size".into(),
+                    "force".into(),
+                ],
+            )
+            .await?;
+        }
+        ImageBackend::Magick => {
+            // `-resize WxH!` 的 `!` 表示忽略宽高比、强制拉伸 ——
+            // 与纯 Rust 的 `resize_exact` 语义一致
+            run_magick(
+                ctx,
+                vec![
+                    src.display().to_string(),
+                    "-resize".into(),
+                    format!("{nw}x{nh}!"),
+                    dst.display().to_string(),
+                ],
+            )
+            .await?;
+        }
+        ImageBackend::Rust => {
+            let resized = img.resize_exact(nw, nh, filter);
+            let fmt = image::ImageFormat::from_path(&dst)
+                .or_else(|_| image::ImageFormat::from_path(&src))
+                .map_err(|_| ToolforgeError::invalid("无法从路径推断输出格式，请显式指定扩展名"))?;
+            encode_image(&resized, &dst, fmt, 92)?;
+        }
+    }
 
     Ok(NodeOutput::file(dst.display().to_string())
         .with_value("width", nw.to_string())
-        .with_value("height", nh.to_string()))
+        .with_value("height", nh.to_string())
+        .with_value("backend", backend.id().to_string()))
 }
 
 async fn image_crop(
@@ -903,31 +1137,76 @@ async fn image_crop(
     let img = decode_image(&src)?;
     let (w, h) = (img.width(), img.height());
 
-    let cropped = match ctx.param_str("mode", "center").as_str() {
+    // 先把裁剪矩形算出来（两种 mode 都要用），再决定交给哪个后端。
+    // 这样三个后端拿到的是**同一个矩形** —— 否则"切出来的位置不一样"
+    // 会变成一个取决于机器装了什么引擎的 bug。
+    let (x, y, cw, ch) = match ctx.param_str("mode", "center").as_str() {
         "custom" => {
             let x = ctx.param_i64("x", 0).max(0) as u32;
             let y = ctx.param_i64("y", 0).max(0) as u32;
             let cw = (ctx.param_i64("width", 512).max(1) as u32).min(w.saturating_sub(x));
             let ch = (ctx.param_i64("height", 512).max(1) as u32).min(h.saturating_sub(y));
-            img.crop_imm(x, y, cw.max(1), ch.max(1))
+            (x, y, cw.max(1), ch.max(1))
         }
         // center / smart 都是中心裁剪：smart 的"内容感知"需要 libvips attention，
         // 纯 Rust 路径退化为几何中心裁剪（诚实降级）
         _ => {
             let cw = (ctx.param_i64("width", 512).max(1) as u32).min(w);
             let ch = (ctx.param_i64("height", 512).max(1) as u32).min(h);
-            let x = (w - cw) / 2;
-            let y = (h - ch) / 2;
-            img.crop_imm(x, y, cw, ch)
+            ((w - cw) / 2, (h - ch) / 2, cw, ch)
         }
     };
 
-    let fmt = image::ImageFormat::from_path(&dst)
-        .map_err(|_| ToolforgeError::invalid("无法从输出路径推断格式"))?;
-    encode_image(&cropped, &dst, fmt, 92)?;
+    let backend = pick_image_backend(ctx).await;
+    ctx.job.log(
+        toolforge_core::job::LogLevel::Debug,
+        format!(
+            "image.crop：后端 = {}；{w}x{h} 取 ({x},{y}) {cw}x{ch}",
+            backend.describe()
+        ),
+    );
+
+    match backend {
+        ImageBackend::Vips => {
+            run_vips(
+                ctx,
+                vec![
+                    "crop".into(),
+                    src.display().to_string(),
+                    dst.display().to_string(),
+                    x.to_string(),
+                    y.to_string(),
+                    cw.to_string(),
+                    ch.to_string(),
+                ],
+            )
+            .await?;
+        }
+        ImageBackend::Magick => {
+            run_magick(
+                ctx,
+                vec![
+                    src.display().to_string(),
+                    "-crop".into(),
+                    format!("{cw}x{ch}+{x}+{y}"),
+                    "+repage".into(),
+                    dst.display().to_string(),
+                ],
+            )
+            .await?;
+        }
+        ImageBackend::Rust => {
+            let cropped = img.crop_imm(x, y, cw, ch);
+            let fmt = image::ImageFormat::from_path(&dst)
+                .map_err(|_| ToolforgeError::invalid("无法从输出路径推断格式"))?;
+            encode_image(&cropped, &dst, fmt, 92)?;
+        }
+    }
+
     Ok(NodeOutput::file(dst.display().to_string())
-        .with_value("width", cropped.width().to_string())
-        .with_value("height", cropped.height().to_string()))
+        .with_value("width", cw.to_string())
+        .with_value("height", ch.to_string())
+        .with_value("backend", backend.id().to_string()))
 }
 
 async fn image_rotate(
@@ -940,35 +1219,135 @@ async fn image_rotate(
     let flip_h = ctx.param_bool("flipH", false);
     let flip_v = ctx.param_bool("flipV", false);
 
-    let mut img = decode_image(&src)?;
-
-    // 纯 Rust 路径只支持 90 的整数倍旋转。
-    // 任意角度需要重采样，走 ImageMagick / libvips —— 这里明确降级而不是静默取整。
     let normalized = ((angle % 360.0) + 360.0) % 360.0;
-    match normalized as i64 {
-        0 => {}
-        90 => img = img.rotate90(),
-        180 => img = img.rotate180(),
-        270 => img = img.rotate270(),
-        _ => {
-            return Err(ToolforgeError::engine_missing("imagemagick").with_detail(format!(
-                "纯 Rust 后端只支持 90° 整数倍旋转（当前 {angle}°）。\
-                 任意角度旋转需要重采样，请安装 ImageMagick 或 libvips。"
-            )));
+    let backend = pick_image_backend(ctx).await;
+    let right_angle = matches!(normalized as i64, 0 | 90 | 180 | 270);
+
+    // 任意角度需要重采样，纯 Rust 的 `image` crate 做不了 ——
+    // 这时必须**明确降级到有能力的后端**，而不是静默取整（取整会让用户
+    // 以为"转了 45°"，实际拿到一张没转的图）。
+    if !right_angle && backend == ImageBackend::Rust {
+        return Err(ToolforgeError::engine_missing("imagemagick").with_detail(format!(
+            "纯 Rust 后端只支持 90° 整数倍旋转（当前 {angle}°）。\
+             任意角度旋转需要重采样，请到「设置 → 引擎管理」安装 libvips 或 ImageMagick。"
+        )));
+    }
+
+    ctx.job.log(
+        toolforge_core::job::LogLevel::Debug,
+        format!(
+            "image.rotate：后端 = {}；角度 {angle}°，翻转 H={flip_h} V={flip_v}",
+            backend.describe()
+        ),
+    );
+
+    match backend {
+        ImageBackend::Vips => {
+            // ⚠️ 这里有两个**实测踩出来的**坑，改之前先看清楚：
+            //
+            // 1. `vips rot` 的 `VipsAngle` 枚举**只有 d0/d90/d180/d270**，
+            //    不接受任意角度。写 `d45` 会直接报
+            //    `enum 'VipsAngle' has no member 'd45'`。
+            //    任意角度必须用 `vips similarity --angle <度>`（它做的是
+            //    旋转 + 缩放 + 平移的仿射变换，正好是"任意角度旋转"需要的）。
+            // 2. **没有 `flop` 这个动作**（那是 `vips_image_flop` 的 C API 名字）。
+            //    CLI 里只有 `flip`，方向作为**参数**给：
+            //    `vips flip in out horizontal|vertical`。
+            //
+            // 我在写这段代码时两个都猜错了，是靠直接跑 vips 命令行才发现的 ——
+            // 所以别凭印象改。
+            let (action, extra): (&str, Vec<String>) = if right_angle {
+                ("rot", vec![format!("d{}", normalized as i64)])
+            } else {
+                ("similarity", vec!["--angle".into(), normalized.to_string()])
+            };
+
+            // 需要翻转时先落到临时文件，再对它做 flip —— 直接写同一个目标会互相覆盖。
+            let needs_flip = flip_h || flip_v;
+            let stage = dst.with_extension(format!("stage.{}", file_ext(&dst)));
+            let first_target = if needs_flip { stage.clone() } else { dst.clone() };
+
+            let mut a = vec![action.into(), src.display().to_string(), first_target.display().to_string()];
+            a.extend(extra);
+            run_vips(ctx, a).await?;
+
+            if needs_flip {
+                // 两个方向都要时先水平再垂直 —— 两次镜像可交换，顺序无所谓
+                let (dir1, dir2) = match (flip_h, flip_v) {
+                    (true, true) => (Some("horizontal"), Some("vertical")),
+                    (true, false) => (Some("horizontal"), None),
+                    _ => (Some("vertical"), None),
+                };
+                let mid = dst.with_extension(format!("mid.{}", file_ext(&dst)));
+                let after_first = if dir2.is_some() { mid.clone() } else { dst.clone() };
+                run_vips(
+                    ctx,
+                    vec![
+                        "flip".into(),
+                        stage.display().to_string(),
+                        after_first.display().to_string(),
+                        dir1.unwrap().into(),
+                    ],
+                )
+                .await?;
+                let _ = std::fs::remove_file(&stage);
+
+                if let Some(d2) = dir2 {
+                    run_vips(
+                        ctx,
+                        vec![
+                            "flip".into(),
+                            mid.display().to_string(),
+                            dst.display().to_string(),
+                            d2.into(),
+                        ],
+                    )
+                    .await?;
+                    let _ = std::fs::remove_file(&mid);
+                }
+            }
+        }
+        ImageBackend::Magick => {
+            // IM7 的 `-rotate` 接受任意角度（`-rotate 45`）。
+            // 90 的整数倍也走它：IM 对整角度有专门优化，结果与 `-rotate 90` 一致。
+            let mut a = vec![
+                src.display().to_string(),
+                "-rotate".into(),
+                normalized.to_string(),
+            ];
+            if flip_h {
+                a.push("-flop".into());
+            }
+            if flip_v {
+                a.push("-flip".into());
+            }
+            a.push(dst.display().to_string());
+            run_magick(ctx, a).await?;
+        }
+        ImageBackend::Rust => {
+            let mut img = decode_image(&src)?;
+            match normalized as i64 {
+                0 => {}
+                90 => img = img.rotate90(),
+                180 => img = img.rotate180(),
+                270 => img = img.rotate270(),
+                // 上面已经拦掉了，这里只是不让编译器要求 catch-all
+                _ => unreachable!("非 90° 整数倍在 Rust 后端已被拒绝"),
+            }
+            if flip_h {
+                img = img.fliph();
+            }
+            if flip_v {
+                img = img.flipv();
+            }
+            let fmt = image::ImageFormat::from_path(&dst)
+                .map_err(|_| ToolforgeError::invalid("无法从输出路径推断格式"))?;
+            encode_image(&img, &dst, fmt, 92)?;
         }
     }
 
-    if flip_h {
-        img = img.fliph();
-    }
-    if flip_v {
-        img = img.flipv();
-    }
-
-    let fmt = image::ImageFormat::from_path(&dst)
-        .map_err(|_| ToolforgeError::invalid("无法从输出路径推断格式"))?;
-    encode_image(&img, &dst, fmt, 92)?;
-    Ok(NodeOutput::file(dst.display().to_string()))
+    Ok(NodeOutput::file(dst.display().to_string())
+        .with_value("backend", backend.id().to_string()))
 }
 
 async fn image_enhance(

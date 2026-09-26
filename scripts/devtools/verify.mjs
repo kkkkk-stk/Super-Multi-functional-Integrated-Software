@@ -53,7 +53,15 @@ c.section('【1】真实转换的产出是否可解码');
     const info = webpInfo(buf);
     console.log(`   ${files[0]}  ${buf.length} 字节  ${JSON.stringify(info)}`);
     c.check(info !== null, '是合法 WebP 容器', info?.format ?? '');
-    c.check(info?.format?.startsWith('VP8L'), '无损编码（纯 Rust 后端的唯一模式）', info?.format ?? '');
+    // 这里**不断言"必须有损"或"必须无损"**：结果取决于这台机器装没装
+    // libvips / ImageMagick（`image.convert` 会按 libvips → ImageMagick →
+    // 纯 Rust 依次降级）。要断言的是"编码块能被认出来、尺寸对得上"——
+    // 那才说明位流是完整的。后端选择另有专门的检查（见 verify-platform.mjs）。
+    c.check(
+      info?.codec === 'VP8' || info?.codec === 'VP8L',
+      '能识别出编码块（VP8 有损 / VP8L 无损）',
+      info?.codec ?? '(未识别)'
+    );
     c.check(info?.width === 320 && info?.height === 200, '解码尺寸与输入一致 320x200', info ? `${info.width}x${info.height}` : '');
   }
 }

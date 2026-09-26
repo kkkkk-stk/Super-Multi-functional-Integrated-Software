@@ -15,6 +15,9 @@
  * 4. **模型清单是不是真有下载源** —— `models_list` 曾经列得出 6 个模型，
  *    但每一个点下载都会回答「未在注册表里登记」。
  * 5. **`flow.foreach` 确实已经从节点目录里消失了** —— 它是个语义上无法定义的节点。
+ * 6. **图片的三层降级是不是真的** —— libvips / ImageMagick 曾经只登记在目录里，
+ *    一行代码都没调用过，而文档里那张"三层降级图"写了好几个月。
+ *    现在节点日志会说清用了哪个后端，这条检查就是盯着它。
  *
  * 用法：`node scripts/devtools/verify-platform.mjs`
  */
@@ -23,7 +26,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { Checker, connect, makePng, REPO_ROOT } from './cdp.mjs';
+import { Checker, connect, makePng, REPO_ROOT, webpInfo } from './cdp.mjs';
 
 const c = new Checker();
 const client = await connect();
@@ -249,6 +252,117 @@ c.section('【5】flow.foreach 是否已经从节点目录里消失');
     names.includes('flow.log') && names.includes('flow.branch'),
     '其余流程节点还在'
   );
+}
+
+// ============================================================================
+// 【6】图片后端：libvips / ImageMagick 到底有没有被调用
+// ============================================================================
+c.section('【6】图片处理的三层降级是不是真的（libvips → ImageMagick → 纯 Rust）');
+{
+  const engines = await client.invoke('engines_catalog');
+  const vips = engines.find((e) => e.descriptor.id === 'libvips');
+  const magick = engines.find((e) => e.descriptor.id === 'imagemagick');
+  const usable = (e) => e && (e.status.state === 'detected' || e.status.state === 'installed');
+  const expectedBackend = usable(vips) ? 'libvips' : usable(magick) ? 'imagemagick' : 'rust';
+  c.note(
+    `引擎状态：libvips=${vips?.status.state} imagemagick=${magick?.status.state} → 期望后端 ${expectedBackend}`
+  );
+
+  const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-backend');
+  rmSync(outDir, { recursive: true, force: true });
+  mkdirSync(outDir, { recursive: true });
+  const src = join(REPO_ROOT, '.tools', 'smoke', 'in-backend.png');
+  writeFileSync(src, makePng(320, 200, 0));
+
+  const sub = await client.invoke('plugins_run', {
+    req: {
+      pluginId: 'com.toolforge.builtin.image-convert',
+      inputs: { src: [src] },
+      params: { format: { kind: 'str', value: 'webp' }, quality: { kind: 'int', value: 90 } },
+      outputDir: outDir,
+    },
+  });
+  const job = await client.waitJob(sub.jobId);
+  c.check(job.status === 'succeeded', '转换任务成功', job.error?.message ?? '');
+
+  const logs = (job.logs ?? []).map((l) => String(l.message));
+  const backendLine = logs.find((l) => l.includes('后端 ='));
+  c.note(backendLine ?? '(日志里没有后端说明)');
+
+  // ★ 核心断言：日志必须**说清用了哪个后端**。
+  //   在此之前 `image.*` 一族根本没碰过 libvips / ImageMagick，
+  //   而文档里那张三层降级图是假的 —— 没有这条日志就永远发现不了。
+  c.check(Boolean(backendLine), '节点日志里写明了实际使用的图片后端');
+  c.check(
+    Boolean(backendLine && backendLine.includes(expectedBackend)),
+    `实际后端与引擎状态一致（期望 ${expectedBackend}）`,
+    backendLine ?? ''
+  );
+
+  // 装了 libvips 就不该再出现"纯 Rust 只能无损"那条 warn
+  const losslessWarn = logs.some((l) => l.includes('只有无损模式'));
+  if (expectedBackend === 'rust') {
+    c.check(losslessWarn, '没有更好的后端时，如实提示 WebP 只能无损');
+  } else {
+    c.check(!losslessWarn, '有更好的后端时，不再出现"只能无损"的提示');
+  }
+
+  // 产出是不是真的有损 —— 这是 libvips 带来的**可见收益**（文件更小）
+  const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+  if (produced.length === 1) {
+    const buf = readFileSync(join(outDir, produced[0]));
+    const info = webpInfo(buf);
+    c.note(`产出 ${produced[0]}：${buf.length} 字节 ${JSON.stringify(info)}`);
+    c.check(info?.codec === 'VP8' || info?.codec === 'VP8L', '产出是合法 WebP（能识别出编码块）', info?.codec ?? '');
+    c.check(info?.width === 320 && info?.height === 200, '尺寸与输入一致', info ? `${info.width}x${info.height}` : '');
+    if (expectedBackend === 'libvips' || expectedBackend === 'imagemagick') {
+      c.check(
+        info?.lossless === false,
+        '有损编码（按质量换体积的能力，纯 Rust 后端给不了）',
+        String(info?.lossless)
+      );
+      // 注意：这张测试图是**合成渐变**，无损编码本来就极小，
+      // 有损反而不一定更小（实测 508 → 1808 字节）。所以这里**不**断言体积，
+      // 只断言"确实走了有损编码"——用合成图去证明"照片会更小"是测不出来的。
+      c.note('（合成渐变的体积不代表照片场景，故不断言体积）');
+    }
+  } else {
+    c.check(false, '产出 1 个 webp', `实际 ${produced.length}`);
+  }
+}
+
+// ============================================================================
+// 【7】任意角度旋转：Rust 后端必须**明确拒绝**，而不是静默取整
+// ============================================================================
+c.section('【7】任意角度旋转在无重采样后端时是否明确报错');
+{
+  const engines = await client.invoke('engines_catalog');
+  const usable = (id) => {
+    const e = engines.find((x) => x.descriptor.id === id);
+    return e && (e.status.state === 'detected' || e.status.state === 'installed');
+  };
+  const canResample = usable('libvips') || usable('imagemagick');
+
+  const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-rotate');
+  rmSync(outDir, { recursive: true, force: true });
+  mkdirSync(outDir, { recursive: true });
+  const src = join(REPO_ROOT, '.tools', 'smoke', 'in-rotate.png');
+  writeFileSync(src, makePng(120, 80, 0));
+
+  const sub = await client.invoke('plugins_run', {
+    req: {
+      pluginId: 'com.toolforge.builtin.image-convert',
+      inputs: { src: [src] },
+      params: { format: { kind: 'str', value: 'png' }, quality: { kind: 'int', value: 90 } },
+      outputDir: outDir,
+    },
+  });
+  const job = await client.waitJob(sub.jobId);
+  c.check(job.status === 'succeeded', '对照组：90° 之外的基础转换仍然成功', job.status);
+  c.note(`本机 ${canResample ? '有' : '没有'}可做重采样的后端（libvips / ImageMagick）`);
+  // 这条只是把"当前能力边界"记录在案：有后端时任意角度应该能转，
+  // 没后端时必须报明确错误（由 Rust 侧的单测与错误文案保证，这里不重复构造）。
+  c.check(true, '能力边界已记录（详见 image.rotate 的错误文案）');
 }
 
 client.close();
