@@ -18,7 +18,7 @@ metadata:
   id: com.toolforge.builtin.remove-bg
   name: 一键抠图
   version: 0.1.0
-  description: AI 抠图去背景，输出透明背景 PNG，可选边缘羽化与背景色替换。
+  description: ⚠️ 该能力尚未实现——AI 抠图去背景，输出透明背景 PNG，可选边缘羽化与背景色替换。依赖的执行器排在 v0.2。
   author: ToolForge
   license: MIT
   icon: scissors

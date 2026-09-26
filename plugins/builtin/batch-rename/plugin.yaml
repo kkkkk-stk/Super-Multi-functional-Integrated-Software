@@ -1,17 +1,25 @@
 # ToolForge L1 插件（声明式编排，零代码）
 #
-# ── 实现状态提醒（务必先读）───────────────────────────────────────────────
-# `flow.foreach` 已经登记在节点目录里（见 `pipeline.rs` 的 `builtin_nodes()`），
-# 因此本清单能通过 `PluginManifest::validate()`；但 `toolforge-engines/src/nodes.rs`
-# 的 `run()` 目前**还没有实现它**，会返回
-# 「内置节点 `flow.foreach` 尚未在 v0.1 中实现」。
-# 也就是说：现在每个任务只处理 `${src}` 指向的那一个文件；
-# 真正的批量循环（按 `concurrency` 并行、逐项迭代）是 v0.2 的执行器能力。
-# 本示例保留该步骤，是为了把批量重命名的**目标形态**先固化下来。
+# ── 批量是怎么发生的（先读这段，别照抄 `flow.foreach`）─────────────────────
+# **多文件输入由宿主命令层扇出，清单里不需要写循环。**
+# `apps/desktop/src-tauri/src/commands.rs::expand_batches` 会把文件数最多的那个
+# 输入端口展开成 N 个单文件批次，逐批调用一次流水线，并用「处理 3/12」上报进度、
+# 在批次边界检查取消。所以本插件只要声明 `multiple: true` 并在流水线里
+# 处理**一张**图，批量语义就自动成立。
 #
-# ── 关于 `with` ──────────────────────────────────────────────────────────
-# `with` 只传路径/结构性参数（`src` / `dst` / `path` / `name` / `value`）；
-# 节点的可调参数由执行器按 id 从插件 `io.params` 读取，写进 `with` 无效。
+# `flow.foreach` 节点仍然登记在节点目录里但**执行器未实现**（会返回
+# 「尚未在 v0.1 中实现」）。这里不用它 —— 用了反而跑不起来。
+#
+# ⚠️ 本项目踩过一次很危险的坑：宿主曾经把「12 张输入」塞进**一次**流水线调用，
+# 而 `${src}` 只绑定第一张，任务却显示 `· 12` 并**成功结束** —— 用户以为 12 张
+# 都处理了。现已由上述扇出修复，并有回归测试覆盖。
+#
+# ── 关于 `with` 与参数 ────────────────────────────────────────────────────
+# 参数写在 `with` 里或 `io.params` 里**都生效**，`with` 里的显式字面量优先。
+# 推荐：路径接线（src / dst / path）放 `with`；用户可调的选项放 `io.params`
+# 并用 `"${params.<id>}"` 注入，这样它才会出现在 UI 表单里。
+#
+# 参数 id 必须与节点读取的键名逐字相同。
 apiVersion: toolforge/v1
 kind: Plugin
 
@@ -83,30 +91,22 @@ io:
       max: 1000000
       step: 1
       required: false
-    # id 叫 `concurrency`：`flow.foreach` 节点的执行器读的就是这个键
-    - id: concurrency
-      label: 并发度
-      type: int
-      description: 透传给 flow.foreach；磁盘是瓶颈时调小更稳。
-      default: { kind: int, value: 4 }
-      min: 1
-      max: 64
-      step: 1
-      required: false
+    # ⚠️ 这里**不再**声明 `concurrency`。
+    #
+    # 并发度是**任务队列**的属性（设置页的「并发数」+ `JobQueue` 的信号量），
+    # 不是插件的可调参数。曾经它被透传给 `flow.foreach` 节点，但：
+    #   ① 那个节点没有执行器实现；
+    #   ② 更重要 —— 并发调度属于队列的职责，混进流水线会让取消与进度上报
+    #      变得极难推理（一个节点内部并行跑 N 个子任务，`${steps.x.y}` 该取谁？）。
+    # 现在批量由命令层逐批扇出，队列负责限流。
 
 runtime:
   kind: pipeline
   pipeline:
-    description: 批量循环标记 + 逐项移动。
+    description: 单文件重命名 + 移动到输出目录；批量由宿主逐文件扇出。
     onError: continue
     steps:
-      - id: loop
-        uses: flow.foreach
-        label: 批量循环
-        with:
-          # `${input.files}` 是**逗号连接**的全部输入路径；
-          # 需要单值时用 `${src}`（第一个输入文件）。
-          items: "${input.files}"
+      # 这里**只处理一个文件**。批量语义来自命令层的扇出，不要写循环。
       - id: rename
         uses: fs.move
         label: 重命名并移动

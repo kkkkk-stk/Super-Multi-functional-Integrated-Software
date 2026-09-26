@@ -1,17 +1,25 @@
 # ToolForge L1 插件（声明式编排，零代码）
 #
-# ── 关于 `with` 的约定（重要，别写错）───────────────────────────────────────
-# `with` 只负责传**路径 / 结构性参数**：`src` / `dst` / `path` / `name` / `value`。
-# 节点的可调参数（format / quality / width / height / filter / mode / …）由执行器
-# 从**插件自己的 `io.params` 里按同名的 id 直接读取**（见
-# `crates/toolforge-engines/src/nodes.rs` 里的 `ctx.param_str("format", "webp")` 等调用）。
-# 所以参数 id 必须与节点读取的键名逐字相同，写进 `with` 反而没有任何效果。
+# ── 参数写在 `with` 里还是 `io.params` 里？─────────────────────────────────
+# **两种都生效，`with` 里的显式字面量优先。**
+#
+# 推荐的分工：
+#   * 路径与流程接线（src / dst / path / name / value）放 `with`；
+#   * 用户可调的选项（format / quality / width / …）放 `io.params`，
+#     并在 `with` 里用 `"${params.<id>}"` 注入 —— 这样它才会出现在 UI 表单里。
+#
+# 参数 id 必须与节点读取的键名逐字相同（`image.convert` 读的就是 `format` / `quality`）。
+#
+# ⚠️ 这条说明曾经写的是「写进 `with` 反而没有任何效果」—— 那在当时是真的，
+# 但它是**设计缺陷**：几乎所有人的直觉都是把参数写进 `with`，结果被静默忽略、
+# 用户拿到默认值还不知道。现在 `NodeCtx::arg_scope` 让取值先看 `with` 再看用户参数。
 #
 # ── 关于 `${...}` 变量 ─────────────────────────────────────────────────────
-# `${src}`   = 本次任务的第一个输入文件（`input.<portId>` 是逗号连接的全部路径）
+# `${src}`  = 本批次要处理的**第一个**输入文件（批量时由宿主逐文件扇出，每次一个）
+# `${input.<portId>}` = 该批次输入端口下逗号连接的全部路径
 # `${output.<portId>}` = 宿主已分配好的输出目标路径
-# 建议始终写 `${output.dst}` 而不是简写 `${dst}`：`${dst}` 取的是输出端口里**任意**
-# 一个（HashMap 顺序不确定），输出端口多于一个时行为不稳定。
+# `${dst}`  = `${output.<portId>}` 的简写，按清单里**声明的端口顺序**取第一个 ——
+#             结果是确定的。多输出端口时仍建议写全，读起来更清楚。
 apiVersion: toolforge/v1
 kind: Plugin
 
@@ -19,7 +27,7 @@ metadata:
   id: com.toolforge.builtin.image-convert
   name: 图片格式转换
   version: 0.1.0
-  description: 在 PNG / JPEG / WebP / BMP / TIFF / GIF 之间互转。纯 Rust 解码器，无需外部引擎即可工作。
+  description: 在 PNG / JPEG / WebP / BMP / TIFF / GIF 之间互转。纯 Rust 解码器，无需外部引擎即可工作；支持一次拖入多张，宿主会逐张处理。
   author: ToolForge
   license: MIT
   icon: image
@@ -46,14 +54,14 @@ io:
       accept: ["image/*"]
       multiple: true
       required: true
-      # ⚠️ 诚实说明（2026-09 核对的实现现状）：
-      # 端口本身接受多张，但 L1 执行器会把 `${src}` 绑定到**第一个**输入路径
-      # （`toolforge-plugins/src/l1.rs`：`req.inputs.values().find_map(|v| v.first())`），
-      # 而 `apps/desktop/src-tauri/src/commands.rs::plugins_run` 只调用一次
-      # `run_pipeline`、不做逐文件扇出。所以「拖入 12 张」目前只会处理第 1 张，
-      # 但任务标题里的 `total_items` 会显示 12（宿主侧的不一致，见 docs/ROADMAP.md）。
-      # 逐文件扇出属待实现能力；在它落地前，请一次只拖入一张。
-      description: 当前实现只处理拖入的第一张图（逐文件扇出尚未落地）。
+      # 多张输入现在是**真的逐张处理**：命令层会把文件数最多的输入端口展开成
+      # N 个单文件批次，逐批调用一次流水线，并用「处理 3/12」上报进度。
+      #
+      # ⚠️ 这条注释曾经写的是「只会处理第 1 张，逐文件扇出尚未落地」—— 那在当时
+      # 是真的，而且是本项目最危险的一类 bug：任务标题显示 `· 12`、实际只处理 1 张、
+      # 然后**成功结束**，用户以为 12 张都好了。现在已由
+      # `commands.rs::expand_batches` 修复，并有回归测试覆盖。
+      description: 可一次拖入多张，宿主会按并发度逐张处理。
   outputs:
     - id: dst
       label: 输出图片
@@ -65,7 +73,7 @@ io:
     - id: format
       label: 目标格式
       type: enum
-      description: 纯 Rust 后端的 WebP 编码只有无损模式；AVIF 需要安装 libvips 或 ImageMagick。
+      description: 纯 Rust 后端的 WebP 编码只有无损模式。AVIF 未列出——默认构建的后端不支持它，装了 libvips 之后才应该加回来。
       default: { kind: str, value: webp }
       options:
         - { value: png, label: PNG（无损，支持透明） }
@@ -74,7 +82,6 @@ io:
         - { value: bmp, label: BMP }
         - { value: tiff, label: TIFF }
         - { value: gif, label: GIF }
-        - { value: avif, label: AVIF（需 libvips / ImageMagick） }
       required: true
       affectsOutput: true
     # id 必须叫 `quality`
