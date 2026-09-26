@@ -26,7 +26,15 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -786,6 +794,92 @@ c.section('【11】AI 超分（ai.upscale）是否真的按倍数放大');
       '没有权重同时声称服务于抠图和超分（归属是按权重而不是按引擎算的）',
       misattributed.map((m) => m.id).join(', ')
     );
+  }
+}
+
+// ============================================================================
+// 【12】中间档：把 libvips 藏起来，ImageMagick 必须真的接手
+// ============================================================================
+c.section('【12】图片降级链的**中间档**（ImageMagick）是否真的会接手');
+{
+  // 为什么这条必须靠"藏目录"来做：三档降级里，第一档（libvips）有就永远走它，
+  // 所以"ImageMagick 档到底能不能用"在装了 libvips 的机器上**永远测不到** ——
+  // 而这正是文档里记了很久的一条空白（"ImageMagick 档位没有环境基线"）。
+  // 把 libvips 的目录临时改名，就能逼出真实的中间档行为；测完还原。
+  const engines = await client.invoke('engines_catalog');
+  const usable = (id) => {
+    const e = engines.find((x) => x.descriptor.id === id);
+    return e && (e.status.state === 'detected' || e.status.state === 'installed');
+  };
+
+  if (!usable('libvips') || !usable('imagemagick')) {
+    c.note(
+      `跳过：需要 libvips 与 imagemagick **同时装着**才谈得上"藏掉前者看后者接管"` +
+        `（当前 libvips=${usable('libvips')} imagemagick=${usable('imagemagick')}）`
+    );
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    const vipsDir = join(DATA_DIR, 'engines', 'libvips');
+    const hidden = join(DATA_DIR, 'engines', 'libvips__hidden_by_verify');
+    const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-tier-magick');
+    const src = join(REPO_ROOT, '.tools', 'smoke', 'in-tier-magick.png');
+
+    const runConvert = async () => {
+      rmSync(outDir, { recursive: true, force: true });
+      mkdirSync(outDir, { recursive: true });
+      writeFileSync(src, makePng(320, 200, 2));
+      const sub = await client.invoke('plugins_run', {
+        req: {
+          pluginId: 'com.toolforge.builtin.image-convert',
+          inputs: { src: [src] },
+          params: { format: { kind: 'str', value: 'webp' }, quality: { kind: 'int', value: 80 } },
+          outputDir: outDir,
+        },
+      });
+      const job = await client.waitJob(sub.jobId, 200, 500);
+      const line =
+        (job.logs ?? []).map((l) => String(l.message)).find((m) => m.includes('后端 =')) ?? '';
+      return { status: job.status, line };
+    };
+
+    let renamed = false;
+    try {
+      renameSync(vipsDir, hidden);
+      renamed = true;
+      await client.invoke('engines_probe_all');
+
+      const vs = await client.invoke('engines_probe', { engineId: 'libvips' });
+      c.check(vs.state !== 'installed' && vs.state !== 'detected', 'libvips 确实已不可用', vs.state);
+
+      const r = await runConvert();
+      c.note(r.line);
+      c.check(r.status === 'succeeded', '藏掉 libvips 后转换仍然成功（降级没断）', r.status);
+      c.check(
+        r.line.includes('ImageMagick'),
+        '★ 实际后端变成了 ImageMagick（中间档真的接手了）',
+        r.line
+      );
+
+      const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+      if (produced.length === 1) {
+        const info = webpInfo(readFileSync(join(outDir, produced[0])));
+        c.check(info?.codec === 'VP8', 'ImageMagick 也给出了有损 WebP', String(info?.codec));
+      }
+    } catch (e) {
+      c.check(false, '中间档测试抛错', String(e.message).split('\n')[0]);
+    } finally {
+      // 还原是**必须**的：留着改名会让后面的检查全部走错档位
+      if (renamed) {
+        try {
+          renameSync(hidden, vipsDir);
+          await client.invoke('engines_probe_all');
+          const back = await client.invoke('engines_probe', { engineId: 'libvips' });
+          c.check(back.state === 'installed' || back.state === 'detected', 'libvips 已还原', back.state);
+        } catch (e) {
+          c.check(false, '还原 libvips 失败 —— 请手动把 libvips__hidden_by_verify 改回 libvips', String(e.message));
+        }
+      }
+    }
   }
 }
 

@@ -131,11 +131,45 @@ export async function connect() {
   await send('Runtime.enable');
   await send('Page.enable');
 
-  /** 在页面里求值并取回结果（页面抛错 → JS 侧抛错） */
+  /**
+   * 在页面里求值并取回结果（页面抛错 → JS 侧抛错）。
+   *
+   * ## 报错必须把**真实原因**带出来
+   *
+   * 原来只有一句 `exception?.description ?? text`。而 CDP 的
+   * `exceptionDetails.exception.description` **只有当异常是 Error 实例时才有**；
+   * 页面 reject 一个**普通对象**（Tauri 的错误就是这么走的）时它是 undefined，
+   * 于是 fallback 到 `text` —— 那也是 undefined，最后抛出一句
+   * `Error: Object`。**真实原因被自己的错误处理吃掉了。**
+   *
+   * 现在把能拿到的都摊开：description、text、以及异常对象的 JSON。
+   * 排查"脚本为什么挂"时，这三样至少有一个能说清。
+   */
   const evaluate = async (expression) => {
     const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
     if (r.exceptionDetails) {
-      throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
+      const d = r.exceptionDetails;
+      const parts = [];
+      if (d.exception?.description) parts.push(d.exception.description);
+      if (d.text && d.text !== 'Uncaught') parts.push(`text=${d.text}`);
+      if (d.exception?.value !== undefined) {
+        try {
+          parts.push(`value=${JSON.stringify(d.exception.value)}`);
+        } catch {
+          parts.push('value=(无法序列化)');
+        }
+      }
+      if (d.exception?.preview) {
+        try {
+          parts.push(`preview=${JSON.stringify(d.exception.preview)}`);
+        } catch {
+          /* 预览拿不到就算了 */
+        }
+      }
+      const err = new Error(parts.length ? parts.join(' | ') : '页面抛出了一个无法描述的值');
+      err.cdpException = d;
+      err.expression = expression.slice(0, 400);
+      throw err;
     }
     return r.result.value;
   };

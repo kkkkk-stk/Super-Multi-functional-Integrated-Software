@@ -922,7 +922,7 @@ pub async fn download(
     let client = build_download_client(false)?;
     match send_download(&client, url).await {
         Ok(resp) if resp.status().is_success() => {
-            return stream_to_file(resp, dest, label, job, tx).await
+            return stream_to_file(resp, dest, label, job, tx, STALL_TIMEOUT).await
         }
         Ok(resp) if is_retryable_status(resp.status()) => {
             tracing::warn!(
@@ -959,7 +959,7 @@ pub async fn download(
              也可以手动下载该文件后放进引擎目录。"
         )));
     }
-    stream_to_file(resp, dest, label, job, tx).await
+    stream_to_file(resp, dest, label, job, tx, STALL_TIMEOUT).await
 }
 
 fn build_download_client(http1_only: bool) -> ToolforgeResult<reqwest::Client> {
@@ -974,10 +974,64 @@ fn build_download_client(http1_only: bool) -> ToolforgeResult<reqwest::Client> {
         .map_err(|e| ToolforgeError::new(ErrorCode::Network, format!("创建 HTTP 客户端失败：{e}")))
 }
 
+/// 把 reqwest 的错误摊开成人能看懂的原因。
+///
+/// ## 为什么不能只 `format!("{e}")`
+///
+/// reqwest 的 `Display` 对连接类错误只给出一句
+/// `error sending request for url (…)` —— **不含原因**。真机实测过：
+/// 同一个 URL 用 `curl` 拿 200（11.7 MB 正常下完），而应用里报的就是这句，
+/// 于是完全无法判断是 DNS、连接被拒、TLS 还是超时。
+/// 排查一个"我们这边失败、curl 那边成功"的问题时，这句话等于零信息。
+///
+/// 这里按 `reqwest::Error` 的分类给出人话，并把 `source()` 链展开 ——
+/// 真正的原因（如 `tls handshake eof`、`connection refused`）在链上。
+fn describe_reqwest_error(e: &reqwest::Error) -> String {
+    let kind = if e.is_timeout() {
+        "超时"
+    } else if e.is_connect() {
+        "连接失败"
+    } else if e.is_decode() {
+        "响应解码失败"
+    } else if e.is_redirect() {
+        "重定向失败"
+    } else if e.is_body() {
+        "读取响应体失败"
+    } else {
+        "请求失败"
+    };
+
+    // source 链：把每一层都串上，最后一层通常才是根因
+    let mut chain: Vec<String> = Vec::new();
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(c) = cur {
+        chain.push(c.to_string());
+        cur = c.source();
+        if chain.len() >= 5 {
+            break;
+        }
+    }
+
+    if chain.is_empty() {
+        format!("{kind}：{e}")
+    } else {
+        format!("{kind}：{}", chain.join(" → "))
+    }
+}
+
 async fn send_download(client: &reqwest::Client, url: &str) -> ToolforgeResult<reqwest::Response> {
     client.get(url).send().await.map_err(|e| {
-        ToolforgeError::new(ErrorCode::Network, format!("请求下载地址失败：{e}"))
-            .with_detail(format!("URL：{url}"))
+        let reason = describe_reqwest_error(&e);
+        ToolforgeError::new(ErrorCode::Network, format!("请求下载地址失败：{reason}")).with_detail(
+            format!(
+                "URL：{url}\n\n\
+                 常见原因：\n\
+                 * **连接被拒 / DNS 失败** —— 这个网络可能屏蔽了该站点，或本地代理没在跑\n\
+                 * **TLS 握手失败** —— 中间设备（公司代理、透明加速、抓包工具）替换了证书。\
+                 可以用系统自带的 curl 试同一个地址来对照：curl 能下、应用不能下，基本就是这类问题\n\
+                 * 也可以手动下载该文件，放进引擎目录后回到「引擎管理」重新探测"
+            ),
+        )
     })
 }
 
@@ -992,12 +1046,17 @@ async fn send_download(client: &reqwest::Client, url: &str) -> ToolforgeResult<r
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 把响应体流式写盘，边写边算 SHA-256。
+///
+/// `stall` 通过参数传入而不是直接用常量，**是为了能被测试**：
+/// 一条"卡住 60 秒才报错"的逻辑如果只能靠等 60 秒来验，就没人会去验它。
+/// 生产路径传 [`STALL_TIMEOUT`]，测试传几百毫秒。
 async fn stream_to_file(
     resp: reqwest::Response,
     dest: &Path,
     label: &str,
     job: &JobCtx,
     tx: Option<tokio::sync::broadcast::Sender<AppEvent>>,
+    stall: Duration,
 ) -> ToolforgeResult<String> {
     use sha2::{Digest, Sha256};
 
@@ -1016,7 +1075,7 @@ async fn stream_to_file(
     use futures_util::StreamExt;
     loop {
         // 卡死检测：把"静默"变成一条**说得清的错误**，而不是干等到总超时
-        let next = tokio::time::timeout(STALL_TIMEOUT, stream.next()).await;
+        let next = tokio::time::timeout(stall, stream.next()).await;
         let chunk = match next {
             Ok(Some(c)) => c,
             Ok(None) => break, // 正常结束
@@ -1026,7 +1085,7 @@ async fn stream_to_file(
                     ErrorCode::Network,
                     format!(
                         "下载 {label} 卡住了：{} 秒内没有收到任何数据",
-                        STALL_TIMEOUT.as_secs()
+                        stall.as_secs_f32()
                     ),
                 )
                 .with_detail(format!(
@@ -1375,6 +1434,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 下载"连上了但一个字节都不吐"时，必须在 `stall` 之后**报错**而不是干等。
+    ///
+    /// ## 为什么这条测试值得写
+    ///
+    /// 这个功能是被一次真机事故逼出来的：装 FFmpeg 时进度条停在 **0%** 十几分钟，
+    /// 因为服务端连接建立之后不再吐数据，而客户端总超时是 30 分钟。
+    /// 用户看到的是一个不动的进度条和零解释。
+    ///
+    /// 如果只能靠"等 60 秒"来验证它，就没人会验 —— 所以 `stream_to_file` 的
+    /// `stall` 是参数，生产传常量、测试传 300 ms。
+    ///
+    /// 用一个**裸 TCP server** 而不是 mock 库：它要做的事只有一件 ——
+    /// 收下请求、回一个声明了 Content-Length 的 200 头、然后**永远沉默**。
+    /// 这正是真实事故的形状，而且不加任何依赖。
+    #[tokio::test]
+    async fn stalled_download_fails_with_a_readable_error() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 服务端：回响应头 → 不发 body → 挂住（连接保持打开）
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                          Content-Length: 1048576\r\n\r\n",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+                // 故意什么都不再做 —— 保持连接直到测试结束
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join("tf-stall-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.join("stalled.bin");
+        let _ = std::fs::remove_file(&dest);
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let queue = toolforge_core::queue::JobQueue::new(1, tx);
+        let job = queue.create(toolforge_core::job::JobKind::Probe, "停滞测试", 1);
+
+        let client = build_download_client(false).unwrap();
+        let resp = send_download(&client, &format!("http://{addr}/big.bin"))
+            .await
+            .expect("连接应当成功（服务端会回响应头）");
+
+        let started = std::time::Instant::now();
+        let err = stream_to_file(
+            resp,
+            &dest,
+            "测试文件",
+            &job,
+            None,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("一个字节都没收到时必须报错");
+
+        assert_eq!(err.code, ErrorCode::Network);
+        assert!(
+            err.message.contains("卡住"),
+            "错误信息应当说清是「卡住」而不是笼统的网络错误：{}",
+            err.message
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "必须在 stall 之后很快返回，实际用了 {:?}",
+            started.elapsed()
+        );
+        // 半截文件必须被删掉：留一个 0 字节的 .zip 在那儿只会让人以为下过
+        assert!(!dest.exists(), "卡死后应当删除未完成的文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 不产出可执行文件的"虚拟引擎"。

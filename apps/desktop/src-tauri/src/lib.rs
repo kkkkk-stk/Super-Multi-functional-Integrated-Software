@@ -228,24 +228,49 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
 /// 解析内置插件目录。
 ///
 /// 打包后它在 resource 目录下；开发时直接指向仓库里的 `plugins/builtin`。
+///
+/// ## 顺序在开发构建里**必须反过来**（这是真机踩出来的）
+///
+/// 原来的实现一律"先看 resource 目录"，而开发构建下
+/// `resource_dir()` 就是**可执行文件所在目录**。于是：
+///
+/// * 从 `target/debug/toolforge.exe` 启动时，`resource_dir()` = `target/debug`，
+///   而那里有一份 `tauri-build` 在**构建期**拷过去的 `bundle.resources`
+///   （`plugins/builtin`）。它只在构建脚本认为需要时才刷新，
+///   新增一个内置插件**不会**触发它 —— 于是那份拷贝是旧的；
+/// * 结果：仓库里明明有 7 个内置插件，应用只装载了 4 个，
+///   另外 3 个报"未安装"，而**从 `target/debug/deps/` 启动却又是 7 个**。
+///   同一个二进制、不同的启动目录，行为不一样。
+///
+/// 这类"看起来像插件坏了、其实是路径解析"的问题极难排查，所以现在：
+/// **开发构建优先用仓库目录**（那才是开发时的真相来源），
+/// 只有打包后的发布构建才先看 resource。
 fn resolve_builtin_plugins(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
-    if let Ok(res) = app.path().resource_dir() {
-        let p = res.join("plugins").join("builtin");
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
     // 开发态：apps/desktop/src-tauri -> 仓库根/plugins/builtin
-    let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("plugins")
-        .join("builtin");
-    if dev.is_dir() {
-        return Some(dev);
-    }
-    None
+    let repo = || {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("plugins")
+            .join("builtin")
+    };
+    let packaged = || {
+        app.path()
+            .resource_dir()
+            .ok()
+            .map(|res| res.join("plugins").join("builtin"))
+            .filter(|p| p.is_dir())
+    };
+
+    // 开发构建以仓库为准；发布构建以打包资源为准
+    let candidates: [&dyn Fn() -> Option<std::path::PathBuf>; 2] = if cfg!(debug_assertions) {
+        [&|| repo().is_dir().then(repo), &packaged]
+    } else {
+        [&packaged, &|| repo().is_dir().then(repo)]
+    };
+
+    candidates.iter().find_map(|f| f())
 }
 
 /// 应用入口。
