@@ -587,7 +587,11 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         inputs: vec![in_file("src", "图片", &["image/*"])],
         outputs: vec![out_file("dst", "输出图片")],
         params: vec![
-            enum_param("format", "目标格式", "webp", &["png", "jpeg", "webp", "bmp", "tiff", "gif", "avif"]),
+            // 注意：默认构建里的纯 Rust 后端**不支持 AVIF**（需要 rav1e，编译数分钟，
+            // 走 `toolforge-engines` 的 `avif` feature）。把 avif 列在枚举里会让用户
+            // 选到一个必然失败的值，所以这里不列；装了 libvips 后如需 avif，
+            // 应在 v0.2 里按引擎可用性动态生成这个枚举。
+            enum_param("format", "目标格式", "webp", &["png", "jpeg", "webp", "bmp", "tiff", "gif"]),
             range_param("quality", "质量", ParamType::Int, 90.0, 1.0, 100.0),
         ],
     });
@@ -900,7 +904,10 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         inputs: vec![in_file("src", "图片", &["image/*"])],
         outputs: vec![out_file("dst", "放大后图片")],
         params: vec![
-            enum_param("model", "模型", "realesrgan-x4plus", &["realesrgan-x4plus", "realesrgan-x2plus", "swinir-l", "hat-l"]),
+            // 枚举必须与 `engine_catalog()` 里 `onnx-models` 的模型表一致 ——
+            // 列出目录里没有的模型 = 用户选到一个永远下不到的模型。
+            // 更多超分模型（x2plus / SwinIR / HAT）随 v0.2 的执行器一起接入。
+            enum_param("model", "模型", "realesrgan-x4plus", &["realesrgan-x4plus"]),
             range_param("scale", "放大倍数", ParamType::Int, 2.0, 2.0, 4.0),
         ],
     });

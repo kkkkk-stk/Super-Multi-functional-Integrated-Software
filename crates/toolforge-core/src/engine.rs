@@ -329,7 +329,13 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             core: true,
             provides: vec!["archive.pack".into(), "archive.unpack".into()],
             platforms: all_platforms(),
-            install_modes: vec![EngineInstallMode::System, EngineInstallMode::Download],
+            // 只支持系统安装。原因有两条，都是实测出来的：
+            //   ① 官方只提供 **安装器**（.exe）或 `7z-extra.7z`，而后者需要先有 7-Zip
+            //      才能解压 —— 先有鸡还是先有蛋；
+            //   ② `engine-sources.json` 里那条版本固定直链（7z2408-extra.7z）
+            //      **已经 404**（维护者实测），继续留着只会误导人。
+            // 另外 7-Zip 本体只有 5 MB，让用户自己装一次完全可接受。
+            install_modes: vec![EngineInstallMode::System],
             requires_license_ack: false,
             models: vec![],
         },

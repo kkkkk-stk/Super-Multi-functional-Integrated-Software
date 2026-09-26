@@ -53,19 +53,38 @@ pub struct NodeCtx {
     pub guard: CapabilityGuard,
     /// 用户填写的参数（已按 `default` 补齐）
     pub params: HashMap<String, ParamValue>,
-    /// 流水线变量（`${vars.x}` 与 `flow.set-var` 写入）
+    /// 流水线变量（`flow.set-var` 写入，可在后续步骤用 `${vars.名称}` 引用）
     pub vars: HashMap<String, String>,
+    /// **当前步骤的 `with` 块**，由 [`run`] 在每次调用前设置。
+    ///
+    /// 它存在的理由是一个真实踩过的坑：节点参数到底该写在 `with` 里还是
+    /// `io.params` 里？插件作者（以及 LLM）的直觉是前者，而执行器原本只读后者 ——
+    /// 于是 `with: { format: webp }` 被**静默忽略**，用户得到的是默认格式。
+    /// 现在 `param_*` 取值时先看 `with`、再看用户参数：两种写法都对，
+    /// 且 `with` 里的显式字面量优先（它更具体）。
+    pub arg_scope: BTreeMap<String, String>,
 }
 
 impl NodeCtx {
+    /// 取字符串：`with` 优先，其次用户参数，最后默认值。
     pub fn param_str(&self, key: &str, default: &str) -> String {
+        if let Some(v) = self.arg_scope.get(key) {
+            if !v.trim().is_empty() {
+                return v.clone();
+            }
+        }
         self.params
             .get(key)
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .and_then(|v| param_to_string(v).into())
             .unwrap_or_else(|| default.to_string())
     }
 
     pub fn param_i64(&self, key: &str, default: i64) -> i64 {
+        if let Some(v) = self.arg_scope.get(key) {
+            if let Some(n) = parse_int(v) {
+                return n;
+            }
+        }
         self.params
             .get(key)
             .and_then(|v| v.as_i64())
@@ -73,6 +92,11 @@ impl NodeCtx {
     }
 
     pub fn param_f64(&self, key: &str, default: f64) -> f64 {
+        if let Some(v) = self.arg_scope.get(key) {
+            if let Ok(n) = v.trim().parse::<f64>() {
+                return n;
+            }
+        }
         self.params
             .get(key)
             .and_then(|v| v.as_f64())
@@ -80,6 +104,9 @@ impl NodeCtx {
     }
 
     pub fn param_bool(&self, key: &str, default: bool) -> bool {
+        if let Some(v) = self.arg_scope.get(key) {
+            return truthy(v);
+        }
         self.params
             .get(key)
             .and_then(|v| v.as_bool())
@@ -90,6 +117,38 @@ impl NodeCtx {
     pub async fn engine(&self, id: &str) -> ToolforgeResult<PathBuf> {
         self.engines.resolve(id).await
     }
+}
+
+/// `ParamValue` → 字符串（模板上下文与 `with` 回退都用它）
+pub fn param_to_string(v: &ParamValue) -> String {
+    match v {
+        ParamValue::Str(s) => s.clone(),
+        ParamValue::Int(i) => i.to_string(),
+        ParamValue::Float(f) => {
+            // 整数值不要显示成 "90.0"，那会让用户困惑
+            if f.fract().abs() < f64::EPSILON {
+                format!("{}", *f as i64)
+            } else {
+                f.to_string()
+            }
+        }
+        ParamValue::Bool(b) => b.to_string(),
+        ParamValue::List(l) => l.join(","),
+    }
+}
+
+fn parse_int(s: &str) -> Option<i64> {
+    let t = s.trim();
+    t.parse::<i64>()
+        .ok()
+        .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
+}
+
+fn truthy(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
 }
 
 /// 节点产出
@@ -192,6 +251,10 @@ pub async fn run(
     node: &str,
     args: &BTreeMap<String, String>,
 ) -> ToolforgeResult<NodeOutput> {
+    // 把本步骤的 `with` 挂到上下文上：`param_*` 取值时先看它、再看用户参数。
+    // 见 `NodeCtx::arg_scope` 的文档 —— 这一步让"参数写在 with 里"也能生效。
+    ctx.arg_scope = args.clone();
+
     match node {
         // ---------- 文件 ----------
         "fs.copy" => fs_copy(ctx, args, false).await,
@@ -223,10 +286,10 @@ pub async fn run(
         "archive.pack" => sevenzip_pack(ctx, args).await,
         "archive.unpack" => sevenzip_unpack(ctx, args).await,
 
-        // ---------- 流程控制（由流水线执行器特殊处理，这里只兜底）----------
-        "flow.log" => Ok(NodeOutput::default()),
+        // ---------- 流程控制 ----------
+        "flow.log" => flow_log(ctx).await,
         "flow.set-var" => flow_set_var(ctx, args).await,
-        "flow.branch" => Ok(NodeOutput::default()),
+        "flow.branch" => flow_branch(ctx).await,
 
         // ---------- 尚未实现（v0.1 明确不支持，见 docs/ROADMAP.md）----------
         other => Err(not_implemented(other)),
@@ -327,9 +390,68 @@ async fn flow_set_var(
     args: &BTreeMap<String, String>,
 ) -> ToolforgeResult<NodeOutput> {
     let name = arg(args, "name")?;
-    let value = arg(args, "value")?;
-    ctx.vars.insert(name.to_string(), value.to_string());
+    // 值优先取 with 里的字面量，其次取同名用户参数 ——
+    // 与其它节点一致，避免"参数写在哪"变成需要记住的隐规则
+    let value = ctx.param_str("value", "");
+    if value.is_empty() {
+        return Err(ToolforgeError::plugin_invalid(
+            "flow.set-var 需要 `value`（写在 with 里或作为用户参数）",
+        ));
+    }
+    ctx.vars.insert(name.to_string(), value.clone());
+    // 同时把值放进本步骤的产出，这样 `${steps.<id>.value}` 也能引用
     Ok(NodeOutput::value("value", value))
+}
+
+/// `flow.log`：向任务日志写一条消息。
+///
+/// **曾经是静默空实现**（直接返回空的 `NodeOutput`，不报错也不做事）——
+/// 那种行为最难排查：用户以为日志节点在跑，任务日志里却什么都没有。
+async fn flow_log(ctx: &mut NodeCtx) -> ToolforgeResult<NodeOutput> {
+    let message = ctx.param_str("message", "");
+    if message.trim().is_empty() {
+        return Err(ToolforgeError::plugin_invalid(
+            "flow.log 缺少 `message`",
+        ));
+    }
+    let level = ctx.param_str("level", "info");
+    match level.to_ascii_lowercase().as_str() {
+        "debug" | "trace" => ctx.job.log(toolforge_core::job::LogLevel::Debug, message.clone()),
+        "warn" | "warning" => ctx.job.warn(message.clone()),
+        "error" => ctx.job.error(message.clone()),
+        _ => ctx.job.info(message.clone()),
+    }
+    Ok(NodeOutput::value("message", message))
+}
+
+/// `flow.branch`：求值条件，把结果写进 `${steps.<id>.active}`。
+///
+/// **刻意不做隐式控制流**：它不会去"跳过某些步骤"，只是产出一个布尔值，
+/// 由后续步骤自己用 `when: ${steps.<id>.active} == true` 消费。
+/// 隐式分支是调试噩梦 —— 你无法从单个步骤的定义看出它会不会被执行。
+///
+/// 曾经也是静默空实现，同样已修。
+async fn flow_branch(ctx: &mut NodeCtx) -> ToolforgeResult<NodeOutput> {
+    let condition = ctx.param_str("condition", "");
+    if condition.trim().is_empty() {
+        return Err(ToolforgeError::plugin_invalid(
+            "flow.branch 缺少 `condition`",
+        ));
+    }
+    // 这里的 condition 已经在流水线执行器里渲染过模板（它来自 with 或参数），
+    // 所以直接按"真值字面量"判断即可，不再二次求值。
+    let active = truthy(&condition) || (!is_falsey_literal(&condition) && !condition.trim().is_empty());
+    let value = if active { "true" } else { "false" };
+    ctx.job
+        .log(toolforge_core::job::LogLevel::Debug, format!("分支判定：{condition} → {value}"));
+    Ok(NodeOutput::value("active", value))
+}
+
+fn is_falsey_literal(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "false" | "0" | "no" | "off"
+    )
 }
 
 // ============================================================================
@@ -1474,5 +1596,162 @@ mod tests {
         std::fs::write(tmp.join("a.txt"), b"hi").unwrap();
         assert!(scan_for_escapes(&tmp).is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ========================================================================
+    // 流程控制节点 + 参数取值优先级
+    //
+    // 这两块都踩过"静默失效"的坑：`flow.log` / `flow.branch` 曾经直接返回空的
+    // `NodeOutput`（不报错也不做事），而 `param_*` 只读 `io.params` 导致写在
+    // `with` 里的参数被无声忽略。所以必须有测试钉住。
+    // ========================================================================
+
+    fn test_ctx() -> (NodeCtx, Arc<toolforge_core::queue::JobQueue>, String) {
+        let (tx, _rx) = tokio::sync::broadcast::channel(64);
+        let queue = Arc::new(toolforge_core::queue::JobQueue::new(1, tx));
+        let job = queue.create(toolforge_core::job::JobKind::Probe, "测试", 0);
+        let id = job.id.to_string();
+        let dir = std::env::temp_dir().join("tf-node-ctx-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let engines = Arc::new(EngineRegistry::new(toolforge_core::paths::AppPaths::new(&dir)));
+        let ctx = NodeCtx {
+            job,
+            engines,
+            resolver: PathResolver::new().with_input(&dir).with_output(&dir),
+            guard: CapabilityGuard::new(
+                "test.plugin",
+                toolforge_core::permission::PermissionSet::empty(),
+            ),
+            params: HashMap::new(),
+            vars: HashMap::new(),
+            arg_scope: BTreeMap::new(),
+        };
+        (ctx, queue, id)
+    }
+
+    fn args_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn flow_branch_produces_a_usable_value() {
+        // 回归：曾经是静默空实现，下游 `when: ${steps.b.active} == true` 永远不成立
+        let (mut ctx, _q, _id) = test_ctx();
+        let out = run(&mut ctx, "flow.branch", &args_of(&[("condition", "true")]))
+            .await
+            .unwrap();
+        assert_eq!(out.values.get("active").map(|s| s.as_str()), Some("true"));
+
+        let out = run(&mut ctx, "flow.branch", &args_of(&[("condition", "false")]))
+            .await
+            .unwrap();
+        assert_eq!(out.values.get("active").map(|s| s.as_str()), Some("false"));
+    }
+
+    #[tokio::test]
+    async fn flow_branch_without_condition_is_an_error_not_a_noop() {
+        let (mut ctx, _q, _id) = test_ctx();
+        let err = run(&mut ctx, "flow.branch", &BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PluginInvalid);
+    }
+
+    #[tokio::test]
+    async fn flow_log_actually_writes_to_the_job_log() {
+        // 回归：曾经是静默空实现 —— 用户以为日志节点在跑，任务日志里什么都没有
+        let (mut ctx, queue, id) = test_ctx();
+        let out = run(
+            &mut ctx,
+            "flow.log",
+            &args_of(&[("message", "开始处理"), ("level", "warn")]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.values.get("message").map(|s| s.as_str()),
+            Some("开始处理")
+        );
+
+        let job = queue.get(&id).expect("任务应当还在队列里");
+        let entry = job.logs.last().expect("应当写进了一条日志");
+        assert_eq!(entry.message, "开始处理");
+        assert_eq!(entry.level, toolforge_core::job::LogLevel::Warn);
+    }
+
+    #[tokio::test]
+    async fn flow_log_without_message_is_an_error() {
+        let (mut ctx, _q, _id) = test_ctx();
+        let err = run(&mut ctx, "flow.log", &BTreeMap::new()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::PluginInvalid);
+    }
+
+    #[tokio::test]
+    async fn flow_set_var_is_reachable_as_vars() {
+        let (mut ctx, _q, _id) = test_ctx();
+        let out = run(
+            &mut ctx,
+            "flow.set-var",
+            &args_of(&[("name", "outDir"), ("value", "/output/x")]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.values.get("value").map(|s| s.as_str()), Some("/output/x"));
+        assert_eq!(ctx.vars.get("outDir").map(|s| s.as_str()), Some("/output/x"));
+    }
+
+    #[test]
+    fn with_takes_precedence_over_user_params() {
+        // 插件作者（和 LLM）天然会把节点参数写在 `with` 里。
+        // 执行器现在两种都认，且 `with` 里的显式字面量优先（它更具体）。
+        let (mut ctx, _q, _id) = test_ctx();
+        ctx.params.insert(
+            "format".into(),
+            toolforge_core::plugin::ParamValue::Str("png".into()),
+        );
+
+        // 没有 with → 用用户参数
+        assert_eq!(ctx.param_str("format", "webp"), "png");
+
+        // 有 with → with 赢
+        ctx.arg_scope = args_of(&[("format", "webp")]);
+        assert_eq!(ctx.param_str("format", "webp"), "webp");
+
+        // 都没有 → 默认值
+        assert_eq!(ctx.param_str("quality", "90"), "90");
+    }
+
+    #[test]
+    fn param_numeric_readers_accept_rendered_strings() {
+        // 模板渲染后 `with` 里全是字符串，数字也得能取出来
+        let (mut ctx, _q, _id) = test_ctx();
+        ctx.arg_scope = args_of(&[
+            ("width", "1280"),
+            ("scale", "2.5"),
+            ("flag", "yes"),
+            ("blank", "   "),
+        ]);
+        assert_eq!(ctx.param_i64("width", 0), 1280);
+        assert_eq!(ctx.param_i64("missing", 7), 7);
+        assert!((ctx.param_f64("scale", 0.0) - 2.5).abs() < f64::EPSILON);
+        assert!(ctx.param_bool("flag", false));
+        // 空白串视为"未提供"，回退到默认值
+        assert_eq!(ctx.param_i64("blank", 5), 5);
+    }
+
+    #[test]
+    fn param_to_string_trims_float_noise() {
+        use toolforge_core::plugin::ParamValue as P;
+        assert_eq!(param_to_string(&P::Int(90)), "90");
+        assert_eq!(param_to_string(&P::Float(90.0)), "90");
+        assert_eq!(param_to_string(&P::Float(92.5)), "92.5");
+        assert_eq!(param_to_string(&P::Bool(true)), "true");
+        assert_eq!(
+            param_to_string(&P::List(vec!["a".into(), "b".into()])),
+            "a,b"
+        );
     }
 }

@@ -306,10 +306,12 @@ permissions:
 `PluginInvalid` 错误（附"可用的变量：input.* / output.* / params.* / steps.* / env.*"），
 因为静默留空会产生"看起来跑通了但结果不对"的 bug —— 这在批量处理里是灾难。
 
-> 🚧 **`${vars.<name>}` 待定**：`flow.set-var` 节点的描述里提到"供后续步骤通过
-> `${vars.名称}` 引用"，但 `l1.rs` 实际只往模板上下文里插入了 `steps.<id>.<key>`，
-> 并没有插入 `vars.*`。所以**目前请用 `${steps.<setVarStepId>.value}` 引用**
-> `flow.set-var` 的结果，不要用 `${vars.*}`。
+> ✅ **`${vars.<name>}` 已可用**：`flow.set-var` 写入的变量会在后续步骤里以
+> `${vars.<名称>}` 暴露（`l1.rs` 每步结束后把 `ctx.vars` 桥接进模板上下文）。
+> 同一份值也能用 `${steps.<setVarStepId>.value}` 引用，两者等价。
+>
+> 曾经这里写的是"`vars.*` 未实现，请改用 `steps.*`" —— 那个说法当时是对的，
+> 现在已随 `l1.rs` 的修复失效。节点目录里 `flow.set-var` 的承诺现在是事实。
 
 **`when` 条件**（`eval_condition`）刻意不做通用表达式引擎——通用表达式意味着通用执行：
 
@@ -411,10 +413,23 @@ permissions:
    清单也能通过校验），但 `toolforge-engines/src/nodes.rs` 的 `run()` 目前只实现了
    **25 个**；标 🚧 的 6 个会返回
    「内置节点 `X` 尚未在 v0.1 中实现」。
-2. **节点的可调参数不是从 `with` 传的**。执行器用 `ctx.param_str("format", "webp")`
-   这类调用，从**插件自己的 `io.params` 里按同名 id 读**。所以参数 id 必须逐字一致，
-   写进 `with` 没有任何效果。`with` 只负责 `src` / `dst` / `path` / `name` / `value` /
-   `duration` 这些路径与结构性参数。
+2. **节点参数写在 `with` 里或 `io.params` 里都可以，`with` 优先**。
+   执行器用 `ctx.param_str("format", "webp")` 这类调用取值，它会**先看当前步骤的 `with`、
+   再看插件自己的 `io.params`（按同名 id）、最后回退默认值**（见 `NodeCtx::arg_scope`）。
+
+   推荐的分工是：
+
+   - **路径与流程接线**（`src` / `dst` / `path` / `name` / `duration`）放 `with`，用
+     `"${src}"` / `"${dst}"` 这类模板注入；
+   - **用户可调的选项**（格式、质量、宽度、模型名）放 `io.params`，在 `with` 里写
+     `format: "${params.format}"`。这样参数才会出现在 UI 表单里，用户能改。
+
+   参数 **id 必须与节点读取的键名逐字一致**（例如 `image.convert` 读 `format` / `quality`）。
+   `with` 的值**必须是字符串**（写 `width: 1280` 会报 `invalid type: integer`，要写 `"1280"`）。
+
+   > 这条曾经是"只能写 `io.params`，写 `with` 完全无效" —— 而几乎所有人（包括 LLM）
+   > 的直觉都是写 `with`，于是参数被**静默忽略**、用户拿到默认值却不知道。
+   > 现在两种写法都生效，且 `with` 里的显式字面量优先（它更具体）。
 
 ### 3.1 文件操作（`file`）
 
@@ -477,11 +492,23 @@ permissions:
 | `flow.log` | 写日志 | — | — | `message`、`level` | 见下方说明 |
 | `flow.foreach` | 批量循环 🚧 | — | — | `concurrency` | **v0.1 未实现**（见下方说明） |
 
-> 🚧 **流程控制节点的真实状态**：`nodes.rs` 里 `flow.log` 与 `flow.branch` 是
-> **空实现**（直接返回空的 `NodeOutput`），`flow.foreach` 落到 `not_implemented`。
-> 注释说它们"由流水线执行器特殊处理"，但 `l1.rs` 的执行循环里并没有这段特殊处理。
-> 所以目前：`flow.set-var` 可用；`flow.log` / `flow.branch` 不报错但也不做事；
-> `flow.foreach` 会直接失败。
+> ✅ **流程控制节点的真实状态**（曾经三条都写着"未实现/空实现"，现已修复）：
+>
+> | 节点 | 状态 | 行为 |
+> |---|---|---|
+> | `flow.set-var` | ✅ 可用 | 写入 `vars.<名称>`，后续步骤用 `${vars.<名称>}` 引用 |
+> | `flow.log` | ✅ 可用 | **真的往任务日志写一条**（`message` 为空时报 `PluginInvalid`） |
+> | `flow.branch` | ✅ 可用 | 求值 `condition`，产出 `${steps.<id>.active}` = `"true"`/`"false"` |
+> | `flow.foreach` | 🚧 未实现 | 落到 `not_implemented`。**批量由命令层展开**，清单里不需要它 |
+>
+> `flow.log` 与 `flow.branch` 曾经是**空实现** —— 直接返回空的 `NodeOutput`，
+> 不报错也不做事。那是最难排查的一类行为：用户以为节点在跑，日志里却什么都没有、
+> 分支永远不成立。现在两者都有回归测试钉住
+> （`flow_log_actually_writes_to_the_job_log`、`flow_branch_produces_a_usable_value`）。
+>
+> `flow.branch` **刻意不做隐式控制流**：它只产出一个布尔值，
+> 由后续步骤自己用 `when: ${steps.<id>.active} == true` 消费 ——
+> 隐式分支会让你无法从单个步骤的定义判断它会不会被执行。
 
 ### 3.5 哪些节点会产出可供 `${steps.x.y}` 引用的值
 

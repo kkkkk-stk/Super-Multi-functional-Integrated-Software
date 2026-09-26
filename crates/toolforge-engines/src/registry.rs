@@ -36,10 +36,19 @@ use toolforge_core::paths::AppPaths;
 use toolforge_core::queue::JobCtx;
 
 /// 各引擎的可执行文件名候选（按优先级）。
+///
+/// ⚠️ **Windows 上不要把 `convert` 当作 ImageMagick 的候选名。**
+/// 系统自带 `C:\Windows\System32\convert.exe`（NTFS 卷转换工具），
+/// 同名不同物 —— 匹配到它会让 ToolForge 认为"ImageMagick 已安装"，
+/// 然后在真正调用时失败。ImageMagick 7 的可执行文件本来就叫 `magick`；
+/// 只有 IM6 才叫 `convert`，而 IM6 在 Windows 上同样会被这个同名文件遮蔽。
 pub const ENGINE_BINARIES: &[(&str, &[&str])] = &[
     ("ffmpeg", &["ffmpeg"]),
     ("ffprobe", &["ffprobe"]),
     ("libvips", &["vips", "vips.exe"]),
+    #[cfg(windows)]
+    ("imagemagick", &["magick"]),
+    #[cfg(not(windows))]
     ("imagemagick", &["magick", "convert"]),
     ("pandoc", &["pandoc"]),
     ("libreoffice", &["soffice"]),

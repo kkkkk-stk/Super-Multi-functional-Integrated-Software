@@ -65,7 +65,8 @@ EngineModel {
 
 另外有两点必须如实说明：
 
-- `crates/toolforge-engines/engine-sources.json` 是一个**独立于 `EngineModel` 的来源清单**（对应 `registry::EngineSourceSpec`）。它确实为 `ffmpeg` / `pandoc` / `libvips` / `7zip` / `python` 给出了候选下载 URL，但**其中每一条的 `sha256` 都是 `null`**；而 `registry.rs` 的文档注释明确规定「`sha256` 为 `None` 时 `EngineRegistry::install` 会**拒绝下载**」。也就是说这些 URL 目前只是候选，尚未成为可用的、经过校验的安装来源。本文档第 2、4 节的「体积」「安装方式」全部取自 `engine_catalog()`，不与 `engine-sources.json` 混用。
+- `crates/toolforge-engines/engine-sources.json` 是一个**独立于 `EngineModel` 的来源清单**（对应 `registry::EngineSourceSpec`）。它为 `ffmpeg` / `pandoc` / `libvips` / `python` 给出了候选下载 URL，但**其中每一条的 `sha256` 都是 `null`**；而 `registry.rs` 的文档注释明确规定「`sha256` 为 `None` 时 `EngineRegistry::install` 会**拒绝下载**」。也就是说这些 URL 目前只是候选，尚未成为可用的、经过校验的安装来源。
+  > **`7zip` 的条目已移除**（原先有，现已删除）：官方只提供安装器，或需要先有 7-Zip 才能解压的 `.7z`（先有鸡还是先有蛋），且那条版本固定直链 `7z2408-extra.7z` **实测 404**。因此 `7zip` 在 `engine_catalog()` 里已改为**仅系统安装**。本文档第 2、4 节的「体积」「安装方式」全部取自 `engine_catalog()`，不与 `engine-sources.json` 混用。
 - 本文档不给出任何版本号要求。`EngineDescriptor` 中只有 `license`、`licenseNote`、`approxSizeMb`、`platforms`、`installModes` 等字段，**没有最低版本字段**。`EngineState::Outdated`（版本过旧）只是一个运行时枚举值，其最低版本判定标准在代码中尚未定义，属于**待定**。
 
 ### 1.4 术语与枚举翻译
@@ -94,7 +95,7 @@ EngineModel {
 | `imagemagick` | ImageMagick | 格式覆盖最全的图像处理工具集，作为 libvips 的兜底。 | `ImageMagick License（Apache-2.0 风格）` | 本体宽松，但若链接了 GPL 组件（如部分 delegate）会传染，分发前需确认构建配置。 | 约 60 MB | 仅探测系统已安装；应用按需下载 | `image.convert`<br>`image.resize`<br>`image.crop`<br>`image.rotate`<br>`image.strip-metadata` | Windows / macOS / Linux | 否 |
 | `pandoc` | Pandoc（核心引擎） | 文档格式转换的瑞士军刀：Markdown / HTML / DOCX / EPUB / LaTeX 互转。 | `GPL-2.0+` | 以独立进程调用不构成衍生作品，可随闭源应用分发；但不得静态链接进你的二进制。 | 约 40 MB | 仅探测系统已安装；应用按需下载 | `doc.convert`<br>`ebook.convert` | Windows / macOS / Linux | 是 |
 | `libreoffice` | LibreOffice (headless) | Office 文档转 PDF 的事实标准。冷启动 2~5 秒，ToolForge 会复用常驻进程。 | `MPL-2.0` | MPL 是文件级 copyleft，独立进程调用无传染风险。 | 约 420 MB | 仅探测系统已安装 | `doc.to-pdf` | Windows / macOS / Linux | 是 |
-| `7zip` | 7-Zip（核心引擎） | 压缩解压，覆盖 zip / 7z / rar / tar 等格式。 | `LGPL-2.1+（含 unRAR 限制条款）` | unRAR 代码禁止用于开发 RAR 压缩器；解压用途不受影响。 | 约 5 MB | 仅探测系统已安装；应用按需下载 | `archive.pack`<br>`archive.unpack` | Windows / macOS / Linux | 否 |
+| `7zip` | 7-Zip（核心引擎） | 压缩解压，覆盖 zip / 7z / rar / tar 等格式。 | `LGPL-2.1+（含 unRAR 限制条款）` | unRAR 代码禁止用于开发 RAR 压缩器；解压用途不受影响。 | 约 5 MB | **仅探测系统已安装**（下载源已移除，见 1.3 节） | `archive.pack`<br>`archive.unpack` | Windows / macOS / Linux | 否 |
 | `calibre` | Calibre | 电子书格式转换与元数据管理（EPUB / MOBI / AZW3）。 | `GPL-3.0` | GPL-3.0 为强 copyleft。仅以独立进程调用；如要随包分发请先做合规评审。 | 约 180 MB | 仅探测系统已安装 | `ebook.convert` | Windows / macOS / Linux | 是 |
 | `python` | Python 运行时 | L3 插件的执行环境（独立 3.11 运行时，与系统 Python 隔离）。 | `PSF-2.0` | 宽松许可；注意随包分发的第三方 wheel 各自的许可证。 | 约 150 MB | 应用按需下载 | `image.remove-background`<br>`ai.upscale`<br>`doc.ocr` | Windows / macOS / Linux | 否 |
 | `onnx-models` | ONNX 模型包 | 抠图 / 超分 / 分割用的模型权重。**不随安装包分发，首次使用时下载**。 | `各模型不同（见下表）` | 代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。 | 约 180 MB | 应用按需下载 | `image.remove-background`<br>`ai.upscale` | Windows / macOS / Linux | 是 |
@@ -104,7 +105,7 @@ EngineModel {
 ### 2.1 总表读法
 
 - **核心引擎共 3 个**：`ffmpeg`、`pandoc`、`7zip`。它们在名称后标注了「（核心引擎）」。缺失时应用**仍然能启动**，但依赖它们的节点不可用：`ffmpeg` 缺失 → 5 个 `video.*` 与 2 个 `audio.*` 节点不可用；`pandoc` 缺失 → `doc.convert` 不可用，并且 `ebook.convert` 失去唯一的纯文档转换后端；`7zip` 缺失 → `archive.pack` / `archive.unpack` 不可用。
-- **只有 `System` 一种安装方式的引擎共 3 个**：`libreoffice`（约 420 MB）、`calibre`（约 180 MB）、`tesseract`（约 60 MB）。这三个都只探测系统安装、不提供应用内下载。另外 `7zip` 虽然同时支持 `System` 与 `Download`，但 `engine-sources.json` 中关于它的备注指出解压 `.7z` 本身需要 7-Zip（先有鸡还是先有蛋），因此推荐走系统安装模式。
+- **只有 `System` 一种安装方式的引擎共 4 个**：`libreoffice`（约 420 MB）、`calibre`（约 180 MB）、`tesseract`（约 60 MB）、`7zip`（约 5 MB）。这四个都只探测系统安装、不提供应用内下载。
 - **只有 `Download` 一种安装方式的引擎共 2 个**：`python`、`onnx-models`。二者不探测系统安装，避免与系统 Python / 系统模型缓存互相污染。
 - **只有 `Remote` 一种安装方式的引擎共 1 个**：`ai-provider`。体积记为 0 MB，因为它没有本地二进制。
 - **需要用户确认许可证（`requiresLicenseAck: true`）的引擎共 5 个**：`ffmpeg`、`pandoc`、`libreoffice`、`calibre`、`onnx-models`。UI 必须在用户点击「下载」之前就把许可证讲清楚（这是 `engine.rs` 中 `licenses` 字段刻意保留的原因）。
@@ -178,7 +179,7 @@ EngineModel {
 
 - **主页**：https://www.7-zip.org/
 - **提供的节点（2 个）**：`archive.pack`、`archive.unpack`。
-- **缺失时会发生什么**：两个节点**都不可用**，无降级路径（`requiresEngines: ["7zip"]`）。虽然 `7zip` 同时支持 `System` 与 `Download`，但下载安装存在「解压 `.7z` 本身需要 7-Zip」的引导问题（见 `engine-sources.json` 中的备注），因此实现时应优先引导系统安装。
+- **缺失时会发生什么**：两个节点**都不可用**，无降级路径（`requiresEngines: ["7zip"]`）。`7zip` 现在**只支持系统安装**（官方只提供安装器，或需要先有 7-Zip 才能解压的 `.7z`；原候选直链已 404），因此 UI 应直接引导到 https://www.7-zip.org/ ，而不是给一个"一键下载"按钮。
 - **许可证与分发注意点**：`LGPL-2.1+（含 unRAR 限制条款）`。unRAR 代码禁止用于开发 RAR 压缩器；**解压用途不受影响**。`requiresLicenseAck: false`——注意这是唯一一个 `core: true` 但不需要许可证确认的引擎。
 
 ### 3.5 电子书域

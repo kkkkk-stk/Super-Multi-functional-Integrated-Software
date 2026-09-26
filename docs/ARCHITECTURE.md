@@ -551,7 +551,8 @@ std::fs::create_dir_all(&workspace).ok();
 - **`nodes.rs` 的翻译职责**：`crates/toolforge-engines/src/nodes.rs::run(ctx, node, args)` 是一个大 `match`，把节点名分派到具体实现：
   - 纯 Rust（**不依赖任何外部引擎，永远可用**）：`image.probe` / `image.convert` / `image.resize` / `image.crop` / `image.rotate` / `image.enhance` / `image.strip-metadata`，以及 `fs.copy` / `fs.move` / `fs.mkdir` / `fs.delete`。
   - 命令行引擎：`video.*` 与 `audio.*` → `ffmpeg_*`；`doc.convert` → `pandoc_convert`；`doc.to-pdf` → `libreoffice_to_pdf`；`archive.pack` / `archive.unpack` → `sevenzip_*`。
-  - 流程控制：`flow.log` 与 `flow.branch` 直接 `Ok(NodeOutput::default())`（"由流水线执行器特殊处理，这里只兜底"）；`flow.set-var` → `flow_set_var`。
+  - 流程控制：`flow.log` → `flow_log`；`flow.set-var` → `flow_set_var`；`flow.branch` → `flow_branch`。
+    > 这三个曾经都是**空实现**（`Ok(NodeOutput::default())`，注释说"由流水线执行器特殊处理"，但 `l1.rs` 里并没有那段处理）—— 表现为"不报错也不做事"，是最难排查的一类行为。现已全部实现：`flow.log` 真的写任务日志、`flow.branch` 求值 `condition` 并产出 `steps.<id>.active`，且有回归测试钉住。
   - **`other => Err(not_implemented(other))`** —— 未实现的节点返回 `ErrorCode::Internal` + "内置节点 `{node}` 尚未在 v0.1 中实现"。`not_implemented` 的注释明确写了理由：「刻意**不返回假的成功**：插件作者与用户都必须立刻知道这个能力还没做，否则会出现"流水线显示跑通了但没产出文件"这种最难排查的问题。」
 - **降级策略**（`lib.rs` 文档）：图片是唯一真正三层降级的领域 —— `libvips ──缺失──► ImageMagick ──缺失──► 纯 Rust image crate`；音视频/文档/压缩包没有纯 Rust 替代品，所以走「必需引擎缺失 → 该节点不可用」并引导安装，「**不假装能跑**」。
 - `NodeCtx::engine(id)` 是节点实现拿可执行文件路径的统一入口。

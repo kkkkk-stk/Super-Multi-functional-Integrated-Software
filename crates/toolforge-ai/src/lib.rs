@@ -89,10 +89,20 @@ pub fn system_prompt() -> String {
    - 写输出：`{{ kind: fsWrite, scope: {{ kind: output }} }}`
    - 出网：`{{ kind: net, hosts: [] }}`（极少数情况才需要）
    - 起进程：`{{ kind: exec }}`（几乎永远不该出现）
-7. 变量模板用 `${{...}}`：`${{src}}` / `${{dst}}` / `${{input.<端口>}}` / `${{output.<端口>}}` / `${{params.<参数>}}` / `${{steps.<步骤id>.<键>}}`。
-8. **只能引用前面步骤的产出**，不允许前向引用。
-9. enum 参数必须给 `options`。
-10. **优先用 L1**。只有在内置节点完全无法表达计算逻辑时，才用 `runtime.kind: python`（不要用 wasm 做图像处理，WASM 里没有文件系统和 SIMD）。
+7. 变量模板用 `${{...}}`：`${{src}}` / `${{dst}}` / `${{input.<端口>}}` / `${{output.<端口>}}` / `${{params.<参数>}}` / `${{steps.<步骤id>.<键>}}` / `${{vars.<变量名>}}`。
+8. **参数写在哪**（最容易搞错，请严格遵守）：
+   - **路径与流程接线**（`src` / `dst` / `path` / `name` / `duration` 等）写在步骤的 `with:` 里；
+   - **用户可调的选项**（格式、质量、宽度、模型名等）写在插件顶层的 `io.params:` 里，
+     并在 `with` 里用 `"${{params.<id>}}"` 传进去；
+   - 两种写法执行器都支持（`with` 里的显式字面量优先），但**上面这种分工才是推荐形态**：
+     它让参数出现在 UI 表单里，用户能改。
+   - 参数 **id 必须与内置节点读取的键名逐字一致**（例如 `image.convert` 读 `format` / `quality`）。
+9. `with` 的**值必须是字符串**（写 `width: 1280` 会解析失败，要写 `width: "1280"`）。
+10. **只能引用前面步骤的产出**，不允许前向引用。
+11. enum 参数必须给 `options`。
+12. **优先用 L1**。只有在内置节点完全无法表达计算逻辑时，才用 `runtime.kind: python`（不要用 wasm 做图像处理，WASM 里没有文件系统和 SIMD）。
+13. 如果某个节点的执行器尚未实现（`image.remove-background` / `doc.ocr` / `ebook.convert` / `ai.upscale` / `ai.describe` / `flow.foreach`），
+    你仍然可以生成引用它们的清单，但**必须在 `metadata.description` 里明确写出"该能力尚未实现"**，不要让用户以为能跑。
 
 # 内置节点清单
 
@@ -152,6 +162,11 @@ runtime:
           format: "webp"
           quality: "90"
           dst: "${{dst}}"
+```
+
+注意上例中的分工：`maxWidth` 是用户可调的，所以放在 `io.params` 并由 `with` 用
+`${{params.maxWidth}}` 注入；`width` / `format` / `quality` 这类节点读的键名
+**在 `with` 里直接给字面量也生效**（执行器会先看 `with` 再看用户参数）。
 "#
     )
 }

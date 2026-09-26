@@ -80,16 +80,6 @@
     "note": "macOS 预编译包。"
   },
   {
-    "id": "7zip",
-    "platform": "windows",
-    "url": "https://www.7-zip.org/a/7z2408-extra.7z",
-    "sha256": null,
-    "archive": "7z",
-    "stripComponents": 0,
-    "binSubdir": ".",
-    "note": "存在先有鸡还是先有蛋的问题：解压 .7z 本身需要 7-Zip。ToolForge 的策略是先尝试系统已装的 7z，再退回 tar（Windows 自带 bsdtar 不支持 .7z）。因此 7-Zip 推荐走系统安装模式。"
-  },
-  {
     "id": "python",
     "platform": "windows",
     "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250115/cpython-3.11.11+20250115-x86_64-pc-windows-msvc-install_only.tar.gz",

@@ -159,6 +159,9 @@ pub async fn run_pipeline(
         guard,
         params,
         vars: HashMap::new(),
+        // 每次调用 `nodes::run` 前会被覆写成该步骤的 `with` 块，
+        // 这里给个空的就行（见 NodeCtx::arg_scope 的文档）。
+        arg_scope: BTreeMap::new(),
     };
 
     // ---- 模板上下文初始值 ----
@@ -176,12 +179,25 @@ pub async fn run_pipeline(
     for (k, v) in &ctx.params {
         tctx.insert(format!("params.{k}"), param_to_string(v));
     }
-    // 最常见的两个端口给简写别名
-    if let Some(first) = req.inputs.values().find_map(|v| v.first()) {
-        tctx.insert("src", first.clone());
+
+    // `${src}` / `${dst}` 是简写别名。
+    //
+    // ⚠️ **必须按清单里声明的端口顺序取**，不能直接 `req.outputs.values().next()` ——
+    // 那是个 `HashMap`，迭代顺序不确定。多输出端口的插件会随机把文件写到
+    // 某一个端口的目标路径上，表现为"偶尔输出到错误的文件名"，极难复现。
+    let first_output = first_output_path(
+        record.manifest.io.outputs.iter().map(|p| p.id.as_str()),
+        &req.outputs,
+    );
+    let first_input = first_input_path(
+        record.manifest.io.inputs.iter().map(|p| p.id.as_str()),
+        &req.inputs,
+    );
+    if let Some(v) = first_input {
+        tctx.insert("src", v);
     }
-    if let Some(first) = req.outputs.values().next() {
-        tctx.insert("dst", first.clone());
+    if let Some(v) = first_output {
+        tctx.insert("dst", v);
     }
 
     let mut result = PipelineRunResult::default();
@@ -285,6 +301,12 @@ pub async fn run_pipeline(
                     tctx.insert(format!("steps.{}.{}", step.id, k), v.clone());
                     ctx.vars.insert(format!("{}.{}", step.id, k), v.clone());
                 }
+                // `flow.set-var` 写的变量以 `${vars.<名称>}` 暴露给后续步骤。
+                // 节点目录里 `flow.set-var` 的描述承诺了这一点，但执行器此前
+                // 只桥接了 `steps.*` —— 于是那份承诺是假的（文档已修正为事实）。
+                for (k, v) in &ctx.vars {
+                    tctx.insert(format!("vars.{k}"), v.clone());
+                }
                 result.outputs.extend(out.outputs.clone());
                 result.steps.push(StepResult {
                     id: step.id.clone(),
@@ -355,21 +377,44 @@ fn step_label(step: &PipelineStep) -> String {
     step.label.clone().unwrap_or_else(|| step.id.clone())
 }
 
-fn param_to_string(v: &ParamValue) -> String {
-    match v {
-        ParamValue::Str(s) => s.clone(),
-        ParamValue::Int(i) => i.to_string(),
-        ParamValue::Float(f) => {
-            // 整数值不要显示成 "90.0"，那会让用户困惑
-            if (f.fract()).abs() < f64::EPSILON {
-                format!("{}", *f as i64)
-            } else {
-                f.to_string()
-            }
+/// 输入端口：按**清单声明的顺序**取第一个非空文件路径。
+///
+/// 清单没声明端口、或端口名对不上时，退化为按键排序 —— 至少结果是确定的，
+/// 而不是随 `HashMap` 的随机种子变化。
+fn first_input_path<'a>(
+    declared_ids: impl Iterator<Item = &'a str>,
+    inputs: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    for id in declared_ids {
+        if let Some(first) = inputs.get(id).and_then(|v| v.first()) {
+            return Some(first.clone());
         }
-        ParamValue::Bool(b) => b.to_string(),
-        ParamValue::List(l) => l.join(","),
     }
+    let mut keys: Vec<&String> = inputs.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .find_map(|k| inputs.get(k).and_then(|v| v.first()).cloned())
+}
+
+/// 输出端口：同上，用于 `${dst}` 别名。
+fn first_output_path<'a>(
+    declared_ids: impl Iterator<Item = &'a str>,
+    outputs: &HashMap<String, String>,
+) -> Option<String> {
+    for id in declared_ids {
+        if let Some(v) = outputs.get(id) {
+            return Some(v.clone());
+        }
+    }
+    let mut keys: Vec<&String> = outputs.keys().collect();
+    keys.sort();
+    keys.first().and_then(|k| outputs.get(*k)).cloned()
+}
+
+/// 参数 → 字符串。复用 `toolforge-engines` 的实现，避免两处逻辑漂移
+/// （曾经这里和 `nodes.rs` 各有一份，改动时很容易只改一边）。
+fn param_to_string(v: &ParamValue) -> String {
+    toolforge_engines::nodes::param_to_string(v)
 }
 
 /// 流水线里是否出现了引用某个参数的步骤（用于粗略判断是否需要 fs 能力）
@@ -401,6 +446,67 @@ mod tests {
             param_to_string(&ParamValue::List(vec!["a".into(), "b".into()])),
             "a,b"
         );
+    }
+
+    // ========================================================================
+    // `${src}` / `${dst}` 别名的确定性
+    //
+    // 回归：原来直接用 `req.outputs.values().next()`，那是 `HashMap` ——
+    // 迭代顺序不确定。多输出端口的插件会**随机**把文件写到某个端口的目标路径上。
+    // ========================================================================
+
+    #[test]
+    fn output_alias_follows_manifest_port_order() {
+        let mut outputs = HashMap::new();
+        // 故意让 HashMap 的键序（通常按哈希）与清单声明序相反
+        outputs.insert("zzz".to_string(), "/out/zzz.png".to_string());
+        outputs.insert("aaa".to_string(), "/out/aaa.png".to_string());
+
+        // 清单把 zzz 声明在前 → `${dst}` 必须取 zzz，与 HashMap 顺序无关
+        let got = first_output_path(["zzz", "aaa"].into_iter(), &outputs);
+        assert_eq!(got.as_deref(), Some("/out/zzz.png"));
+
+        // 反过来声明 → 取 aaa
+        let got = first_output_path(["aaa", "zzz"].into_iter(), &outputs);
+        assert_eq!(got.as_deref(), Some("/out/aaa.png"));
+    }
+
+    #[test]
+    fn output_alias_is_deterministic_even_without_manifest_ports() {
+        let mut outputs = HashMap::new();
+        outputs.insert("zzz".to_string(), "/out/zzz.png".to_string());
+        outputs.insert("aaa".to_string(), "/out/aaa.png".to_string());
+        // 清单没声明任何端口 → 退化为按键排序，至少每次结果一样
+        for _ in 0..32 {
+            assert_eq!(
+                first_output_path(std::iter::empty(), &outputs).as_deref(),
+                Some("/out/aaa.png")
+            );
+        }
+    }
+
+    #[test]
+    fn input_alias_uses_declared_port_order_and_skips_empty_ports() {
+        let mut inputs = HashMap::new();
+        inputs.insert("mask".to_string(), vec![]); // 声明在前但为空
+        inputs.insert("src".to_string(), vec!["/in/a.png".to_string()]);
+
+        let got = first_input_path(["mask", "src"].into_iter(), &inputs);
+        assert_eq!(
+            got.as_deref(),
+            Some("/in/a.png"),
+            // 注意 `${{...}}` 的双大括号：assert_eq! 的提示文本会被当成 format! 字符串，
+            // 里面单个 `{src}` 会被解析成"隐式捕获变量 src"并报 E0425。
+            "空端口必须被跳过，否则 ${{src}} 会解析成空串"
+        );
+    }
+
+    #[test]
+    fn aliases_are_absent_when_there_are_no_ports() {
+        let empty: HashMap<String, Vec<String>> = HashMap::new();
+        assert!(first_input_path(std::iter::empty(), &empty).is_none());
+        let empty2: HashMap<String, String> = HashMap::new();
+        assert!(first_output_path(std::iter::empty(), &empty2).is_none());
     }
 
     #[test]
