@@ -18,10 +18,14 @@
  * 6. **图片的三层降级是不是真的** —— libvips / ImageMagick 曾经只登记在目录里，
  *    一行代码都没调用过，而文档里那张"三层降级图"写了好几个月。
  *    现在节点日志会说清用了哪个后端，这条检查就是盯着它。
+ * 7. **AI 抠图能不能真的输出透明背景** —— 它是产品定位里的招牌能力。
+ * 8. **电子书转换的降级与拦截** —— pandoc 遇到写不出的格式会**假装成功**
+ *    （生成一个扩展名骗人的 HTML），所以必须验证"该拒的真的拒了"。
  *
  * 用法：`node scripts/devtools/verify-platform.mjs`
  */
 
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -439,6 +443,105 @@ c.section('【8】AI 抠图（image.remove-background）是否真的能出透明
         '前景占比落在合理区间（既不是"什么都没找到"也不是"整张图都是前景"）',
         `${pct}%`
       );
+    }
+  }
+}
+
+// ============================================================================
+// 【9】电子书转换：pandoc 降级路径 + "pandoc 会假装成功"的拦截
+// ============================================================================
+c.section('【9】电子书转换（ebook.convert）的降级与拦截');
+{
+  const engines = await client.invoke('engines_catalog');
+  const usable = (id) => {
+    const e = engines.find((x) => x.descriptor.id === id);
+    return e && (e.status.state === 'detected' || e.status.state === 'installed');
+  };
+  const hasCalibre = usable('calibre');
+  const hasPandoc = usable('pandoc');
+  c.note(`引擎：calibre=${hasCalibre} pandoc=${hasPandoc}`);
+
+  if (!hasCalibre && !hasPandoc) {
+    c.note('跳过：两个引擎都没装（到「引擎管理」装 Pandoc 只 40 MB）');
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-ebook-verify');
+    rmSync(outDir, { recursive: true, force: true });
+    mkdirSync(outDir, { recursive: true });
+
+    // 输入：用 pandoc 自己造一本真 epub（不引入任何二进制测试素材）
+    const src = join(REPO_ROOT, '.tools', 'smoke', 'in-ebook.epub');
+    const md = join(REPO_ROOT, '.tools', 'smoke', 'in-ebook.md');
+    writeFileSync(md, '# 验证用书\n\n这是一段正文。\n', 'utf8');
+    const pandoc = engines.find((e) => e.descriptor.id === 'pandoc')?.status?.path;
+    if (hasPandoc && pandoc) {
+      try {
+        execFileSync(pandoc, [md, '-o', src], { stdio: 'ignore' });
+      } catch (e) {
+        c.note(`造输入 epub 失败：${String(e.message).slice(0, 120)}`);
+      }
+    }
+
+    if (existsSync(src)) {
+      const sub = await client.invoke('plugins_run', {
+        req: {
+          pluginId: 'com.toolforge.builtin.ebook-convert',
+          inputs: { src: [src] },
+          params: { format: { kind: 'str', value: 'docx' } },
+          outputDir: outDir,
+        },
+      });
+      const job = await client.waitJob(sub.jobId, 300, 1000);
+      c.check(job.status === 'succeeded', 'epub → docx 成功', job.error?.message ?? job.status);
+      const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+      if (produced.length === 1) {
+        const buf = readFileSync(join(outDir, produced[0]));
+        // ★ DOCX 必须是 ZIP 容器（PK）。这条断言能抓到"其实写了个 HTML 出来"
+        //   这一类静默错误 —— 那正是 pandoc 在遇到不认识的扩展名时的行为。
+        c.check(
+          buf.subarray(0, 2).toString('ascii') === 'PK',
+          '产出是真正的 DOCX（ZIP 容器，不是被改了扩展名的 HTML）',
+          buf.subarray(0, 4).toString('ascii')
+        );
+        c.check(
+          !buf.subarray(0, 200).toString('utf8').toLowerCase().includes('<html'),
+          '产出内容不是 HTML'
+        );
+      } else {
+        c.check(false, '产出 1 个 docx', produced.join(', '));
+      }
+    } else {
+      c.note('（没有 pandoc，无法造出测试用 epub，跳过正向转换）');
+    }
+
+    // ★ 反向断言：pandoc 写不出的格式必须**被提前拦下**。
+    //   不拦的话 pandoc 会退出码 0、生成一个扩展名为 .mobi 的 HTML ——
+    //   用户拿到一个骗人的文件，然后在完全无关的地方找原因。
+    if (!hasCalibre && hasPandoc) {
+      const badDir = join(REPO_ROOT, '.tools', 'smoke', 'out-ebook-mobi');
+      rmSync(badDir, { recursive: true, force: true });
+      mkdirSync(badDir, { recursive: true });
+      let rejected = false;
+      let msg = '';
+      try {
+        const sub = await client.invoke('plugins_run', {
+          req: {
+            pluginId: 'com.toolforge.builtin.ebook-convert',
+            inputs: { src: [src] },
+            params: { format: { kind: 'str', value: 'mobi' } },
+            outputDir: badDir,
+          },
+        });
+        const job = await client.waitJob(sub.jobId, 200, 1000);
+        rejected = job.status === 'failed';
+        msg = `${job.error?.code ?? ''} ${job.error?.message ?? ''}`;
+      } catch (e) {
+        rejected = true;
+        msg = String(e.message);
+      }
+      const leftovers = existsSync(badDir) ? readdirSync(badDir) : [];
+      c.check(rejected, '没有 Calibre 时，转 MOBI 被明确拒绝（而不是"成功"出一个假文件）', msg.slice(0, 90));
+      c.check(leftovers.length === 0, '磁盘上没有留下假的 .mobi', leftovers.join(', '));
     }
   }
 }

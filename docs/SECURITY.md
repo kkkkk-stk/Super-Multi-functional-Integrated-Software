@@ -701,7 +701,8 @@ Component::ParentDir => { if !out.pop() { out.push("..") } }
 
 ### 5.3 现状标注与落地验收条件
 
-**现状**：与"`src/` 目录还不存在、主程序未写"的旧描述不同，外壳代码**已经存在**：`src/commands.rs`（28 个命令）、`src/ipc.rs`、`src/state.rs`、`src/lib.rs`、`src/main.rs`、`src/bin/export_bindings.rs`。命令层本身的设计纪律是好的——`commands.rs` 的模块文档写着「命令只做编排」「耗时操作一律异步化」「前端拿不到裸 shell」「AI 的产出永远只是草稿」，且 `lib.rs` 用 `COMMAND_NAMES` 与 `collect_commands!` 做数量一致性自检（`debug_assert_eq!(COMMAND_NAMES.len(), 28)`）。
+**现状**：与"`src/` 目录还不存在、主程序未写"的旧描述不同，外壳代码**已经存在**：`src/commands.rs`（**32** 个命令）、`src/ipc.rs`、`src/state.rs`、`src/lib.rs`、`src/main.rs`、`src/bin/export_bindings.rs`。命令层本身的设计纪律是好的——`commands.rs` 的模块文档写着「命令只做编排」「耗时操作一律异步化」「前端拿不到裸 shell」「AI 的产出永远只是草稿」，且 `COMMAND_NAMES` 与 `collect_commands!` 之间**有逐条对齐的守卫**。
+> ⚠️ 这里原先写的是「`lib.rs` 用 `debug_assert_eq!(COMMAND_NAMES.len(), 28)` 做数量一致性自检」——**那条断言已经被删掉了**（当时数字还写成 28，实际早已是 32）：它比的是两处各自维护的常量，忘了同步就会让 debug 构建**在启动时 panic**。真正管这件事的是 `src/bin/export_bindings.rs` 的守卫 2——它按名字逐个核对 `COMMAND_NAMES` 里的每一条都出现在生成的绑定里、且注册数一致，随 `pnpm bindings` 执行。
 
 因此本节的状态应标注为：**设计约束已写进代码与注释，能力配置已存在但需要收窄**；下面这些验收条件应在 v0.1/v0.2 阶段被实际检查。
 
@@ -942,6 +943,17 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | 26 | ~~`nodes.rs::libreoffice_to_pdf` 在 `dst` 没有父目录时回退到 `std::env::temp_dir()`~~ | —— | ✅ **已修复**：改为**直接报错**而不是回退到宿主机临时目录。宁可让调用方看到"输出路径没有父目录"，也不要在授权范围之外偷偷写文件 | 关闭 |
 | 27 | `ai.persistApiKey` 打开后，API Key **明文**写在 `<data>/ai-key.txt`；**没有加密、没有 DPAPI / Keychain** | 拿到该文件即可拿到 Key。这是相对系统钥匙串的**能力降级**，而代码里 `ai-provider` 的 `licenseNote` 仍写着「只存在本机加密存储中」，属于与实现不符的文案 | 开关**默认关闭**（`persistApiKey: false`，Key 默认只在内存）；关掉开关会**删除**该文件；Key 不进日志、不进审计、不序列化给前端 | 待定（OS 钥匙串仍是 ROADMAP 上的待办；在它落地前**不得**在任何文案里声称加密存储） |
 | 28 | 模型权重的下载**依赖服务端提供正确文件**，而 `birefnet-general` / `modnet-portrait` / `realesrgan-x4plus` **没有 url/hash** | 对后三者前端只能显示「无下载源」并禁用按钮（刻意的：宁可按钮是灰的，也不放一个点了必然失败的按钮） | 已核对的三个 rembg 权重带**真实下载后算出来的** SHA-256；**哈希不匹配即删除文件**（`registry.rs::install_model` → `IntegrityCheckFailed`），不留没校验过的产物 | 待定（补齐剩余三个模型的真实哈希后再放开按钮） |
+| 29 | **抠图节点首次运行会自己建 venv 并联网 `pip install`**（`onnxruntime` / `numpy` / `pillow`，约 30 MB），**这不是用户逐条点出来的动作** | 一次主机侧的、未做完整性校验的网络拉包：**没有哈希锁定、没有签名校验**，装进来的 wheel 会被推理子进程直接 import。它同样是"首次运行要联网"这个事实在产品里的第二个入口（第一个是权重下载） | 只在**首次运行 `image.remove-background` 时**发生（不是安装应用时、不是启动时，也不是别的节点）；venv 独立落在 `<data>/cache/onnx-runtime/`，**不碰用户自己的 Python**，卸载就是删掉那个目录；**推理本身完全本地** —— 不联网、不上传图片；用户必须自行下载权重，所以这个节点不可能在用户完全没动作的情况下自己开跑 | v0.2（讨论方向：把 wheel 版本固定并校验哈希，或改为随包分发 / 由 `engine-sources.json` 提供受校验的来源） |
+
+> **关于第 29 项，几条必须说清楚、不能含糊的边界：**
+>
+> - **什么时候发生**：**只有首次运行抠图节点（`image.remove-background`）时**。安装应用、启动应用、跑别的节点都不会触发。
+> - **装到哪里**：`<data>/cache/onnx-runtime/` 下的**独立 venv**。
+> - **会不会动用户的 Python**：**不会**。这是刻意选独立 venv 的理由 —— 用户的系统 Python 一个字节都不改，卸载也只是删目录。
+> - **推理联网吗**：**不联网**。图片不上传，推理全在本机；网络只用于**一次**拉取依赖。
+> - **不能声称的**：**不能说这些 pip 包被哈希锁定或经过校验** —— 它们没被锁定、也没被校验。也不要说"这个节点完全离线可用"：**没有网络的机器在依赖就位之前用不了它**（权重还得用户自己下）。
+>
+> 相关设计理由（为什么跑 Python 子进程而不是 Rust 内推理）见 `docs/ARCHITECTURE.md` 决策 9；引擎与权重侧的说明见 `docs/ENGINE-MATRIX.md` 第 3.2、3.6 节。
 
 ### 附：本次核对中**没有**发现问题的部分（也值得记下来）
 
@@ -979,7 +991,8 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | 审计 | `crates/toolforge-plugins/src/audit.rs`（`AuditEventKind` / `AuditEvent` / `AuditLog` / `content_hash` / `record_violation` / `record_escalation` / `record_integrity`） |
 | 插件仓库与安装 | `crates/toolforge-plugins/src/store.rs`（`PluginStore::install` / `finish_install` / `set_granted` / `set_enabled` / `runnable` / `verify_integrity` / `quarantine_if_changed` / `safe_relative_path` / `diff_capabilities`） |
 | 子进程监管 | `crates/toolforge-process/src/supervisor.rs`（`SpawnSpec` / `ChildSupervisor::spawn` / `initialize` / `call` / `shutdown` / `kill` / `decorate`）、`crates/toolforge-process/src/lib.rs`（`hide_console` / `detach_process_group` / 安全边界说明） |
-| 内置节点与虚拟前缀 | `crates/toolforge-engines/src/nodes.rs`（`resolve_path`） |
+| 内置节点与虚拟前缀 | `crates/toolforge-engines/src/nodes.rs`（`resolve_path`；`image_remove_background` 是第 29 项那次联网 `pip install` 的触发点） |
+| 抠图的运行时准备与外发网络 | `crates/toolforge-engines/src/nodes.rs`（`image_remove_background` + `ensure_onnx_runtime`：建 venv、`pip install onnxruntime numpy pillow`）、`crates/toolforge-engines/py/rembg.py`（实际执行推理的脚本，本身不联网） |
 | AI 生成与审核 | `crates/toolforge-ai/src/review.rs`（`AiDraft` / `SecurityReview` / `review_draft` / `scan_code`）、`crates/toolforge-ai/src/provider.rs`（`AiProviderConfig` 的 `api_key`） |
 | 外壳与 IPC | `apps/desktop/src-tauri/src/commands.rs`（`plugins_install` / `plugins_grant` / `plugins_run` / `ai_generate` / `build_io` / `resolve_output_dir`）、`apps/desktop/src-tauri/src/lib.rs`（`COMMAND_NAMES` / `specta_builder` / 插件注册）、`apps/desktop/src-tauri/capabilities/default.json`、`apps/desktop/src-tauri/tauri.conf.json` |
 | 阶段目标 | `docs/ROADMAP.md`、`docs/ENGINE-MATRIX.md` |

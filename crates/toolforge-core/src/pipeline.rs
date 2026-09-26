@@ -540,10 +540,9 @@ pub const UNIMPLEMENTED_NODES: &[&str] = &[
     "ai.upscale",
     // 依赖 AI 服务提供方；`ai_test_connection` 已经能连通，但"看图说话"这一步没写
     "ai.describe",
-    // 依赖 tesseract，而 tesseract 目前只支持系统安装（没有配置下载源）
+    // 依赖 tesseract，而 tesseract 只提供**安装器**（不是压缩包），
+    // 没有配置下载源 —— 见 engine.rs 里 tesseract 那条的说明
     "doc.ocr",
-    // 依赖 calibre，同样只支持系统安装
-    "ebook.convert",
 ];
 
 // `flow.foreach` 曾经在这里，现在**整个节点都删掉了**。留个记录，免得有人再把它加回来：
@@ -947,7 +946,11 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "ebook.convert".into(),
         label: "电子书转换".into(),
-        description: "EPUB / MOBI / AZW3 / PDF 互转。优先 Calibre，缺失时降级到 Pandoc（仅 EPUB/HTML）。".into(),
+        description: "电子书格式互转。**优先 Calibre**（格式最全，MOBI / AZW3 / LIT 只有它能写）；\
+                      没装 Calibre 时降级到 Pandoc（EPUB / DOCX / FB2 / HTML / Markdown / RTF / ODT / TXT）。\
+                      Pandoc 覆盖不到的格式会**在调用前**被挡下来并提示装 Calibre —— \
+                      因为 pandoc 遇到不认识的输出扩展名不会报错，它会写一个 HTML 出来、\
+                      保留原扩展名、然后返回成功。".into(),
         category: NodeCategory::Ebook,
         requires_engines: vec![],
         optional_engines: vec![engine("calibre"), engine("pandoc")],

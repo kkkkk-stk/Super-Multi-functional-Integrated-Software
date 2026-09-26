@@ -331,6 +331,10 @@ pub async fn run(
         "audio.normalize" => ffmpeg_audio_normalize(ctx, args).await,
 
         // ---------- 文档 / 压缩包 ----------
+        // ---------- 电子书（Calibre 优先，缺失时按能力表降级到 Pandoc）----------
+        "ebook.convert" => ebook_convert(ctx, args).await,
+
+        // ---------- 文档（Pandoc / LibreOffice）----------
         "doc.convert" => pandoc_convert(ctx, args).await,
         "doc.to-pdf" => libreoffice_to_pdf(ctx, args).await,
         "archive.pack" => sevenzip_pack(ctx, args).await,
@@ -2280,6 +2284,138 @@ async fn ffmpeg_audio_normalize(
 // ============================================================================
 // 文档 / 压缩包
 // ============================================================================
+
+async fn ebook_convert(
+    ctx: &mut NodeCtx,
+    args: &BTreeMap<String, String>,
+) -> ToolforgeResult<NodeOutput> {
+    let src = resolve_path(ctx, "input", arg(args, "src")?)?;
+    let dst = resolve_path(ctx, "output", arg(args, "dst")?)?;
+    let title = ctx.param_str("title", "");
+    let author = ctx.param_str("author", "");
+
+    let src_ext = file_ext(&src);
+    let dst_ext = file_ext(&dst);
+    if dst_ext.is_empty() {
+        return Err(ToolforgeError::invalid(
+            "输出路径没有扩展名，无法判断要转成什么格式",
+        ));
+    }
+
+    // ---- Calibre 优先：格式覆盖最全（mobi / azw3 / lit 只有它能写）----
+    if ctx.engines.is_available("calibre").await {
+        let calibre = ctx.engine("calibre").await?;
+        let mut a = vec![src.display().to_string(), dst.display().to_string()];
+        if !title.trim().is_empty() {
+            a.push("--title".into());
+            a.push(title.clone());
+        }
+        if !author.trim().is_empty() {
+            a.push("--authors".into());
+            a.push(author.clone());
+        }
+        let r = exec(
+            ExecOptions::new(calibre)
+                .args(a)
+                .cancel(ctx.job.cancel.clone())
+                .timeout(Duration::from_secs(1800))
+                .quiet(true),
+        )
+        .await?;
+        if !r.success() {
+            return Err(r.into_error("calibre"));
+        }
+        return Ok(NodeOutput::file(dst.display().to_string())
+            .with_value("backend", "calibre".to_string()));
+    }
+
+    // ---- 降级到 Pandoc ----
+    //
+    // ⚠️ **这里有本项目遇到过的、最阴的一种失败模式。**
+    //
+    // pandoc 对"我不认识的输出扩展名"**不会报错**：它打一句
+    // `[WARNING] Could not deduce format from file extension .mobi` +
+    // `Defaulting to html`，然后**退出码 0**、文件也真的生成了 ——
+    // 只是那是一个 HTML 文件，被命名成了 `.mobi`。
+    //
+    // 也就是说：如果我们把 mobi 直接交给 pandoc，用户会拿到一个
+    // "转换成功"的、扩展名骗人的坏文件。所以必须**在调用之前**
+    // 就按自己的能力表把关，而不是相信它的退出码。
+    if ctx.engines.is_available("pandoc").await {
+        if !PANDOC_EBOOK_OUT.contains(&dst_ext.as_str()) {
+            return Err(ToolforgeError::engine_missing("calibre").with_detail(format!(
+                "pandoc 写不出 `.{dst_ext}`（它只会**默默把输出写成 HTML 并保留这个扩展名**，\
+                 退出码还是 0 —— 那种「成功」比失败更糟）。\n\
+                 pandoc 能写的电子书格式只有：{}。\n\
+                 要转 `.{dst_ext}` 请安装 Calibre：「设置 → 引擎管理 → Calibre」。",
+                PANDOC_EBOOK_OUT.join(" / ")
+            )));
+        }
+        if !PANDOC_EBOOK_IN.contains(&src_ext.as_str()) {
+            return Err(ToolforgeError::engine_missing("calibre").with_detail(format!(
+                "pandoc 读不了 `.{src_ext}`（它能读的电子书格式只有：{}）。\n\
+                 要转 `.{src_ext}` 请安装 Calibre：「设置 → 引擎管理 → Calibre」。",
+                PANDOC_EBOOK_IN.join(" / ")
+            )));
+        }
+
+        let pandoc = ctx.engine("pandoc").await?;
+        let mut a = vec![
+            src.display().to_string(),
+            "-o".into(),
+            dst.display().to_string(),
+        ];
+        if !title.trim().is_empty() {
+            a.push("--metadata".into());
+            a.push(format!("title={title}"));
+        }
+        if !author.trim().is_empty() {
+            a.push("--metadata".into());
+            a.push(format!("author={author}"));
+        }
+        let r = exec(
+            ExecOptions::new(pandoc)
+                .args(a)
+                .cancel(ctx.job.cancel.clone())
+                .timeout(Duration::from_secs(900))
+                .quiet(true),
+        )
+        .await?;
+        if !r.success() {
+            return Err(r.into_error("pandoc"));
+        }
+        ctx.job.info(
+            "本次转换用的是 Pandoc（能写 EPUB / DOCX / FB2 / HTML / Markdown / RTF / ODT / TXT）。\
+             要转 MOBI / AZW3 / PDF，请安装 Calibre。",
+        );
+        return Ok(NodeOutput::file(dst.display().to_string())
+            .with_value("backend", "pandoc".to_string()));
+    }
+
+    Err(ToolforgeError::engine_missing("calibre").with_detail(
+        "电子书转换需要 Calibre（格式最全）或 Pandoc（覆盖 EPUB / DOCX / FB2 / HTML 等常见格式）。\n\
+         请到「设置 → 引擎管理」安装其中之一：\n\
+         * Calibre —— 支持 MOBI / AZW3 / LIT 等全部主流格式（约 180 MB）\n\
+         * Pandoc —— 只有 40 MB，覆盖 EPUB / DOCX / FB2 / HTML / Markdown，但**不包括 MOBI / AZW3**"
+            .to_string(),
+    ))
+}
+
+/// pandoc 能**读**的电子书类格式（实测核对过，不是照抄文档）。
+///
+/// 不在表里的（mobi / azw3 / lit / pdf）必须落到 Calibre ——
+/// pandoc 遇到它们不是报错，而是当成纯文本来读，产出垃圾。
+const PANDOC_EBOOK_IN: &[&str] = &[
+    "epub", "fb2", "html", "htm", "xhtml", "md", "markdown", "docx", "odt", "rtf", "txt", "rst",
+];
+
+/// pandoc 能**写**的电子书类格式。
+///
+/// ⚠️ 这张表是**把关用**的，不能图省事直接交给 pandoc 去判断：
+/// 它遇到不认识的扩展名会写一个 HTML 出来、保留原扩展名、并返回 0。
+const PANDOC_EBOOK_OUT: &[&str] = &[
+    "epub", "fb2", "html", "htm", "md", "markdown", "docx", "odt", "rtf", "txt", "rst",
+];
 
 async fn pandoc_convert(
     ctx: &mut NodeCtx,

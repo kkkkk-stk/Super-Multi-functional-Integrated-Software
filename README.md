@@ -48,23 +48,47 @@
 Rust 没有稳定 ABI，Windows 还有文件锁 —— 原生插件的热重载**必然崩**，而且一崩就是整个应用。
 如果你确实需要，正确的方向是「独立进程 + IPC」，那其实就是 L3。
 
-### 4. 图片处理的目标是三层降级，但**目前只有纯 Rust 那一层在跑**
+### 4. 图片处理的三层降级：**四个节点是真的，两个还不是**（libvips 实测装过）
 
 ```
 libvips（快、省内存） ──缺失──▶ ImageMagick（格式最全） ──缺失──▶ 纯 Rust image crate
                                                                     （零依赖，永远可用）
 ```
 
-> 🚧 **诚实说明**：上面这张图是**设计目标**。`nodes.rs` 里真正被调用的引擎只有
-> ffmpeg / pandoc / libreoffice / 7zip 四个，`libvips` 与 `imagemagick`
-> **没有任何一处被 resolve 或调用** —— 图像节点全部只走纯 Rust 路径。
-> 所以"装了 libvips 就自动提速"现在**不成立**。详见
-> [docs/ENGINE-MATRIX.md](docs/ENGINE-MATRIX.md) 第 5.1 节与
+> ✅ **这张图现在真的会走**：`nodes.rs::pick_image_backend()` 按上面的顺序挑后端，
+> 并把用的是哪个**报出来** —— 节点输出里多一个 `backend`（`libvips` / `imagemagick` / `rust`），
+> 日志里多一条 `image.convert：后端 = libvips（快、省内存）；a.png → a.webp（质量 90）`。
+> `scripts/devtools/verify-platform.mjs` 的【6】号检查专门盯着"实际后端与引擎状态是否一致"。
+>
+> **走这条链的**：`image.convert`、`image.resize`、`image.crop`、`image.rotate`。
+> **还没走的**：`image.enhance` 与 `image.strip-metadata`（仍是纯 Rust 实现，不问引擎）——
+> 尽管 `libvips.provides` 声明了它们。详见
+> [docs/ENGINE-MATRIX.md](docs/ENGINE-MATRIX.md) 第 5.1、6.2 节与
 > [docs/ROADMAP.md](docs/ROADMAP.md) 的「不一致 2」。
+>
+> **libvips 带来的收益要说准**：是**按质量换体积的能力**（WebP/JPEG 有损编码），
+> 纯 Rust 后端的 WebP 只能无损。**但"有损一定更小"是错的** ——
+> 实测一张 320×200 合成渐变图，无损 508 字节反而小于有损 1808 字节；
+> 这个能力对**照片**才有意义。
+>
+> 另外，**"一键安装引擎"是真的跑通过**：libvips 8.18.6 由应用自己下载 → 校验 SHA-256 →
+> 解压 → 探测为 `installed`（落在 `<数据目录>/engines/libvips/bin/vips.exe`，约 29.67 MB）。
+> 它顺带暴露了两个 `toolforge-process` 的缺陷（裸命令名 `tar` 不查 PATH 导致解压必失败、
+> `quiet` 把输出丢光导致引擎版本一律显示「未知」），两者都已修复并有回归测试。
 
 音视频 / 文档 / 压缩包没有纯 Rust 替代品，所以 FFmpeg 缺失时**直接告诉用户去装**，
-而不是假装能跑。同理，v0.1 里没实现的节点会返回明确的 `未实现` 错误，
-**绝不静默产出空文件**。
+而不是假装能跑。同理，没实现的节点（`ai.upscale` / `ai.describe` / `doc.ocr` / `ebook.convert`）
+会返回明确的 `未实现` 错误，**绝不静默产出空文件**。
+
+> 🆕 **抠图是第四条路，别把它算进上面那条三层链。** `image.remove-background` 已经实现并真机跑通，
+> 但它跑的是 **ONNX 推理**，不经过 `pick_image_backend()` —— 装了 libvips / ImageMagick 也不会让它快一点。
+> 它要的是**另外两个引擎**（`python` + `onnx-models`），推理**不在 Rust 里做**而是交给 Python 子进程：
+> Rust 的 `ort` 会在**构建期**下载预编译原生库，那会让离线 / 内网构建直接失败，而**一次构建失败的代价
+> 远大于多一个运行时依赖**。首次运行有两步一次性准备 —— 用户在「模型权重」里下 `u2netp`（4.4 MB），
+> 应用再在 `<数据目录>/cache/onnx-runtime/` 下建独立 venv 装 `onnxruntime`（约 30 MB，**要联网**，
+> 不动用户自己的 Python）。**没有网络的机器在依赖就位前用不了这个节点**；之后推理全在本地、不传图片。
+> Python 需要 **3.9 ~ 3.13**（`onnxruntime` 没有 3.14 的 wheel）。
+> 详见 [docs/ENGINE-MATRIX.md](docs/ENGINE-MATRIX.md) 第 3.2 节与 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 决策 9。
 
 ### 5. `tauri-plugin-shell` 对前端几乎是关闭的
 
@@ -143,7 +167,8 @@ ToolForge 想用**一个统一入口**解决这件事，并且解决得更彻底
    │    └─ 批次序号由宿主注入：${batch.index}（从 1 起）/ ${batch.total}
    │
    ▼  nodes::run（toolforge-engines）
-   │    ├─ image.*  → 纯 Rust image crate（libvips/ImageMagick 至今没有被调用）
+   │    ├─ image.*  → 先挑后端：libvips → ImageMagick → 纯 Rust（输出里报 backend）
+   │    │             （image.enhance / image.strip-metadata 目前只有纯 Rust 一条路）
    │    ├─ video.*  → 构造 ffmpeg 命令行 + 解析 -progress 输出为百分比
    │    └─ 取消令牌贯穿到子进程，UI 点"取消"秒级生效
    │
@@ -344,12 +369,13 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
 - [x] 插件骨架（三级运行时 + 权限模型 + 审计）
 - [x] 任务队列（限流 / 取消 / 进度 / 日志尾部裁剪）
 - [x] 引擎管理（探测 / 按需下载 / SHA-256 校验 / 降级）
-- [x] 图片：格式转换、缩放、裁剪、旋转、增强、清除元数据（纯 Rust，开箱可用）
+- [x] 图片：格式转换、缩放、裁剪、旋转、增强、清除元数据（纯 Rust 打底、开箱可用；**前四者会在装了 libvips / ImageMagick 时自动走它们，并在输出里报 `backend`**）
 - [x] 音视频：转码、抽音轨、抽帧、剪辑、压缩、音量标准化（需 FFmpeg）
 - [x] 文档/压缩包：Pandoc 转换、7-Zip 打包解压（含 Zip Slip 防护）
 - [x] 可视化流程编辑器（React Flow）
 - [x] AI 生成插件 + 安全审核门
-- [ ] 抠图 / 超分 / OCR —— **节点已登记，执行器待实现**（v0.2，见 [ROADMAP](docs/ROADMAP.md)）
+- [x] **抠图去背景**（`image.remove-background`）—— **已实现**，走一条独立的 ONNX 推理链：先到「模型权重」下 `u2netp`（4.4 MB），首次运行会自动建一个独立 venv 装 `onnxruntime`（约 30 MB，**这一步要联网**；不动你自己的 Python），之后每张图都是**本地推理**。实测 400×300 测试图输出 RGBA PNG、前景覆盖 18.87%、单张约 0.7 秒。它不是 libvips / ImageMagick 那条降级链的一部分
+- [ ] 超分 / OCR / 电子书转换 —— **节点已登记，执行器仍未实现**（`ai.upscale` / `doc.ocr` / `ebook.convert`；另有 `ai.describe`，见 [ROADMAP](docs/ROADMAP.md)）
 - [x] 模型权重下载（`models_list` / `models_install` / `models_remove`）：已核对哈希的三个 rembg 权重可下载，**哈希不匹配即删文件**；另外三个没有下载源，UI 直接禁用按钮（不让你点了才失败）
 - [ ] LibreOffice 常驻 UNO listener（当前是每次冷启动）
 - [ ] OS 钥匙串存储 API Key —— **仍未实现**。Key 默认只存在内存；可选开关「记住 API Key」把它**明文**写到 `<数据目录>/ai-key.txt`（默认关闭，关掉即删文件）
@@ -377,12 +403,20 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
    下载文件**逐个校验 SHA-256**（`u2net` / `u2netp` / `isnet-general` 三条的哈希是真实下载后算出来的），
    **不匹配就删除文件并报错**，不留没校验过的产物。`birefnet-general` / `modnet-portrait` /
    `realesrgan-x4plus` 还没有核对过的哈希，因此 UI 显示「无下载源」并把下载按钮**置灰**。
+   > ⚠️ **权重之外还有一次联网**：抠图节点首次运行时会自己建 venv 并 `pip install`
+   > `onnxruntime` / `numpy` / `pillow`（约 30 MB）。这些包**没有哈希锁定、没有签名校验**。
+   > 详见 [docs/SECURITY.md](docs/SECURITY.md) §9 第 29 项。
 4. **设置会真的落盘**。非机密设置写 `<数据目录>/settings.json`（原子写：临时文件 + rename）；
    文件损坏时被隔离成 `settings.broken.json` 并用默认值启动，**不会因为一个坏 JSON 就打不开应用**。
    API Key **不在这个文件里**：默认只在内存，只有显式打开「记住 API Key」才**明文**写到
    `<数据目录>/ai-key.txt`，关掉该开关会删除这个文件（OS 钥匙串尚未实现）。
-5. **`--stripComponents` / 解压依赖系统 `tar`**。Windows 10 1803+ 自带 bsdtar；
-   更老的系统会退回到 7-Zip；都没有时给出明确的手动解压指引。
+5. **解压依赖系统 `tar`**。Windows 10 1803+ 自带 bsdtar；更老的系统会退回到 7-Zip；
+   都没有时给出明确的手动解压指引。
+   > 这条路径**曾经整体是坏的**：`ExecOptions::new("tar")` 用的是裸命令名，而当时的
+   > 存在性检查走 `Path::exists()`（**不查 PATH**），于是"一键安装引擎"必然卡在解压，
+   > 还甩出一句误导人的"可执行文件不存在：tar"。现在裸名字由
+   > `toolforge_process::resolve_program()` 统一按 PATH（Windows 再按 `PATHEXT`）解析，
+   > **显式路径不会回退到 PATH**；libvips 8.18.6 已按这条路真实安装成功。
 6. **AVIF 编码默认关闭**（rav1e 编译要几分钟）。需要时开 `toolforge-engines` 的 `avif` feature。
 
 ---

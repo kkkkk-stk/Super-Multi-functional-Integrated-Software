@@ -438,9 +438,13 @@ permissions:
 
 1. **登记 ≠ 已实现**。下面 32 个节点都登记在节点目录里（所以流程编辑器能拖出来、
    清单也能通过校验），但 `toolforge-engines/src/nodes.rs` 的 `run()` 目前只实现了
-   **27 个**；标 🚧 的 5 个会返回
+   **28 个**；标 🚧 的 4 个会返回
    「内置节点 `X` 尚未在 v0.1 中实现」（名单的唯一真相来源是
    `toolforge_core::pipeline::UNIMPLEMENTED_NODES`）。
+   > ✅ **这条原来说的是「27 个已实现、5 个未实现」，其中一个是 `image.remove-background`。**
+   > 它现在**已经实现**（抠图的执行器 `image_remove_background`，走 Python 子进程跑 ONNX 推理），
+   > 所以从 🚧 名单里出列了。**剩下的 4 个仍然全部是未实现**：`doc.ocr`、`ebook.convert`、
+   > `ai.upscale`、`ai.describe`。
 2. **节点参数写在 `with` 里或 `io.params` 里都可以，`with` 优先**。
    执行器用 `ctx.param_str("format", "webp")` 这类调用取值，它会**先看当前步骤的 `with`、
    再看插件自己的 `io.params`（按同名 id）、最后回退默认值**（见 `NodeCtx::arg_scope`）。
@@ -473,23 +477,48 @@ permissions:
 | 节点名 | 中文名 | 必需引擎 | 可选引擎 | 参数 id（从 `io.params` 读） | 说明 |
 |---|---|---|---|---|---|
 | `image.probe` | 读取图片信息 | — | — | — | 读尺寸/格式/色彩空间。纯 Rust，无需外部引擎 |
-| `image.convert` | 图片格式转换 | — | libvips、imagemagick | `format`、`quality` | PNG/JPEG/WebP/BMP/TIFF/GIF 互转 |
-| `image.resize` | 图片缩放 | — | libvips、imagemagick | `width`、`height`、`filter` | Lanczos3 重采样；只给一边时另一边按比例推导（**两边都不给会报错**） |
-| `image.crop` | 裁剪 / 缩略图 | — | libvips、imagemagick | `mode`、`width`、`height`、`x`、`y` | `mode` 取 `center`/`custom`/`smart`（`smart` 目前与 `center` 相同） |
-| `image.rotate` | 旋转 / 翻转 | — | imagemagick | `angle`、`flipH`、`flipV`、`autoOrient` | 非 90° 倍数的角度**需要 ImageMagick**，缺失时报 `ENGINE_MISSING` |
-| `image.enhance` | 图像增强 | — | libvips | `brightness`、`contrast`、`saturation`、`sharpen` | 纯 Rust 走内置卷积 |
-| `image.strip-metadata` | 清除元数据 | — | libvips、imagemagick | — | 重新编码即不保留 EXIF/IPTC/XMP |
-| `image.remove-background` | 抠图去背景 🚧 | python、onnx-models | — | `model`、`alphaMatting`、`backgroundColor` | AI 抠图；**v0.1 未实现** |
+| `image.convert` | 图片格式转换 | — | libvips、imagemagick | `format`、`quality` | PNG/JPEG/WebP/BMP/TIFF/GIF 互转。**输出 `backend`**（`libvips` / `imagemagick` / `rust`）。装了 libvips 时 WebP/JPEG 才按 `quality` 走**有损**编码；纯 Rust 后端的 WebP **只有无损** |
+| `image.resize` | 图片缩放 | — | libvips、imagemagick | `width`、`height`、`filter` | Lanczos3 重采样；只给一边时另一边按比例推导（**两边都不给会报错**）。**输出 `backend`** |
+| `image.crop` | 裁剪 / 缩略图 | — | libvips、imagemagick | `mode`、`width`、`height`、`x`、`y` | `mode` 取 `center`/`custom`/`smart`（`smart` 目前与 `center` 相同）。**输出 `backend`** |
+| `image.rotate` | 旋转 / 翻转 | — | imagemagick | `angle`、`flipH`、`flipV`、`autoOrient` | 非 90° 倍数需要**会重采样的后端**：libvips（`similarity --angle`）或 ImageMagick（`-rotate`）；**两者都没有时报 `ENGINE_MISSING`**（detail 让你去装 libvips 或 ImageMagick），**不会静默把角度取整**。**输出 `backend`** |
+| `image.enhance` | 图像增强 | — | libvips | `brightness`、`contrast`、`saturation`、`sharpen` | 纯 Rust 走内置卷积。⚠️ **该节点不参与三层降级，也不会输出 `backend`** —— 声明里的 `libvips` 目前没有被调用 |
+| `image.strip-metadata` | 清除元数据 | — | libvips、imagemagick | — | 重新编码即不保留 EXIF/IPTC/XMP。⚠️ **当前是纯 Rust 实现，不调用 libvips / ImageMagick，也没有 `backend` 输出** |
+| `image.remove-background` | 抠图去背景 | python、onnx-models | — | `model`、`mode`、`background`、`threshold`、`feather` | AI 抠图。**已实现**（此前是"登记了但执行器没写"）。走一条**独立的 ONNX 推理链**，不属于上面的 libvips / ImageMagick / 纯 Rust 三层降级（见下）。`model` 默认 `u2netp`（4.4 MB），可选 `u2net` / `isnet-general`；`mode` 取 `alpha`（透明背景 PNG）或 `color`（换纯色底，用 `background`）。**首次运行有两步一次性准备**：用户自己去「模型权重」下权重，应用再建一个独立 venv 装 `onnxruntime` / `numpy` / `pillow`（约 30 MB，**这一步要联网**）。之后推理全在本地，**不联网、不上传图片** |
 
 **图像格式的真实支持情况**：纯 Rust 后端的 `parse_format` 支持
 `png` / `jpeg` / `webp` / `bmp` / `tiff` / `gif` / `ico` / `pnm` / `qoi` / `tga` /
 `dds` / `hdr` / `ff`。**`avif` 不在其中**（节点目录的枚举里列了它，但纯 Rust 后端
 会报"不支持的图片格式 `avif`"并提示装 libvips 或 ImageMagick）。
-另外纯 Rust 的 **WebP 编码只有无损模式**，会在任务日志里打一条警告。
+另外纯 Rust 的 **WebP 编码只有无损模式**，会在任务日志里打一条警告
+（**装了 libvips 之后这条警告不会再出现**，因为届时走的是有损编码）。
 
-> 🚧 **libvips / ImageMagick 目前只是"声明"而非"实现"**：`nodes.rs` 里除
-> `image.rotate` 的非直角分支外，图像节点全部只走纯 Rust 路径。所以
-> "检测到 libvips 自动提速"这句话目前还没有落地。
+> ✅ **libvips / ImageMagick 现在真的会被调用 —— 但只对 4 个节点。**
+> `nodes.rs::pick_image_backend()` 按 `libvips → ImageMagick → 纯 Rust` 挑后端，
+> 并把结果报出来：节点输出里多一个 **`backend`** 值（`"libvips"` / `"imagemagick"` / `"rust"`），
+> 任务日志里多一条 debug 行（形如 `image.convert：后端 = libvips（快、省内存）；a.png → a.webp（质量 90）`）。
+> 走这条链的是 **`image.convert` / `image.resize` / `image.crop` / `image.rotate`**；
+> **`image.enhance` 与 `image.strip-metadata` 不走**（纯 Rust 实现，没有 `backend` 输出）。
+> 后端选择是**可观测**的这一设计是有意的 —— 代码注释写得很直白：不看日志就只能靠猜，
+> 而这个项目已经被"文档说有、实际没有"坑过好几次。
+> 详细的降级矩阵与两处仍未对齐的 `provides` 声明见
+> [ENGINE-MATRIX.md](ENGINE-MATRIX.md) 第 5.1、6.2 节。
+>
+> **别把 libvips 的收益说成"文件一定更小"**：它带来的是**按质量换体积的能力**
+> （WebP/JPEG 有损编码），这对照片很重要，但在一张**合成渐变**图上，无损反而可能更小
+> （实测 320×200 渐变：无损 508 字节 vs 有损 1808 字节）。
+
+> 🆕 **抠图是第四条路，别把它算进上面那条三层链。**
+> `image.remove-background` 已实现，跑的是 **ONNX 推理**（`nodes.rs::image_remove_background`
+> → Python 子进程 → `onnxruntime`），**不调用 `pick_image_backend()`**，
+> 所以它**没有 `backend` 输出**，装了 libvips / ImageMagick 也不会让它快一点。
+> 反过来说，它需要的是**另外两个引擎**（`python` + `onnx-models`），两者都是必需项。
+> 细节见 [ENGINE-MATRIX.md](ENGINE-MATRIX.md) 第 3.2、5.2 节。
+>
+> ⚠️ **它旧参数里的 `alphaMatting` 已被删除**，那是一个**假参数**：从登记那天起就没有
+> 任何实现，用户在表单里勾上它，什么都不会发生。参数 id 与节点读取的键名对不上时
+> 宿主会**静默用默认值** —— 这正是本项目反复强调"参数 id 必须逐字一致"的原因
+> （见 3. 开头的第 2 条）。现在的真实参数是 `model` / `mode` / `background` /
+> `threshold` / `feather`，同样**没有** `backgroundColor`（旧名字，已改为 `background`）。
 
 ### 3.3 视频（`video`）与音频（`audio`）
 
@@ -554,14 +583,17 @@ permissions:
 | 节点 | 可引用的 key |
 |---|---|
 | `image.probe` | `width`、`height`、`color`、`megapixels` |
-| `image.resize` | `width`、`height` |
-| `image.crop` | `width`、`height` |
+| `image.resize` | `width`、`height`、`backend` |
+| `image.crop` | `width`、`height`、`backend` |
+| `image.rotate` | `width`、`height`、`backend` |
 | `fs.copy`、`fs.move` | `path` |
-| `image.convert` | `path` |
+| `image.convert` | `path`、`backend` |
 | `fs.mkdir` | `path` |
 | `archive.unpack` | `path` |
 | `flow.set-var` | `value` |
 | 其它（如 `video.thumbnail`、`video.transcode`） | **没有可引用的值** —— 只能通过 `${output.<portId>}` 传路径 |
+
+**`backend` 是什么**：`image.convert` / `image.resize` / `image.crop` / `image.rotate` 会报出**实际使用的图像后端**，取值为 `"libvips"` / `"imagemagick"` / `"rust"`。它让"到底走没走 libvips"这件事变成流程内可判断的事实，例如后续步骤可以写 `when: ${steps.conv.backend} == rust` 来做"纯 Rust 路径下的补偿处理"。`image.enhance` 与 `image.strip-metadata` **不产出这个值**（它们不参与三层降级）。
 
 **因此：想做"多步文件接力"，正确做法是给插件声明两个输出端口，用
 `${output.frame}` / `${output.dst}` 传路径，而不是指望 `${steps.frame.dst}`。**
@@ -1015,7 +1047,7 @@ runtime:
 
 | 想看什么 | 去哪里 |
 |---|---|
-| 可以直接抄的完整例子 | `plugins/builtin/image-convert/`（L1 单节点）、`plugins/builtin/video-to-gif/`（L1 多步 + `${steps.x.y}`）、`plugins/builtin/batch-rename/`（批量编号形状：`${batch.index}` + `${src.stem}`）、`plugins/builtin/remove-bg/`（引擎依赖 + 模型选择）、`plugins/wasm-example/`（L2）、`plugins/python-example/`（L3） |
+| 可以直接抄的完整例子 | `plugins/builtin/image-convert/`（L1 单节点）、`plugins/builtin/video-to-gif/`（L1 多步 + `${steps.x.y}`）、`plugins/builtin/batch-rename/`（批量编号形状：`${batch.index}` + `${src.stem}`）、`plugins/builtin/remove-bg/`（**引擎依赖 + 模型选择 + 需要一次联网准备的节点**，v0.2.0：默认模型 `u2netp`，参数与节点逐字对齐，顶部如实写明首次运行要下权重与 Python 依赖）、`plugins/wasm-example/`（L2）、`plugins/python-example/`（L3） |
 | 引擎与许可证矩阵、降级路径 | `docs/ENGINE-MATRIX.md` |
 | 架构与数据流 | `docs/ARCHITECTURE.md` |
 | 安全模型与权限风险 | `docs/SECURITY.md` |

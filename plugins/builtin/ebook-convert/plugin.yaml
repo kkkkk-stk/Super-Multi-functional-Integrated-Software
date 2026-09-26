@@ -1,0 +1,106 @@
+# ToolForge L1 插件（声明式编排，零代码）
+#
+# ── 两个引擎，各有各的覆盖面 ─────────────────────────────────────────────
+# `ebook.convert` 会用**能用的那个引擎**：
+#
+#   Calibre（首选）  MOBI / AZW3 / LIT / PDB / PDF 只有它能写，格式覆盖最全
+#   Pandoc（降级）   EPUB / DOCX / FB2 / HTML / Markdown / RTF / ODT / TXT，只有 40 MB
+#
+# **两个都没装时不会静默失败**：节点会报错并说清该装哪个、能解决什么。
+#
+# ── 为什么 Pandoc 覆盖不到的格式是被"提前挡下"的 ─────────────────────────
+# 因为 pandoc 遇到不认识的**输出**扩展名时**不报错**：它打一句
+# `[WARNING] Could not deduce format from file extension .mobi`、
+# `Defaulting to html`，然后**退出码 0**、文件也真的生成了 ——
+# 只是那是一个 HTML 文件被命名成了 `.mobi`。
+#
+# 这种"成功"比失败更糟：用户会拿着一个扩展名骗人的文件去 Kindle 上打开，
+# 然后在完全无关的地方找原因。所以执行器会先按能力表把关，再决定要不要调它。
+#
+# ── 引擎依赖不是权限 ─────────────────────────────────────────────────────
+# `requiresEngines` 由节点自己声明，缺失时界面把节点标灰并引导安装；
+# 插件**不需要**为此申请任何能力（申请了反而是多余的扩权）。
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.builtin.ebook-convert
+  name: 电子书转换
+  version: 0.1.0
+  description: 电子书格式互转。装了 Calibre 支持 MOBI / AZW3 / PDF 等全部主流格式；只装 Pandoc（40 MB）也能覆盖 EPUB / DOCX / FB2 / HTML / Markdown。
+  author: ToolForge
+  license: MIT
+  icon: book-open
+  category: ebook
+  tags: [电子书, epub, mobi, azw3, calibre, pandoc]
+
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+
+io:
+  inputs:
+    - id: src
+      label: 电子书
+      type: file
+      accept: [".epub", ".mobi", ".azw3", ".fb2", ".pdf", ".txt", ".docx", ".html"]
+      multiple: false
+      required: true
+      description: MOBI / AZW3 / PDF 需要 Calibre；EPUB / DOCX / FB2 / HTML 用 Pandoc 就够。
+  outputs:
+    - id: dst
+      label: 输出文件
+      type: file
+      required: false
+      description: 目标格式由输出文件名的扩展名决定。
+  params:
+    # 参数 id 与 `ebook.convert` 节点读取的键名逐字一致
+    - id: format
+      label: 目标格式
+      type: enum
+      description: MOBI / AZW3 / PDF 需要 Calibre；其余格式 Pandoc 也能做。
+      default: { kind: str, value: epub }
+      options:
+        - { value: epub, label: EPUB（通用，Pandoc 可做） }
+        - { value: docx, label: Word DOCX（Pandoc 可做） }
+        - { value: fb2, label: FictionBook 2（Pandoc 可做） }
+        - { value: html, label: 单个 HTML（Pandoc 可做） }
+        - { value: md, label: Markdown（Pandoc 可做） }
+        - { value: txt, label: 纯文本（Pandoc 可做） }
+        - { value: mobi, label: MOBI（需要 Calibre） }
+        - { value: azw3, label: AZW3 / Kindle（需要 Calibre） }
+        - { value: pdf, label: PDF（需要 Calibre） }
+      required: false
+      affectsOutput: true
+    - id: title
+      label: 书名
+      type: text
+      description: 覆盖原书元数据里的书名。留空则保持原样。
+      default: { kind: str, value: "" }
+      required: false
+    - id: author
+      label: 作者
+      type: text
+      description: 覆盖原书元数据里的作者。留空则保持原样。
+      default: { kind: str, value: "" }
+      required: false
+
+runtime:
+  kind: pipeline
+  pipeline:
+    description: 单节点流水线：一次调用完成转换。
+    onError: fail
+    # Calibre 转大书可能要几分钟，给足 20 分钟
+    timeoutMs: 1200000
+    steps:
+      - id: convert
+        uses: ebook.convert
+        label: 转换电子书
+        with:
+          src: "${src}"
+          dst: "${output.dst}"
+          title: "${params.title}"
+          author: "${params.author}"

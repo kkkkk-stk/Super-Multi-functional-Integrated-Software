@@ -38,7 +38,9 @@
 
 有两点必须讲清楚：
 
-1. **本文档没有运行过 `cargo build` / `cargo test`**，因此不对「当前能否构建成功」下结论。可以确认的是：根 `Cargo.toml` 的 `members = ["crates/*", "apps/desktop/src-tauri"]` 现在都有对应目录。因此**第 5 节的降级矩阵仍然是「规格」而不是「已验证行为」**：它准确描述的是 `builtin_nodes()` 声明的引擎依赖关系，而不是经测试验证的运行时行为。（相关编译阻塞与实测结论见 `docs/ROADMAP.md` 的「当前阻塞项」。）
+1. **本文档最早写作时没有运行过 `cargo build` / `cargo test`**，因此当时不对「当前能否构建成功」下结论。可以确认的是：根 `Cargo.toml` 的 `members = ["crates/*", "apps/desktop/src-tauri"]` 现在都有对应目录。
+   > ✅ **已更新（现在有实测数据了）**：`cargo test --workspace` 的 Rust 测试为 **215 passed / 0 failed**；`scripts/devtools/verify-platform.mjs`（`scripts/devtools/run.mjs` 里的第 5 个脚本）**41 项检查全通过**，其中【6】号检查就是盯着"图片后端到底有没有真的被调用"，【7】号检查盯着任意角度旋转会不会静默取整，【8】号检查盯着**抠图这条 ONNX 链路能不能真的出透明背景**。
+   > 所以**第 5 节的降级矩阵现在是混合状态**：图像域的 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 四行已经是**实测行为**（见 5.1），`image.remove-background` 也已有端到端实测（见 3.2、5.2），其余各行仍然只是 `builtin_nodes()` 声明的引擎依赖关系，不是经测试验证的运行时行为。（相关编译阻塞与实测结论见 `docs/ROADMAP.md` 的「当前阻塞项」。）
 2. 本文档因此同时承担两个角色：**引擎层规格说明**（现在就能定下来的接口契约：有哪些引擎、能力边界、许可证约束、降级规则）与**待实现清单**（第 6 节列出尚未落地的部分与已知的数据不一致）。
 
 > 核对说明：任务简报假定「仓库目前只存在 `crates/toolforge-core`，`toolforge-engines` / `toolforge-process` / `toolforge-plugins` / `toolforge-ai` 以及 `apps/desktop` 都还没落地」。实际核对后，这些组件中的多数已经存在（其中一部分正是在核对期间被并行写入的）。本节按仓库实际文件撰写，未沿用该假定。
@@ -74,6 +76,9 @@ EngineModel {
 - `crates/toolforge-engines/engine-sources.json` 是一个**独立于 `EngineModel` 的来源清单**（对应 `registry::EngineSourceSpec`）。
   > ✅ **已回填 6 条**（Windows / Linux 的 `ffmpeg` / `libvips` / `pandoc` / `python`），每条都带**实际核对过的 SHA-256** 与**版本固定直链**；`registry.rs` 规定 `sha256` 为 `None` 时拒绝下载，所以 macOS 三条与 `ffmpeg@linux`（上游是滚动别名）目前仍**不可自动安装**，会返回 `HashRequired`。核对方式与实测版本表见 `docs/ROADMAP.md` §3。
   > **`7zip` 的条目已移除**（原先有，现已删除）：官方只提供安装器，或需要先有 7-Zip 才能解压的 `.7z`（先有鸡还是先有蛋），且那条版本固定直链 `7z2408-extra.7z` **实测 404**。因此 `7zip` 在 `engine_catalog()` 里已改为**仅系统安装**。本文档第 2、4 节的「体积」「安装方式」全部取自 `engine_catalog()`，不与 `engine-sources.json` 混用。
+- ✅ **「一键安装」现在真的装成功过（这是新事实，不是设计意图）**：通过应用真实安装过一次 **libvips 8.18.6** —— 下载约 30 MB → SHA-256 校验通过 → 解压 → 被探测为 `installed`，可执行文件落在托管布局的 `…/engines/libvips/bin/vips.exe`，磁盘占用约 29.67 MB。**在此之前这条路径从未被跑通过**，原因不是哈希没回填，而是两个 `toolforge-process` 的缺陷（都已修复、都有回归测试）：
+  1. **裸命令名不查 PATH**：`exec_streaming` 曾用 `program.exists()` 判断程序是否存在，而 `Path::new("tar").exists()` 对裸名字**永远是 false**（它按当前工作目录解析，不查 PATH）。引擎安装正是用 `ExecOptions::new("tar")` 解压 `.zip` / `.tar.gz`，于是流程是「下载成功 → SHA-256 校验通过 → 解压时报"可执行文件不存在：tar"」——错误信息还把责任指错了地方。现在由公开函数 `toolforge_process::resolve_program()` 统一解析：裸名字走 PATH（Windows 再按 `PATHEXT` 补后缀），**显式路径永不回退到 PATH**。
+  2. **`quiet(true)` 曾经把所有输出都丢掉**：它的语义本该是"只保留尾部"（不累积头部），实际却把 stdout / stderr 一起扔了。后果是 `probe_version` 什么都读不到 → **每个引擎的版本都显示「未知」**，引擎失败时 stderr 也是空的（没有任何可操作的细节）。现在 `quiet` = **只留尾部**，与它自己的文档注释一致，版本能正常显示、失败原因带得住。
 - 本文档不给出任何版本号要求。`EngineDescriptor` 中只有 `license`、`licenseNote`、`approxSizeMb`、`platforms`、`installModes` 等字段，**没有最低版本字段**。`EngineState::Outdated`（版本过旧）只是一个运行时枚举值，其最低版本判定标准在代码中尚未定义，属于**待定**。
 
 ### 1.4 术语与枚举翻译
@@ -113,7 +118,8 @@ EngineModel {
 
 - **核心引擎共 3 个**：`ffmpeg`、`pandoc`、`7zip`。它们在名称后标注了「（核心引擎）」。缺失时应用**仍然能启动**，但依赖它们的节点不可用：`ffmpeg` 缺失 → 5 个 `video.*` 与 2 个 `audio.*` 节点不可用；`pandoc` 缺失 → `doc.convert` 不可用，并且 `ebook.convert` 失去唯一的纯文档转换后端；`7zip` 缺失 → `archive.pack` / `archive.unpack` 不可用。
 - **只有 `System` 一种安装方式的引擎共 4 个**：`libreoffice`（约 420 MB）、`calibre`（约 180 MB）、`tesseract`（约 60 MB）、`7zip`（约 5 MB）。这四个都只探测系统安装、不提供应用内下载。
-- **只有 `Download` 一种安装方式的引擎共 2 个**：`python`、`onnx-models`。二者不探测系统安装，避免与系统 Python / 系统模型缓存互相污染。
+- **只有 `Download` 一种安装方式的引擎共 2 个**：`python`、`onnx-models`。
+  > ⚠️ **这句原来接着写的是「二者不探测系统安装」—— 那是错的（本条已修正）。** `install_modes` 只决定「应用能不能替你下载」，**不决定探测范围**：`probe()` 的顺序是 ① 托管目录 → ② PATH → ③ 平台常见路径，对所有引擎一视同仁。所以系统里已有的 Python 会被探到，状态是 `Detected` / `source: System`。这恰恰是 `force` 标志与「另外安装应用托管版本」按钮存在的原因 —— **"探测到可用"不等于"满足这个节点的要求"**，系统 Python 3.14 显示可用却跑不了 `onnxruntime`（见 3.2、3.6）。`onnx-models` 是唯一的例外，它没有二进制，走下面那条虚拟引擎判据。
 - **只有 `Remote` 一种安装方式的引擎共 1 个**：`ai-provider`。体积记为 0 MB，因为它没有本地二进制。
 - **需要用户确认许可证（`requiresLicenseAck: true`）的引擎共 5 个**：`ffmpeg`、`pandoc`、`libreoffice`、`calibre`、`onnx-models`。UI 必须在用户点击「下载」之前就把许可证讲清楚（这是 `engine.rs` 中 `licenses` 字段刻意保留的原因）。
 - **全部 11 个引擎都声明支持三平台**：Windows / macOS / Linux。当前目录中没有平台受限的引擎。
@@ -144,18 +150,30 @@ EngineModel {
 - **主页**：https://www.libvips.org/
 - **提供的节点（4 个）**：`image.convert`、`image.resize`、`image.enhance`、`image.strip-metadata`。注意其中 `image.enhance` 只由 libvips 一家声明提供。
 - **缺失时会发生什么**：这 4 个节点不会失效，因为它们的 `requiresEngines` 都是空数组，libvips 只是 `optionalEngines` 中的首选。缺失后自动降级：先退到 ImageMagick，两者都缺失时退到纯 Rust 的 `image` crate。代价是批量/大图场景更慢、更吃内存（libvips 的价值正是在于低内存、流式处理）。
+  > ✅ **这条降级链现在是真的 —— 但只覆盖 4 个节点**：`nodes.rs::pick_image_backend()` 真的按 `libvips → imagemagick → 纯 Rust` 的顺序挑后端，并把用的是哪个报在节点输出的 `backend` 里（详见 5.1）。走这条链的是 **`image.convert` / `image.resize` / `image.crop` / `image.rotate`**；而 **`image.enhance` 与 `image.strip-metadata` 仍然是纯 Rust 实现、一行都不问引擎** —— 所以"libvips 提供 `image.enhance` / `image.strip-metadata`"这两条 `provides` 声明目前比实现更乐观（见 6.2）。
+- **已实测的一键安装**：libvips 8.18.6 通过应用安装成功，可执行文件落在托管布局的 `…/engines/libvips/bin/vips.exe`，磁盘占用约 29.67 MB（数据点与顺带修掉的两个 `toolforge-process` 缺陷见 1.3）。
 - **许可证与分发注意点**：`LGPL-2.1`。以动态库方式调用即可满足 LGPL 要求，无需开源你自己的代码——这也是它被选为图像域首选引擎的原因。`requiresLicenseAck: false`。
 
 #### ImageMagick（`imagemagick`）
 
 - **主页**：https://imagemagick.org/
 - **提供的节点（5 个）**：`image.convert`、`image.resize`、`image.crop`、`image.rotate`、`image.strip-metadata`。其中 `image.rotate` 只有它一家声明提供。
-- **缺失时会发生什么**：节点仍可用（都不是必需引擎），但 `image.rotate` 会失去唯一的外部实现，退到纯 Rust `image` crate；`image.convert` / `image.resize` / `image.strip-metadata` 失去第二层兜底（libvips 仍优先）。
+- **缺失时会发生什么**：节点仍可用（都不是必需引擎），但 `image.convert` / `image.resize` / `image.crop` 会失去第二层兜底（libvips 仍优先）。`image.rotate` 的处境要看实现而不是看声明：`imagemagick` 是它唯一声明提供该能力的引擎，但 `nodes.rs::image_rotate` 在 libvips 可用时也会走 libvips（非 90° 倍数用 `vips similarity --angle`，ImageMagick 用 `-rotate`），**只有两个都没有、只剩纯 Rust 时**才返回 `EngineMissing`（见 5.1）。
 - **许可证与分发注意点**：`ImageMagick License（Apache-2.0 风格）`，本体宽松；但若链接了 GPL 组件（如部分 delegate）会传染，分发前需确认构建配置。`requiresLicenseAck: false`。
 
-#### Python 运行时 + ONNX 模型包（抠图与超分）
+#### Python 运行时 + ONNX 模型包（抠图与超分）—— **ONNX 路径，不属于三层降级链**
 
-- 见 3.5 中的 `python` 与 `onnx-models` 条目。图像域的 `image.remove-background`（抠图去背景）**同时要求两个引擎**（`requiresEngines: ["python", "onnx-models"]`），任一缺失即不可用，且没有降级路径。
+- 见 3.6 中的 `python` 与 `onnx-models` 条目。图像域的 `image.remove-background`（抠图去背景）**同时要求两个引擎**（`requiresEngines: ["python", "onnx-models"]`），任一缺失即不可用，且没有降级路径。
+- **它不属于上面那张 `libvips → ImageMagick → 纯 Rust` 的表**。这一条很容易被误读，必须写清楚：**抠图是第四条路（ONNX 推理），三层降级一格都不覆盖它。** libvips / ImageMagick 再全，也做不了"从图里判断哪个像素是主体"这件事——那是模型的工作，不是图像处理库的工作。反过来，装齐两个引擎也**不会**让抠图在缺 libvips 时变慢，因为它压根不经过 `pick_image_backend()`。
+- **执行方式**：`nodes.rs::image_remove_background` 不自己做推理，而是把推理交给一个 **Python 子进程**（`python` 引擎）。
+  - 推理脚本是 `crates/toolforge-engines/py/rembg.py`，用 `include_str!` 编进二进制，运行时释放到 `<data>/cache/onnx-runtime/rembg.py`。**刻意不做成 Tauri 的 bundle resource**：资源路径在开发态 / 打包态 / 各平台之间都不一样，而这个脚本只有几 KB，一旦"从包里找不到"就是一个极难查的运行时故障——编进二进制就不会丢。
+  - **为什么不写在 Rust 里**：Rust 的 ONNX 绑定 `ort` 会在**构建期**下载预编译原生库。那会让离线 / 内网构建直接失败，而"构建失败"的代价远大于"多一个运行时依赖"。Python 的 `onnxruntime` 是成熟、可验证、进程内隔离的路径，而且 L3 插件运行时本来就要求一个受管 Python——复用它不引入新的东西。
+- **首次运行要准备两件事**，都会写进任务日志：
+  1. **模型权重**：用户在「设置 → 引擎管理 → 模型权重」里自己下（见第 4 节）。节点不会替用户偷偷下载权重。
+  2. **依赖**：应用会在 `<data>/cache/onnx-runtime/` 下**另建一个独立 venv**，`pip install onnxruntime numpy pillow`（约 30 MB，一次性）。用独立 venv 是为了**不动用户自己的 Python**，卸载也只是删掉这个目录。
+  - ⚠️ **这一步需要联网**。第一次跑抠图时才会发生，而且只有这一个节点会触发；此后推理**完全本地、不联网、不上传图片**。**没有网络的机器在依赖就位之前用不了这个节点。**
+- **Python 版本要求：3.9 ~ 3.13**。原因是 `onnxruntime` 没有 3.14 的 wheel。若机器上只有 3.14，节点会返回一条明确的 `EngineMissing`，告诉用户去装应用托管的 Python 3.11，而不是抛一个看不懂的 pip 报错。
+- **「探测到可用」不等于「满足我的要求」**：系统里那个 3.14 会被引擎管理显示为"可用"，但它跑不了 onnxruntime。因此 `EngineInstallRequest` 增加了 **`force`** 标志：`force: true` 会跳过「已经可用，不用下载」的短路，让用户**在系统 Python 之外**再装一份应用托管的副本。引擎卡片上对应一个「另外安装应用托管版本」按钮（当 `status.source === "system"` 且 `entry.managedAvailable` 时显示），背后是 `EngineEntry.managedAvailable` 与 `EngineRegistry::has_download_source()`。
 
 ### 3.3 文档域
 
@@ -206,12 +224,15 @@ EngineModel {
 - **提供的节点（3 个）**：`image.remove-background`、`ai.upscale`、`doc.ocr`。
 - **缺失时会发生什么**：这 3 个节点**全部不可用**，因为 `python` 在它们三个的 `requiresEngines` 里都是必需引擎，没有降级路径。这是影响面仅次于 FFmpeg 的单点依赖：图像抠图、AI 超分、OCR 三个能力都以它为前置。
 - **许可证与分发注意点**：`PSF-2.0`，宽松许可；但要注意随包分发的第三方 wheel 各自的许可证。它**只有 `Download` 一种安装方式**，说明这是独立于系统 Python 的 3.11 运行时（与系统 Python 隔离）。`requiresLicenseAck: false`。
+- **版本区间：3.9 ~ 3.13**。上界不是随便定的：`onnxruntime` 没有 Python 3.14 的 wheel，所以抠图节点在 3.14 上跑不起来，会返回明确的 `EngineMissing` 让用户去装应用托管的 3.11。**注意"探测为可用"与"满足某个节点的要求"是两件事** —— 系统里的 3.14 在引擎管理里显示可用，但用不了抠图；这也是 `EngineInstallRequest.force` 存在的原因（见 3.2 末段）。
 
 #### ONNX 模型包（`onnx-models`）
 
 - **主页**：https://onnxruntime.ai/
 - **提供的节点（2 个）**：`image.remove-background`、`ai.upscale`。
 - **缺失时会发生什么**：这两个节点不可用（与 `python` 一样是必需引擎）。它是**唯一带模型权重清单的引擎**（6 个模型，见第 4 节），也是唯一需要单独做许可证确认的模型入口。
+- **它是「虚拟引擎」，探测规则与别的引擎不同**：`onnx-models` 没有可执行文件，它只是权重文件的宿主，「有没有 `onnx-models.exe`」这个问题本身就是错的。
+  > ✅ **这条曾经是坏的**：`probe()` 只对 `install_modes == [Remote]` 的引擎做特判，`onnx-models` 落到普通分支，于是**永远探测为 `Missing`** —— 后果是 `image.remove-background` 在界面上**永远显示不可用，哪怕用户已经把权重下好了**。现在 `probe()` 对 `onnx-models` 单独判：**至少有一个权重已安装 = 可用**，message 里也会点名当前是"还没下权重"还是"已下载 N 个"。这条规则写在 `registry.rs::probe()` 里。
 - **许可证与分发注意点**：许可证字段本身写的是「各模型不同（见下表）」，注意事项是「代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。」体积标注约 180 MB（这只是 `approxSizeMb` 字段给出的引擎级估算；注意 6 个模型逐个加起来远超此值，且模型按需下载、不随安装包分发）。`requiresLicenseAck: true`。
 
 #### AI 服务提供方（`ai-provider`）
@@ -253,6 +274,8 @@ EngineModel {
 | `realesrgan-x4plus` | Real-ESRGAN x4plus | 通用图像超分辨率放大 | 约 67 MB | `BSD-3-Clause` | 是 | **无下载源**（同上一行） | 同上 |
 
 > 「下载地址」与「SHA-256」两列的说明见第 1.3 节。前三个模型的地址与哈希来自 `engine_catalog()`，且哈希是**真实下载后算出来的**（不是抄网页）；下载路径是 `<data_dir>/models/<model_id>/<file_name>`，`file_name` 与模型 id 不同名。后三个模型在代码里就是 `None`，**不得凭推测填写**；单测 `verified_sources_are_pinned` 守着"三个字段全有或全无"这条纪律。
+>
+> **抠图节点的默认模型是 `u2netp`（4.4 MB），不是 `u2net`（168 MB）。** 这条是**改过**的：原来的默认是 `u2net`，等于"想试一下抠图，先下 168 MB"。既然这个功能的瓶颈就是"第一次能不能跑起来"，默认值就该给最轻的那个。`model` 参数的枚举只有 `u2netp` / `u2net` / `isnet-general` —— 三个有下载源的，其余三个没有来源的模型**不出现在选项里**。
 
 ### 4.1 商业使用结论（必须落实到 UI）
 
@@ -303,12 +326,12 @@ EngineModel {
 | `fs.mkdir` | 无（不依赖外部引擎，纯 Rust） | 无 | 不适用——永远可用 | 无 |
 | `fs.delete` | 无（不依赖外部引擎，纯 Rust） | 无 | 不适用——永远可用 | 无 |
 | `image.probe` | 无（纯 Rust 解码，读取图片信息） | 无 | 不适用——永远可用 | 无 |
-| `image.convert` | 图片格式转换（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底 | 批量/大图更慢、更吃内存；失去 libvips 的流式低内存优势；退回纯 Rust 时可用格式覆盖变窄 |
-| `image.resize` | 图片缩放（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底 | 同上：更慢、更吃内存，缩放算法与格式覆盖可能变少 |
-| `image.crop` | 裁剪 / 缩略图（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底（另见第 6.2 节的一致性问题） | 同上：更慢、更吃内存 |
-| `image.rotate` | 旋转 / 翻转（可选：`imagemagick`） | `imagemagick`（可选，非必需） | `imagemagick` 缺失 → 纯 Rust `image` crate 打底。**注意：该节点只有 imagemagick 一个可选外部引擎，没有第二个外部兜底** | 更慢、更吃内存，且失去 ImageMagick 的格式覆盖（`libvips` 的 `provides` 未声明 `image.rotate`，无法接手） |
-| `image.enhance` | 图像增强（可选：`libvips`） | `libvips`（可选，非必需） | `libvips` 缺失 → 纯 Rust `image` crate 打底。**注意：该节点只有 libvips 一个可选外部引擎，没有第二个外部兜底** | 更慢、更吃内存；增强算法质量可能下降 |
-| `image.strip-metadata` | 清除元数据（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底 | 更慢、更吃内存；对部分容器格式的元数据块清理可能不完整 |
+| `image.convert` | 图片格式转换（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底（**✅ 实测走通**，节点输出含 `backend`） | 批量/大图更慢、更吃内存；失去 libvips 的流式低内存优势；退回纯 Rust 时可用格式覆盖变窄，**且 WebP 只能无损编码**（丢掉"按质量换体积"的能力） |
+| `image.resize` | 图片缩放（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底（**✅ 实测走通**，节点输出含 `backend`） | 同上：更慢、更吃内存，缩放算法与格式覆盖可能变少 |
+| `image.crop` | 裁剪 / 缩略图（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底（**✅ 实测走通**，节点输出含 `backend`；但 `libvips.provides` 没声明这个能力，见第 6.2 节） | 同上：更慢、更吃内存 |
+| `image.rotate` | 旋转 / 翻转（可选：`imagemagick`） | `imagemagick`（可选，非必需） | `libvips`（实现里也能接手，见下）→ `imagemagick` → 两者都缺失 → 纯 Rust `image` crate **只支持 90° 整数倍**，非直角直接报 `EngineMissing`（**✅ 实测走通**，节点输出含 `backend`） | 更慢、更吃内存；**只剩纯 Rust 时任意角度旋转能力丧失**（不是静默取整，而是明确报错要用户装引擎） |
+| `image.enhance` | 图像增强（可选：`libvips`） | `libvips`（可选，非必需） | 🚧 **没有降级链，只有纯 Rust 一条路**：该节点的实现既不问后端、也不调用 libvips（见下） | 与"降级"无关：无论装了什么引擎，`image.enhance` 都走内置卷积 |
+| `image.strip-metadata` | 清除元数据（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | 🚧 **同上一行：只有纯 Rust 实现**（重新编码即不保留 EXIF/IPTC/XMP），`pick_image_backend()` 没有被它调用 | 与"降级"无关：装不装引擎，行为都一样；对部分容器格式的元数据块清理可能不完整 |
 | `ebook.convert` | 电子书格式转换（可选：`calibre`、`pandoc`） | `calibre`（可选，非必需） | `calibre` 缺失 → `pandoc`（**仅覆盖 EPUB / HTML**）；`pandoc` 也缺失 → 没有任何可用后端 | **MOBI / AZW3 输出能力完全丧失**；只剩 EPUB/HTML 互转。两个后端都缺失时，该节点虽不被判为不可用，但实际无法完成任何转换（见第 6.3 节） |
 | `flow.branch` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
 | `flow.set-var` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
@@ -316,16 +339,27 @@ EngineModel {
 | `text.replace` | 无（纯 Rust 文本处理） | 无 | 不适用——永远可用 | 无 |
 | `name.build` | 无（纯 Rust 字符串拼装） | 无 | 不适用——永远可用 | 无 |
 
-**关于图像域的补充说明：** `image.convert` / `image.resize` / `image.crop` / `image.rotate` / `image.enhance` / `image.strip-metadata` 这 6 个节点是「纯 Rust `image` crate 打底」，缺失可选引擎时**仍然工作**，只是更慢、更吃内存。整个 `toolforge-engines` 的降级**设计**就是围绕这一点展开的（见该 crate `src/lib.rs` 的模块注释）——图像处理是唯一设想中做三层降级的领域，因为纯 Rust 路径能兜住基础能力：
+**关于图像域的补充说明：** `image.convert` / `image.resize` / `image.crop` / `image.rotate` / `image.enhance` / `image.strip-metadata` 这 6 个节点都是「纯 Rust `image` crate 打底」，缺失可选引擎时**仍然工作**，只是更慢、更吃内存（其中前 4 个已经真的会挑外部后端，后 2 个目前只有纯 Rust 一条路，见上）。整个 `toolforge-engines` 的降级**设计**就是围绕这一点展开的（见该 crate `src/lib.rs` 的模块注释）——图像处理是唯一设想中做三层降级的领域，因为纯 Rust 路径能兜住基础能力：
 
 ```text
 libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全）  ──缺失──►  纯 Rust image crate
                                                                       （零依赖，始终可用）
 ```
 
-> 🚧 **但这条链路目前只有最后一档在跑。** `nodes.rs` 里**真正被解析和调用的引擎只有 ffmpeg / pandoc / libreoffice / 7zip 四个**，`libvips` 与 `imagemagick` **没有任何一处被 resolve 或调用**（`image.rotate` 的非直角分支不是降级到 ImageMagick，而是直接返回 `engine_missing("imagemagick")`）。所以上表「`libvips` 缺失 → ImageMagick → 纯 Rust」这几列描述的是**声明与规格**，不是可观察的运行时行为；`toolforge-engines/src/lib.rs` 模块注释里那张三层图同理，属于**待落地**而不是现状。要改成正向结论，必须先真的在节点里调用这两个引擎（见 `docs/ROADMAP.md` 的「不一致 2」）。
+> ✅ **这条链路现在是"真的"了 —— 但要看清它覆盖了哪几个节点。** 新增的 `nodes.rs::pick_image_backend()` 会按上面的顺序真的挑一个后端（每次调用都问一遍引擎注册表；`is_available` 读的是带缓存的状态，不会每个文件都 spawn 一次 `vips --version`），并且**把用的是哪个后端报出来**：
+>
+> - 节点输出里多一个值 **`backend`**，取值为 `"libvips"` / `"imagemagick"` / `"rust"`，后续步骤可以用 `${steps.<id>.backend}` 引用；
+> - 任务日志里多一条 debug 行，形如 `image.convert：后端 = libvips（快、省内存）；a.png → a.webp（质量 90）`。
+> - 理由（代码注释原文的意思）：后端选择一旦不可观测，"到底走没走 libvips"就只能靠猜 —— 而这个项目已经被"文档说有、实际没有"坑过好几次。
+>
+> **走这条链的是 4 个节点**：`image.convert`、`image.resize`、`image.crop`、`image.rotate`。
+> **不走这条链的是 2 个节点**：`image.enhance` 与 `image.strip-metadata` —— 它们**仍然是纯 Rust 实现**，既不调用 `pick_image_backend()`，也不产生 `backend` 输出。所以 `libvips.provides` 里的 `image.enhance` / `image.strip-metadata`、以及 `imagemagick.provides` 里的 `image.strip-metadata`，这些声明目前**仍然只是声明**（见 6.2）。
+>
+> **`image.rotate` 的任意角度（非 90° 倍数）在新实现下的行为**：libvips 可用时走 `vips similarity --angle N`；ImageMagick 可用时走 `-rotate N`；**只有纯 Rust 可用时返回明确的 `EngineMissing`**，detail 让用户去「设置 → 引擎管理」装 libvips 或 ImageMagick。它**不会**静默把角度取整 —— 取整会让用户以为"转了 45°"，实际拿到一张没转的图。`verify-platform.mjs` 的【7】号检查盯着这一点。
+>
+> **libvips 档位带来的真实收益要说准**：装了 libvips 后 WebP / JPEG 会按请求的画质做**有损**编码，而纯 Rust 后端的 WebP **只能无损**。准确的说法是"**按质量换体积的能力**"（这对照片很重要）。**不要写成"有损一定更小"**：实测在一张 320×200 的**合成渐变**图上，无损 508 字节反而小于有损 1808 字节 —— 合成图本来就会被无损压得极小，所以 `verify-platform.mjs`【6】只断言"确实走了有损编码"，**刻意不断言体积**。要证明"照片会更小"，得拿真实照片测。
 
-但要注意每个节点的可选引擎清单并不相同：`image.rotate` 与 `image.enhance` **只有 imagemagick / libvips 一个可选项**，不存在第二个外部兜底，一旦该引擎缺失就直接落到纯 Rust 路径。
+但要注意每个节点的可选引擎清单并不相同，而且**清单与实现并不总是一致**：`image.enhance` 在 `optionalEngines` 里只列了 `libvips` 一个（实现里则一个都不调）；`image.rotate` 的清单只列 `imagemagick`，实现却会优先用 `libvips`。以 `builtin_nodes()` 的字段为准的只有"节点可用性"（有必需引擎时的判定），**"实际会调用哪个引擎"必须以 `nodes.rs` 的实现为准**。
 
 ### 5.2 必需引擎非空：没有降级路径，缺失即不可用（15 个）
 
@@ -333,7 +367,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 
 | 内置节点 | 所需能力 | 主引擎 | 主引擎缺失时的降级路径 | 降级后的能力损失 |
 | --- | --- | --- | --- | --- |
-| `image.remove-background` | 抠图去背景 | `python` + `onnx-models`（**均为必需**） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 Python 运行时」与「需要安装 ONNX 模型包」，并分别提供下载入口（两者都是 `Download` 模式，可应用内获取） |
+| `image.remove-background` | 抠图去背景（ONNX 推理） | `python` + `onnx-models`（**均为必需**） | **无降级路径**（也**不参与** 5.1 的 libvips / ImageMagick / 纯 Rust 三层链 —— 这是第四条路，见 3.2） | 节点完全不可用。UI 显示「需要安装 Python 运行时」与「需要安装 ONNX 模型包」，并分别提供下载入口（两者都是 `Download` 模式，可应用内获取）。**`onnx-models` 走虚拟引擎判据**：已下过至少一个权重才算可用（见 3.6）。手动装齐两个引擎后，**首次运行仍需联网**装 `onnxruntime numpy pillow` 到 `<data>/cache/onnx-runtime/` 的独立 venv（约 30 MB，一次性） |
 | `video.transcode` | 音视频转码 | `ffmpeg`（必需） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 FFmpeg」并提供下载入口 |
 | `video.extract-audio` | 提取音轨 | `ffmpeg`（必需） | **无降级路径** | 节点完全不可用。同上提示 |
 | `video.thumbnail` | 视频抽帧 / 缩略图 | `ffmpeg`（必需） | **无降级路径** | 节点完全不可用。同上提示 |
@@ -351,7 +385,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 
 **不要为这一节编造降级方案。** 例如「`video.transcode` 缺失 FFmpeg 时改用纯 Rust 解码」这类说法在当前代码与依赖里没有任何依据：workspace 的依赖清单中没有纯 Rust 的音视频转码库，`toolforge-engines` 的模块注释也明确说明音视频/文档/压缩包没有纯 Rust 替代品。此类建议如需成立，必须先改代码、再改本文档（见 1.1 的维护约定）。
 
-**实现现状（快照，详见第 6.6、6.7 节）：** `crates/toolforge-engines/src/nodes.rs` 的 `run()` 分发函数已实现 27 个节点。本节涉及的节点中，`archive.pack` / `archive.unpack` 已实现且确实**硬依赖** `7zip`（实现里是 `ctx.engine("7zip").await?`，缺失即报错），与本节的「无降级路径」结论一致；`video.*` / `audio.*` / `doc.convert` / `doc.to-pdf` 同样以必需引擎为准。但 `image.remove-background`、`doc.ocr`、`ai.upscale`、`ai.describe`（以及第 5.1 节的 `ebook.convert`）共 5 个节点仍会返回「尚未在 v0.1 中实现」的错误，因此它们的降级行为目前只能是规格，尚无可观察的运行时表现。
+**实现现状（快照，详见第 6.6、6.7 节）：** `crates/toolforge-engines/src/nodes.rs` 的 `run()` 分发函数已实现 28 个节点。本节涉及的节点中，`archive.pack` / `archive.unpack` 已实现且确实**硬依赖** `7zip`（实现里是 `ctx.engine("7zip").await?`，缺失即报错），与本节的「无降级路径」结论一致；`video.*` / `audio.*` / `doc.convert` / `doc.to-pdf` 同样以必需引擎为准；**`image.remove-background` 也已实现并在真机上跑通整条链路**（模型 + 独立 venv + ONNX 推理，见 3.2）。但 `doc.ocr`、`ai.upscale`、`ai.describe`（以及第 5.1 节的 `ebook.convert`）共 4 个节点仍会返回「尚未在 v0.1 中实现」的错误，因此它们的降级行为目前只能是规格，尚无可观察的运行时表现。
 
 ### 5.3 引擎与许可证的组合风险
 
@@ -385,13 +419,14 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 - 处理方式：**待补齐**。要么在 `engine_catalog()` 的 `onnx-models.models` 里补上这三个模型的完整条目（含体积、许可证、`commercialUse`），要么收紧 `ai.upscale` 的枚举。**本文档不为它们补写任何数据**——补数据必须走代码，然后同步本文档（第 1.1 节维护约定）。
 - 补充：现有测试 `every_node_engine_reference_exists_in_catalog` 只校验节点引用的**引擎 id** 是否存在，不校验参数枚举里的**模型 id** 是否有对应权重条目，所以这个不一致目前不会被测试拦住。
 
-### 6.2 `image.crop` 引用了 `libvips`，但 `libvips` 未声明提供该能力
+### 6.2 `provides` 声明与实现之间的两处对不上（`image.crop` / `image.enhance` + `image.strip-metadata`）
 
-- `image.crop` 的 `optionalEngines` 是 `["libvips", "imagemagick"]`。
-- 但 `libvips` 的 `provides` 只有 `image.convert`、`image.resize`、`image.enhance`、`image.strip-metadata`——**没有 `image.crop`**；`image.crop` 只在 `imagemagick` 的 `provides` 里。
-- 影响：第 5.1 节中 `image.crop` 的那行按代码写作「`libvips` 缺失 → ImageMagick」，但按 `provides` 的声明，libvips 未必真的能承担 `image.crop`；如果实际实现里 libvips provider 支持裁剪，就应该把 `image.crop` 补进 `libvips.provides`。
-- 处理方式：**待补齐**，需在 `toolforge-engines` 的 `nodes` 模块实现时确认并二选一对齐。
-- 补充：现有测试 `every_provided_capability_maps_to_a_real_node` 只校验「`provides` 里的能力都有对应节点」这个方向，**不校验反方向**，所以这个不一致同样不会被测试拦住。
+- **方向一：引用方有、声明方没有。** `image.crop` 的 `optionalEngines` 是 `["libvips", "imagemagick"]`，但 `libvips` 的 `provides` 只有 `image.convert`、`image.resize`、`image.enhance`、`image.strip-metadata`——**没有 `image.crop`**；`image.crop` 只在 `imagemagick` 的 `provides` 里。
+  > ✅ **实现已经查清**：`nodes.rs::image_crop` 确实调用 `pick_image_backend()`，**libvips 可用时就用 libvips 做裁剪**。也就是说"libvips 能不能承担 `image.crop`"这个问题，答案是**能，而且已经在做**（这一点也由 `verify-platform.mjs`【6】间接覆盖：它验证的是"实际后端与引擎状态一致"）。
+  > 处理方式：**待补齐** —— 应该把 `image.crop` 补进 `libvips.provides`，让声明追上实现。
+- **方向二：声明方有、实现里没有。** `libvips.provides` 里还有 `image.enhance` 与 `image.strip-metadata`，但这两个节点的实现**完全没有调用 `pick_image_backend()`**（也就没有 `backend` 输出），是纯 Rust 内部实现。
+  > 处理方式：**待补齐** —— 要么在实现里真的接上 libvips，要么把这两个能力从 `libvips.provides` 里撤掉。**在二选一完成之前，"libvips 提供图像增强/清除元数据"这句话只是声明**，使用者不该据此以为装了 libvips 这两步会提速。
+- 补充：现有测试 `every_provided_capability_maps_to_a_real_node` 只校验「`provides` 里的能力都有对应节点」这个方向，**不校验反方向，也不校验"实现里到底调没调"**，所以这两处不一致都不会被测试拦住。
 
 ### 6.3 `ebook.convert` 在「两个可选引擎都缺失」时没有明确定义
 
@@ -404,6 +439,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 
 - `EngineState` 中有 `Outdated`（「版本过旧」）状态，`EngineStatus` 中有 `version` 字段，但 `EngineDescriptor` 中**没有最低版本字段**，也没有任何地方定义「过旧」的判定标准。
 - 处理方式：**待定**。本文档因此不给出任何版本号要求（见第 1.3 节）。
+- ✅ **补一条已经修好的相关事实**：**版本号本身现在真的读得出来了**。此前 `toolforge-process` 的 `ExecOptions::quiet(true)` 会把子进程输出整段丢弃，于是 `probe_version` 什么都拿不到 —— 界面上**每个引擎的版本都显示「未知」**，引擎失败时 stderr 也是空的。`quiet` 现已改为「只保留尾部」，`probe_version` 有回归测试（`probe_version_returns_something`）钉住。注意区别：**"能读到版本号"已经成立，"低于多少算过旧"仍然没有定义**，所以 `EngineState::Outdated` 依旧不会被触发。
 
 ### 6.5 模型下载地址与 SHA-256：三个已核对，三个刻意留空
 
@@ -414,7 +450,15 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
   > **注意**：上一段关于"模型权重仍全部为 `null`"的旧结论已经不成立。
 - ~~另外 `engine-sources.json` 中 5 个引擎的候选 URL 虽然存在，但**每条 `sha256` 均为 `null`**，因此没有任何一个引擎具备可用的自动安装来源。~~
   > ✅ **已修正**：`engine-sources.json` 已回填 **6 条**带真实核对哈希 + 版本固定直链的来源（`ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux`）。因此 Windows 与 Linux 上的这 4 个引擎**现在可以自动安装**；macOS 三条与 `ffmpeg@linux` 仍为 `null`。详见 `docs/ROADMAP.md` §3。
-- 处理方式：**还剩三个模型待补齐**（补哈希必须先在真实环境下载核对，不能凭推测填写）。注意下载链路本身已通，但**依赖模型的节点执行器仍未实现**，所以 v0.1 仍用不上模型。
+- 处理方式：**还剩三个模型待补齐**（补哈希必须先在真实环境下载核对，不能凭推测填写）。
+  > ✅ **另一件事已经不再成立**：这条原来说「依赖模型的节点执行器仍未实现，所以 v0.1 仍用不上模型」—— **抠图的执行器 已经实现并真机跑通**（`image_remove_background`：下权重 → 独立 venv 装 `onnxruntime` → ONNX 推理 → 出 RGBA PNG），所以模型现在**真的被用上了**。仍然没实现的是 `ai.upscale`（`realesrgan-x4plus` 连下载源都没有）。
+
+**下载链路上后来加的三件事（都是实测逼出来的）：**
+
+1. **失败重试一次，第二次只用 HTTP/1.1**：`registry.rs` 对 **5xx / 429 / 连接错误**重试一次，第二次换成 `http1_only()` 的客户端。触发点是观察到**同一个 GitHub release URL 一次返回 502、稍后再请求就是 200**。
+   > ⚠️ **诚实说明**：**重试本身依据充分**（那是个真实发生过的 5xx），但**"换成 HTTP/1.1"这一步的依据较弱** —— 那个 502 **没有复现过**，它很可能只是一次瞬时的服务端错误，与 HTTP 版本无关。之所以还是保留，是因为代价极低（只在第一次失败后才多花一次请求），而如果它真与 HTTP/2 的某些中间设备有关，那就是白捡的。**不要把它写成"确认是 HTTP/2 的问题"。**
+2. **本地已有且哈希正确的文件直接跳过下载**：`models_install` 会先对已存在的本地文件算哈希，**匹配就直接返回**（`u2net` 是 168 MB，用户在界面上多点一次下载不该付一次完整下载的代价）；**不匹配则重新下载**并留一条 warn（本地文件坏掉这件事本身值得被看见）。为什么不是"文件存在就当已安装"：模型权重会被用户手工替换、被同步工具截断、被磁盘错误写坏，而**拿一个损坏的权重去跑推理得到的是乱码结果，不是错误** —— 那比下载失败难查得多。
+3. **一条"URL 必须以落盘文件名结尾"的断言**：`engine.rs` 的 `verified_sources_are_pinned` 里新增。它是被一次**真机下载**逼出来的：`url` 曾经写成 release tag 本身（`…/download/v0.0.0`，**少拼了资产名**），看起来完全正常、单测也照样绿（因为没人会去"下载"），真跑的时候得到 `HTTP 404`，而错误信息只含糊地说"下载 u2netp 失败"。要求"URL 以 `file_name` 结尾"是最便宜的自洽检查：**只要有人再漏拼一次资产名，这条会立刻红**（GitHub 资产地址必须以具体文件名结尾，指向 release tag 会 404）。
 
 ### 6.6 `nodes.rs` 的模块文档表与实际实现不一致：`archive.*` 的「系统 tar」兜底并不存在
 
@@ -422,24 +466,33 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 - 但实现并非如此：`sevenzip_pack()` 与 `sevenzip_unpack()` 都直接写 `let sevenzip = ctx.engine("7zip").await?;`——`7zip` 缺失时立即返回错误，执行失败时 `r.into_error("7zip")`。代码中**没有**任何改用系统 `tar` 的分支（`tar` 只作为 `sevenzip_args_for_format()` 的一个**输出格式**出现，即 `-ttar`，不是兜底程序）。
 - 影响：那张模块文档表会让读者以为 `archive.*` 在 7zip 缺失时仍能工作。本文档第 5.2 节依据 `builtin_nodes()` 的 `requiresEngines: ["7zip"]` 与上述实现，结论是「**无降级路径**」——与实现一致，与那张文档表不一致。
 - 处理方式：**待对齐**。要么真的实现系统 `tar` 兜底（注意 `tar` 只能覆盖 tar 系列与部分 zip，**无法处理 7z / rar**，因此仍需保留 `requiresEngines` 的语义或在 UI 上区分），要么改掉 `nodes.rs` 的模块文档表。
-- 附带问题：`nodes.rs` 的表还声称自己是降级矩阵的「唯一真相来源」，而本文档声明的依据是 `pipeline.rs` 的 `requiresEngines` / `optionalEngines`。建议统一口径为「`builtin_nodes()` 的字段是权威数据，`nodes.rs` 的表只是实现的简化摘要」，否则两份表会持续漂移：`image.rotate` 与 `image.enhance` 只有单一外部兜底、`doc.ocr` 的 `tesseract` 是可选引擎、`ebook.convert` 的 `calibre` → `pandoc` 顺序，这些都没有体现在 `nodes.rs` 的表里。
+- 附带问题：`nodes.rs` 的表还声称自己是降级矩阵的「唯一真相来源」，而本文档声明的依据是 `pipeline.rs` 的 `requiresEngines` / `optionalEngines`。建议统一口径为「`builtin_nodes()` 的字段是权威数据，`nodes.rs` 的表只是实现的简化摘要」，否则两份表会持续漂移：`doc.ocr` 的 `tesseract` 是可选引擎、`ebook.convert` 的 `calibre` → `pandoc` 顺序、`image.enhance` 与 `image.strip-metadata` 其实完全不走降级链（见 5.1、6.2），这些都没有体现在 `nodes.rs` 的表里。
 
-### 6.7 `nodes.rs` 中仍有 5 个内置节点未实现
+### 6.7 `nodes.rs` 中仍有 4 个内置节点未实现（`image.remove-background` 已出列）
 
-- `nodes.rs` 的 `run()` 分发函数实现了 27 个节点，其余 5 个会落到 `not_implemented()`，返回 `ErrorCode::Internal` 与消息「内置节点 `xxx` 尚未在 v0.1 中实现」。
-- 这 5 个节点是：`image.remove-background`、`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`。清单的**唯一真相来源**是 `toolforge_core::pipeline::UNIMPLEMENTED_NODES`（原来它在四个地方各存一份，漏同步过一次）。
+- `nodes.rs` 的 `run()` 分发函数实现了 28 个节点，其余 4 个会落到 `not_implemented()`，返回 `ErrorCode::Internal` 与消息「内置节点 `xxx` 尚未在 v0.1 中实现」。
+- 这 4 个节点是：`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`。清单的**唯一真相来源**是 `toolforge_core::pipeline::UNIMPLEMENTED_NODES`（原来它在四个地方各存一份，漏同步过一次）。
+- ✅ **本条原来写的是 5 个，第一个是 `image.remove-background`** —— 它是产品的招牌功能，**此前从未真正工作过**。现在它有了执行器 `image_remove_background`，并已在真机上跑通整条链路。
+  - **实测数据**（真机、非推断）：托管 Python 由应用装成 **3.11.16 / 145.2 MB / tar.gz 路径**；venv + pip 自动装上 `onnxruntime-1.30.0`、`numpy-2.4.6`、`pillow-12.3.0`；对一张 **400×300**（白底 + 一个红椭圆）的测试图，输出是 **RGBA PNG（colorType 6）、400×300、椭圆中心 alpha 254、角落 alpha 0、前景覆盖 18.87%** —— 与椭圆的真实面积吻合。**运行时就绪后单张推理约 0.7 秒**（含 pip 的首次运行为约 32 秒）。
+  - **一张渐变图测不出显著性模型**：在没有明显主体的渐变图上，模型如实报告约 0% 覆盖并让节点发一条警告说明这一点。所以验收脚本必须用**有真实主体**的图 —— 拿渐变图测显著性模型，测出来的是"模型坏了"这种假象。
+  - 参数也已对齐实现：现在是 `model` / `mode`（`alpha` | `color`）/ `background` / `threshold` / `feather`。**旧的 `alphaMatting` 参数已被删除** —— 它从登记那天起就没有任何实现，是个**假参数**：用户在 UI 里勾上它，什么都不会发生。
+  - `python` 版本区间是 **3.9 ~ 3.13**（`onnxruntime` 没有 3.14 的 wheel），首次运行需要在 `<data>/cache/onnx-runtime/` 建独立 venv 并联网 `pip install`，详见 3.2。
+- ✅ **新增了一条防回归测试**：`unimplemented_list_matches_the_dispatch_table` 会**遍历真实分发表**，对 `UNIMPLEMENTED_NODES` 里的每个节点断言它**确实**还落在 `not_implemented` 上。它守住的失误形态是"实现完了却忘了从名单里删掉"（以及反方向）—— 那种错会让用户看到与真实行为相反的提示，而**这个项目已经因此踩过一次坑**。同名的兄弟测试 `unimplemented_list_matches_actual_dispatch` 也在守同一件事。
 - **曾经的 `flow.foreach` 不在这个名单里 —— 它被整个删除了**，不是"留着不实现"。它的语义在平铺的步骤列表里无法定义，描述里的「宿主会按并发度并行调度」也是假的；批量改由宿主在命令层做（`expand_batches`：多文件与目录输入都扇出成单文件批次，`${batch.index}` 取序号）。`UNIMPLEMENTED_NODES` 里只留了一行注释记录原因，防止有人再加回来。
 - 这是**刻意的设计**：`not_implemented()` 的注释明确说明「刻意**不返回假的成功**」，否则会出现「流水线显示跑通了但没产出文件」这种最难排查的问题。
-- 处理方式：**待实现**。这 5 个恰好覆盖了本文档第 5 章里引擎最重的节点（抠图、OCR、电子书转换、AI 超分、AI 描述），因此它们也是 `python`、`onnx-models`、`ai-provider`、`calibre` 这几个引擎落地程度的直接体现。`not_implemented()` 的错误提示把实现进度指向 `docs/ROADMAP.md`。
+- 处理方式：**待实现**。剩下这 4 个覆盖的是 OCR、电子书转换、AI 超分、AI 描述，因此它们仍是 `ai-provider`、`calibre` 这几个引擎落地程度的直接体现；`ai.upscale` 是**最有可能接着做的一个**（它可以照抄抠图这条"模型 + 推理"链，缺的只是 `realesrgan-x4plus` 的下载源）。`not_implemented()` 的错误提示把实现进度指向 `docs/ROADMAP.md`。
+- **别把"抠图通了"读成"AI 媒体能力都通了"**：`ai.upscale` / `ai.describe` / `doc.ocr` / `ebook.convert` 四个**仍然会返回未实现错误**，界面上也仍然按未实现标注。
 
 ### 6.8 桌面端入口已补齐，但前端仍缺失
 
 > **状态更新**：本条最初写作时 `apps/desktop/src-tauri/src/` 与 `crates/toolforge-ai` 都还不存在，随后被并行开发补齐。以下保留原判断并标注最新观察结果。
+>
+> ⚠️ **另外注意**：下面"没有运行过 `cargo test`、第 5 章未经过测试回归验证"这句**已经过期**（保留作为历史）。当前有可复核的实测数据：`cargo test --workspace` **215 passed / 0 failed**、`scripts/devtools/verify-platform.mjs` **41 项检查全通过**、一次真实的 libvips 一键安装、以及抠图整条链路的真机验证（见 1.3、3.2、5.1）。不过要分清范围：**测试全绿 ≠ 第 5 章每一行都验证过** —— 图像域那 4 个节点的后端选择有【6】、【7】两条运行时检查，抠图有【8】，其余各行仍然没有专门的运行时检查。
 
 - 根 `Cargo.toml` 的 `members = ["crates/*", "apps/desktop/src-tauri"]`：两个模式现在都有对应目录。`apps/desktop/src-tauri/src/` 已存在（`main.rs` / `lib.rs` / `commands.rs` / `ipc.rs` / `state.rs` / `bin/`）。
 - 但**前端 `apps/desktop/src/` 仍不存在**（没有 `package.json`、没有 `dist/`、没有生成的 `bindings.ts`），所以根 `package.json` 里指向 `@toolforge/desktop` 的脚本跑不起来。
 - `crates/toolforge-ai` 也已存在（`lib.rs` / `provider.rs` / `review.rs`），不再是缺失依赖。
-- 影响：本文档**没有运行过 `cargo build` / `cargo test`**，因此不对「当前能否构建」下结论；也正因为如此，第 5 章的降级矩阵与第 2、4 节的数据目前都**没有经过测试回归验证**。
+- 影响（**已过期，见上**）：本文档**没有运行过 `cargo build` / `cargo test`**，因此不对「当前能否构建」下结论；也正因为如此，第 5 章的降级矩阵与第 2、4 节的数据目前都**没有经过测试回归验证**。
 - 处理方式：**待实现**（补齐前端工程）。已知的编译阻塞与实测结论见 `docs/ROADMAP.md` 的「当前阻塞项」。
 
 ---
@@ -449,12 +502,15 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 | 路径 | 与本文档的关系 |
 | --- | --- |
 | `crates/toolforge-core/src/engine.rs` | 第 2、4 节的权威来源：`engine_catalog()`、`EngineDescriptor`、`EngineModel`、`EngineState`、`EngineSource`、`EngineInstallMode` |
-| `crates/toolforge-core/src/pipeline.rs` | 第 5 节的权威来源：`builtin_nodes()`（32 个节点）、`NodeDescriptor.requiresEngines` / `optionalEngines`、`UNIMPLEMENTED_NODES`（5 个，唯一真相来源） |
+| `crates/toolforge-core/src/pipeline.rs` | 第 5 节的权威来源：`builtin_nodes()`（32 个节点）、`NodeDescriptor.requiresEngines` / `optionalEngines`、`UNIMPLEMENTED_NODES`（4 个，唯一真相来源） |
 | `crates/toolforge-engines/src/lib.rs` | 引擎层的职责划分与图像域三层降级设计的说明；`MANAGED_LAYOUT`、`version_args()` |
-| `crates/toolforge-engines/src/registry.rs` | 引擎探测 / 下载 / 校验的实现；`EngineSourceSpec`、`ModelSpec`、`EngineRegistry`（含「`sha256` 为 `None` 时拒绝下载」的规则） |
-| `crates/toolforge-engines/src/nodes.rs` | 节点执行实现：`run()` 分发已实现 27 个节点；模块文档自带一张降级表，但与实现存在出入，见第 6.6、6.7 节 |
+| `crates/toolforge-engines/src/registry.rs` | 引擎探测 / 下载 / 校验的实现；`EngineSourceSpec`、`ModelSpec`、`EngineRegistry`（含「`sha256` 为 `None` 时拒绝下载」的规则与 `has_download_source()`）；`probe()` 里对 `onnx-models` 这个**虚拟引擎**的特判也在这里（见 3.6） |
+| `crates/toolforge-engines/src/nodes.rs` | 节点执行实现：`run()` 分发已实现 28 个节点；`pick_image_backend()` / `ImageBackend` 是第 5.1 节那张三层图的**真实实现**（四个节点走它，两个不走）；`image_remove_background` 是**第 3.2 节那条 ONNX 路径**（不经过三层链）；模块文档自带一张降级表，但与实现存在出入，见第 6.6、6.7 节 |
+| `crates/toolforge-engines/py/rembg.py` | ONNX 推理脚本，用 `include_str!` 编进二进制、运行时释放到 `<data>/cache/onnx-runtime/rembg.py`；见第 3.2 节 |
+| `crates/toolforge-process/src/exec.rs` | 子进程执行：`resolve_program()`（裸名字走 PATH、显式路径不回退）、`ExecOptions::quiet` 的"只留尾部"语义、`ExecResult` 的输出裁剪；见第 1.3 节 |
 | `crates/toolforge-engines/engine-sources.json` | 下载来源清单：**6 条已回填真实哈希 + 版本固定直链**（Windows/Linux 的 ffmpeg/libvips/pandoc/python），macOS 三条与 `ffmpeg@linux` 仍为 `null`（安装时返回 `HashRequired`）。见第 1.3 与 6.5 节 |
 | `crates/toolforge-process/` | 外部进程调用（执行、RPC、进程监管），是引擎被真正调用的下层 |
+| `scripts/devtools/verify-platform.mjs` | 真机运行时验收脚本（`scripts/devtools/run.mjs` 的第 5 个），**41 项检查**；其中【6】验证"图片后端与引擎状态一致"、【7】验证任意角度旋转不静默取整、【8】验证抠图整条 ONNX 链路真的出透明背景。第 5.1 节的实测结论来自它，第 3.2 节的抠图实测数据来自【8】 |
 | `docs/ROADMAP.md` | `nodes.rs` 的 `not_implemented()` 错误提示所指向的实现进度文档（本文档未引用其内容，也不与其重复记录进度） |
 | `Cargo.toml`（根） | workspace 成员与依赖声明，见第 1.2 与 6.8 节 |
 

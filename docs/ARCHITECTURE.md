@@ -27,7 +27,7 @@ Rust 工作区：
 | `rust-toolchain.toml` | ✅ | `channel = "stable"`，`profile = "minimal"` |
 | `crates/toolforge-core/` | ✅ | 10 个模块：`engine` `error` `events` `ids` `job` `paths` `permission` `pipeline` `plugin` `queue` |
 | `crates/toolforge-process/` | ✅ | `exec.rs` `rpc.rs` `supervisor.rs` |
-| `crates/toolforge-engines/` | ✅ | `lib.rs` `nodes.rs` `registry.rs` + `engine-sources.json` |
+| `crates/toolforge-engines/` | ✅ | `lib.rs` `nodes.rs` `registry.rs` + `engine-sources.json` + `py/rembg.py`（抠图推理脚本，`include_str!` 编进二进制） |
 | `crates/toolforge-plugins/` | ✅ | `audit.rs` `l1.rs` `store.rs` `runtimes.rs` `runtimes/wasm.rs` `runtimes/python.rs` |
 | `crates/toolforge-ai/` | ✅ | `lib.rs` `provider.rs` `review.rs` |
 | `apps/desktop/src-tauri/` | ✅ | `Cargo.toml` `build.rs` `tauri.conf.json` `capabilities/default.json` `src/{lib,main,commands,ipc,state}.rs` `src/bin/export_bindings.rs` |
@@ -239,14 +239,25 @@ flowchart TD
 ### 3.2 `toolforge-process` —— 子进程编排
 
 - **职责**：`lib.rs` 列出它存在的理由 —— 直接 `Command::new(...).output().await` 会踩四个坑：管道死锁、取消不生效、Windows 控制台窗口闪现、输出无限膨胀。另外 `supervisor` 提供**常驻子进程**管理（L3 Python 插件、LibreOffice listener），协议是 JSON-RPC 2.0 按行分帧。
-- **公开入口**：`exec` / `exec_streaming` / `exec_checked` / `probe_version`、`ExecOptions`（`program` `args` `cwd` `env` `clear_env` `timeout` `cancel` `stdin_data` `quiet`）、`ExecResult`（`exit_code` `stdout` `stderr` `duration_ms` `killed` `truncated`；`success()` / `into_error()`）、`StreamKind`；`RpcError` / `RpcRequest` / `RpcResponse` / `RpcMessage` / `notification()`、`JSONRPC_VERSION`；`ChildSupervisor`（`spawn` / `state` / `name` / `next_notification` / `try_next_notification_blocking` / `notification_queue` / `drain_notifications` / `initialize` / `call` / `notify` / `shutdown` / `kill`）、`SpawnSpec`（`program` `args` `cwd` `env` `clear_env` `deny_network` `default_timeout` `init_timeout`）、`SupervisorState`；平台辅助 `CREATE_NO_WINDOW` / `hide_console` / `detach_process_group`。
+- **公开入口**：`exec` / `exec_streaming` / `exec_checked` / `probe_version`、**`resolve_program()`**、`ExecOptions`（`program` `args` `cwd` `env` `clear_env` `timeout` `cancel` `stdin_data` `quiet`）、`ExecResult`（`exit_code` `stdout` `stderr` `duration_ms` `killed` `truncated`；`success()` / `into_error()`）、`StreamKind`；`RpcError` / `RpcRequest` / `RpcResponse` / `RpcMessage` / `notification()`、`JSONRPC_VERSION`；`ChildSupervisor`（`spawn` / `state` / `name` / `next_notification` / `try_next_notification_blocking` / `notification_queue` / `drain_notifications` / `initialize` / `call` / `notify` / `shutdown` / `kill`）、`SpawnSpec`（`program` `args` `cwd` `env` `clear_env` `deny_network` `default_timeout` `init_timeout`）、`SupervisorState`；平台辅助 `CREATE_NO_WINDOW` / `hide_console` / `detach_process_group`。
+- **`resolve_program()` —— 程序名解析（这条是补出来的，因为缺它整条"一键安装引擎"都是坏的）**：`exec_streaming` 在执行前会检查 `opts.program.exists()`，而 **`Path::new("tar").exists()` 对裸命令名永远是 `false`**（`exists()` 按当前工作目录解析相对路径，**根本不看 PATH**）。引擎安装解压 `.zip` / `.tar.gz` 用的正是 `ExecOptions::new("tar")`，于是真机表现是：**下载成功 → SHA-256 校验通过 → 卡在解压，甩出一句"可执行文件不存在：tar"**（错误信息与真实原因毫无关系）。现在由公开函数 `resolve_program()` 统一解析，规则两条：
+  - **带路径分隔符的**（`./x`、`C:\a\b.exe`、`/usr/bin/x`）—— 原样校验，**不查 PATH**。这是故意的：调用方明确给了路径，就不该被 PATH 里同名的东西顶掉。
+  - **裸名字** —— 按 PATH 逐项找；Windows 上再按 `PATHEXT` 补后缀（写 `magick`，磁盘上是 `magick.exe`）；`PATHEXT` 缺失时用一个够用的默认集合。
+  - 回归测试：`bare_name_is_resolved_through_path`、`windows_addes_pathext_suffix`、`explicit_paths_never_fall_back_to_path`、`bare_name_actually_executes`。
+- **`quiet` 的语义是"只保留尾部"，不是"丢弃输出"**：字段注释写的是"是否只保留尾部输出（批量处理时不要把 3000 个文件的信息都堆在内存里）"，头部 32 KB 的累积被关掉、**尾部 96 KB 照常保留**。但实现曾经写成"quiet 时一行都不 push"，后果很具体：
+  - `probe_version` 用的就是 `.quiet(true)`，于是**每个引擎的版本号都显示为「未知」**；
+  - 引擎失败时的 `stderr` 是空的 —— 报错没有任何可操作的细节。
+  - 修复方式是让实现与注释一致（`keep_head = !opts.quiet`），回归测试：`quiet_still_keeps_output`、`probe_version_returns_something`、`tail_buffer_without_head_still_keeps_tail`（最后一条是同一次修复带出来的次生缺陷：quiet 下头部恒为空，早期实现照样插一句"中间输出已省略"）。
 - **依赖了谁**：`toolforge-core` + `serde` `serde_json` `thiserror` `tracing` `tokio` `tokio-util` `futures-util` `parking_lot`。
 - **被谁依赖**：`toolforge-engines`、`toolforge-plugins`、`apps/desktop/src-tauri`。
 
 ### 3.3 `toolforge-engines` —— 引擎层
 
 - **职责**：`lib.rs` 写明三个职责，按依赖顺序 —— **探测**（装在哪、什么版本）、**获取**（按需下载 + SHA-256 校验 + 解压）、**调用**（把内置节点语义翻译成命令行或纯 Rust 调用，并把引擎缺失变成**可降级路径**）。
-- **公开入口**：`EngineRegistry`（`new` / `with_events` / `load_sources_file` / `register_model` / `paths` / `probe_all` / `probe` / `status` / `cached_statuses` / `managed_binary` / `system_binary` / `resolve` / `is_available` / `install` / `download_to` / `install_model`）、`EngineSourceSpec`、`ModelSpec`、`EngineInstallOutcome`（`Installed` / `AlreadyAvailable` / `NotConfigured` / `HashRequired`）、`download()`、`ENGINE_BINARIES`、`MANAGED_LAYOUT`、`version_args()`；`nodes::NodeCtx`（`param_str` / `param_i64` / `param_f64` / `param_bool` / `engine`）、`nodes::NodeOutput`（`value` / `file` / `with_value`）、`nodes::run()`。
+- **公开入口**：`EngineRegistry`（`new` / `with_events` / `load_sources_file` / `register_model` / `paths` / `probe_all` / `probe` / `status` / `cached_statuses` / `managed_binary` / `system_binary` / `resolve` / `is_available` / `install` / `download_to` / `install_model`）、`EngineSourceSpec`、`ModelSpec`、`EngineInstallOutcome`（`Installed` / `AlreadyAvailable` / `NotConfigured` / `HashRequired`）、`download()`、`ENGINE_BINARIES`、`MANAGED_LAYOUT`、`version_args()`；`nodes::NodeCtx`（`param_str` / `param_i64` / `param_f64` / `param_bool` / `engine`）、`nodes::NodeOutput`（`value` / `file` / `with_value`）、`nodes::run()`、**`nodes::pick_image_backend()` / `nodes::ImageBackend`**（`Vips` / `Magick` / `Rust`）。
+- **图像域的三层降级现在是实现，不再只是 `lib.rs` 里的一张图**：`pick_image_backend()` 按 `libvips → imagemagick → 纯 Rust` 挑后端（`is_available` 读带缓存的状态，不会每个文件都去 spawn 一次 `vips --version`），并把结果**报出去** —— 节点输出里多一个 `backend` 值（`"libvips"` / `"imagemagick"` / `"rust"`），任务日志里多一条 debug 行。**走这条链的是 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个节点；`image.enhance` 与 `image.strip-metadata` 仍是纯 Rust 实现，不问引擎**（详见 `docs/ENGINE-MATRIX.md` 第 5.1、6.2 节）。理由写在代码注释里：后端选择一旦不可观测，"到底走没走 libvips"就只能靠猜，而这个项目已经被"文档说有、实际没有"坑过好几次。
+- **抠图是第四条路，不在这张图里**：`image.remove-background` 已经实现（`image_remove_background`），但它跑的是 **ONNX 推理**，不经过 `pick_image_backend()`，`libvips` / ImageMagick 装得再全也不会让它快一点。推理**不在 Rust 里做**，而是交给 `python` 引擎的子进程执行 —— 理由见决策 9。
+- **模型下载的两条加固**（详见 4.11 第 12 条）：`install_model` 会先对**已存在的本地文件**算哈希，匹配就跳过下载（`u2net` 是 168 MB）；`download()` 对 5xx / 429 / 连接错误**重试一次**（第二次换 `http1_only` 客户端）。
 - **依赖了谁**：`toolforge-core`、`toolforge-process` + `reqwest`（下载）、`image`（含 `png` `jpeg` `webp` `bmp` `tiff` `gif` `ico` `pnm` `qoi` `tga` `dds` `hdr` `ff` feature）、`which` `sha2` `hex` `walkdir` `dashmap` `parking_lot` `futures-util` 等。Cargo feature：`avif = ["image/avif"]`、`heavy-formats = ["image/exr"]`，**两者默认关闭**。
 - **被谁依赖**：`toolforge-plugins`、`apps/desktop/src-tauri`。
 
@@ -406,7 +417,8 @@ flowchart TD
 | `jobs_list` / `jobs_get` / `jobs_cancel` / `jobs_clear_finished` / `jobs_stats` | `commands.rs` 同名函数 | 任务中心与重连对账 |
 | `engines_catalog` / `engines_probe_all` / `engines_probe` / `engines_install` | `commands.rs` 同名函数 | 引擎面板与安装 |
 
-完整的 32 个命令（`lib.rs::COMMAND_NAMES`，与 `collect_commands!` 一一对应，`run()` 里有 `debug_assert_eq!(COMMAND_NAMES.len(), 32)`）：
+完整的 32 个命令（`lib.rs::COMMAND_NAMES`，与 `collect_commands!` 一一对应）：
+> ⚠️ `run()` 里曾经有一条 `debug_assert_eq!(COMMAND_NAMES.len(), 29)` 的"魔数断言"，**它已经被删掉**：那个数字与清单是两处各自维护的常量，忘了同步就会让 **debug 构建的应用在启动时直接 panic**（为一个纯记账问题付一个启动崩溃的代价）。真正逐条核对命令的守卫在 `src/bin/export_bindings.rs`（它逐名比对 `COMMAND_NAMES` 与 `collect_commands!` 的注册项，跑 `pnpm bindings` 时执行），那才是该管这件事的地方。
 
 `app_info` `app_paths` `system_status` | `settings_get` `settings_patch` | `jobs_list` `jobs_get` `jobs_cancel` `jobs_clear_finished` `jobs_stats` `jobs_retry` | `engines_catalog` `engines_probe_all` `engines_probe` `engines_install` | `models_list` `models_install` `models_remove` | `plugins_list` `plugins_get` `plugins_reload` `plugins_validate` `plugins_install` `plugins_grant` `plugins_set_enabled` `plugins_uninstall` `plugins_audit` `plugins_run` | `pipeline_nodes` | `ai_test_connection` `ai_generate` `ai_review_draft`
 
@@ -558,12 +570,15 @@ std::fs::create_dir_all(&workspace).ok();
   - `lib.rs` 给了「托管优先」的理由：「因为用户从官网下的绿色版 FFmpeg 通常不在 PATH 里。」
 
 - **`nodes.rs` 的翻译职责**：`crates/toolforge-engines/src/nodes.rs::run(ctx, node, args)` 是一个大 `match`，把节点名分派到具体实现：
-  - 纯 Rust（**不依赖任何外部引擎，永远可用**）：`image.probe` / `image.convert` / `image.resize` / `image.crop` / `image.rotate` / `image.enhance` / `image.strip-metadata`，以及 `fs.copy` / `fs.move` / `fs.mkdir` / `fs.delete`。
+  - 纯 Rust 打底（**不依赖任何外部引擎，永远可用**）：`image.probe` / `image.enhance` / `image.strip-metadata`，以及 `fs.copy` / `fs.move` / `fs.mkdir` / `fs.delete`。
+  - 纯 Rust 打底 + **可选外部后端**：`image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个先 `pick_image_backend()` 挑一个后端（`libvips` → `imagemagick` → 纯 Rust），走外部后端时用 `ctx.engine(..)` 拿路径起子进程，并在节点输出里报 `backend`。**`image.enhance` 与 `image.strip-metadata` 不在其中** —— 它们只有纯 Rust 实现（见 `docs/ENGINE-MATRIX.md` 5.1、6.2）。
   - 命令行引擎：`video.*` 与 `audio.*` → `ffmpeg_*`；`doc.convert` → `pandoc_convert`；`doc.to-pdf` → `libreoffice_to_pdf`；`archive.pack` / `archive.unpack` → `sevenzip_*`。
   - 流程控制：`flow.log` → `flow_log`；`flow.set-var` → `flow_set_var`；`flow.branch` → `flow_branch`。
     > 这三个曾经都是**空实现**（`Ok(NodeOutput::default())`，注释说"由流水线执行器特殊处理"，但 `l1.rs` 里并没有那段处理）—— 表现为"不报错也不做事"，是最难排查的一类行为。现已全部实现：`flow.log` 真的写任务日志、`flow.branch` 求值 `condition` 并产出 `steps.<id>.active`，且有回归测试钉住。
   - **`other => Err(not_implemented(other))`** —— 未实现的节点返回 `ErrorCode::Internal` + "内置节点 `{node}` 尚未在 v0.1 中实现"。`not_implemented` 的注释明确写了理由：「刻意**不返回假的成功**：插件作者与用户都必须立刻知道这个能力还没做，否则会出现"流水线显示跑通了但没产出文件"这种最难排查的问题。」
 - **降级策略**（`lib.rs` 文档）：图片是唯一真正三层降级的领域 —— `libvips ──缺失──► ImageMagick ──缺失──► 纯 Rust image crate`；音视频/文档/压缩包没有纯 Rust 替代品，所以走「必需引擎缺失 → 该节点不可用」并引导安装，「**不假装能跑**」。
+  > ✅ **这张图现在是实现，但只覆盖 4 个节点**（`image.convert` / `image.resize` / `image.crop` / `image.rotate`）。`image.enhance` 与 `image.strip-metadata` 仍只有纯 Rust 一条路 —— 尽管 `libvips.provides` 声明了它们，实现里没调用。边界见 `docs/ENGINE-MATRIX.md` 第 5.1、6.2 节。
+  > `image.rotate` 的任意角度（非 90° 倍数）：libvips 走 `vips similarity --angle N`、ImageMagick 走 `-rotate N`；**只有纯 Rust 可用时返回明确的 `EngineMissing`**（不是静默取整）。
 - `NodeCtx::engine(id)` 是节点实现拿可执行文件路径的统一入口。
 - **状态**：✅ 已实现（但见 4.11 的节点覆盖缺口）。
 
@@ -651,23 +666,30 @@ std::fs::create_dir_all(&workspace).ok();
    - 结论是**删掉节点**，而不是继续挂着。真正需要批量的场景**已经由宿主在命令层解决**（`commands.rs::expand_batches`，见步骤 3）：多文件输入与**目录输入**都扇出成单文件批次，逐批调用流水线、上报「处理 3/12」、在批次边界检查取消，清单里可以用 `${batch.index}` 取序号。**清单里从来不需要写循环**，也就不需要这个节点。
    - `pipeline.rs` 在 `UNIMPLEMENTED_NODES` 原位留了一段注释记录这件事，防止有人再把它加回来。
 5. ✅ **多文件与目录输入现在会逐项执行**（曾经的实现只处理第 1 张）。`commands.rs::expand_batches` 在命令层扇出，`${src}` 只绑定**当前批次**的那一个文件，`total_items` 也改成批次数。目录输入会被展开成其中的文件（**只一层**、排序、跳过隐藏文件、上限 5000 且**超限报错而不是静默截断**）；`build_io` 对目录输入改用**目录自身**作为授权根，而不是它的父级。
-6. 🚧 **5 个节点已登记但未实现**。清单在 `toolforge_core::pipeline::UNIMPLEMENTED_NODES`，`nodes::run` 的 `match` 覆盖其余 27 个；命中的一律返回 `not_implemented`：
+6. 🚧 **4 个节点已登记但未实现**。清单在 `toolforge_core::pipeline::UNIMPLEMENTED_NODES`，`nodes::run` 的 `match` 覆盖其余 28 个；命中的一律返回 `not_implemented`：
 
-   `image.remove-background`、`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`
+   `doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`
+
+   > ✅ **这条原来是 5 个，第一个是 `image.remove-background`** —— 产品的招牌功能，此前从未真正工作过。它现在有执行器了（`image_remove_background`），并已在真机上端到端跑通（见决策 9 与 `docs/ENGINE-MATRIX.md` 第 3.2、6.7 节）。**剩下这 4 个仍然全部返回未实现错误**，别把"抠图通了"读成"AI 能力都通了"。
 
    ✅ **这份名单现在有唯一真相来源**：`UNIMPLEMENTED_NODES`（`pipeline.rs`）同时被三处消费 —— `nodes::run` 的兜底分支、IPC 的 `NodeCatalogResponse.unimplemented`、以及前端的节点面板/画布/Inspector（前端**不再硬编**）。以前它在**四个地方**各存一份（Rust 执行器、SDK 文档、示例清单注释、前端的 `node-support.ts`），每实现一个节点要手工同步四处。
-   两条测试守着它与真实分发表的一致性：`unimplemented_list_matches_actual_dispatch`（遍历节点目录，断言"名单里的确实走 not_implemented、名单外的不走"）与 `is_implemented_is_the_complement_of_the_list`。
-   另有一条示例层面的规则测试：`examples_do_not_silently_use_unimplemented_nodes` —— 示例要么别用未实现节点，要么必须在 `metadata.description` 里写明（`remove-bg` 走后者）。
+   两条测试守着它与真实分发表的一致性：`unimplemented_list_matches_the_dispatch_table`（**遍历真实分发表**，对名单里的每个节点断言它确实还落在 `not_implemented` 上）与 `is_implemented_is_the_complement_of_the_list`。第一条守的正是本条刚刚发生过的那次失误形态 —— **实现完了却忘了从名单里删掉**（或反方向），那会让用户看到与真实行为相反的提示。
+   另有一条示例层面的规则测试：`examples_do_not_silently_use_unimplemented_nodes` —— 示例要么别用未实现节点，要么必须在 `metadata.description` 里写明。
+   > ✅ **`remove-bg` 现在不再属于"走后者"的那种了**：它引用的 `image.remove-background` 已经实现，`plugins/builtin/remove-bg/plugin.yaml` 也重写为 v0.2.0 —— 顶部那条「尚未实现」的警告已经删掉，参数改成与节点真实参数一致（`model` / `mode` / `background` / `threshold` / `feather`），默认模型是 `u2netp`。
 7. ✅ **`JobFilter::kinds` 已生效**。`matches()` 现在读它（按 `JobKind::label()` 匹配），并有单测 `filter_by_kind_label`。
 8. ✅ **`jobs_retry` 已存在**。命令已注册；`plugins_run` 会注册重放闭包，任务中心的「重试」按钮因此可用。`AiGenerate` 与 `EngineInstall` 仍然**不**可重试（有副作用/成本）。
 9. ✅ **`settings_patch` 改并发度已作用到队列**。新增 `JobQueue::set_concurrency()` 并在命令层调用。**降低并发是渐近生效的**（`Semaphore::forget_permits` 只能收回空闲许可），这一点写在该方法的文档注释里。
 10. ✅ **打包后内置插件会被分发**。`tauri.conf.json` 的 `bundle.resources` 已改为 `{ "../../../plugins/builtin": "plugins/builtin" }`，与 `resolve_builtin_plugins()` 打包态查找的 `resource_dir()/plugins/builtin` 对齐。
 11. ✅ **引擎下载源已回填 6 条**（此前每一项的 `sha256` 都是 `null`，导致任何引擎都装不上）。现在 `ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux` 都带**实际核对过的哈希 + 版本固定直链**；macOS 三条与 `ffmpeg@linux` 仍为 `null`，`install` 对它们返回 `EngineInstallOutcome::HashRequired`（由 `commands.rs::engines_install` 映射成 `ErrorCode::IntegrityCheckFailed`）。`allow_unverified = true` 时才会走未校验路径。详见 README「已知风险」第 2 条与 `docs/ROADMAP.md` §3。
+    - **而且这条路径现在真的跑通过**：通过应用安装过一次 **libvips 8.18.6**（下载 → SHA-256 校验 → 解压 → 探测为 `installed`，落在 `<data_dir>/engines/libvips/bin/vips.exe`，约 29.67 MB）。跑通它顺带暴露了两个 `toolforge-process` 的缺陷（裸命令名不查 PATH、`quiet` 丢光输出），见 3.2。
 12. ✅ **模型权重下载已落地**。以前 `EngineRegistry.models` 是一张**永远空的 map**（只有 `register_model` 能填，而没有任何调用点），于是 UI 列出 6 个模型、每次点下载都答「未在注册表里登记」。现在 `EngineRegistry::new` 直接从 `toolforge_core::engine::engine_catalog()` 建这张表（**注册表 map 这个"第二真相来源"已被删掉**），并新增三条 IPC：`models_list` / `models_install` / `models_remove`。
     - `EngineModel` 增加了 `file_name`：GitHub 的资产名与模型 id **不一致**（`isnet-general` 的资产是 `isnet-general-use.onnx`），文件落在 `<data_dir>/models/<model_id>/<file_name>`。
     - `u2netp` / `u2net` / `isnet-general` 三条已带**真实下载后算出来的** SHA-256 与固定 tag（`v0.0.0`）直链；**哈希不匹配就删文件**（`registry.rs::install_model` 用 `remove_file` + `IntegrityCheckFailed`），绝不"下坏了也凑合用"。
     - `birefnet-general` / `modnet-portrait` / `realesrgan-x4plus` **刻意没有** url/hash（哈希尚未核对），UI 显示「无下载源」并**禁用**下载按钮 —— 宁可按钮是灰的，也不放一个"点了必然失败"的按钮。单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name 三者全有或全无、哈希是 64 位小写十六进制、且 `file_name` 不重复。
-    - 依赖模型的节点（`image.remove-background` / `ai.upscale`）执行器**仍然没实现**（见上面第 6 条），所以 v0.1 仍然用不上模型。
+    - **下载前先算本地哈希**：`install_model` 对已存在的本地文件算一次哈希，匹配就**跳过下载**（`u2net` 是 168 MB，多点一次下载不该付一次完整下载的成本）；不匹配才重新下载并留一条 warn。为什么不是"文件存在就当已安装"：坏掉的权重**跑出来是乱码而不是报错**，那比下载失败难查得多。
+    - **失败重试一次（第二次只用 HTTP/1.1）**：5xx / 429 / 连接错误都算可重试（触发点是同一个 GitHub URL 一次 502、稍后再请求就是 200）。**诚实说清楚：重试本身依据充分，但"换 HTTP/1.1"这一步依据较弱** —— 那个 502 没有复现过，很可能只是瞬时服务端错误。保留它是因为代价极低，**不代表已确认问题出在 HTTP/2**。
+    - **一条被真机 404 逼出来的断言**：`verified_sources_are_pinned` 现要求模型的 `url` **必须以 `file_name` 结尾**。此前 `url` 写成 release tag 本身（少拼资产名），看着正常、单测也绿，真下载才 404，而错误只说"下载失败"。
+    - 依赖模型的节点现在**有一个能用了**：`image.remove-background` 的执行器已实现并在真机跑通（下权重 → 独立 venv 装 `onnxruntime` → ONNX 推理 → 出 RGBA PNG，400×300 测试图前景覆盖 18.87%，运行时就绪后单张约 0.7 秒，首次含 pip 约 32 秒）。`ai.upscale` **仍然没实现**（见上面第 6 条），所以"超分"这条链还用不上模型。
 13. ⚠️ **生产 CSP 与 Vite 开发模式的冲突（已解决，但容易被人"清理"掉）**。
 
     `app.security.csp` 里的 `script-src 'self'` 会拦掉 `@vitejs/plugin-react`
@@ -694,7 +716,7 @@ std::fs::create_dir_all(&workspace).ok();
 
 | 级别 | 载体 | 能力边界 | 适用场景 | 安全等级 | 资源限制 | 是否可做图像处理 |
 |---|---|---|---|---|---|---|
-| **L1** `PluginRuntime::Pipeline` | **YAML 编排内置节点**。`PipelineDef { steps, on_error, timeout_ms }`，步骤是 `PipelineStep { id, uses, with, when, on_error, retry, timeout_ms, depends_on, position }`。**是数据，不是代码**：宿主在 `l1.rs::run_pipeline` 里逐节点执行，节点的能力边界**编译期写死在 `nodes::run` 的 `match` 里**。 | 受限于内置节点目录（`core/pipeline.rs::builtin_nodes()`，32 个已登记 / 27 个已实现）。可以调用 `fs.*`、`image.*`（纯 Rust + 可选 libvips/ImageMagick）、`video.*`/`audio.*`（FFmpeg）、`doc.convert`（Pandoc）、`doc.to-pdf`（LibreOffice）、`archive.*`（7-Zip）。不能表达任意算法。 | 格式转换、批量重命名、缩放裁剪、打包解压 —— 任何「组合现有引擎」的需求。**也是 AI 生成产物的首选形态**（`plugins/lib.rs`：「数据不是代码，**AI 生成的最优形态**：没有任意代码执行面」）。 | **最高**。没有任意代码执行面。安全依赖 `CapabilityGuard` + `PathResolver`。`l1.rs` 在跑之前先做 fs 能力硬检查，缺 `FsRead` 就 `audit::record_violation` + 返回 `violation` 错误。 | 单步 `timeout_ms` 走 **`tokio::time::timeout`（墙钟）**；流水线级 `timeout_ms`（0 = 不限）；`retry` 次数；由 `JobQueue::gate` 限并发。**资源上限靠外部引擎自己 + 队列并发度**，没有内存上限。 | ✅ **可以，而且这是它的主场**。图片节点**目前只走纯 Rust `image` crate 这一条路** —— `optional_engines` 里声明的 libvips / ImageMagick 至今**没有任何一处被 resolve 或调用**（`nodes.rs` 真正用到的引擎只有 ffmpeg / pandoc / libreoffice / 7zip），所以"检测到 libvips 时自动切换"这句降级链目前**是规格、不是事实**，详见 `docs/ENGINE-MATRIX.md` 第 5.1 节与 `docs/ROADMAP.md` 的「不一致 2」。 |
+| **L1** `PluginRuntime::Pipeline` | **YAML 编排内置节点**。`PipelineDef { steps, on_error, timeout_ms }`，步骤是 `PipelineStep { id, uses, with, when, on_error, retry, timeout_ms, depends_on, position }`。**是数据，不是代码**：宿主在 `l1.rs::run_pipeline` 里逐节点执行，节点的能力边界**编译期写死在 `nodes::run` 的 `match` 里**。 | 受限于内置节点目录（`core/pipeline.rs::builtin_nodes()`，32 个已登记 / 28 个已实现）。可以调用 `fs.*`、`image.*`（纯 Rust + 可选 libvips/ImageMagick，抠图另走一条 ONNX 路径）、`video.*`/`audio.*`（FFmpeg）、`doc.convert`（Pandoc）、`doc.to-pdf`（LibreOffice）、`archive.*`（7-Zip）。不能表达任意算法。 | 格式转换、批量重命名、缩放裁剪、打包解压、**抠图去背景**（需要 `python` + `onnx-models` 两个引擎，首次运行还要联网装依赖）—— 任何「组合现有引擎」的需求。**也是 AI 生成产物的首选形态**（`plugins/lib.rs`：「数据不是代码，**AI 生成的最优形态**：没有任意代码执行面」）。 | **最高**。没有任意代码执行面。安全依赖 `CapabilityGuard` + `PathResolver`。`l1.rs` 在跑之前先做 fs 能力硬检查，缺 `FsRead` 就 `audit::record_violation` + 返回 `violation` 错误。 | 单步 `timeout_ms` 走 **`tokio::time::timeout`（墙钟）**；流水线级 `timeout_ms`（0 = 不限）；`retry` 次数；由 `JobQueue::gate` 限并发。**资源上限靠外部引擎自己 + 队列并发度**，没有内存上限。 | ✅ **可以，而且这是它的主场**。图片节点里 `image.convert` / `image.resize` / `image.crop` / `image.rotate` **真的会按 `libvips → ImageMagick → 纯 Rust` 挑后端**（`pick_image_backend()`），并把用的是哪个报在节点输出的 `backend` 里；`image.probe` / `image.enhance` / `image.strip-metadata` 仍只有纯 Rust 一条路。**抠图（`image.remove-background`）在这个级别里可用，但不走那条三层链** —— 它是 ONNX 推理，见决策 9。也就是说"检测到 libvips 时自动切换"这句降级链**对 4 个节点已经成立、对 2 个节点还不成立**，详见 `docs/ENGINE-MATRIX.md` 第 5.1、6.2 节与 `docs/ROADMAP.md` 的「不一致 2」。 |
 | **L2** `PluginRuntime::Wasm` | **Extism WASM**（wasmtime 后端）。`WasmRuntimeDef { path, entry（默认 `"run"`）, memory_limit_mb（默认 `64`）, timeout_ms（默认 `5_000`）, allow_host_functions（默认空）}`。装载：`WasmPlugin::load` 用 `extism::PluginBuilder::new(manifest).with_wasi(false).with_fuel_limit(fuel_for_timeout(timeout_ms))`。 | `runtimes.rs` 逐条列出：❌ **没有文件系统**（连 `open` 都没有）、❌ **没有网络**、❌ **没有线程**（WASM 线程需要 shared memory + COOP/COEP，Extism 未启用）、⚠️ **没有 SIMD**（"wasmtime 默认不开 `simd` 特性给 Extism 模块"）；✅ 有确定性的整数/浮点运算；✅ 通过宿主函数白名单可以 `log` 与读写自己的 KV。**结论：只适合"输入一串字节，输出一串字节"的纯计算。** | 文本变换、哈希、编码解码、规则计算、数据校验。`plugins/lib.rs` 的三级表把「真沙箱，但**没有文件系统/网络/SIMD**，做不了图像解码」写成一句话总结。 | **高**。关闭 WASI + 白名单宿主函数。`wasm.rs` 的注释给出了关闭 WASI 的理由：「打开 WASI 就等于把宿主的文件描述符暴露给插件。」**v0.1 不注入任何自定义宿主函数** —— 原文理由：「宿主函数是**唯一**能从沙箱里伸出手来的口子，每加一个都要单独评估。宁可不加。」 | **① 燃料（fuel）做上界，不是墙钟超时。** `fuel_for_timeout(timeout_ms)`：`FUEL_PER_SEC = 100_000_000`（注释说是保守估计）、`MIN_FUEL = 10_000_000`，`secs = (timeout_ms/1000.0).max(0.05)`。理由（`wasm.rs` 原文）：关掉 WASI 后 WASM **无法阻塞**（没有 I/O、没有网络、没有 `sleep`），"它唯一能做的就是烧 CPU"；用墙钟超时把调用丢进另一个线程再 `timeout`，「超时后那个线程还在烧 CPU，我们只是不再等它 —— 那是**假装**超时，会积压线程」。燃料耗尽会 trap，`Plugin::call` 直接返回错误。**② 内存上限走 `Manifest::with_memory_max(pages)`，单位是 64KiB 页**（`pages_for_memory(mb)` = `mb*1MiB/65536`，`clamp(16, 65_536)`，即 1 MiB .. 4 GiB）。**③ payload 有 16MB 上限**：`call` 里 `const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;`，超了返回 `InvalidArgument`，detail 是「WASM 插件适合处理小数据。大文件请走 L1 内置节点或 L3 Python 插件。」 | ❌ **不能**。见第 6 节决策 3。注意 `core/plugin.rs::validate_runtime` 会对「声明了 fs/net 权限却选 WASM 运行时」发 `WASM_WITH_PERMISSIONS` **警告**（"通常是多余或设计错误"）。 |
 | **L3** `PluginRuntime::Python` | **独立 Python 进程 + JSON-RPC over stdio**。`PythonRuntimeDef { entry, python_version（默认 `"3.11"`）, requirements, timeout_ms（默认 `300_000`）, workers（默认 `1`）, allow_network（默认 `false`）}`。协议走 `toolforge_process::rpc` 的 **JSON-RPC 2.0 按行分帧**，stdout 只跑协议、stderr 是自由日志。方法：`initialize`（宿主→插件，返回 `-32601` 表示插件不实现握手则按无状态处理）、`run`（宿主→插件）、`shutdown`（宿主→插件）；通知：`progress`（`{value, stage}`）、`log`（`{level, message}`）、`host.request`（**一律拒绝**，见下）。 | 受 `core::permission` 约束。`runtimes.rs` 的三级表：「能力最强也最危险，靠 `toolforge_core::permission` 约束 + 进程隔离兜底」。可做 AI 推理、重模型、需要生态库的场景。`plugin.rs` 的枚举文档写「受 [`crate::permission`] 约束」。 | **低（三者中最低），而且必须诚实说明**。`runtimes.rs` 的原文：「**但是**：这不是内核级沙箱。一个蓄意的插件可以直接用 `socket` 绕过代理环境变量、可以读它进程能读的任何文件。真正的隔离需要 Windows Job Object + AppContainer、或 macOS `sandbox-exec`、或 Linux seccomp —— 这些在 v0.2 的路线图里（见 ROADMAP）。**因此 L3 插件的安全依赖两件事**：1. 用户在授权前真的看了权限清单（所以 UI 必须把高危能力标红）；2. 审计日志能事后追溯。**不要对用户宣称"L3 是沙箱"。**」`toolforge-process/src/lib.rs` 有同样的声明：「本 crate **不是**操作系统级沙箱。`clear_env` + 锁定 `cwd` + 断网环境变量只能挡住"顺手而为"的越权，挡不住蓄意攻击。」 | 宿主实际做的（`python.rs::launch` + `supervisor.rs`）：**① 清空继承的环境变量**（`spec.clear_env = true` → `cmd.env_clear()`），**只留 `PATH`**（`supervisor.rs`：「至少要给 PATH，否则 Windows 上子进程自己起程序会失败」），另外固定注入 `PYTHONUNBUFFERED=1` / `PYTHONIOENCODING=utf-8` / `PYTHONDONTWRITEBYTECODE=1`，以及 `TOOLFORGE_PLUGIN_ID`、`TOOLFORGE_CAPABILITIES`（逗号连接的能力短标签）、`PYTHONNOUSERSITE=1`（"不给 `PYTHONPATH`，避免插件意外 import 到宿主的包"）。**② 锁定 cwd**（`spec.cwd = Some(plugin_dir)`；不存在则先 `create_dir_all`，再 `cmd.current_dir(cwd)`）。**③ 默认断网**（`spec.deny_network = !(def.allow_network && granted.wants_network())`；`supervisor.rs` 设 `HTTP_PROXY` / `HTTPS_PROXY` / `http_proxy` / `https_proxy` = `http://127.0.0.1:1`、`NO_PROXY=""`，并写 `TOOLFORGE_NETWORK=denied`／`allowed`）。**④ 超时后杀进程**（`PythonPlugin::call` 在 `Err(e) if e.code == ErrorCode::Timeout` 时 `drop(call)` + `self.supervisor.kill().await`，注释「超时的进程已经不可信（可能卡在 native 代码里），必须回收」；`shutdown(grace)` 是「先 `shutdown` 再关 stdin，最后才 kill」）。**⑤ 每个插件独立 venv**（`plugin_dir/.venv`；`prepare_venv` 用 `python_exe -m venv`，再 `venv_python -m pip install --no-input --disable-pip-version-check --only-binary=:all: <requirements>`；超时分别 180s / 1800s；venv 存在就复用）。**⑥ 运行期提权一律拒绝**（`handle_notification` 的 `"host.request"` 分支只 `job.warn(...)`：「插件在运行中想申请新能力。**我们不会满足它** —— 能力必须在装载前由用户授权，运行期提权是"点击劫持"的经典入口。」） | ✅ **可以**。这是做图像/模型重活的推荐层。`engine.rs` 的 `python` 引擎 `provides` 就写着 `image.remove-background` / `ai.upscale` / `doc.ocr`。 |
 
@@ -787,7 +809,7 @@ if !probe.function_exists(&def.entry) { return Err(PluginInvalid(...)) }
   - 需要**纯计算**且要强隔离 → **L2**（Extism WASM，关 WASI，燃料上界）。
   - 需要**任意逻辑 / 重依赖 / 模型推理** → **L3**（Python 独立进程 + JSON-RPC），用 `CapabilityGuard` + `PathResolver` + 清空环境变量 + 锁 cwd + 默认断网 + 超时杀进程兜底，并且**明确不宣称它是沙箱**。
 - **代价**：
-  - L1 表达力有限（只能编排 27 个已实现节点）；一旦需求超出节点目录，就必须写 L2/L3。
+  - L1 表达力有限（只能编排 28 个已实现节点）；一旦需求超出节点目录，就必须写 L2/L3。
   - L2 的性能与能力面都很窄（见决策 3）。
   - L3 的隔离是"尽力而为"，安全性最终依赖**用户真的看了权限清单**和**审计日志可追溯**（`runtimes.rs` 原文）。这对 UI 提出了硬要求（高危能力必须标红：`permission.rs::RiskLevel` 四档 `Low`/`Medium`/`High`/`Critical`，`Capability::risk()` 里 `Exec` 是 `Critical`、`Net { hosts: [] }` 是 `High`、`FsRead { scope: Explicit(_) }` 是 `High`）。
   - 每个 L3 插件一个 Python 进程 + 一个独立 venv，内存与磁盘成本明显高于 L1/L2；`ensure_loaded` 的实例缓存与"调用后放回去"的写法就是在为这个成本做缓解。
@@ -820,7 +842,7 @@ if !probe.function_exists(&def.entry) { return Err(PluginInvalid(...)) }
 - **理由**：`Job::LOG_TAIL_LIMIT` 的注释原文：「单个任务在内存里保留的最大日志行数。批量处理 5000 个文件时，不设上限会把几百 MB 日志堆在内存里。」`Job::log` 的实现是 `push` 后 `if len > LIMIT { drain(0..len-LIMIT) }`，并有单测 `logs_are_trimmed_to_tail_limit` 锁定"保留的是最新的"。
 - **代价**：
   - **长任务的前期日志会永久丢失**，且是静默丢失（没有"已裁剪 N 行"的提示，也没有把完整日志落盘的逻辑）。这会把排查责任推给 `tracing` 的应用日志。
-  - `MAX_INPUT` 类的裁剪在 `toolforge-process::exec` 里还有另一层（`TailBuffer` / `ExecResult::truncated`），两层的上限互不相关，需要分别理解。
+  - `MAX_INPUT` 类的裁剪在 `toolforge-process::exec` 里还有另一层（`TailBuffer` / `ExecResult::truncated`：**头部 32 KB + 尾部 96 KB**；`quiet(true)` 只是关掉头部那一半），两层的上限互不相关，需要分别理解。
 
 ### 决策 8（补充）—— `PipelineDef` 刻意不做通用表达式引擎
 
@@ -831,6 +853,18 @@ if !probe.function_exists(&def.entry) { return Err(PluginInvalid(...)) }
   - 字符串比较意味着数值比较是**词法**的（`"9" == "9"` 可以，但 `"9" < "10"` 这类需求无法表达）。
   - `render_template` 的"未解析即报错"让插件作者在写 `with` 时必须精确知道有哪些可用变量（`input.*` / `output.*` / `params.*` / `steps.*` / `env.*`），错误信息里的提示是唯一帮助。
   - `flow.branch` 的"写 `steps.<id>.active` 供后续 `when` 使用"是一种**显式控制流**，比隐式分支啰嗦，但 `l1.rs` 认为这是必要的：「**刻意不做隐式控制流** —— 隐式分支是调试噩梦。」
+
+### 决策 9（补充）—— ONNX 推理走 Python 子进程，不写进 Rust
+
+- **决策**：抠图（`image.remove-background`，执行器 `nodes.rs::image_remove_background`）不做进程内推理，而是把推理**交给一个 Python 子进程**（`python` 引擎）；推理脚本 `crates/toolforge-engines/py/rembg.py` 用 `include_str!` 编进二进制、运行时释放到 `<data>/cache/onnx-runtime/rembg.py`。
+- **理由（这条是本题的关键，不能只写"因为方便"）**：Rust 侧的 ONNX 绑定 `ort` 会在**构建期**去下载预编译的原生库。这会让**离线 / 内网构建直接失败** —— 而一次构建失败的代价，远大于多一个运行时依赖。Python 的 `onnxruntime` 是成熟、可验证、天然进程隔离的路径，而且 **L3 插件运行时本来就要求一个受管 Python**：复用它不引入新的东西，只是多装三个 wheel。
+  - 脚本**刻意不做成 Tauri 的 bundle resource**：资源路径在开发态 / 打包态 / 各平台之间都不一样，而这个脚本只有几 KB 大，一旦"从包里找不到"就是一个极难定位的运行时故障。编进二进制就不会丢。
+- **代价**：
+  - **首次运行要联网**：应用会在 `<data>/cache/onnx-runtime/` 下建一个**独立 venv** 并 `pip install onnxruntime numpy pillow`（约 30 MB，一次性）。用独立 venv 是为了**不动用户自己的 Python**，卸载也只是删掉那个目录。**没有网络的机器在依赖就位前用不了这个节点**（模型权重同样需要用户自己先下）。
+  - **依赖版本区间**：`onnxruntime` 没有 Python 3.14 的 wheel，因此可用区间是 **3.9 ~ 3.13**；只有 3.14 时节点返回明确的 `EngineMissing`，让用户去装应用托管的 3.11。
+- **配套的两个引擎层修正（都是同一个教训的产物：可用性判断不能只看"有没有装着"）**：
+  1. **`force` 安装标志**。系统 Python 3.14 会被探到、显示为可用，却**跑不了 onnxruntime** —— 于是引擎安装的默认短路（"已可用就不用下载"）会把用户困在原地。`EngineInstallRequest` 因此加了 **`force`**：`force: true` 跳过那条短路，允许在系统副本之外**再装一份应用托管的副本**；引擎卡片上对应「另外安装应用托管版本」按钮（当 `status.source === "system"` 且 `entry.managedAvailable` 时显示，背后是 `EngineEntry.managedAvailable` 与 `EngineRegistry::has_download_source()`）。教训写清楚：**"探测到 / 可用" ≠ "满足我的要求"**，前者是引擎层的事实，后者是具体节点的判断。
+  2. **虚拟引擎 `onnx-models` 的探测特判**。`probe()` 原来只对 `install_modes == [Remote]` 的引擎特判，而 `onnx-models` **没有可执行文件**（它只是权重文件的宿主），于是永远探测为 `Missing` —— 后果是 `image.remove-background` **永远显示不可用，哪怕用户已经把权重下好了**。现在 `probe()` 对 `onnx-models` 单独判：**至少有一个权重已安装 = 可用**，message 里点名当前缺的是哪一步。
 
 ---
 
@@ -850,10 +884,12 @@ if !probe.function_exists(&def.entry) { return Err(PluginInvalid(...)) }
    - **权重与引擎分开**：`EngineModel` 的注释原文：「**刻意与引擎本身分开** —— 权重体积大、许可证各异，而且很多是"只有用了这个功能才需要"。」`EngineModel` 有独立的 `license` 与 `commercial_use` 字段，注释甚至标了「权重许可证（可能与代码许可证不同！）」。
    - **代码许可 ≠ 权重许可**：`onnx-models` 的 `license_note` 原文：「代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。」`engine.rs` 的单测 `model_licenses_are_explicit` 强制「至少要有一个明确不可商用的（模型），提醒用户」。
    - **当前状态**：✅ 下载链路已经落地（`models_list` / `models_install` / `models_remove`；`u2net` / `u2netp` / `isnet-general` 三条带**真实核对过的** SHA-256 + 固定 tag 直链，文件落在 `<data_dir>/models/<model_id>/<file_name>`，**哈希不匹配即删文件**）。"不自动下载"仍然成立：`models_install` 是用户点出来的动作，`requires_license_ack` 依旧是硬门，另外 3 个模型（`birefnet-general` / `modnet-portrait` / `realesrgan-x4plus`）**没有任何下载源**，UI 把按钮置灰（见 4.11 第 12 条）。
+   - ⚠️ **一条必须与上面分开说的区别**：**权重不自动下载，但推理依赖会自动装。** 抠图节点首次运行时会在 `<data>/cache/onnx-runtime/` 下建独立 venv 并 `pip install onnxruntime numpy pillow`（约 30 MB），这一步**需要联网**，且**不是用户逐条点出来的**。不要因为"模型权重都要用户自己下"就以为这个节点完全离线可用。详见决策 9 与 `docs/SECURITY.md`。
 6. **不把缺失引擎伪装成可用**。
    - `toolforge-engines/src/lib.rs` 原文：「音视频/文档/压缩包没有纯 Rust 替代品，所以走「必需引擎缺失 → 该节点不可用」并在 UI 上直接引导安装。**不假装能跑**。」
    - `EngineState::is_usable()` 只在 `Detected | Installed` 时为真；`resolve` 找不到就返回 `EngineMissing` 并给出安装指引。
    - `commands.rs::pipeline_nodes` 会把缺引擎的节点在 `availability` 里标 `false`，并填 `missing_engines` 映射（缺哪个引擎 → 需要它的节点）。
+   - ✅ **反方向也踩过坑**：`onnx-models` 这个虚拟引擎没有可执行文件，`probe()` 却按普通引擎判它，于是**已下好权重也被判成 `Missing`** —— 节点"明明能用却显示不可用"。现在 `probe()` 对它单独判（至少一个权重已安装 = 可用）。**两个方向都要防：既不能把缺的伪装成有，也不能把有的伪装成缺。** 见决策 9。
 7. **不为未实现的节点返回假的成功**。
    - `engines/nodes.rs::not_implemented` 原文：「刻意**不返回假的成功**：插件作者与用户都必须立刻知道这个能力还没做，否则会出现"流水线显示跑通了但没产出文件"这种最难排查的问题。」
    - 同理 `l1.rs` 对 `onError: skip/continue` 的处理也拒绝静默：「明确记录跳过原因，绝不静默」；命令层对"跑完但零产出"会 `ctx.warn("流水线执行成功但没有产出任何文件，请检查步骤的输出端口绑定")`。
@@ -886,7 +922,7 @@ if !probe.function_exists(&def.entry) { return Err(PluginInvalid(...)) }
 
 **子进程层**：`crates/toolforge-process/src/{lib,exec,rpc,supervisor}.rs`。
 
-**引擎层**：`crates/toolforge-engines/src/{lib,registry,nodes}.rs`。
+**引擎层**：`crates/toolforge-engines/src/{lib,registry,nodes}.rs`、`crates/toolforge-engines/py/rembg.py`（抠图推理脚本，见决策 9）。
 
 **插件层**：`crates/toolforge-plugins/src/{lib,l1,runtimes,store,audit}.rs`、`crates/toolforge-plugins/src/runtimes/{wasm,python}.rs`。
 
@@ -899,3 +935,5 @@ if !probe.function_exists(&def.entry) { return Err(PluginInvalid(...)) }
 **其他**：`README.md`、`scripts/`（`enginectl.mjs` `gen-icon.mjs` `env.ps1` 的存在性）、`docs/` 目录清单、`git status`。
 
 **未核对的内容**（因此本文档不做断言）：`docs/ENGINE-MATRIX.md`、`docs/ROADMAP.md`、`docs/SECURITY.md` 的正文（它们是独立文档，本文档只引用代码里对它们的提及）；`Cargo.lock` 的解析结果；`plugins/builtin/` 中除 `image-convert` 之外各清单的字段级内容；`scripts/*.mjs` 的实现。
+
+> 补充：`plugins/builtin/remove-bg/plugin.yaml` 的字段级内容**后来单独核对过**（决策 9 与 4.11 第 6 条引用了它的参数与版本）。所以上一段那句"除 `image-convert` 之外未核对"是**早期快照**，不再覆盖这一份清单。其余 `plugins/builtin/*` 的字段级内容仍属未核对。
