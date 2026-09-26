@@ -361,7 +361,9 @@ pub async fn engines_install(
 #[tauri::command]
 #[specta::specta]
 pub async fn models_list(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Vec<ModelEntry>> {
-    let nodes = builtin_nodes();
+    // 不再需要节点目录：权重服务于哪些节点**由权重自己声明**（`EngineModel.used_by`），
+    // 而不是从"它所属引擎被谁用"去推 —— 那个推断对 `onnx-models`
+    // （同时承载抠图与超分两组权重）是错的，曾导致验证脚本挑错模型。
     let registered: HashMap<String, toolforge_engines::ModelSpec> = state
         .engines
         .models()
