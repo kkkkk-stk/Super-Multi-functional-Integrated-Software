@@ -115,6 +115,24 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::ai_review_draft,
         ])
         .events(tauri_specta::collect_events![])
+        // `AppEvent` 不是"注册事件"而是**一个普通类型**，但它必须被导出。
+        //
+        // 背景：本项目所有领域事件都发在同一个通道上
+        // （`toolforge://event`），载荷是带 `type` 判别式的 `AppEvent` 枚举。
+        // 这种"单通道 + 判别联合"的形态不符合 `collect_events!` 的模型
+        // （那要求每个事件一个实现 `Event` trait 的类型），所以
+        // `collect_events![]` 是空的。
+        //
+        // 结果是：`AppEvent` 一度成为**前端唯一手写的契约** —— 而手写意味着
+        // 后端改一个字段名（例如 `errorMessage` 改成 `error`），
+        // TypeScript 侧**不会报错**，只会在运行时静默拿到 `undefined`。
+        // 这正是本项目其它地方费力消灭的漂移，没理由在这里留一个。
+        //
+        // `typ::<T>()` 把类型加进导出集合，不改事件注册机制 —— 一行解决。
+        //
+        // ⚠️ 这一行如果被删掉，`pnpm bindings` 会**报错退出**（守卫在
+        // `src/bin/export_bindings.rs` 里），而不是安静地少导出一个类型。
+        .typ::<AppEvent>()
         // specta 默认拒绝把 u64 / i64 导出成 TS `number`，因为在 JS 里
         // 超过 2^53 的整数会静默丢精度。而这个项目导出到前端的整数只有三类：
         //   * 计数（文件数、条目数、插件数）—— 远小于 2^31

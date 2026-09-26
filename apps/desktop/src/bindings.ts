@@ -253,6 +253,78 @@ export type AiTestConnectionResponse_Serialize = {
 	error?: string | null,
 };
 
+export type AppEvent = AppEvent_Serialize | AppEvent_Deserialize;
+
+export type AppEvent_Deserialize = 
+/**  任务整体状态变化（排队 → 运行 → 结束，或标题/产出变化） */
+({ type: "jobUpdated"; job: Job_Deserialize }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**
+ *  任务进度变化。
+ * 
+ *  **单独走一个事件而不是重推整个 `Job`**：转码任务一秒能产出几十次进度，
+ *  每次都序列化整条 Job（含日志数组）会把 IPC 打爆。
+ *  队列内部已经做了 100ms 节流。
+ */
+({ type: "jobProgressHint"; jobId: string; progress: JobProgress_Deserialize }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; level?: never; message?: never; pluginId?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**  任务新增日志行。**单独走一个事件**，避免日志刷屏时反复推送整个 Job。 */
+({ type: "jobLog"; jobId: string; entry: JobLogEntry }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; error?: never; errorMessage?: never; job?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**  任务终结（前端据此弹通知、刷新文件列表、决定是否重试） */
+({ type: "jobFinished"; jobId: string; status: JobStatus; title: string; errorMessage?: string | null }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; job?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; subject?: never; total?: never } | 
+/**  引擎探测/安装状态变化 */
+({ type: "engineStatusChanged"; status: EngineStatus_Deserialize }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; subject?: never; title?: never; total?: never } | 
+/**  引擎下载进度（`downloaded` / `total` 单位是字节；`total` 为 0 表示未知） */
+({ type: "engineDownloadProgress"; engineId: string; downloaded: number; total: number; speedBps: number | null }) & { delta?: never; detail?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; status?: never; subject?: never; title?: never } | 
+/**  插件集合发生变化（装载/卸载/启用/授权） */
+({ type: "pluginChanged"; pluginId: string }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**  插件运行时输出（L2 的 log 宿主函数 / L3 的 stderr） */
+({ type: "pluginLog"; pluginId: string; level: string; message: string }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**
+ *  **安全事件**：插件越权、哈希不匹配、AI 产出未通过审核。
+ *  前端应当以醒目方式提示，并写入审计日志。
+ */
+({ type: "securityAlert"; severity: string; title: string; detail: string; subject?: string | null }) & { delta?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; speedBps?: never; status?: never; total?: never } | 
+/**  AI 流式输出增量（插件生成过程实时显示） */
+({ type: "aiDelta"; requestId: string; delta: string }) & { detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**  AI 生成结束 */
+({ type: "aiDone"; requestId: string; error?: string | null }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**  通用提示（前端转成 toast） */
+({ type: "toast"; level: string; title: string; message?: string | null }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; total?: never };
+
+export type AppEvent_Serialize = 
+/**  任务整体状态变化（排队 → 运行 → 结束，或标题/产出变化） */
+({ type: "jobUpdated"; job: Job_Serialize }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**
+ *  任务进度变化。
+ * 
+ *  **单独走一个事件而不是重推整个 `Job`**：转码任务一秒能产出几十次进度，
+ *  每次都序列化整条 Job（含日志数组）会把 IPC 打爆。
+ *  队列内部已经做了 100ms 节流。
+ */
+({ type: "jobProgressHint"; jobId: string; progress: JobProgress_Serialize }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; level?: never; message?: never; pluginId?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**  任务新增日志行。**单独走一个事件**，避免日志刷屏时反复推送整个 Job。 */
+({ type: "jobLog"; jobId: string; entry: JobLogEntry }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; error?: never; errorMessage?: never; job?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**  任务终结（前端据此弹通知、刷新文件列表、决定是否重试） */
+({ type: "jobFinished"; jobId: string; status: JobStatus; title: string; errorMessage?: string | null }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; job?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; subject?: never; total?: never } | 
+/**  引擎探测/安装状态变化 */
+({ type: "engineStatusChanged"; status: EngineStatus_Serialize }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; subject?: never; title?: never; total?: never } | 
+/**  引擎下载进度（`downloaded` / `total` 单位是字节；`total` 为 0 表示未知） */
+({ type: "engineDownloadProgress"; engineId: string; downloaded: number; total: number; speedBps: number | null }) & { delta?: never; detail?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; status?: never; subject?: never; title?: never } | 
+/**  插件集合发生变化（装载/卸载/启用/授权） */
+({ type: "pluginChanged"; pluginId: string }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**  插件运行时输出（L2 的 log 宿主函数 / L3 的 stderr） */
+({ type: "pluginLog"; pluginId: string; level: string; message: string }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**
+ *  **安全事件**：插件越权、哈希不匹配、AI 产出未通过审核。
+ *  前端应当以醒目方式提示，并写入审计日志。
+ */
+({ type: "securityAlert"; severity: string; title: string; detail: string; subject?: string | null }) & { delta?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; requestId?: never; speedBps?: never; status?: never; total?: never } | 
+/**  AI 流式输出增量（插件生成过程实时显示） */
+({ type: "aiDelta"; requestId: string; delta: string }) & { detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**  AI 生成结束 */
+({ type: "aiDone"; requestId: string; error?: string | null }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; errorMessage?: never; job?: never; jobId?: never; level?: never; message?: never; pluginId?: never; progress?: never; severity?: never; speedBps?: never; status?: never; subject?: never; title?: never; total?: never } | 
+/**  通用提示（前端转成 toast） */
+({ type: "toast"; level: string; title: string; message?: string | null }) & { delta?: never; detail?: never; downloaded?: never; engineId?: never; entry?: never; error?: never; errorMessage?: never; job?: never; jobId?: never; pluginId?: never; progress?: never; requestId?: never; severity?: never; speedBps?: never; status?: never; subject?: never; total?: never };
+
 /**
  *  应用元信息（前端「关于」页用）
  * 

@@ -29,18 +29,15 @@
  */
 
 /**
- * 给 `AppEvent` 用的本地别名：事件载荷里嵌的是**同一批生成类型**，
- * 这里 import 一次、起个不会和下面的再导出撞名的名字，
- * 免得满文件写 `import("@/bindings")` 这种内联类型。
+ * 给下面几个"按 kind 收窄"的工具类型用的本地别名。
+ *
+ * 曾经这里有 7 个别名，其中 5 个是给**手写的 `AppEvent`** 用的。
+ * `AppEvent` 改为从 bindings 再导出之后（见文件末尾），那 5 个就不需要了 ——
+ * 这本身就是"手写契约消失"的一个可见信号。
  */
 import type {
   Capability as EventCapability,
-  EngineStatus_Serialize as EventEngineStatus,
   JobKind as EventJobKind,
-  JobLogEntry as EventJobLogEntry,
-  JobProgress_Serialize as EventJobProgress,
-  JobStatus as EventJobStatus,
-  Job_Serialize as EventJob,
 } from "@/bindings";
 
 // ============================================================================
@@ -215,58 +212,34 @@ export const ACTIONABLE_CODES = [
 // ============================================================================
 
 /**
- * 事件负载。
+ * 事件负载 —— **由后端生成，不再手写**。
  *
- * **为什么这里仍是手写的**：后端 `specta_builder()` 里的
- * `collect_events![]` 是空的（事件靠 `app.emit` 手发，没走 specta 注册），
- * 所以 `bindings.ts` 里**没有** `AppEvent`。这个类型是唯一一处手写契约，
- * 核对来源是 `crates/toolforge-core/src/events.rs`：
+ * ## 为什么它一度是手写的，以及为什么现在不是了
  *
- * - tag 是 `"type"`，变体名 camelCase；
- * - 后端加了 `rename_all_fields = "camelCase"`，所以**载荷字段是 camelCase**：
- *   `jobId` / `errorMessage` / `engineId` / `speedBps` / `requestId` / `pluginId`；
- * - 内嵌的 `Job` / `JobProgress` / `EngineStatus` 等直接用从 bindings 转出来的
- *   同名类型（见上面的 import），所以只有"字段名"这一层是手写的，
- *   结构本身仍然跟着生成类型走；
- * - `Option<T>` + `skip_serializing_if` 的字段（`errorMessage` / `subject` /
- *   `error` / `message`）为空时**整个键不出现**，所以是可选的。
+ * 本项目的领域事件全部发在同一个通道上（`toolforge://event`），载荷是带
+ * `type` 判别式的 `AppEvent` 枚举。这种"单通道 + 判别联合"的形态**不符合**
+ * `tauri-specta` 的 `collect_events!` 模型（那要求"每个事件一个实现了
+ * `Event` trait 的类型"），所以 `specta_builder()` 里那个宏是空的 ——
+ * 而宏为空就意味着 `bindings.ts` 里没有 `AppEvent`，前端只能手写一份。
  *
- * `use-events.ts` 在这里统一做"camelCase 优先、snake_case 兜底"的读取，
- * 万一后端回退 `rename_all_fields` 也不会整体失灵。
+ * 手写意味着：后端把 `errorMessage` 改成 `error`，**TypeScript 不会报错**，
+ * 只会在运行时静默拿到 `undefined`。这正是本项目其它地方费力消灭的漂移，
+ * 没理由在这里留一个。
+ *
+ * 解法是 `Builder::typ::<AppEvent>()`（`lib.rs::specta_builder`）：它把类型
+ * 加进导出集合，**不改事件注册机制**。一行解决。
+ *
+ * ## 用哪个相位
+ *
+ * 事件是**后端 → 前端**，所以取 `_Serialize`（与 `lib/ipc.ts` 里
+ * "返回值用 `_Serialize`、入参用 `_Deserialize`" 的约定一致）。
+ * 生成的联合还带了 `& { <其他变体的键>?: never }` 守卫，比手写版收窄得更准。
  */
-export type AppEvent =
-  | { type: "jobUpdated"; job: EventJob }
-  | { type: "jobProgressHint"; jobId: string; progress: EventJobProgress }
-  | { type: "jobLog"; jobId: string; entry: EventJobLogEntry }
-  | {
-      type: "jobFinished";
-      jobId: string;
-      status: EventJobStatus;
-      title: string;
-      errorMessage?: string;
-    }
-  | { type: "engineStatusChanged"; status: EventEngineStatus }
-  | {
-      type: "engineDownloadProgress";
-      engineId: string;
-      downloaded: number;
-      total: number;
-      speedBps: number;
-    }
-  | { type: "pluginChanged"; pluginId: string }
-  | { type: "pluginLog"; pluginId: string; level: string; message: string }
-  | {
-      type: "securityAlert";
-      severity: string;
-      title: string;
-      detail: string;
-      subject?: string;
-    }
-  | { type: "aiDelta"; requestId: string; delta: string }
-  | { type: "aiDone"; requestId: string; error?: string }
-  | { type: "toast"; level: string; title: string; message?: string };
+export type { AppEvent_Serialize as AppEvent } from "@/bindings";
 
-export type AppEventType = AppEvent["type"];
+import type { AppEvent_Serialize } from "@/bindings";
+
+export type AppEventType = AppEvent_Serialize["type"];
 
 // ============================================================================
 // 派生工具类型
