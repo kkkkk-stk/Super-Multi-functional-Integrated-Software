@@ -77,8 +77,18 @@ libvips（快、省内存） ──缺失──▶ ImageMagick（格式最全）
 > `quiet` 把输出丢光导致引擎版本一律显示「未知」），两者都已修复并有回归测试。
 
 音视频 / 文档 / 压缩包没有纯 Rust 替代品，所以 FFmpeg 缺失时**直接告诉用户去装**，
-而不是假装能跑。同理，没实现的节点（`ai.upscale` / `ai.describe` / `doc.ocr` / `ebook.convert`）
-会返回明确的 `未实现` 错误，**绝不静默产出空文件**。
+而不是假装能跑。**32 个内置节点现在全部有执行器**（`UNIMPLEMENTED_NODES` 是空数组），
+所以不再有"登记了但点了必失败"的节点。最后补齐的四个各自把失败说清楚：
+
+- `ebook.convert` —— Calibre 优先、Pandoc 兜底。**关键是在调用 pandoc 之前就把关**：
+  它遇到认不出的输出扩展名**不报错**，只打一句 warning、写一个 HTML 出来、
+  **保留原扩展名、退出码 0**。认不出输入格式时更糟（当纯文本读，产出垃圾）。
+  "成功"的坏文件比失败更糟，所以这里不信退出码。
+- `doc.ocr` —— 有 tesseract 走本地（离线免费），没有就用视觉模型；**PDF 输入明确拒绝**
+  （要先按页栅格化，那条链路没做）。
+- `ai.describe` —— 视觉模型看图为它写描述。⚠️ **图片会上传给你配置的 AI 服务商**
+  （见下方「已知风险」）。
+- `ai.upscale` —— Real-ESRGAN 分块推理，**推理全在本机**。
 
 > 🆕 **抠图是第四条路，别把它算进上面那条三层链。** `image.remove-background` 已经实现并真机跑通，
 > 但它跑的是 **ONNX 推理**，不经过 `pick_image_backend()` —— 装了 libvips / ImageMagick 也不会让它快一点。
@@ -89,6 +99,10 @@ libvips（快、省内存） ──缺失──▶ ImageMagick（格式最全）
 > 不动用户自己的 Python）。**没有网络的机器在依赖就位前用不了这个节点**；之后推理全在本地、不传图片。
 > Python 需要 **3.9 ~ 3.13**（`onnxruntime` 没有 3.14 的 wheel）。
 > 详见 [docs/ENGINE-MATRIX.md](docs/ENGINE-MATRIX.md) 第 3.2 节与 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 决策 9。
+>
+> 🆕 **AI 超分（`ai.upscale`）与它是同一条链**：Real-ESRGAN，**256 px 分块 / 16 px 重叠 / 只取中心贴回**，
+> 所以大图也跑得动；`scale=2|3` 是"先按 4 倍推理再用 Lanczos 缩回去"（细节是模型真算出来的）。
+> 权重默认 `realesr-general-x4v3`（4.87 MB，输入尺寸动态）。**同样纯本地推理，不上传图片。**
 
 ### 5. `tauri-plugin-shell` 对前端几乎是关闭的
 
@@ -253,8 +267,11 @@ pnpm engines:install  # 交互式安装引擎（本地开发用）
 
 ### 真机验证（补上自动化测试覆盖不到的那一层）
 
-> 本项目在 `cargo check` / 194 个单元测试 / `tsc` / `vite build` **全绿**的情况下，
+> 本项目在 `cargo check` / **214 个 Rust 测试** / `tsc` / `vite build` **全绿**的情况下，
 > 真机跑一次仍然找出了 **3 个发布级缺陷**。共同点是"组件各自正确，连起来不对"。
+> 同一类问题后来还出现过一次：验证脚本自己挑了一个**错误的模型**去超分，
+> 尺寸断言**全部通过**而输出是垃圾（复盘见 [docs/ENGINE-MATRIX.md](docs/ENGINE-MATRIX.md) 第 3.2 节）。
+> **"测过了"这句话本身要能被质疑。**
 
 两个终端：
 
@@ -307,7 +324,7 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
 │   │   └── features/            按功能页划分
 │   └── src-tauri/               Tauri 外壳
 │       ├── src/ipc.rs           前端可见的契约类型
-│       ├── src/commands.rs      28 个命令
+│       ├── src/commands.rs      32 个命令
 │       ├── src/state.rs         子系统组装
 │       ├── src/lib.rs           事件桥 + specta 导出
 │       ├── capabilities/        能力白名单（最小权限）
@@ -362,6 +379,15 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
 真正的隔离需要 Windows Job Object + AppContainer / macOS `sandbox-exec` / Linux seccomp —— 在 v0.2 的路线图里。
 **所以 L3 插件的安全最终依赖两件事：用户在看权限清单时真的看了；审计日志能事后追溯。**
 
+**还有一条与"数据出不出本机"有关的，必须和上一条并列说**：
+
+- `image.remove-background` 与 `ai.upscale`：**推理完全在本机**，图片不出本机。
+- `ai.describe` 与 `doc.ocr` 的 AI 路径：**会把图片上传给你配置的 AI 服务商**（缩小并转 JPEG 后）。
+  这两条都是内置节点，走宿主自己发起的 HTTP，**不经过插件的 `net` 能力声明**。
+  完整的对照表、默认行为与"想离线该用哪个"见 [docs/SECURITY.md](docs/SECURITY.md) §3.9。
+
+**别把"AI 功能"笼统地说成"都要联网"或"都是本地的"** —— 两种说法都会误导用户，而这是用户最在意的问题。
+
 ---
 
 ## 🗂️ 功能规划
@@ -375,8 +401,13 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
 - [x] 可视化流程编辑器（React Flow）
 - [x] AI 生成插件 + 安全审核门
 - [x] **抠图去背景**（`image.remove-background`）—— **已实现**，走一条独立的 ONNX 推理链：先到「模型权重」下 `u2netp`（4.4 MB），首次运行会自动建一个独立 venv 装 `onnxruntime`（约 30 MB，**这一步要联网**；不动你自己的 Python），之后每张图都是**本地推理**。实测 400×300 测试图输出 RGBA PNG、前景覆盖 18.87%、单张约 0.7 秒。它不是 libvips / ImageMagick 那条降级链的一部分
-- [ ] 超分 / OCR / 电子书转换 —— **节点已登记，执行器仍未实现**（`ai.upscale` / `doc.ocr` / `ebook.convert`；另有 `ai.describe`，见 [ROADMAP](docs/ROADMAP.md)）
-- [x] 模型权重下载（`models_list` / `models_install` / `models_remove`）：已核对哈希的三个 rembg 权重可下载，**哈希不匹配即删文件**；另外三个没有下载源，UI 直接禁用按钮（不让你点了才失败）
+- [x] **超分 / OCR / 电子书转换 / AI 描述 —— 四个节点全部实现**（`ai.upscale` / `doc.ocr` / `ebook.convert` / `ai.describe`）。
+      超分是 Real-ESRGAN 分块推理（权重 `realesr-general-x4v3` 4.87 MB，**纯本地**）；
+      OCR 有 tesseract 走本地、没有就用视觉模型（**PDF 输入明确拒绝**）；
+      电子书转换 Calibre 优先、Pandoc 兜底，并在调用 pandoc 前拦住它"假装成功"的格式；
+      AI 描述需要**视觉模型**，⚠️ **会把图片上传给你配置的 AI 服务商**（见下方「已知风险」第 7 条）。
+      7 个内置示例插件里的 `plugins/builtin/{ebook-convert,ai-describe,image-upscale}` 就是它们的现成用法
+- [x] 模型权重下载（`models_list` / `models_install` / `models_remove`）：**8 个权重**（抠图 5 + 超分 3）里**5 个**可下载，哈希**真实下载核对过**、**不匹配即删文件**；另外 3 个没有下载源，UI 直接禁用按钮（不让你点了才失败）
 - [ ] LibreOffice 常驻 UNO listener（当前是每次冷启动）
 - [ ] OS 钥匙串存储 API Key —— **仍未实现**。Key 默认只存在内存；可选开关「记住 API Key」把它**明文**写到 `<数据目录>/ai-key.txt`（默认关闭，关掉即删文件）
 
@@ -400,10 +431,17 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
    > `every_declared_hash_is_a_wellformed_sha256` 守着这两条纪律。
 3. **模型权重不随包分发**。U²-Net 是 Apache-2.0 可商用，MODNet / BiRefNet 的**权重**许可不同，
    首次使用时会下载并单独确认许可证。
-   下载文件**逐个校验 SHA-256**（`u2net` / `u2netp` / `isnet-general` 三条的哈希是真实下载后算出来的），
+   目录里共 **8 个权重**（抠图 5 + 超分 3），其中 **5 个**带下载源：
+   `u2net` / `u2netp` / `isnet-general`（rembg）与 `realesr-general-x4v3` / `realesrgan-anime6b`（Hugging Face）。
+   下载文件**逐个校验 SHA-256**（哈希都是真实下载后算出来的），
    **不匹配就删除文件并报错**，不留没校验过的产物。`birefnet-general` / `modnet-portrait` /
-   `realesrgan-x4plus` 还没有核对过的哈希，因此 UI 显示「无下载源」并把下载按钮**置灰**。
-   > ⚠️ **权重之外还有一次联网**：抠图节点首次运行时会自己建 venv 并 `pip install`
+   `realesrgan-x4plus` 没有下载源，因此 UI 显示「无下载源」并把下载按钮**置灰**。
+   > ⚠️ **`realesrgan-x4plus` 的原因和另外两个不同，值得单独说**：它缺的不是哈希，而是**能用的 ONNX 导出** ——
+   > 找到的每一份输入尺寸都是**固定的**（64×64 或 128×128），要跑通必须先补上「补齐到固定尺寸 → 推理 → 裁回去」，
+   > 而补边质量直接决定边缘块的结果。与其先上一个会留下**网格状接缝**的版本，不如先把两个
+   > **动态尺寸**的模型做扎实（它们对任意尺寸都能直接推理，不需要补边）。
+   > 要做它：补上补齐 + 裁切 → 重跑接缝检查 → 真实下载后填哈希。见 [ROADMAP](docs/ROADMAP.md) 的开放项。
+   > ⚠️ **权重之外还有一次联网**：抠图与超分节点**首次运行**时会自己建 venv 并 `pip install`
    > `onnxruntime` / `numpy` / `pillow`（约 30 MB）。这些包**没有哈希锁定、没有签名校验**。
    > 详见 [docs/SECURITY.md](docs/SECURITY.md) §9 第 29 项。
 4. **设置会真的落盘**。非机密设置写 `<数据目录>/settings.json`（原子写：临时文件 + rename）；
@@ -418,6 +456,17 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
    > `toolforge_process::resolve_program()` 统一按 PATH（Windows 再按 `PATHEXT`）解析，
    > **显式路径不会回退到 PATH**；libvips 8.18.6 已按这条路真实安装成功。
 6. **AVIF 编码默认关闭**（rav1e 编译要几分钟）。需要时开 `toolforge-engines` 的 `avif` feature。
+7. **`ai.describe` 与 `doc.ocr` 会把你的图片上传给你配置的 AI 服务商** —— 这是真实的隐私代价，必须直说。
+   - `ai.describe` 只有这一条路（没有本地替代）；`doc.ocr` 的 `engine` 默认是 `auto`：
+     **装了 tesseract 就走本地，没装就用视觉模型**，也就是"没装 tesseract 的机器上跑 OCR"会**自动**把图片发出去。
+   - 发送前会先把图片**缩小并转成 JPEG**（`ai.describe` 最长边默认 1024、`doc.ocr` 默认 2048），
+     这降低了费用与流量，**但不改变"图片离开了你的机器"这个事实**。
+   - 服务商由你自己在「设置 → AI」里指定，Key 不进日志、不进插件；但 ToolForge **不代理、不转存**，
+     也不在发送前再问一次。任务日志里会写明"图片会上传给 AI 服务商"。
+   - **要完全离线，就用 `image.remove-background` 与 `ai.upscale`** —— 这两个的推理**全在本机**，
+     图片不出本机（首次装依赖要联网一次，但那是拉包，不是传图）。
+   - 自动化验收脚本**不会**把真实图片发给任何服务商：它起一个**假端点**（`scripts/devtools/mock-openai.mjs`），
+     喂的是脚本自己生成的合成 PNG。详见 [docs/SECURITY.md](docs/SECURITY.md) §3.9。
 
 ---
 

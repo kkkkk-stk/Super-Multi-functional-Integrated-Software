@@ -30,18 +30,16 @@
 | 阻塞 1：`pipeline.rs` 双引号未转义导致无法编译 | **已修复**：该处（`video.compress` 的描述，约第 751 行）已改用「」中文引号 |
 | 阻塞 2：`pipeline.rs` 的 `Some(-16.0.into())` 触发 E0282 | **已修复**：现已写成 `Some((-16.0f64).into())` 并附了说明注释 |
 | 阻塞 3：`PermissionSet` 的 `#[serde(transparent)]` 与 `plugin.rs` 测试夹具不匹配 | **已消解，但方向与当初判断相反**：`#[serde(transparent)]` 被**移除**，schema 改为 `permissions: { capabilities: [...] }`，各夹具本来就是映射形式，因此 5 个失败用例现在通过。**后果是原先按裸数组写的示例插件全部失效**，`plugins/` 下 6 个 `plugin.yaml` 已改正并重新通过校验（见 §3.0） |
-| 阻塞 4：`paths.rs` 的 `sanitize_id` 实现与自身测试不符 | **仍然成立**（见 §4.5） |
+| 阻塞 4：`paths.rs` 的 `sanitize_id` 实现与自身测试不符 | ✅ **已修复**：实现改为「替换非法字符 → **把连续的点折叠成单个点** → 去掉首尾的点 → 空串回落 `unnamed`」，结构上不可能再出现 `..`；测试也改成断言不变量（结果不含 `..` / `/` / `\`、非空）并新增 `sanitize_never_leaves_dotdot`。**下面 §4.5 的原文保留为历史。** |
 
-结论：**判断"现在能不能跑"必须以代码和 CI 输出为准**，本文档只描述代码里存在的安全机制与缺口。下面是委托方在 `crates/toolforge-core` 源码快照上用真实 `cargo test --lib` 得到的**最新**基线（此前"61 个测试中 54 通过"的记录已过期）：
+结论：**判断"现在能不能跑"必须以代码和 CI 输出为准**，本文档只描述代码里存在的安全机制与缺口。下面是**当前**可复核的基线（本文档最早写作时的那份"编译失败 / 59 passed, 2 failed"记录**已完全过期**，它的两个失败项正是上面已修掉的阻塞 1–4）：
 
 ```text
-compiling 成功（阻塞 1、2 已修）
-test result: FAILED. 59 passed; 2 failed
-失败项：paths::tests::sanitize_blocks_traversal
-        paths::tests::plugin_data_stays_inside_plugin_dir
+cargo test --workspace                  →  214 passed / 0 failed
+scripts/devtools/verify-platform.mjs    →  69 项检查全通过（【1】–【11】）
 ```
 
-即当前唯一剩余的测试失败就是阻塞 4（`sanitize_id`），其余 59 项全绿。
+> ⚠️ **但"全绿"不等于"本文档列的每一条都已修好"**：上面这张 §9 的缺口清单里，第 2–5、7、13、19、22–25、27–30 项**仍然成立**（它们是设计边界或未接线，不是测试失败）。测试绿说明"代码自洽"，不说明"防护完整"。
 
 ### 0.3 强度分级用语
 
@@ -457,13 +455,14 @@ permissions:
 **攻击面**：
 
 - **额度消耗**：被循环调用刷额度是最直接的损失（L3 插件的 `timeout_ms` 只限单次调用，`workers` 上限 8，但没有总调用配额）；
-- **数据外传**：把用户文件内容/路径拼进 prompt 发出去。这是 `Ai` 能力**最容易被低估**的一面——`Ai` 的风险等级是 Low，但它实际上意味着"可以把数据送出本机"（发给用户自己配置的 AI 服务商，仍然算外传）；
+- **数据外传**：把用户文件内容/路径拼进 prompt 发出去。这是 `Ai` 能力**最容易被低估**的一面——`Ai` 的风险等级是 Low，但它实际上意味着"可以把数据送出本机"（发给用户自己配置的 AI 服务商，仍然算外传）。**这一条现在不再只是"可能"**：`ai.describe` 与 `doc.ocr` 的 AI 路径**默认就会把图片上传给服务商**，完整说明见 §3.9。
 - **提示词注入回流**：AI 的输出在 `ai_generate` 流程里被当成"草稿数据"处理（见 §6），但如果某个插件把 AI 输出当指令执行，就构成了注入链。
 
 **当前状态**：
 
 - 宿主侧的 AI 调用在命令层（`commands.rs` 的 `ai_test_connection` / `ai_generate` / `ai_review_draft`），走 `toolforge-ai` 的 `AiClient`；
 - **`Ai` 能力没有运行时裁决点**：`CapabilityRequest` 枚举里根本没有对应变体（只有 `ReadFile`/`WriteFile`/`Http`/`ReadEnv`/`Spawn`），也就是说连"插件请求调用 AI"这个事件类型都还不存在（§9 第 5 项）。
+  > ⚠️ **但"宿主自己调 AI"这件事已经落地，而且有两个节点会把图片发出去**（`ai.describe` 与 `doc.ocr` 的 AI 路径）。它们走的是宿主侧 `AiClient`，**不经过 `CapabilityGuard`**，也不受插件 `net` 声明约束 —— 完整的隐私说明与本地/联网对照表见 §3.9，缺口清单见 §9 第 30 项。
 
 **缓解**：UI 文案直说"消耗你的额度"；建议把 `Ai` 当成**中风险**对待（"能外传数据"），不要因为 `risk()` 返回 Low 就降低确认强度。
 
@@ -527,6 +526,36 @@ pub enum PathScope {
 - **方案 B（后来实际采用的方向）**：让 `PermissionSet` 不再 `#[serde(transparent)]`，改用显式字段 `permissions: { capabilities: [...] }`。**这一步已经落地**（见 §3.0），`Capability` / `PathScope` 的表示此后可以自由调整；代价是原先按裸数组写的示例与文档需要同步更正（`plugins/` 下 6 个 `plugin.yaml` 与 `docs/PLUGIN-SDK.md` 已完成更正并重新校验通过）。
 
 在选定方案之前，任何文档、示例、UI 都**不应该**向用户展示 `Explicit` 的写法——因为它写出来必然解析失败。
+
+---
+
+### 3.9 把图片送出本机：`ai.describe` 与 `doc.ocr` 的 AI 路径（这一节必须直说）
+
+前面 §3.6 讲 `Ai` 能力时说过一句"`Ai` 风险等级是 Low，但它实际上意味着可以把数据送出本机"。**现在这句话有了两个具体的、默认就会发生的实现入口**，所以单独开一节，把话说完整：
+
+| 节点 | 图片去哪 | 是否联网 | 是否上传用户图片 |
+| --- | --- | --- | --- |
+| `ai.describe` | **上传到用户自己配置的 AI 服务商** | 是（唯一联网的地方） | **是** |
+| `doc.ocr`（AI 路径） | **上传到用户自己配置的 AI 服务商** | 是 | **是** |
+| `doc.ocr`（tesseract 路径） | 不出本机 | 否 | 否 |
+| `image.remove-background` | **不出本机** | 否（只有首次装依赖时要联网） | 否 |
+| `ai.upscale` | **不出本机** | 否（同上） | 否 |
+
+**必须让用户知道的三件事：**
+
+1. **这是真的外传，不是"调用了一个 API"这么轻。** `ai.describe` 会把图片**缩小并转成 JPEG**（默认最长边 1024、质量 85）后以内联 data URL 发出；`doc.ocr` 的 AI 路径同理（最长边 2048）。缩小与重编码降低了**费用与流量**，**但不改变"这张图离开了你的机器"这个事实** —— 服务端仍然看到了图片内容，而且这是用户自己选的第三方服务商，它的留存、训练与合规政策与 ToolForge 无关。
+2. **它是默认行为，不是可选项。** `ai.describe` 只有这一条路（没有本地模型替代）；`doc.ocr` 的 `engine` 默认是 `auto` —— **装了 tesseract 就走本地，没装就用 AI**。也就是说"没装 tesseract 的机器上跑 OCR"会**自动**把图片发出去，用户唯一的线索是任务日志里那一句「本机没有 Tesseract，改用多模态模型识别（图片会上传给 AI 服务商）」。
+3. **想完全离线，就用本地那两个节点。** `image.remove-background` 与 `ai.upscale` 的推理**全在本机**（Python 子进程 + ONNX Runtime），图片不出本机。它们仍然需要联网**一次**去拉推理依赖（`onnxruntime` / `numpy` / `pillow`，见 §9 第 29 项），以及用户自己去下模型权重 —— 但**推理过程与图片内容不上传**。这条区别很重要，因为"AI 相关"这四个字很容易让人以为它们都要联网。
+
+**诚实补一句边界**：这条外传**不经过任何权限门**。`ai.describe` / `doc.ocr` 是**内置节点**，它们在宿主进程里发起 HTTP 请求，所以：
+
+- 插件清单里的 `net` 能力**管不到它们** —— 那是给 L2/L3 插件用的；
+- `CapabilityGuard` 的 `Http` 分支**没有调用点**（§9 第 2 项），所以"宿主代插件发 HTTP"这件事目前既没有白名单强制，也没有按 `hosts` 校验；
+- 唯一真正起作用的是**用户自己在「设置 → AI」里配的那个服务商地址** —— 也就是说，**地址是用户选的，ToolForge 不代理、也不转存**，但它确实不会在发送前再问一次。
+
+> ⚠️ **别把内置插件的"不申请 net 权限"读成"这个操作不联网"**。`plugins/builtin/ai-describe/plugin.yaml` 的注释写得很准确：「插件本身**不申请** net 能力：联网发生在宿主的节点里，不在插件进程里。」它不申请 net 是**对**的（插件进程确实没联网），但这不代表图片没被发出去。
+
+**关于测试**：验收脚本里有一条 AI 视觉链路检查（`verify-platform.mjs` 的【10】），它**不调用任何真实服务商**，而是起一个**假 OpenAI 兼容端点**（`scripts/devtools/mock-openai.mjs`）并把应用的 AI 设置**临时**指过去。这个假端点收到的是**脚本自己生成的一张合成 PNG**（240×180），跑完即被丢弃；**它永远不会看到任何真实用户图片**。这也是"不去用真模型验证"的原因之一 —— 除了要花钱、结果不可复现之外，**自动化测试本来就不该把用户的文件发到第三方**。脚本在 `finally` 里会把用户的 AI 设置**原样恢复**（否则用户的配置会被指向一个已经关掉的假端点）。
 
 ---
 
@@ -613,28 +642,30 @@ Component::ParentDir => { if !out.pop() { out.push("..") } }
 
 **一条"间接成立"的补充结论**：`resolve()` 只显式拒绝 `is_absolute()` 的路径，没有像 `store.rs` 的 `safe_relative_path()` 那样显式检查 Windows 盘符前缀（`C:foo`）与根目录。看起来仍会被拦住——因为 `PathBuf::join`/`push` 在遇到"有前缀无根"或"有根无前缀"的路径时会**替换**整段，结果落在 `root` 之外，于是被 `starts_with` 判否。但这条推理依赖标准库的替换语义，属于**阅读推导而非实测**，建议对齐 `safe_relative_path()` 补一条显式检查，降低对库语义的依赖。**待定**。
 
-### 4.5 `sanitize_id()`：目录名拼接的最后一道防线（含一处待修缺陷）
+### 4.5 `sanitize_id()`：目录名拼接的最后一道防线 ✅ 缺陷已修复（原文保留为历史）
 
 `crates/toolforge-core/src/paths.rs` 的 `sanitize_id()` 用途是把任意 ID 清洗成安全的目录名，被 `plugin_dir()` / `engine_dir()` / `model_dir()` / `job_workspace()` 使用。它自己的注释说明了定位：
 
 > 虽然插件 ID 在校验阶段已经限制过字符集，但**目录名拼接是最后一道防线**：任何时候把外部输入拼进路径都必须再过一次，防止 `..` 或分隔符漏网。
 
-实现是：非 `[A-Za-z0-9.\-_]` 的字符一律替换成 `_`，然后 `trim_matches('.')` 去掉首尾的点，空串回落成 `"unnamed"`。
+**现在的实现是三步**：非 `[A-Za-z0-9.\-_]` 的字符替换成 `_` → **把连续的点折叠成单个点**（`..` 结构上不再可能出现）→ 去掉首尾的点，空串回落成 `"unnamed"`。单元测试 `sanitize_blocks_traversal` 现在断言的是**不变量**（不含 `..`、不含 `/`、不含 `\`、非空），并新增 `sanitize_never_leaves_dotdot` 作为回归测试。
 
-**缺陷（与 `ROADMAP.md` 阻塞 4 一致，本次核对仍成立）**：实现**先替换、再去点**，所以：
+**曾经的缺陷（`ROADMAP.md` 阻塞 4，现已修复）**：实现**先替换、再去点**，所以 `../../etc/passwd` 返回 `_.._etc_passwd`（`/` 先变成 `_`，于是 `..` 不再位于字符串首部，`trim_matches('.')` 去不掉它），而测试期望的是 `etc_passwd`。
 
-| 输入 | 实际返回 | 单元测试断言 | 结论 |
+| 输入 | 当时返回 | 当时测试断言 | 当时结论 |
 | --- | --- | --- | --- |
 | `../../etc/passwd` | `_.._etc_passwd` | `etc_passwd` | ❌ 测试会失败 |
 | `..` | `unnamed` | `unnamed` | ✅ |
 | `""` | `unnamed` | `unnamed` | ✅ |
 | `a/b\c` | `a_b_c` | `a_b_c` | ✅ |
 
-（"实际返回"是按实现逐字符推导得到的，与 `ROADMAP.md` 记录的实测结果一致；本次**未运行测试**验证。）
+**严重性判断（当时就不该夸大，现在也一样）**：`_.._etc_passwd` 里的 `..` 是**同一个路径组件的一部分**（它前后是 `_` 与 `e`，没有分隔符），所以它**不是**可穿越的路径。`sanitize_id` 把 `/` 与 `\` 都换成了 `_`，因此它**没有**给出目录穿越能力。所以那始终是**"实现与自己声明的意图/测试不一致"**的缺陷，而不是一个可立即利用的漏洞。同时 `paths.rs` 的 `plugin_data_stays_inside_plugin_dir` 断言了 `!dir.to_string_lossy().contains("..")`——现在实现满足它了。
 
-**严重性判断（不要夸大）**：`_.._etc_passwd` 里的 `..` 是**同一个路径组件的一部分**（它前后是 `_` 与 `e`，没有分隔符），所以它**不是**可穿越的路径。`sanitize_id` 把 `/` 与 `\` 都换成了 `_`，因此它**没有**给出目录穿越能力。所以这是**"实现与自己声明的意图/测试不一致"**的缺陷，而不是一个可立即利用的漏洞。同时 `paths.rs` 的 `plugin_data_stays_inside_plugin_dir` 测试断言 `!dir.to_string_lossy().contains("..")`，对 `../../evil` 得到的 `_.._evil` 同样会失败——这条断言比必要强度更严。
+**修法的落点**（`ROADMAP.md` 阻塞 4）：不是放宽测试，而是**改实现**（折叠点、去首尾点、空串回落），并**先补齐边界用例**（`..`、`....//`、`..\..\`、绝对路径、空串、纯空白）。方向选对了，因为这是路径收敛的边界 —— 边界上的断言该收紧，不该放松。
 
-修法（**待定**，取其一并与测试对齐）：让实现先消除 `..` 组件（例如按路径组件处理、丢弃 `.`/`..`，再对每段做字符替换），或者放宽测试断言到"结果仍是单个路径组件且不含分隔符"。**在改动它之前应先补边界用例**（`..`、`..\`、绝对路径、尾随点、Windows 保留名），因为它处在路径收敛的边界上。
+> **严重性判断（当时就不该夸大，现在也一样）**：`_.._etc_passwd` 里的 `..` 是**同一个路径组件的一部分**（它前后是 `_` 与 `e`，没有分隔符），所以它**不是**可穿越的路径。`sanitize_id` 把 `/` 与 `\` 都换成了 `_`，因此它**没有**给出目录穿越能力。所以那始终是**"实现与自己声明的意图/测试不一致"**的缺陷，而不是一个可立即利用的漏洞。同时 `paths.rs` 的 `plugin_data_stays_inside_plugin_dir` 断言 `!dir.to_string_lossy().contains("..")`，对 `../../evil` 得到的 `_.._evil` 同样会失败——那条断言比必要强度更严（**现在实现已经满足它**）。
+
+> **修法选的是"改实现"，不是"放宽容忍度"**：折叠连续的点（`..` 结构上不可能出现）→ 去掉首尾的点 → 空串回落 `unnamed`，并**先补齐边界用例**（`..`、`....//`、`..\..\`、绝对路径、空串、纯空白）。之所以该这样选：这是路径收敛的边界，**边界上的断言该收紧，不该放松**。
 
 ### 4.6 虚拟前缀
 
@@ -923,7 +954,7 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | 6 | `PathScope::Explicit` **无法通过 `plugin.yaml` 表达**（内部标签 + `String` newtype 变体无法调和） | `HOST_PATH_WRITE` 警告与 `FsRead{Explicit}` 的 High 分支**暂不可达**；需要访问固定系统目录的合法插件也写不出来 | 无（逃生舱口实际锁死） | 待定（需先定 §3.8 的方案 A / B） |
 | 7 | 词法规范化**挡不住符号链接**、Windows 8.3 短名、UNC/设备路径、TOCTOU | 若攻击者能在授权根内放置链接，可读到根目录之外 | 绝对路径拒绝 + `starts_with(root)` 组件级比较 | v0.2 起（`openat`/`O_NOFOLLOW`/逐级校验） |
 | 8 | `PathResolver::resolve()` **不显式拒绝盘符前缀/根目录**（依赖 `join`/`push` 的替换语义） | 看起来仍被 `starts_with` 拦住，但结论是阅读推导、非实测，依赖标准库语义 | 同上。建议对齐 `store.rs::safe_relative_path()` 补显式检查 | 待定 |
-| 9 | `sanitize_id()` 实现与自身单测不符（`../../etc/passwd` → `_.._etc_passwd`，断言期望 `etc_passwd`）；`plugin_data_stays_inside_plugin_dir` 的 `!contains("..")` 断言同样会失败 | 不是可穿越漏洞（`/`、`\` 已被替换，结果仍是单个组件），但"最后一道防线"的行为与声明不一致；测试不可通过 | 无（行为本身未造成穿越） | v0.1（`ROADMAP.md` 阻塞 4；改前先补边界用例） |
+| 9 | ~~`sanitize_id()` 实现与自身单测不符~~ | —— | ✅ **已修复**：实现改为「替换非法字符 → **折叠连续的点** → 去掉首尾的点 → 空串回落 `unnamed`」，`..` 结构上不可能再出现；测试改为断言不变量并新增 `sanitize_never_leaves_dotdot`。**注意它当时也不是可穿越漏洞**（`/`、`\` 已被替换，结果仍是单个组件），是"实现与声明不一致"。见 §4.5 | 关闭 |
 | 10 | ~~`plugin.rs`、`store.rs`、`toolforge-ai/src/review.rs` 的清单夹具与 `PermissionSet` 的 serde 表示不符~~ **已消解** | 这些夹具使用的是映射形式 `permissions: { capabilities: [...] }`，而 `PermissionSet` 的 `#[serde(transparent)]` 已被**移除**、schema 统一到映射形式，因此不再有解析失败。相反，原先按裸数组写的 6 个示例 `plugin.yaml` 一度全部失效，已改正并重新校验通过 | 无 | 已关闭 |
 | 11 | `crates/toolforge-process/src/supervisor.rs` 的 `ChildSupervisor::spawn()` 在返回结构体时写了 `notifications: notify_rx`，而局部变量名是 `notifications`（`notify_rx` 在文件里不存在） | 该 crate **看起来无法编译**，进而 L3 的进程隔离（`clear_env` / `deny_network` / 超时强杀）都还没被真正跑起来。**本次仅通过阅读发现，未运行 `cargo` 验证** | 无 | v0.1（属编译阻塞，性质同 `ROADMAP.md` 的阻塞 1/2） |
 | 12 | ~~`capabilities/default.json` 里 `shell:allow-execute` 放行的是 `explorer` + `args: true`~~ | —— | ✅ **已修复**：`shell:allow-execute` 与 `shell:allow-open` 已**整体移除**。"在文件管理器里显示输出文件"改走 `opener` 插件的 `revealItemInDir()` —— 目的明确的 API，不是通用命令执行。shell 插件仍被注册（对齐技术选型与未来的 sidecar 分发），但**零权限**。`lib.rs` 里那句与配置不符的注释也已改正 | 关闭 |
@@ -943,17 +974,25 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | 26 | ~~`nodes.rs::libreoffice_to_pdf` 在 `dst` 没有父目录时回退到 `std::env::temp_dir()`~~ | —— | ✅ **已修复**：改为**直接报错**而不是回退到宿主机临时目录。宁可让调用方看到"输出路径没有父目录"，也不要在授权范围之外偷偷写文件 | 关闭 |
 | 27 | `ai.persistApiKey` 打开后，API Key **明文**写在 `<data>/ai-key.txt`；**没有加密、没有 DPAPI / Keychain** | 拿到该文件即可拿到 Key。这是相对系统钥匙串的**能力降级**，而代码里 `ai-provider` 的 `licenseNote` 仍写着「只存在本机加密存储中」，属于与实现不符的文案 | 开关**默认关闭**（`persistApiKey: false`，Key 默认只在内存）；关掉开关会**删除**该文件；Key 不进日志、不进审计、不序列化给前端 | 待定（OS 钥匙串仍是 ROADMAP 上的待办；在它落地前**不得**在任何文案里声称加密存储） |
 | 28 | 模型权重的下载**依赖服务端提供正确文件**，而 `birefnet-general` / `modnet-portrait` / `realesrgan-x4plus` **没有 url/hash** | 对后三者前端只能显示「无下载源」并禁用按钮（刻意的：宁可按钮是灰的，也不放一个点了必然失败的按钮） | 已核对的三个 rembg 权重带**真实下载后算出来的** SHA-256；**哈希不匹配即删除文件**（`registry.rs::install_model` → `IntegrityCheckFailed`），不留没校验过的产物 | 待定（补齐剩余三个模型的真实哈希后再放开按钮） |
-| 29 | **抠图节点首次运行会自己建 venv 并联网 `pip install`**（`onnxruntime` / `numpy` / `pillow`，约 30 MB），**这不是用户逐条点出来的动作** | 一次主机侧的、未做完整性校验的网络拉包：**没有哈希锁定、没有签名校验**，装进来的 wheel 会被推理子进程直接 import。它同样是"首次运行要联网"这个事实在产品里的第二个入口（第一个是权重下载） | 只在**首次运行 `image.remove-background` 时**发生（不是安装应用时、不是启动时，也不是别的节点）；venv 独立落在 `<data>/cache/onnx-runtime/`，**不碰用户自己的 Python**，卸载就是删掉那个目录；**推理本身完全本地** —— 不联网、不上传图片；用户必须自行下载权重，所以这个节点不可能在用户完全没动作的情况下自己开跑 | v0.2（讨论方向：把 wheel 版本固定并校验哈希，或改为随包分发 / 由 `engine-sources.json` 提供受校验的来源） |
+| 29 | **抠图节点首次运行会自己建 venv 并联网 `pip install`**（`onnxruntime` / `numpy` / `pillow`，约 30 MB），**这不是用户逐条点出来的动作** | 一次主机侧的、未做完整性校验的网络拉包：**没有哈希锁定、没有签名校验**，装进来的 wheel 会被推理子进程直接 import。它同样是"首次运行要联网"这个事实在产品里的第二个入口（第一个是权重下载） | 只在**首次运行 `image.remove-background` 或 `ai.upscale` 时**发生（不是安装应用时、不是启动时，也不是别的节点）；venv 独立落在 `<data>/cache/onnx-runtime/`，**不碰用户自己的 Python**，卸载就是删掉那个目录；**推理本身完全本地** —— 不联网、不上传图片；用户必须自行下载权重，所以这两个节点不可能在用户完全没动作的情况下自己开跑 | v0.2（讨论方向：把 wheel 版本固定并校验哈希，或改为随包分发 / 由 `engine-sources.json` 提供受校验的来源） |
+| 30 | **`ai.describe` 与 `doc.ocr` 的 AI 路径会把图片上传给用户配置的 AI 服务商**，且**不经过任何权限门**（内置节点走宿主侧 `AiClient`，插件 `net` 声明管不到、`CapabilityGuard` 的 `Http` 分支也没有调用点） | 用户图片（缩小并转 JPEG 后）离开本机，交给第三方；服务端的留存/训练政策与 ToolForge 无关。`doc.ocr` 的 `engine` 默认 `auto`，所以**没装 tesseract 的机器上跑 OCR 会自动外传**，用户只从任务日志里那一句提示得知 | `maxSide` 会先把图缩小（`ai.describe` 默认 1024、`doc.ocr` 默认 2048）以降费用与流量，但**不改变外传这一事实**；服务商地址由用户自己在「设置 → AI」里指定；任务日志会写明"图片会上传给 AI 服务商"；**完全离线的替代品是同为内置节点的 `image.remove-background` 与 `ai.upscale`（推理全在本机）** | 待定（方向：把"这次会把图片发到 <服务商>"做成一次显式确认；`doc.ocr` 的 `auto` 在没装 tesseract 时不要默默选 AI） |
 
 > **关于第 29 项，几条必须说清楚、不能含糊的边界：**
 >
-> - **什么时候发生**：**只有首次运行抠图节点（`image.remove-background`）时**。安装应用、启动应用、跑别的节点都不会触发。
+> - **什么时候发生**：**只有首次运行 `image.remove-background` 或 `ai.upscale` 时**。安装应用、启动应用、跑别的节点都不会触发。
 > - **装到哪里**：`<data>/cache/onnx-runtime/` 下的**独立 venv**。
 > - **会不会动用户的 Python**：**不会**。这是刻意选独立 venv 的理由 —— 用户的系统 Python 一个字节都不改，卸载也只是删目录。
 > - **推理联网吗**：**不联网**。图片不上传，推理全在本机；网络只用于**一次**拉取依赖。
-> - **不能声称的**：**不能说这些 pip 包被哈希锁定或经过校验** —— 它们没被锁定、也没被校验。也不要说"这个节点完全离线可用"：**没有网络的机器在依赖就位之前用不了它**（权重还得用户自己下）。
+> - **不能声称的**：**不能说这些 pip 包被哈希锁定或经过校验** —— 它们没被锁定、也没被校验。也不要说"这两个节点完全离线可用"：**没有网络的机器在依赖就位之前用不了它们**（权重还得用户自己下）。
 >
 > 相关设计理由（为什么跑 Python 子进程而不是 Rust 内推理）见 `docs/ARCHITECTURE.md` 决策 9；引擎与权重侧的说明见 `docs/ENGINE-MATRIX.md` 第 3.2、3.6 节。
+>
+> ---
+>
+> **关于第 30 项（图片外传），最容易混淆的一点单独说清楚：** 这个项目里带"AI"字样的四个节点**并不都联网**。
+> `ai.describe` 与 `doc.ocr`(AI 路径) **会把图片发给第三方**；`image.remove-background` 与 `ai.upscale` **不会**（本地 ONNX 推理）。
+> 对外描述时**不要**笼统地说"AI 功能需要联网"或"AI 功能都是本地的" —— 两种说法都会误导用户，
+> 而这一条恰好是用户最在意的隐私问题。完整的对照表与说明见 §3.9。
 
 ### 附：本次核对中**没有**发现问题的部分（也值得记下来）
 
@@ -989,6 +1028,8 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | L3 进程隔离 | `crates/toolforge-plugins/src/runtimes/python.rs`（`PythonPlugin::launch` / `handle_notification` / `prepare_venv`） |
 | L1 执行与权限预检 | `crates/toolforge-plugins/src/l1.rs`（`run_pipeline` / `pipeline_uses_fs`） |
 | 审计 | `crates/toolforge-plugins/src/audit.rs`（`AuditEventKind` / `AuditEvent` / `AuditLog` / `content_hash` / `record_violation` / `record_escalation` / `record_integrity`） |
+| 图片外传（§3.9） | `crates/toolforge-core/src/ai.rs`（`VisionClient` / `VisionRequest`）、`crates/toolforge-ai/src/provider.rs`（`impl VisionClient for AiClient`）、`crates/toolforge-engines/src/nodes.rs`（`ai_describe` / `doc_ocr` / `shrink_for_vision`，本地重编码为 JPEG q85） |
+| AI 视觉链路的验收（不碰真实服务商） | `scripts/devtools/mock-openai.mjs`（假 OpenAI 兼容端点）、`scripts/devtools/verify-platform.mjs` 的【10】号检查（跑完还原用户的 AI 设置） |
 | 插件仓库与安装 | `crates/toolforge-plugins/src/store.rs`（`PluginStore::install` / `finish_install` / `set_granted` / `set_enabled` / `runnable` / `verify_integrity` / `quarantine_if_changed` / `safe_relative_path` / `diff_capabilities`） |
 | 子进程监管 | `crates/toolforge-process/src/supervisor.rs`（`SpawnSpec` / `ChildSupervisor::spawn` / `initialize` / `call` / `shutdown` / `kill` / `decorate`）、`crates/toolforge-process/src/lib.rs`（`hide_console` / `detach_process_group` / 安全边界说明） |
 | 内置节点与虚拟前缀 | `crates/toolforge-engines/src/nodes.rs`（`resolve_path`；`image_remove_background` 是第 29 项那次联网 `pip install` 的触发点） |

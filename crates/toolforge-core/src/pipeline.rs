@@ -703,10 +703,13 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "image.enhance".into(),
         label: "图像增强".into(),
-        description: "亮度/对比度/饱和度/锐化/降噪。纯 Rust 走内置卷积；装了 libvips 时用其更快的实现。".into(),
+        description: "亮度/对比度/饱和度/锐化。**只有纯 Rust 实现**（内置卷积）。\
+                      装了 libvips 也不会走它 —— 这条链路还没接，别在界面上给人\"装了会更快\"的错觉。".into(),
         category: NodeCategory::Image,
         requires_engines: vec![],
-        optional_engines: vec![engine("libvips")],
+        // 空：libvips / ImageMagick 都**没有**被这个节点调用。
+        // 写上它们会让界面显示"装了它解锁这个节点"，而那是假的。
+        optional_engines: vec![],
         inputs: vec![in_file("src", "图片", &["image/*"])],
         outputs: vec![out_file("dst", "输出图片")],
         params: vec![
@@ -719,10 +722,12 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "image.strip-metadata".into(),
         label: "清除元数据".into(),
-        description: "去掉 EXIF / IPTC / XMP。分享图片前用来抹除 GPS 位置等隐私信息。".into(),
+        description: "去掉 EXIF / IPTC / XMP。分享图片前用来抹除 GPS 位置等隐私信息。\
+                      **只有纯 Rust 实现**：解码再重新编码，天然不会保留任何元数据块。".into(),
         category: NodeCategory::Image,
         requires_engines: vec![],
-        optional_engines: vec![engine("libvips"), engine("imagemagick")],
+        // 同 `image.enhance`：外部后端没有接入，不要靠 optional_engines 制造期待
+        optional_engines: vec![],
         inputs: vec![in_file("src", "图片", &["image/*"])],
         outputs: vec![out_file("dst", "输出图片")],
         params: vec![],
@@ -899,15 +904,23 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "doc.ocr".into(),
         label: "OCR 文字识别".into(),
-        description: "图片/扫描件转文字。默认走系统 OCR，装了 PaddleOCR 时质量更高。".into(),
+        description: "从图片里提取文字。两条路径：装了 **Tesseract** 就用它（离线、免费、快，中文质量一般）；\
+                      没装则用**多模态模型**（中文/手写/复杂版式明显更强，但图片会上传给 AI 服务商并计费）。\
+                      **只支持图片** —— PDF 要先按页转图，那条链路还没做，所以 PDF 输入会被明确拒绝。".into(),
         category: NodeCategory::Document,
-        requires_engines: vec![engine("python")],
-        optional_engines: vec![engine("tesseract")],
-        inputs: vec![in_file("src", "图片或 PDF", &["image/*", ".pdf"])],
+        // 两个引擎都是**可选的**：有其一即可。放成 requires 会让"只装了 Tesseract"
+        // 的机器上这个节点被无谓地标灰 —— 而那正是它最该能用的场景。
+        requires_engines: vec![],
+        optional_engines: vec![engine("tesseract"), engine("ai-provider")],
+        inputs: vec![in_file("src", "图片", &["image/*"])],
         outputs: vec![port("text", "识别文本", PortType::Text, false)],
         params: vec![
-            enum_param("engine", "识别引擎", "auto", &["auto", "tesseract", "paddleocr"]),
-            param("lang", "语言", ParamType::Text, Some("chi_sim+eng".into()), false),
+            // 枚举必须与执行器读的分支**逐字一致**。这里原来写着 `paddleocr`，
+            // 而执行器根本没有那条分支 —— 用户选中它只会静默走到 auto 的行为。
+            // 参数名对了但取值对不上，是比"参数名写错"更难发现的一类漂移：
+            // 界面照常显示、执行器照常运行，只有结果不符合预期。
+            enum_param("engine", "识别引擎", "auto", &["auto", "tesseract", "ai"]),
+            param("lang", "语言（Tesseract 用，如 chi_sim+eng）", ParamType::Text, Some("chi_sim+eng".into()), false),
         ],
     });
 

@@ -73,8 +73,8 @@
 
 | 项 | 状态 |
 | --- | --- |
-| `plugins/` 示例插件 | ✅ 6 个：`builtin/image-convert`、`builtin/batch-rename`、`builtin/video-to-gif`、`builtin/remove-bg`（L1）；`wasm-example`（L2，含已编译的 `plugin.wasm`）；`python-example`（L3，含 `main.py`） |
-| 示例插件的 `permissions` 写法 | ✅ 6 个 `plugin.yaml` 全部使用**正确的映射形式** `permissions: { capabilities: [...] }`，并逐一通过了用当前源码编译出的 `PluginManifest::validate()`（schema 曾变过一次，见阻塞 3） |
+| `plugins/` 示例插件 | ✅ 7 个：`builtin/image-convert`、`builtin/batch-rename`、`builtin/video-to-gif`、`builtin/remove-bg`、`builtin/ebook-convert`、`builtin/ai-describe`、`builtin/image-upscale`（均为 L1）；另有 `wasm-example`（L2，含已编译的 `plugin.wasm`）与 `python-example`（L3，含 `main.py`） |
+| 示例插件的 `permissions` 写法 | ✅ 全部使用**正确的映射形式** `permissions: { capabilities: [...] }`，并逐一通过了用当前源码编译出的 `PluginManifest::validate()`（schema 曾变过一次，见阻塞 3） |
 | `docs/ENGINE-MATRIX.md` | ✅ 已存在（439 行），引擎矩阵与降级规格 |
 | `docs/ROADMAP.md` | ✅ 本文件 |
 | `docs/ARCHITECTURE.md` / `docs/PLUGIN-SDK.md` / `docs/SECURITY.md` | 🚧 **不存在**，但已被代码/示例引用（见不一致项 6c、6d） |
@@ -403,14 +403,17 @@ pnpm build          # tsc --noEmit && vite build
 
 ```text
 【静态】
-cargo test --workspace                  →  215 passed / 0 failed
+cargo test --workspace                  →  214 passed / 0 failed
 cargo run -p toolforge --bin export-bindings
   → 生成 32 个命令的绑定 + 4 项守卫（其中「命令清单逐条核对」已取代被删除的魔数断言）
 
 【真机运行】
-scripts/devtools/verify-platform.mjs    →  41 项检查全通过
+scripts/devtools/verify-platform.mjs    →  69 项检查全通过（【1】–【11】）
                                             （run.mjs 里的第 5 个脚本；【6】= 图片后端，
-                                             【7】= 任意角度旋转，【8】= 抠图整条 ONNX 链路）
+                                             【7】= 任意角度旋转，【8】= 抠图整条 ONNX 链路，
+                                             【9】= 电子书降级与拦停，【10】= ai.describe 的
+                                             请求形状（假端点 mock-openai.mjs），
+                                             【11】= 超分是不是真的按倍数放大）
 一键安装引擎                            →  libvips 8.18.6 真实装上：
                                             下载 ≈30 MB → SHA-256 校验 → 解压 → installed
                                             落盘 <data_dir>/engines/libvips/bin/vips.exe（≈29.67 MB）
@@ -423,9 +426,18 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
                                             椭圆中心 alpha 254、角落 0、前景覆盖 18.87%
                                             （与椭圆真实面积吻合）；
                                             运行时就绪后单张推理 ≈0.7 s（首次含 pip ≈32 s）
+                                             权重：u2netp
+AI 超分（ai.upscale）                   →  Real-ESRGAN 分块推理（256 px 分块 / 16 px 重叠 /
+                                             只取中心贴回）跑通；权重 realesr-general-x4v3（4.87 MB）
+电子书（ebook.convert）                 →  epub→docx 是真正的 PK magic ZIP；
+                                             epub→md 中文文本完整保留；
+                                             epub→mobi 且无 Calibre 时干净拒绝、磁盘零残留
+AI 图像描述（ai.describe）              →  走假端点：请求形状（1 张图 / 内联 data URL /
+                                             image/jpeg / 带系统提示词 / 非流式）与下游接线全对，
+                                             跑完已还原用户的 AI 设置
 ```
 
-**这份基线里仍然为空的**：`image.enhance` / `image.strip-metadata` 未接外部后端；ImageMagick 档位没有实测记录；4 个内置节点未实现（不一致 1）；三档输出的结果一致性没有测试。
+**这份基线里仍然为空的**：`image.enhance` / `image.strip-metadata` 未接外部后端（仍是纯 Rust 实现）；ImageMagick 档位没有实测记录；macOS 没有环境基线；**三档输出的结果一致性没有测试**；"两个可选引擎都缺失"这类组合环境没有专门基线。
 
 > ⚠️ **关于【8】号检查的诚实说明**：它需要先有模型权重与 Python 运行时，而那些都要下载。**前置条件不满足时它是"跳过"，不是"通过"** —— 脚本会明确打一条 skip（`c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）')`），不会把"没测"算成"测过了"。
 
@@ -450,7 +462,12 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 
 这些不是「待实现的功能」，而是**代码已经写了、但与它自己的声明/文档/其它模块不一致**的地方。它们比缺功能更危险，因为会让人在运行时才发现。
 
-### 1. 节点登记 32 个，执行器实现 28 个（**原为 27 个，抠图已补齐**）
+### 1. 节点登记 32 个，执行器**也是 32 个**（差集已清零）
+
+> ✅ **本条已关闭（保留为历史）**：权威目录 `toolforge_core::pipeline::builtin_nodes()` 登记 **32** 个节点，
+> `crates/toolforge-engines/src/nodes.rs` 的 `run()` 分发臂现在**覆盖全部 32 个**，
+> `UNIMPLEMENTED_NODES` 是**空数组**。下面原文记录的差集是 4 个（更早是 5 个、6 个），
+> 逐个的去向见 `docs/ENGINE-MATRIX.md` 第 6.7 节。
 
 - 权威目录 `toolforge_core::pipeline::builtin_nodes()` 登记 **32** 个节点（已逐条列出核对）。
 - `crates/toolforge-engines/src/nodes.rs` 的 `run()` 分发臂实际实现 **28** 个。
@@ -461,8 +478,21 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
   > **本条原来的差集是 5 个，第一个是 `image.remove-background`** —— 它是产品的招牌功能，
   > 却长期停在"登记了但执行器没写"。**现在它已经实现并真机跑通**（下权重 → 独立 venv 装
   > `onnxruntime` → ONNX 推理 → 出 RGBA PNG），详见下方「AI 媒体能力」与
-  > `docs/ENGINE-MATRIX.md` 第 3.2、6.7 节。**剩下这 4 个仍然全部未实现**，
-  > 别把"抠图通了"读成"AI 能力都通了"。
+  > `docs/ENGINE-MATRIX.md` 第 3.2、6.7 节。
+  >
+  > ✅ **剩下这 4 个已在最后这一轮全部补齐**，而且**不是同一个做法**：
+  > * `ebook.convert` —— Calibre 优先、Pandoc 兜底，并且**在调用 pandoc 之前**按能力表
+  >   （`PANDOC_EBOOK_IN` / `PANDOC_EBOOK_OUT`）检查扩展名。原因是 pandoc 对认不出的
+  >   **输出**扩展名**不报错**：它打印一句 `[WARNING] Could not deduce format from file extension`
+  >   + `Defaulting to html`，写一个 HTML 出来、**保留原扩展名、退出码 0**。认不出**输入**
+  >   格式时更糟（当成纯文本读，产出垃圾）。**"成功"的坏文件比失败更糟，所以退出码在这里不可信。**
+  > * `ai.describe` —— 视觉模型；图片先按 `maxSide`（默认 1024）缩小再转 **JPEG q85** 内联发送。
+  >   新增示例插件 `plugins/builtin/ai-describe`：描述 → `text.replace` 净化为文件名 → `name.build` → `fs.move`。
+  > * `doc.ocr` —— 有 tesseract 就用它（离线免费），否则用视觉模型；**PDF 输入明确拒绝**
+  >   （要先按页栅格化，那条链路没做）。
+  > * `ai.upscale` —— Real-ESRGAN + 分块推理（`py/upscale.py`：256 px 分块、16 px 重叠、
+  >   只取中心贴回），配了两个**动态输入尺寸**的权重。
+  > 逐条的实测数据与参数见 `docs/ENGINE-MATRIX.md` 第 3.2、3.3、3.5、6.7 节。
 
   > **结论（`flow.foreach` 已结案）**：这条当时写的是"6 个"，第 6 个是 `flow.foreach`。
   > 后来它不是被实现，而是被**整个删除**了 —— L1 的步骤列表是平铺的，
@@ -473,10 +503,29 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
   > 上限 5000 个且**超限报错而不是截断**），逐批调用流水线，清单用 `${batch.index}` 取序号。
   > 所以清单里从来不需要这个节点。`pipeline.rs` 在原名单位置留了一段注释记录原因。
 
-- 剩下这 4 个**各自卡在不同的东西上，不是同一个原因**：`ai.describe` 卡在 **AI 服务提供方的视觉能力**（`ai_test_connection` 已经能连通，但"看图说话"这一步没写）；`doc.ocr` 卡在 **tesseract**；`ebook.convert` 卡在 **calibre** —— 后两个**都没有配置下载源**（只支持系统安装），所以它们连"先装个引擎"这条路都要用户自己去官网。**`ai.upscale` 是这里面最可能先做到的一个**：它可以照抄抠图那条"模型 + 推理"链（权重下载、`onnx-models` 判据、Python 子进程推理那一整套都是现成的），缺的只是 `realesrgan-x4plus` 的下载源（哈希未核对，见不一致 3 / `docs/ENGINE-MATRIX.md` 第 6.5 节）。
-- **设计上这是刻意的**（`not_implemented()` 的注释明确说明「不返回假的成功」），但**清单式插件可以合法引用它们并通过 `validate()`**，于是用户会看到「插件安装成功、运行即报错」。`plugins/builtin/remove-bg` **不再属于这一类**（它的节点已实现，`plugin.yaml` 顶部那条"尚未实现"的警告已删掉，版本升到 v0.2.0）。
-  - 顺带一提：因为 `flow.foreach` 是**被删除**而不是"未实现"，引用它的清单现在**连 `validate()` 都过不去**（`STEP_UNKNOWN_NODE`），这与上面"可以合法引用"的情况不同 —— 删除是更彻底的诚实。
-- ✅ **新增了一条防回归测试**：`unimplemented_list_matches_the_dispatch_table` **遍历真实分发表**，对 `UNIMPLEMENTED_NODES` 里的每个节点断言它确实还落在 `not_implemented` 上 —— 也就是"实现了却忘了从名单里删掉"（以及反方向）会**直接把构建弄红**，而不是等用户看到与真实行为相反的提示。
+- **一个必须记住的教训（本轮新增）**：`ai.upscale` 与 `image.remove-background` 都依赖
+  `onnx-models`，而**"这个权重服务于哪个节点"曾经是从引擎推断出来的** —— 推断的结果是错的
+  （`u2netp` 这个**分割**模型也声称服务于 `ai.upscale`）。验证脚本据此拿它去超分，把单通道
+  mask 当成图片、"算出倍数 1"、缩放到目标尺寸，于是**每一条尺寸断言都通过**，绿色对勾、
+  输出垃圾。修法是三件：`EngineModel.used_by` 逐条写明（不再推断）、`upscale.py` 自检
+  （输入 `[N,3,H,W]`、输出必须 3 通道、倍数必须是整数且 ≥ 2，否则报错并打印真实输出形状）、
+  以及 `verify-platform.mjs` 的反向断言（拿抠图权重跑超分**必须失败且不留文件**）。
+  完整复盘见 `docs/ENGINE-MATRIX.md` 第 3.2 节。**它说明的不是"断言写错了"，而是"断言测的东西
+  根本不是要验证的东西"。**
+- **设计上这是刻意的**（`not_implemented()` 的注释明确说明「不返回假的成功」），而且现在这条
+  兜底分支只剩**一种**成因：**节点名拼错了**。它会把两种处境分开说 —— 名字不在节点目录里
+  →「多半是清单里写错了名字」；名字在目录里 →「执行器还没实现，见 ROADMAP」。
+  以前这两者共用同一条出口，而那里还挂着一条 `debug_assert!`，于是**一个拼错的节点名会
+  panic 掉 debug 构建**；那条断言已经删掉（理由与替代测试见 `docs/ARCHITECTURE.md` 决策 10）。
+  - 清单式插件引用一个**不存在**的节点仍会被 `validate()` 拦下（`STEP_UNKNOWN_NODE`）；
+    而 `flow.foreach` 因为**被删除**（不是"未实现"），引用它的清单同样**连 `validate()` 都过不去** ——
+    删除是更彻底的诚实。
+- ✅ **防回归测试**：`unimplemented_list_matches_actual_dispatch` **遍历真实分发表**，对
+  `UNIMPLEMENTED_NODES` 里的每个节点断言它确实还落在 `not_implemented` 上（反方向也查）。
+  名字不同但守同一件事的还有 `unimplemented_list_matches_the_dispatch_table`。
+  **名单为空之后这两条测试依然有用** —— 它们是"下次加节点时"的护栏。
+- ✅ **示例层面还有一条护栏**：`examples_do_not_silently_use_unimplemented_nodes` —— 示例要么别用
+  未实现节点，要么必须在 `metadata.description` 里写明。现在它始终通过，**但不要删**。
 
 ### 2. 图像节点的「可选加速」只是声明，执行器从不调用 libvips / ImageMagick ✅ **已部分关闭（4 个节点走通，2 个还没走）**
 
@@ -484,7 +533,7 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 >
 > - `image.convert`、`image.resize`、`image.crop`、`image.rotate` **四个节点会真的按 `libvips → ImageMagick → 纯 Rust` 挑后端**，把结果报在节点输出的 **`backend`**（`"libvips"` / `"imagemagick"` / `"rust"`）与一条 debug 日志里。后端可观测是刻意的：不看日志就只能靠猜，而这个项目已经被"文档说有、实际没有"坑过好几次。
 > - `image.rotate` 的任意角度不再是"直接报缺 ImageMagick"：libvips 可用时走 `vips similarity --angle N`，ImageMagick 可用时走 `-rotate N`，**只有纯 Rust 可用时才返回 `EngineMissing`** —— 仍然**不会静默取整**（取整会让用户以为转了 45°，实际拿到没转的图）。
-> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错；整个脚本 **41 项检查全通过**。
+> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错；整个脚本 **69 项检查全通过**。
 > - **收益要说准**：libvips 档位带来的是**按质量换体积的能力**（WebP/JPEG 有损编码），纯 Rust 后端的 WebP 只能无损。**但"有损一定更小"是错的**，实测 320×200 合成渐变图：无损 508 字节 vs 有损 1808 字节（所以【6】只断言"确实走了有损编码"，不断言体积）。
 >
 > **本条还剩两件事没做**（因此标"部分关闭"而不是"已关闭"）：
@@ -549,6 +598,24 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 | 6h | `crates/toolforge-plugins/src/runtimes.rs` 模块文档 | L3 的隔离度自述为「清空继承环境变量（只留 PATH）+ 锁定 cwd + 默认断网 + 超时 + 优雅关闭」，并**主动声明这不是内核级沙箱**：蓄意插件可直接用 `socket` 绕过代理环境变量。真正的隔离（Windows Job Object / AppContainer、macOS `sandbox-exec`、Linux seccomp）留给后续阶段。UI 与文档**不得**把 L3 称为「沙箱」 |
 | 6i | `crates/toolforge-core/src/pipeline.rs:149` | 未知节点的校验错误信息指向 `docs/ENGINE-MATRIX.md`（该文档存在），而 `nodes.rs` 的 `not_implemented` 指向 `docs/ROADMAP.md`（本文件）——两处进度指引指向不同文档，建议统一 |
 
+### 7. 本轮补齐节点之后的开放项（老实列出来）
+
+"32 个节点都有执行器"是一句真的话，但它不等于"每一件想做的事都做完了"。下面是**真正还欠着的东西**，按"用户会不会碰上"排序：
+
+| # | 开放项 | 现状与影响 | 这不是什么 |
+| --- | --- | --- | --- |
+| 1 | **`realesrgan-x4plus` 的固定输入尺寸支持** | 它的 ONNX 导出输入尺寸固定（64×64 或 128×128），要跑通必须先补上「补齐到固定尺寸 → 推理 → 裁回去」，否则边缘块会留下**网格状接缝**。所以它**故意没有下载源**，也不出现在 `ai.upscale` 的 `model` 枚举里 | 不是"哈希没核对"—— 另外两个没有下载源的抠图模型（`birefnet-general` / `modnet-portrait`）才是这个原因。要做的顺序：补逻辑 → 重跑接缝检查 → 真实下载后填哈希 |
+| 2 | **`image.enhance` / `image.strip-metadata` 仍然只有纯 Rust 一条路** | 它们**不问引擎**、不调用 `pick_image_backend()`、不产出 `backend`，所以装了 libvips 也不会更快。而 `libvips.provides` 里**声明了**这两个能力 —— **声明比实现更乐观**（`docs/ENGINE-MATRIX.md` 第 6.2 节） | 不是降级链的问题：降级链只覆盖 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个节点，这一点从上一轮起就没变 |
+| 3 | **`doc.ocr` 的 PDF 栅格化** | PDF 输入现在被**明确拒绝**（要按页转图片，需要 pdfium / poppler）。报错文案清楚，但功能确实没有 | 不是"忘了处理"—— 拒绝是刻意的：产出一堆乱码比报错糟得多 |
+| 4 | **`ebook.convert` 在两个可选引擎都没有时的 UI 提示** | 运行期会返回明确的 `EngineMissing`（detail 列出 Calibre 与 Pandoc 的覆盖范围与体积），但**节点可用性判定仍只看 `requiresEngines`**，所以这种机器上它依旧显示"可用" | 不是安全问题，是**知情时机的落差**：用户点下去才知道要装东西 |
+| 5 | **`doc.ocr` 的参数枚举与执行器对不上** | 枚举是 `auto` / `tesseract` / `paddleocr`，执行器认 `auto` / `tesseract` / `ai`。填 `ai` 有效但不在下拉里；填 `paddleocr` 能选中却会走到"两者都不满足"的报错分支。节点描述里的 PaddleOCR 目前只是**文案** | 不是"功能缺失"—— 是**声明与实现的一处漂移**，改起来只需二选一（要么实现 PaddleOCR，要么把枚举改成 `ai` 并把描述改掉） |
+| 6 | **`doc.ocr` 的可用性判定严于实现** | `requiresEngines` 是 `["python"]`，缺 Python 时整个节点被标灰；但执行器的 **tesseract 那条路根本不碰 Python** | 又是一处"能用却显示不可用"的可能（这个项目在 `onnx-models` 上已经踩过反方向的坑） |
+| 7 | **`doc.ocr` 的 AI 路径没有声明 `ai-provider`** | `doc_ocr` 在没有 tesseract 时会 `require_ai`，但 `doc.ocr` 的 `optionalEngines` 只有 `["tesseract"]`，`ai-provider.provides` 里也只有 `ai.describe`。所以"没装 tesseract 又没配 AI"时，UI 不会提示缺引擎，只有运行才报错 | 同上：运行期错误是清楚的，缺的是**提前告知** |
+| 8 | **ImageMagick 档位与 macOS 没有环境基线** | "只有 ImageMagick 可用"这一档从未被单独测过（本机没装 ImageMagick）；macOS 三条下载源也仍是 `null`（没有环境核对哈希） | 不是"没实现"—— 代码路径在，缺的是验证记录 |
+| 9 | **验证脚本的覆盖面仍然是"我们可控的那部分"** | `ai.describe` 用假端点验证请求形状（这是对的，真模型不可复现、要花钱），但它**验不了**"模型答得好不好"；同理【11】验的是倍数与尺寸，不是超分画质 | 这是**刻意的边界**，不是疏漏。写清楚是为了避免有人把"69 项全通过"读成"AI 能力已经验收" |
+
+> **一句话总结这一轮**：节点的账已经平了（32/32，`UNIMPLEMENTED_NODES` 为空），但上面这 9 条里**有 6 条是"声明与实现/UI 之间的小漂移"** —— 这类问题不会让构建变红，只会让用户在看到真实行为时感到意外。它们比"缺一个功能"更难发现，所以专门列在这里而不是埋进正文。
+
 ---
 
 ## v0.1 —— 骨架可运行
@@ -596,12 +663,13 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 
 - [x] ✅ 骨架完成：`PluginStore`（`reload` / `list` / `get` / `install` / `uninstall` / `set_enabled` / `set_granted` / `verify_integrity` / `quarantine_if_changed`）、`l1::run_pipeline`、`AuditLog`
 - [x] ✅ 6 个示例插件的 `plugin.yaml` 已就位
-- [ ] 🚧 装载示例插件并在「已实现的 28 个节点」范围内跑通一次真实流水线
+- [x] ✅ 装载示例插件并跑通一次真实流水线 —— 7 个内置示例里的 `image-convert` / `batch-rename` / `video-to-gif` / `remove-bg` 都已在真机上跑通（`scripts/devtools/verify-platform.mjs` 的【1】、【6】、【8】），本轮又补上了 `ebook-convert` / `ai-describe` / `image-upscale`（【9】、【10】、【11】）。
 - [ ] 🚧 权限声明 → 待授权列表 → 逐条授权的数据流打通（UI 可先极简）
 - [x] ✅ 用未实现节点时给出**可读且可操作**的错误，而不是内部错误码裸抛
-  - ✅ **已部分结案**：批量循环那条支路（`flow.foreach`）彻底消失了 —— 节点被删除，
+  - ✅ **已结案**：批量循环那条支路（`flow.foreach`）彻底消失了 —— 节点被删除，
     引用它的清单在校验阶段就报 `STEP_UNKNOWN_NODE`，根本走不到运行时。
-    剩下 4 个未实现节点仍走 `not_implemented`，错误文案指向本文档。
+    **名单（`UNIMPLEMENTED_NODES`）现在是空的**，所以这条兜底错误只剩"节点名拼错"一种成因，
+    而它会把两种处境分开说（"名字不在目录里" vs "在目录里但没实现"）。错误文案依然指向本文档。
 
 **任务中心**
 
@@ -622,7 +690,7 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 ### 验收标准
 
 1. `cargo test --workspace` 全绿，且 `cargo test -p toolforge-core` 恰好 **61 个测试通过、0 失败**。
-   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **215 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
+   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **214 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
 2. `cargo clippy --workspace -- -D warnings` 与 `cargo fmt --check` 无输出（零告警、零格式差异）。
 3. `cargo check --workspace --all-targets` 成功（即 `pnpm check:rust` 通过），且 `Cargo.lock` 已生成并入库。
 4. `pnpm check:all` 退出码为 0。
@@ -631,10 +699,10 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 7. **取消可验证**：对一张大图发起任务后立刻取消，任务状态在 2 秒内变为「已取消」，且目标目录**不留下**半个输出文件（临时文件被清理）。
 8. **不依赖外部二进制**：在未安装 ImageMagick / libvips / ffmpeg 的干净机器上，第 6 条闭环仍然成功（纯 Rust 路径打底）。
 9. **错误可读**：人为传入不存在的输入路径，前端展示的错误包含模块名与错误码，而不是 `undefined` 或裸 panic。
-10. **未实现节点诚实报错**：用 `doc.ocr` 构造一个插件并运行，前端明确显示「该内置节点尚未实现」及**指向本文档**的指引，而不是「任务成功但没产出文件」。
-    > 注：这条原本用 `flow.foreach` 举例。那个节点**已被删除**，现在引用它的清单在校验阶段就报 `STEP_UNKNOWN_NODE`（更早、更彻底）；剩下 4 个未实现节点继续走 `not_implemented`，所以验收用例改用 `doc.ocr`。
-    > **注意别再举 `image.remove-background` 当反例** —— 它已经实现并在真机跑通了（见「AI 媒体能力」）。
-11. **L1 示例可跑**：`plugins/builtin/image-convert` 与 `plugins/builtin/video-to-gif` 在**已实现的 28 个节点范围内**能完整执行并产出文件（后者需 ffmpeg；无 ffmpeg 时给出可操作的安装提示）。
+10. **未实现节点诚实报错** ✅ **已达成并已无对象**：`UNIMPLEMENTED_NODES` 现在是空数组，所以"内置节点尚未实现"这条错误**只剩"节点名拼错"一种成因**，而且它会明确区分"名字不在目录里（多半拼错了）"与"在目录里但还没实现"。这条验收用例因此不再需要拿某个节点当例子。
+    > 注：这条原本用 `flow.foreach` 举例。那个节点**已被删除**，现在引用它的清单在校验阶段就报 `STEP_UNKNOWN_NODE`（更早、更彻底）。
+    > **注意别再举 `image.remove-background` 或 `ai.upscale` / `doc.ocr` / `ai.describe` / `ebook.convert` 当反例** —— 它们全部已经实现（见「AI 媒体能力」）。
+11. **L1 示例可跑**：`plugins/builtin/image-convert` 与 `plugins/builtin/video-to-gif` 在节点目录范围内能完整执行并产出文件（后者需 ffmpeg；无 ffmpeg 时给出可操作的安装提示）。**32 个节点都有执行器**，所以这条不再有"撞到未实现节点"的可能。
 12. **权限门可见**：示例插件的全部能力声明能在 UI 列出，未授权能力被执行时被拒绝并给出具体原因。
 13. `pnpm icons` 全链路成功（`assets/icon-source.png` 存在）。
 
@@ -697,7 +765,7 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 3. **引擎可安装**：12 条源中的每一条在 `sha256` 回填后，`install` 能成功下载、校验、落地；`sha256` 缺失时**拒绝安装**的行为有测试守护。
 4. **许可证确认可验证**：在全新用户数据目录下首次安装/调用需要确认的引擎（如 ffmpeg、calibre、tesseract）前，必须出现许可证确认；拒绝确认时任务**不会**执行，且不留下部分产物；确认记录可在审计日志中查到。
 5. **降级可验证**：分别测「无任何外部引擎」「仅系统安装 ImageMagick」「安装 libvips」三种环境，同一图片转换任务都能完成，输出在尺寸/通道/格式上一致（编码字节允许差异）。
-   > 进度（🚧）：**「安装 libvips」一档已有真机证据**（`verify-platform.mjs`【6】断言实际后端与引擎状态一致，且该脚本 41 项全通过）；**另两档还没有专门的环境基线** —— 尤其是"仅 ImageMagick"这一档从未被单独测过。"三档输出一致"也还没有测试。
+   > 进度（🚧）：**「安装 libvips」一档已有真机证据**（`verify-platform.mjs`【6】断言实际后端与引擎状态一致，且该脚本 69 项全通过）；**另两档还没有专门的环境基线** —— 尤其是"仅 ImageMagick"这一档从未被单独测过。"三档输出一致"也还没有测试。
 6. **加速链路真实可用** ✅ **已达成**：有 libvips 的环境下，`image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个节点会真的走 libvips 而非纯 Rust，并**通过节点输出的 `backend` 与一条 debug 日志证实**（`verify-platform.mjs`【6】的核心断言就是"日志里写明了实际使用的图片后端"且"与引擎状态一致"）。对应「不一致 2」——**部分关闭**：`image.enhance` / `image.strip-metadata` 仍只有纯 Rust 路径，`ImageMagick` 档位仍无实测记录。
 7. **L2 沙箱可验证**：尝试文件读取/网络访问的 WASM 插件被拒绝并返回明确错误；分配超限内存或耗尽燃料时被终止，宿主进程存活且后续调用正常。
 8. **L2 宿主函数白名单可验证**：仅 `log` / `kv` 可调用；调用未白名单宿主函数返回「未定义函数」类错误；`allowHostFunctions` 里写其它名字在装载期即被拒绝。
@@ -722,7 +790,7 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 - [x] ✅ 骨架完成：`GenerationRequest` / `AiProviderConfig` / `ChatMessage`、系统提示词（把 32 个**真实**内置节点目录注入提示词，避免模型编造 `uses`）、`parse_model_output`（支持 `path=` 多文件代码块、裸 YAML 容错、缺 `plugin.yaml` 拒绝）
 - [x] ✅ 骨架完成：`review_draft` / `SecurityReview`（能力清单 + 可疑模式 + 风险定级；需要 L3 时直接标 `Critical` 并提示逐行阅读）
 - [ ] 🚧 接真实 provider 并端到端跑通一次生成
-- [ ] 🚧 静态校验：schema 校验、API 版本校验、**节点白名单校验（尤其要挡住 4 个未实现节点；已被删除的 `flow.foreach` 由 `STEP_UNKNOWN_NODE` 直接拦掉）**、危险模式检测
+- [ ] 🚧 静态校验：schema 校验、API 版本校验、**节点白名单校验（`UNIMPLEMENTED_NODES` 现在是空的 —— 32 个节点全部有执行器，所以这条目前只挡"节点名不在目录里"，例如已被删除的 `flow.foreach`，由 `STEP_UNKNOWN_NODE` 直接拦掉）**、危险模式检测
 - [ ] 🚧 权限差异检测：对比旧版本能力集合，**任何扩权都必须重新确认**
 - [ ] 🚧 人工 diff 审阅：强制展示差异，未确认不得落盘
 - [ ] 🚧 落盘 + 哈希锁定：生成物记录内容哈希，装载时再校验一次（`store.rs` 已有 `verify_integrity` / `quarantine_if_changed` 可复用）
@@ -737,11 +805,28 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
   - **实测数据（真机，非推断）**：托管 Python **3.11.16 / 145.2 MB / tar.gz 路径**（此前只跑过 zip 路径）；venv 自动装上 `onnxruntime-1.30.0`、`numpy-2.4.6`、`pillow-12.3.0`；对一张 **400×300**（白底 + 一个红椭圆）的测试图输出 **RGBA PNG（colorType 6）、400×300、椭圆中心 alpha 254、角落 alpha 0、前景覆盖 18.87%**（与椭圆真实面积吻合）；**运行时就绪后单张推理约 0.7 秒**（首次含 pip 约 32 秒）。
   - **测试方法上的一个坑**：**显著性模型不能用渐变图测** —— 在没有明显主体的渐变图上，模型正确报告约 0% 覆盖并让节点发一条警告。验收脚本因此改用**有真实主体**的图。
   - 参数现在是 `model` / `mode`（`alpha` | `color`）/ `background` / `threshold` / `feather`；**旧的 `alphaMatting` 已被删除**（它从登记起就没有实现，是个**假参数**）。默认模型从 `u2net`（168 MB）改成 **`u2netp`（4.4 MB）** —— "先让它跑起来"比"一上来就要下 168 MB"重要得多。
-  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（`41 项检查全通过`）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
+  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（整个脚本 **69 项检查全通过**）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
   - **配套修掉的一个引擎层缺陷**：`probe()` 原来只对 `install_modes == [Remote]` 的引擎特判，而 `onnx-models` **没有可执行文件**（它只是权重文件的宿主），于是永远探测为 `Missing` —— 结果是这个节点**永远显示不可用，哪怕用户已经把权重下好了**。现在 `probe()` 对它单独判：**至少有一个权重已安装 = 可用**。另外 `EngineInstallRequest` 新增 **`force`** 标志 + 引擎卡片上的「另外安装应用托管版本」按钮：系统 Python 3.14 会被探到、显示可用，却跑不了 `onnxruntime` —— **"探测到可用"不等于"满足这个节点的要求"**。
-- [ ] 🚧 AI 超分（`ai.upscale`，当前 `not_implemented`）—— **最有可能接着做的一个**：抠图那条"模型 + 推理"链（权重下载、`onnx-models` 判据、Python 子进程推理）都可以直接照抄，缺的是 `realesrgan-x4plus` 的下载源（哈希未核对）。另外 `ai.upscale` 的 `model` 枚举里有三个模型在 `engine_catalog()` 里**没有对应条目**（见 `docs/ENGINE-MATRIX.md` 第 6.1 节）。
-- [ ] 🚧 AI 描述（`ai.describe`，当前 `not_implemented`）—— 卡在**服务提供方的视觉能力**：`ai_test_connection` 已经能连通，但"看图说话"这一步没写。
-- [ ] 🚧 OCR（`doc.ocr`，当前 `not_implemented`）与电子书转换（`ebook.convert`，当前 `not_implemented`）—— 卡在 **tesseract** 与 **calibre**，而这两个引擎**只支持系统安装、没有配置下载源**，所以连"让用户在应用里点一下装好"都做不到。
+- [x] ✅ **AI 超分（`ai.upscale`）—— 已实现，真机跑通**
+  - 以前的写法是「🚧 AI 超分（`ai.upscale`，当前 `not_implemented`）」。它曾经是"最有可能接着做的一个"，因为可以照抄抠图那条"模型 + 推理"链 —— 这一轮正是这么做的。
+  - **执行方式**：`python` + `onnx-models` 两个必需引擎，推理交给 `crates/toolforge-engines/py/upscale.py`（同样 `include_str!` 编进二进制、运行时释放到 `<data>/cache/onnx-runtime/`）。
+  - **分块逻辑**：**256 px 分块、16 px 重叠、只取中心区域贴回**（`tile` / `overlap` 都是节点参数）。重叠让每块能看到周围上下文，"只取中心"让边缘不留接缝。脚本返回 `uncoveredRatio`（没有被任何一块覆盖到的像素比例），大于 `0.0001` 时节点会 warn —— 那属于**我们自己的分块 bug**，不该悄悄交付。
+  - **`scale=2|3` 的语义**：模型原生只有 4 倍，所以先按 4 倍推理、再用 Lanczos 缩回去。缩回来的是**模型真算出来的细节**，比直接插值好得多。报告里 `modelScale` 恒为 4，`targetScale` 才是用户要的倍数。
+  - **两个权重，都带真实下载后算出的 SHA-256**：`realesr-general-x4v3`（4.87 MB，**默认**，输入尺寸动态，单块约 26 ms）与 `realesrgan-anime6b`（18.35 MB，动漫/插画，输入尺寸同样动态）。
+  - **`realesrgan-x4plus` 被有意排除**：找到的每一份 ONNX 导出都是**固定输入尺寸**（64×64 或 128×128），要跑通必须先补上「补齐到固定尺寸 → 推理 → 裁回去」，而补边质量直接决定边缘块的结果。与其先上一个会留下网格状接缝的版本，不如先把两个动态尺寸的模型做扎实 —— 这也是它**没有配下载源**（`url` / `sha256` / `file_name` 全为 `None`）而不是"哈希没核对"的原因。见下方开放项。
+  - **它自己的形状自检**：`upscale.py` 要求输入 `[N,3,H,W]`、输出必须 3 通道、空间倍数必须是整数且 ≥ 2，否则报错并打印模型真实的输出形状。这段自检是被一次真实事故逼出来的（见「已知不一致」第 1 条）。
+  - 真机验收落在 `verify-platform.mjs` 的**【11】号检查**（尺寸是不是真的乘了倍数），另有一条反向断言：**拿抠图权重去超分必须失败、且不在磁盘上留下文件**。
+- [x] ✅ **AI 描述（`ai.describe`）—— 已实现**
+  - **执行方式**：视觉模型。图片先按 `maxSide`（默认 **1024**）缩小，再在本地重新编码成 **JPEG q85**，然后以**内联 data URL** 发送。之所以要在本地重编码：**视觉计费随像素增长**，把原始 4K 图直接发出去是白花钱，而"看图说话"不需要原始分辨率。
+  - **参数**：`instruction`（默认「用一句中文描述这张图片，并给出5个标签」）/ `maxTokens`（默认 512，本地也会按 `maxTokens × 4` 字符截断，防止某些端点无视它）/ `maxSide`（默认 1024，0 = 不缩）。
+  - **错误说破**：服务端对纯文本模型只会回一句 400，用户完全看不出问题在模型选择上。节点在错误信息里补上「很可能是这个模型不支持图片输入」并指向「设置 → AI → 模型」。另外它**在解码图片之前**就检查 AI 是否配好 —— 先花几百毫秒解码再告诉用户"没配 Key"是没必要的等待，还会让错误看起来像图片的问题。
+  - **配套示例插件** `plugins/builtin/ai-describe`（v0.1.0）：`ai.describe` → `text.replace`（把空白与标点归一成 `_`）→ `name.build` → `fs.move`，即"按图片内容重命名"。它顶部的注释如实写明**图片会上传给 AI 服务商**，并建议要完全离线就用 `image.remove-background`。插件本身**不申请 `net` 能力** —— 联网发生在宿主的节点里，不在插件进程里。
+  - 真机验收落在 `verify-platform.mjs` 的**【10】号检查**：起一个**假 OpenAI 兼容端点**（`scripts/devtools/mock-openai.mjs`），把应用的 AI 设置临时指过去（provider 用 `ollama` —— 本地提供方，**不需要 API Key**），然后断言我们**自己可控**的那部分：恰好 1 次请求、恰好 1 张图、内联 data URL、MIME `image/jpeg`、体积合理（实测约 6.9 KB）、带系统提示词、用户提示词原样送达、`stream: false`，最后验证描述真的流到了下游文件名。**跑完会还原用户的 AI 设置。** 假端点**永远不会看到真实用户图片**（见 `docs/SECURITY.md`）。
+- [x] ✅ **OCR（`doc.ocr`）与电子书转换（`ebook.convert`）—— 均已实现**
+  - **`doc.ocr`**：有 tesseract 就用它（离线、免费、快，中文质量一般）；没有就用**多模态模型**（更强、要联网计费），日志里会写明切换了。**PDF 输入被明确拒绝** —— 要先按页栅格化成图片，这条链路没做。⚠️ 参数枚举（`auto` / `tesseract` / `paddleocr`）与执行器（认 `auto` / `tesseract` / `ai`）**有一处对不上**，见下方开放项。
+  - **`ebook.convert`**：`calibre` 优先（**MOBI / AZW3 / LIT / PDF 只有它能写**），缺了退到 `pandoc`（EPUB / DOCX / FB2 / HTML / Markdown / RTF / ODT / TXT）。**关键点是"在调用前把关"**：pandoc 对认不出的输出扩展名**不报错**，只打一句 warning、写一个 HTML 出来、**保留原扩展名、退出码 0**；认不出输入格式时会把文件当纯文本读。所以执行器按两张能力表（`PANDOC_EBOOK_IN` / `PANDOC_EBOOK_OUT`）先检查，不通过就拒绝并要求装 Calibre。**"成功"的坏文件比失败更糟 —— 退出码在这里不可信。**
+  - 真机实测：epub→docx 是真正的 `PK` magic ZIP；epub→md 中文文本完整保留；epub→mobi 且无 Calibre 时**干净拒绝、磁盘零残留**。验收落在 `verify-platform.mjs` 的**【9】号检查**。
+  - 这两个引擎（tesseract / calibre）**只支持系统安装、没有配下载源**，所以 UI 只能引导用户去官网。
 - [x] ✅ **模型文件管理（下载 / 校验 / IPC 部分已完成）**：`EngineRegistry.models` 以前是一张**永远空的 map**（只有 `register_model` 能填，而无人调用），于是 UI 列出 6 个模型、每次下载都答「未在注册表里登记」。现在 `EngineRegistry::new` 直接从 `engine_catalog()` 建表（"第二真相来源"已删除），新增 IPC `models_list` / `models_install` / `models_remove`；`EngineModel` 加 `file_name`（GitHub 资产名 ≠ 模型 id，如 `isnet-general` → `isnet-general-use.onnx`），文件落在 `<data_dir>/models/<model_id>/<file_name>`。
   - `u2net` / `u2netp` / `isnet-general` 三个 rembg 权重带**真实下载后算出来的** SHA-256 与固定 tag 直链（`.../rembg/releases/download/v0.0.0/`）；**哈希不匹配就删文件**（`registry.rs::install_model`，`IntegrityCheckFailed`）。
   - 单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name **全有或全无**、哈希为 64 位小写十六进制、`file_name` 不重复。
@@ -752,7 +837,7 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 
 - [ ] 🚧 基于 React Flow（`@xyflow/react`）的节点编辑器
 - [ ] 🚧 节点 = 内置算子 / 插件节点；连线 = 数据流
-- [ ] 🚧 **未实现节点必须可视化禁用**（以 `nodes.rs` 的 28 个为准，4 个 `not_implemented` 标灰并给出原因），避免「拖出来能连、运行必失败」
+- [x] ✅ **节点灰显机制：现在没有可灰显的节点，但机制要点保留下来**。前端仍从 IPC 的 `NodeCatalogResponse.unimplemented` 取名单（**不硬编**），所以"把未实现节点标灰并给出原因"这套 UI 逻辑**仍然存在**，只是 `UNIMPLEMENTED_NODES` 为空、它永远不会命中。**不要因为名单是空的就把这段逻辑或那个常量删掉** —— 它的用途是"下次加节点却忘了实现执行器"时立刻生效（`nodes::run` 的兜底分支、节点面板灰显、以及那条遍历真实分发表的测试会一起跟上）。
 - [ ] 🚧 保存/加载流程定义，可导出为可复现的流水线描述
 - [ ] 🚧 保存前校验：非法连线、缺失参数、缺失权限
 - [x] ✅ **批量循环（`flow.foreach`）：结论是「不实现，改为删除节点 + 宿主展开」**
@@ -778,16 +863,17 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 1. `cargo test --workspace` 全绿，且 v0.1 / v0.2 的验收用例全部继续通过（**无回归**）。
 2. **生成闭环可复现**：给定同一段需求描述与固定模型版本，产出通过静态校验的插件草稿；在**未点击确认**时，磁盘上不存在该插件的最终文件（只有临时区内容）。
 3. **生成不越权**：`AiDraft` 无法自行写盘——需有一个测试证明「仅生成、不确认」不会在插件目录产生任何文件。
-4. **未实现节点被拦截**：让 AI 生成一个使用 `ai.upscale` / `doc.ocr` 的插件，必须在**静态校验阶段**就被拒绝（而不是运行时报 `not_implemented`）。
-   > 注：这条原本举 `flow.foreach`。该节点已**被删除**，引用它会报 `STEP_UNKNOWN_NODE`（同样在校验阶段，甚至早于"未实现"检查），所以用例改用两个仍然存在的未实现节点。
+4. **未实现节点被拦截** ✅ **已无对象（保留为护栏）**：`UNIMPLEMENTED_NODES` 是空数组，32 个节点都有执行器，所以"让 AI 生成一个用未实现节点的插件"这件事现在**在节点目录层面不可能**。护栏仍在两处：`STEP_UNKNOWN_NODE`（节点名不在目录里，例如已被删除的 `flow.foreach`）与 `examples_do_not_silently_use_unimplemented_nodes`（示例层面）。下次加节点而未实现执行器时，把名字加进名单即可让这条验收重新有对象。
+   > 注：这条原本举 `flow.foreach`。该节点已**被删除**，引用它会报 `STEP_UNKNOWN_NODE`。
 5. **扩权必须重新确认**：构造一个升级版本新增 `net` 能力的插件，安装时必然出现权限差异提示；拒绝后运行该插件被拒绝。
 6. **哈希锁定有效**：手工修改已落盘插件的任一文件后，加载被拒绝并提示哈希不匹配（可复用 `verify_integrity` 的既有测试）。
 7. **静态校验有效**：至少覆盖 5 类恶意/错误样本（超范围能力声明、未白名单节点、错误 API 版本、非法插件 id、参数缺失选项），全部在落盘前被拦截。
 8. **编辑器可用**：在可视化编辑器中搭一条「缩放到 1920 宽 → 转 WebP → 输出到目录」的流程，保存后关闭并重开应用，流程可加载且执行结果与手写配置一致。
-9. **编辑器诚实标注**：4 个未实现节点在编辑器中**不可放置或明确标灰**，悬停能看到「尚未实现，见 ROADMAP」。已被删除的 `flow.foreach` 不需要标灰 —— 它根本不在节点目录里。
+9. **编辑器诚实标注**：✅ **已无对象**（没有未实现节点可标）。机制仍在：编辑器从 `NodeCatalogResponse.unimplemented` 取名单、为空则全部可放置。已被删除的 `flow.foreach` 不需要标灰 —— 它根本不在节点目录里。
 10. **批量吞吐可测**：1000 张 1–2 MP 图片的批量转换任务，在公布的目标机型与目标引擎组合下达成约定的总耗时；峰值常驻内存不超过约定阈值（数值随首次基准测试结果固化并写入本文档，见下方注）。
 11. **批处理可中断且可恢复**：处理 1000 张的中途取消，已完成产物完整可用，未完成的**不留残留文件**；再次执行只处理未完成的部分，或明确说明从头开始。
-12. **AI 能力可用**：抠图与超分各在至少 3 张样例上产出符合预期（抠图边界无明显错误、超分输出尺寸与放大倍数一致）；模型许可证在首次使用前完成确认。
+12. **AI 能力可用** ✅ **已达成（抠图与超分）**：抠图与超分都已实现并真机验证 —— 抠图 400×300 测试图输出 RGBA PNG、椭圆中心 alpha 254 / 角落 0 / 前景覆盖 18.87%（与真实面积吻合），单张约 0.7 秒；超分走 Real-ESRGAN 分块推理，`verify-platform.mjs`【11】验证尺寸真的乘了倍数。抠图/超分的权重许可证经 `onnx-models` 引擎的 `requiresLicenseAck` 门确认。
+    > 仍缺的：**"在至少 3 张样例上产出符合预期"这个抽样规模没有专门记录**（目前是单张测试图 + 脚本断言），以及真实的**照片**样本（渐变合成图测不出显著性模型的问题，见 `docs/ENGINE-MATRIX.md` 第 6.7 节）。
 13. **审计可追溯**：在一次包含「AI 生成 → 审阅 → 授权 → 执行」的完整操作后，审计日志能按时间顺序还原全过程，且不含文件内容。
 
 > 注：第 10 条的定量阈值属于**待固化项**——首次基准测试完成前不写死数字；测试完成后把机型、引擎版本、耗时与内存阈值一并补入本节，避免出现无法检验的目标。
@@ -874,13 +960,13 @@ AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 M
 | 检查点 | 命令/动作 | 期望 |
 | --- | --- | --- |
 | 领域层健康 | `cargo test -p toolforge-core` | 61 通过 / 0 失败（**写本文档时的目标值**；当前全仓合计见下一行，不再逐 crate 维护） |
-| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 215 passed / 0 failed** |
+| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 214 passed / 0 failed** |
 | 全目标检查 | `cargo check --workspace --all-targets` | 退出码 0 |
 | 静态质量 | `cargo clippy --workspace -- -D warnings`、`cargo fmt --check` | 无输出 |
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | 退出码 0（需前端工程先落地） |
 | 聚合 | `pnpm check:all` | 退出码 0 |
 | 类型桥 | `pnpm bindings` 连续两次 | 第二次后 `git status` 干净（该命令同时跑 4 项守卫，含 `COMMAND_NAMES` 与注册命令的逐条核对） |
-| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **41 项检查全通过**（覆盖图片后端选择、任意角度旋转、设置落盘、模型下载、**AI 抠图整条 ONNX 链路**【8】等；【8】在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"） |
+| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **69 项检查全通过**（【1】–【11】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】；【8】【9】【11】在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"） |
 | 最小闭环 | `pnpm tauri:dev` → 图片转换任务 | 任务完成、输出存在 |
 | 引擎 | `pnpm engines:list` / `engines:install` | 能探测、能安装并通过 SHA-256 校验；**libvips 已实测装成功**（哈希回填的 6 条仍限 Windows / Linux） |
 | 图标 | `pnpm icons` | 成功（需先补 `assets/icon-source.png`） |

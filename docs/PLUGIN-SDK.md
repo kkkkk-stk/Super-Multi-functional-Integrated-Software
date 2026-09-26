@@ -8,7 +8,9 @@
 > `crates/toolforge-plugins/src/runtimes.rs` 及其子模块。
 > 代码改了这里没改就是文档的 bug，请提 issue。
 >
-> **仓库正在开发中**：标注 🚧 的能力属于"清单能写、执行器还没实现"，标 ⛔ 的表示尚未落地。
+> **仓库正在开发中**：标 ⛔ 的表示尚未落地。**节点目录已经全部实现**（32/32，
+> `UNIMPLEMENTED_NODES` 是空数组），剩下的 🚧 集中在**运行时的非节点能力**上
+> （例如 L2 的 `kv` 宿主函数、`PathScope::Explicit` 的 schema 缺陷）。
 
 ---
 
@@ -436,15 +438,16 @@ permissions:
 
 ⚠️ 两点必须先知道：
 
-1. **登记 ≠ 已实现**。下面 32 个节点都登记在节点目录里（所以流程编辑器能拖出来、
-   清单也能通过校验），但 `toolforge-engines/src/nodes.rs` 的 `run()` 目前只实现了
-   **28 个**；标 🚧 的 4 个会返回
-   「内置节点 `X` 尚未在 v0.1 中实现」（名单的唯一真相来源是
-   `toolforge_core::pipeline::UNIMPLEMENTED_NODES`）。
-   > ✅ **这条原来说的是「27 个已实现、5 个未实现」，其中一个是 `image.remove-background`。**
-   > 它现在**已经实现**（抠图的执行器 `image_remove_background`，走 Python 子进程跑 ONNX 推理），
-   > 所以从 🚧 名单里出列了。**剩下的 4 个仍然全部是未实现**：`doc.ocr`、`ebook.convert`、
-   > `ai.upscale`、`ai.describe`。
+1. **登记 = 已实现。现在没有未实现的节点了。** 下面 32 个节点都登记在节点目录里，
+   而且 `toolforge-engines/src/nodes.rs` 的 `run()` **32 个分发臂全部指向真实实现**：
+   `toolforge_core::pipeline::UNIMPLEMENTED_NODES` 是**空数组**。
+   > ✅ **这条原来说的是「32 个登记、28 个已实现，标 🚧 的 4 个会返回"尚未实现"」**（更早是 27/5、26/6）。
+   > 最后一个离队的是上一轮的 `image.remove-background`，本轮一次补齐了 `ebook.convert`、
+   > `ai.describe`、`doc.ocr`、`ai.upscale` 四个。所以**表里已经没有 🚧 节点了**。
+   > `UNIMPLEMENTED_NODES` 常量**仍然保留**（现在是空的），因为前端还靠
+   > `NodeCatalogResponse.unimplemented` 来决定"哪些节点要标灰"——
+   > **那段灰显逻辑是"休眠但保留"的**：现在永远不会命中，但下次加节点时它会立刻生效。
+   > 别因为"名单是空的"就把前端那段代码或这个常量删掉。
 2. **节点参数写在 `with` 里或 `io.params` 里都可以，`with` 优先**。
    执行器用 `ctx.param_str("format", "webp")` 这类调用取值，它会**先看当前步骤的 `with`、
    再看插件自己的 `io.params`（按同名 id）、最后回退默认值**（见 `NodeCtx::arg_scope`）。
@@ -522,7 +525,7 @@ permissions:
 
 ### 3.3 视频（`video`）与音频（`audio`）
 
-| 节点名 | 中文名 | 必需引擎 | 参数 id | 说明 🚧=未实现 |
+| 节点名 | 中文名 | 必需引擎 | 参数 id | 说明 |
 |---|---|---|---|---|
 | `video.transcode` | 视频转码 | ffmpeg | `container`、`vcodec`、`acodec`、`crf`、`preset`、`hwaccel` | 完整实现 |
 | `video.extract-audio` | 提取音频 | ffmpeg | `format`、`bitrate` | 完整实现 |
@@ -538,15 +541,33 @@ permissions:
 |---|---|---|---|---|---|
 | `doc.convert` | 文档格式转换 | pandoc | — | `to`、`standalone`、`toc`、`extraArgs` | Markdown/HTML/DOCX/EPUB/LaTeX 互转 |
 | `doc.to-pdf` | 转 PDF（Office） | libreoffice | — | `format` | Word/Excel/PPT → PDF |
-| `doc.ocr` | OCR 文字识别 🚧 | python | tesseract | `engine`、`lang` | **v0.1 未实现** |
+| `doc.ocr` | OCR 文字识别 | python | tesseract | `engine`、`lang` | **已实现**。有 tesseract 就走它（离线、免费、快）；没有就用**多模态模型**（更强但要联网计费）。`engine` 默认 `auto`；`lang` 默认 `chi_sim+eng`。**PDF 输入会被明确拒绝**（要按页栅格化，那条链路没做）。输出可引用 `text` 与 `backend`（`tesseract` 或 `ai-vision`）。见下方说明 |
 | `archive.pack` | 打包压缩 | 7zip | — | `format`、`level`、`password` | zip / 7z / tar / tar.gz / tar.xz |
 | `archive.unpack` | 解压 | 7zip | — | `password`、`keepStructure` | 内置 Zip Slip 防护 |
-| `ebook.convert` | 电子书转换 🚧 | — | calibre、pandoc | `format`、`title`、`author` | **v0.1 未实现** |
-| `ai.upscale` | AI 超分辨率 🚧 | python、onnx-models | — | `model`、`scale` | **v0.1 未实现** |
-| `ai.describe` | AI 图像描述 🚧 | ai-provider | — | `instruction`、`maxTokens` | **v0.1 未实现** |
+| `ebook.convert` | 电子书转换 | — | calibre、pandoc | `format`、`title`、`author` | **已实现**。`calibre` 优先（MOBI/AZW3/LIT/PDF 只有它能写），缺了退到 `pandoc`（EPUB/DOCX/FB2/HTML/Markdown/RTF/ODT/TXT）。**超出 pandoc 能力表的格式会在调用前被拒绝**（理由见下）。输出可引用 `backend`（`calibre` / `pandoc`） |
+| `ai.upscale` | AI 超分辨率 | python、onnx-models | — | `model`、`scale`、`tile`、`overlap` | **已实现**。Real-ESRGAN 分块推理。`model` 默认 `realesr-general-x4v3`（4.9 MB，可换 `realesrgan-anime6b`）；`scale` 默认 4（可选 2/3 —— **先用 4 倍推理再 Lanczos 缩回去**）；`tile` 默认 256、`overlap` 默认 16。输出可引用 `path`、`model`、`backend`、`width`、`height`。**纯本地推理，不上传图片** |
+| `ai.describe` | AI 图像描述 | ai-provider | — | `instruction`、`maxTokens`、`maxSide` | **已实现**。调视觉模型生成描述与标签。`maxSide` 默认 1024（发送前把最长边缩到这个值再转 **JPEG q85** 内联发送，因为视觉计费随像素增长）；`maxTokens` 默认 512。输出可引用 `text` 与 `model`。⚠️ **需要视觉模型**（纯文本模型会回 400），且**图片会上传给 AI 服务商**，见 `docs/SECURITY.md` |
 | `flow.branch` | 条件分支 | — | — | `condition` | 见下方说明 |
 | `flow.set-var` | 设置变量 | — | — | `name`、`value` | 写入流水线变量；产出 `${steps.<id>.value}` |
 | `flow.log` | 写日志 | — | — | `message`、`level` | 见下方说明 |
+
+> ⚠️ **`ebook.convert` 为什么必须"在调用前"把关，而不是相信子进程的退出码**：
+> pandoc 对认不出的输出扩展名**不报错** —— 它打一句
+> `[WARNING] Could not deduce format from file extension .mobi` + `Defaulting to html`，
+> 然后**退出码 0**、文件也真的生成了，只是那是一个 HTML 文件被命名成了 `.mobi`。
+> 认不出**输入**格式时更糟：它会把文件当纯文本读，产出垃圾。
+> 所以执行器先按两张能力表（`PANDOC_EBOOK_IN` / `PANDOC_EBOOK_OUT`）检查扩展名，
+> 不通过就直接拒绝并要求装 Calibre。**"成功"的坏文件比失败更糟** —— 这一条值得记在脑子里。
+>
+> **`ai.describe` / `doc.ocr` 的 AI 路径要你先把 AI 配好**：没配服务商或 API Key 时它们
+> 会在**解码图片之前**就报错（先花几百毫秒解码再告诉用户"没配 Key"是没必要的等待，
+> 还会让错误看起来像图片的问题）。`ai.describe` 在服务端回 400 时会额外提示
+> 「很可能是这个模型不支持图片输入」，并让你去换视觉模型。
+>
+> ⚠️ **`doc.ocr` 的参数枚举与实现有一处对不上**：节点目录里 `engine` 的选项是
+> `auto` / `tesseract` / `paddleocr`，而执行器认的是 `auto` / `tesseract` / **`ai`**（`paddleocr`
+> 既没实现、也不在错误提示里）。所以现在**别写 `paddleocr`**；要强制走 AI 就写 `ai`。
+> 节点描述里那句「装了 PaddleOCR 时质量更高」目前只是文案，没有对应实现。
 
 > ⚠️ 这里原来还有一行 `flow.foreach`（批量循环）。**这个节点已经被整个删除**，
 > 不是"留着不实现" —— 所以清单里写 `uses: flow.foreach` 现在会直接**校验不过**
@@ -586,14 +607,18 @@ permissions:
 | `image.resize` | `width`、`height`、`backend` |
 | `image.crop` | `width`、`height`、`backend` |
 | `image.rotate` | `width`、`height`、`backend` |
+| `ai.upscale` | `path`、`model`、`backend`（恒为 `onnx-python`）、`width`、`height` |
+| `ai.describe` | `text`（模型给的描述）、`model`（实际使用的模型名） |
+| `doc.ocr` | `text`（识别出的文字）、`backend`（`tesseract` 或 `ai-vision`） |
+| `ebook.convert` | `backend`（`calibre` 或 `pandoc`） |
 | `fs.copy`、`fs.move` | `path` |
 | `image.convert` | `path`、`backend` |
 | `fs.mkdir` | `path` |
 | `archive.unpack` | `path` |
 | `flow.set-var` | `value` |
-| 其它（如 `video.thumbnail`、`video.transcode`） | **没有可引用的值** —— 只能通过 `${output.<portId>}` 传路径 |
+| 其它（如 `video.thumbnail`、`video.transcode`、`image.remove-background`） | **没有可引用的值** —— 只能通过 `${output.<portId>}` 传路径 |
 
-**`backend` 是什么**：`image.convert` / `image.resize` / `image.crop` / `image.rotate` 会报出**实际使用的图像后端**，取值为 `"libvips"` / `"imagemagick"` / `"rust"`。它让"到底走没走 libvips"这件事变成流程内可判断的事实，例如后续步骤可以写 `when: ${steps.conv.backend} == rust` 来做"纯 Rust 路径下的补偿处理"。`image.enhance` 与 `image.strip-metadata` **不产出这个值**（它们不参与三层降级）。
+**`backend` 是什么**：`image.convert` / `image.resize` / `image.crop` / `image.rotate` 会报出**实际使用的图像后端**，取值为 `"libvips"` / `"imagemagick"` / `"rust"`。它让"到底走没走 libvips"这件事变成流程内可判断的事实，例如后续步骤可以写 `when: ${steps.conv.backend} == rust` 来做"纯 Rust 路径下的补偿处理"。`image.enhance` 与 `image.strip-metadata` **不产出这个值**（它们不参与三层降级）；`ebook.convert` / `doc.ocr` / `ai.upscale` 也各有自己的 `backend` 值，含义见上表 —— 名字一样，但**取值域不一样**，别拿一个节点的取值去判断另一个节点。
 
 **因此：想做"多步文件接力"，正确做法是给插件声明两个输出端口，用
 `${output.frame}` / `${output.dst}` 传路径，而不是指望 `${steps.frame.dst}`。**
@@ -1010,7 +1035,7 @@ runtime:
 | 错误码 / 现象 | 原因 | 修法 |
 |---|---|---|
 | `ENGINE_MISSING`（`subject` 是引擎 id） | 节点需要的引擎没装。受影响的节点见第 3 节 | 在「引擎管理」里安装；或换用无引擎依赖的节点 |
-| `内置节点 \`X\` 尚未在 v0.1 中实现` | 你用了 🚧 的节点 | 见 3.2~3.4 的实现状态列；当前请改用已实现的节点或写 L3 |
+| `内置节点 \`X\` 尚未在 v0.1 中实现` | **现在只剩一种成因：节点名拼错了**。名单（`UNIMPLEMENTED_NODES`）是空的，所以正常路径下不该再看到这句话；报错会把"名字不在目录里"与"确实没实现"分开说 | 先逐字核对 `uses`。若确认名字没错，说明你用的是给更新版本写的清单，请对照 3. 的全表 |
 | `模板变量 \`${x}\` 无法解析` | 变量名写错，或引用了不存在的端口/参数 | 对照 1.6 的变量表；注意 `${dst}` 只在输出端口唯一时才可靠 |
 | `路径逃逸被拦截` | 路径解析后落在授权目录之外（相对路径的 `..`、或根**之外**的绝对路径） | 用授权目录内的路径。`${src}` / `${output.<端口>}` 本身就是绝对路径，正常使用即可；**别自己编宿主机路径** |
 | ~~`插件不允许使用绝对路径`~~ | ⛔ **这条错误已经不存在了** | 它曾是个发布级 bug：宿主自己往流水线里注入绝对路径却又拒绝绝对路径，导致任何真实转换都失败。现在绝对路径只要落在授权根内就放行 |
@@ -1047,7 +1072,7 @@ runtime:
 
 | 想看什么 | 去哪里 |
 |---|---|
-| 可以直接抄的完整例子 | `plugins/builtin/image-convert/`（L1 单节点）、`plugins/builtin/video-to-gif/`（L1 多步 + `${steps.x.y}`）、`plugins/builtin/batch-rename/`（批量编号形状：`${batch.index}` + `${src.stem}`）、`plugins/builtin/remove-bg/`（**引擎依赖 + 模型选择 + 需要一次联网准备的节点**，v0.2.0：默认模型 `u2netp`，参数与节点逐字对齐，顶部如实写明首次运行要下权重与 Python 依赖）、`plugins/wasm-example/`（L2）、`plugins/python-example/`（L3） |
+| 可以直接抄的完整例子 | `plugins/builtin/image-convert/`（L1 单节点）、`plugins/builtin/video-to-gif/`（L1 多步 + `${steps.x.y}`）、`plugins/builtin/batch-rename/`（批量编号形状：`${batch.index}` + `${src.stem}`）、`plugins/builtin/remove-bg/`（**引擎依赖 + 模型选择 + 需要一次联网准备的节点**，v0.2.0：默认模型 `u2netp`，参数与节点逐字对齐，顶部如实写明首次运行要下权重与 Python 依赖）、`plugins/builtin/ebook-convert/`（**可选引擎降级 + "pandoc 会假装成功"的拦停**）、`plugins/builtin/ai-describe/`（**AI 描述 → 文本净化 → 拼名 → 改名**：`ai.describe` + `text.replace` + `name.build` + `fs.move` 四步，是"用描述当文件名"的标准形状，也演示了 `onError: continue` 与 300 秒流水线超时的取舍）、`plugins/builtin/image-upscale/`（**超分 + 纯本地 ONNX 推理**）、`plugins/wasm-example/`（L2）、`plugins/python-example/`（L3） |
 | 引擎与许可证矩阵、降级路径 | `docs/ENGINE-MATRIX.md` |
 | 架构与数据流 | `docs/ARCHITECTURE.md` |
 | 安全模型与权限风险 | `docs/SECURITY.md` |

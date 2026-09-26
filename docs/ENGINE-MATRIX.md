@@ -13,15 +13,16 @@
 
 | 数据 | 权威来源 | 内容 |
 | --- | --- | --- |
-| 引擎目录（11 个）与模型清单（6 个） | `engine_catalog()`，位于 `crates/toolforge-core/src/engine.rs` | 返回 `Vec<EngineDescriptor>`：引擎的许可证、许可证注意事项、体积、安装方式、支持平台、`provides` 能力标签 |
+| 引擎目录（11 个）与模型清单（8 个） | `engine_catalog()`，位于 `crates/toolforge-core/src/engine.rs` | 返回 `Vec<EngineDescriptor>`：引擎的许可证、许可证注意事项、体积、安装方式、支持平台、`provides` 能力标签；每个 `EngineModel` 还带 `usedBy`（这个权重是给哪个节点用的，**逐条写明，不再推断**） |
 | 内置节点目录（32 个） | `builtin_nodes()`，位于 `crates/toolforge-core/src/pipeline.rs` | 返回 `Vec<NodeDescriptor>`：每个节点的 `requiresEngines`（必需引擎）与 `optionalEngines`（可选引擎），是本文档第 5 节降级矩阵的唯一依据 |
+| 未实现节点名单（**0 个**） | `UNIMPLEMENTED_NODES`，同样位于 `crates/toolforge-core/src/pipeline.rs` | 返回 `&[&str]`。**现在是空数组**：32 个内置节点全都有执行器。这个常量刻意**保留**，因为前端仍通过 `NodeCatalogResponse.unimplemented` 拿它来决定"节点要不要标灰" —— 删掉它会让那句"该能力尚未实现"的提示失去数据来源 |
 
 **维护约定：改代码必须同步改本文档。**
 
 - 在 `engine_catalog()` 里新增、删除或改名引擎 → 必须同步更新第 2 节与第 3 节。
 - 修改 `EngineModel` 的 `license` 或 `commercialUse` → 必须同步更新第 4 节，尤其是「不可商用」的标注。
 - 修改 `NodeDescriptor` 的 `requiresEngines` / `optionalEngines` → 必须同步更新第 5 节。
-- `crates/toolforge-core/src/engine.rs` 中已有测试 `every_provided_capability_maps_to_a_real_node`（引擎声明的能力必须都有对应节点）和 `every_node_engine_reference_exists_in_catalog`（节点引用的引擎必须都在引擎目录里）在守护这两份数据的一致性。本文档就是这两个测试的说明版本。
+- `crates/toolforge-core/src/engine.rs` 中已有测试 `every_provided_capability_maps_to_a_real_node`（引擎声明的能力必须都有对应节点）与 `every_node_engine_reference_exists_in_catalog`（节点引用的引擎必须都在引擎目录里）在守护前两份数据的一致性。第三份（权重的 `used_by`）由 `verified_sources_are_pinned` 里新增的一段断言守护：每个权重必须写明非空的 `used_by`，且它声明的每个节点名都必须在 `builtin_nodes()` 里真实存在。本文档就是这些测试的说明版本。
 
 ### 1.2 实现状态（以仓库实际文件为准）
 
@@ -29,29 +30,31 @@
 
 | 组件 | 落地状态（快照） | 依据文件 |
 | --- | --- | --- |
-| `crates/toolforge-core` | 已落地 | 11 个源文件（`lib.rs` + 10 个模块），含 `src/engine.rs`（引擎目录）与 `src/pipeline.rs`（32 个内置节点） |
-| `crates/toolforge-engines` | 已落地 | `Cargo.toml`、`src/lib.rs`、`src/registry.rs`、`src/nodes.rs`（节点执行实现）、`engine-sources.json` |
+| `crates/toolforge-core` | 已落地 | 12 个源文件（`lib.rs` + 11 个模块），含 `src/engine.rs`（引擎目录）、`src/pipeline.rs`（32 个内置节点）与 `src/ai.rs`（`VisionClient` 抽象，见 3.6） |
+| `crates/toolforge-engines` | 已落地 | `Cargo.toml`、`src/lib.rs`、`src/registry.rs`、`src/nodes.rs`（节点执行实现）、`engine-sources.json`、`py/rembg.py` 与 `py/upscale.py`（两个推理脚本，都用 `include_str!` 编进二进制） |
 | `crates/toolforge-process` | 已落地 | `src/lib.rs`、`src/exec.rs`、`src/rpc.rs`、`src/supervisor.rs` |
 | `crates/toolforge-plugins` | **已补齐** | 7 个源文件：`lib.rs`、`audit.rs`、`store.rs`、`l1.rs`、`runtimes.rs`、`runtimes/wasm.rs`、`runtimes/python.rs`（编写本文档时只有前 3 个） |
 | `crates/toolforge-ai` | **已补齐** | 3 个源文件：`lib.rs`、`provider.rs`、`review.rs`（编写本文档时目录尚不存在） |
-| `apps/desktop` | **已补齐后端** | `src-tauri/src/` 下有 `main.rs`、`lib.rs`、`commands.rs`、`ipc.rs`、`state.rs`、`bin/`；**但前端 `apps/desktop/src/` 仍不存在** |
+| `apps/desktop` | **已落地** | `src-tauri/src/` 下有 `main.rs`、`lib.rs`、`commands.rs`、`ipc.rs`、`state.rs`、`settings_store.rs`、`bin/`；前端 `apps/desktop/src/` 也已存在（`lib/ipc.ts` 是唯一 IPC 出口，`bindings.ts` 由 specta 生成并入库） |
 
 有两点必须讲清楚：
 
 1. **本文档最早写作时没有运行过 `cargo build` / `cargo test`**，因此当时不对「当前能否构建成功」下结论。可以确认的是：根 `Cargo.toml` 的 `members = ["crates/*", "apps/desktop/src-tauri"]` 现在都有对应目录。
-   > ✅ **已更新（现在有实测数据了）**：`cargo test --workspace` 的 Rust 测试为 **215 passed / 0 failed**；`scripts/devtools/verify-platform.mjs`（`scripts/devtools/run.mjs` 里的第 5 个脚本）**41 项检查全通过**，其中【6】号检查就是盯着"图片后端到底有没有真的被调用"，【7】号检查盯着任意角度旋转会不会静默取整，【8】号检查盯着**抠图这条 ONNX 链路能不能真的出透明背景**。
-   > 所以**第 5 节的降级矩阵现在是混合状态**：图像域的 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 四行已经是**实测行为**（见 5.1），`image.remove-background` 也已有端到端实测（见 3.2、5.2），其余各行仍然只是 `builtin_nodes()` 声明的引擎依赖关系，不是经测试验证的运行时行为。（相关编译阻塞与实测结论见 `docs/ROADMAP.md` 的「当前阻塞项」。）
+   > ✅ **已更新（现在有实测数据了）**：`cargo test --workspace` 的 Rust 测试为 **214 passed / 0 failed**；`scripts/devtools/verify-platform.mjs`（`scripts/devtools/run.mjs` 里的第 5 个脚本）**69 项检查全通过**（覆盖【1】–【11】），其中【6】号检查就是盯着"图片后端到底有没有真的被调用"、【7】号检查盯着任意角度旋转会不会静默取整、【8】号检查盯着**抠图这条 ONNX 链路能不能真的出透明背景**、【9】号盯着电子书转换的降级与拦停、【10】号用假 AI 端点验证图像描述的请求形状、【11】号盯着超分是不是真的按倍数放大。
+   > **节点层面已经没有"未实现"这回事了**：`builtin_nodes()` 登记 32 个，`nodes.rs::run()` 的 32 个分发臂全都指向真实实现，`UNIMPLEMENTED_NODES` 是**空数组**。第 5 节的降级矩阵里，图像域的四行、抠图、电子书、超分、OCR、图像描述都已有实测或明确的失败路径；其余各行仍然只是 `builtin_nodes()` 声明的引擎依赖关系，不是经测试验证的运行时行为（例如本机没有 ImageMagick，"仅 ImageMagick"这一档始终没有单独的环境基线）。（相关实测结论见 `docs/ROADMAP.md` 的「当前阻塞项」与「基线再更新」。）
 2. 本文档因此同时承担两个角色：**引擎层规格说明**（现在就能定下来的接口契约：有哪些引擎、能力边界、许可证约束、降级规则）与**待实现清单**（第 6 节列出尚未落地的部分与已知的数据不一致）。
 
 > 核对说明：任务简报假定「仓库目前只存在 `crates/toolforge-core`，`toolforge-engines` / `toolforge-process` / `toolforge-plugins` / `toolforge-ai` 以及 `apps/desktop` 都还没落地」。实际核对后，这些组件中的多数已经存在（其中一部分正是在核对期间被并行写入的）。本节按仓库实际文件撰写，未沿用该假定。
 
-### 1.3 下载地址与校验哈希：三个有、三个刻意没有
+### 1.3 下载地址与校验哈希：八个模型，五个有、三个刻意没有
 
-`EngineModel` 结构体（`crates/toolforge-core/src/engine.rs`）中，`url` / `sha256` / `file_name` 都是 `Option<String>`。`onnx-models` 的 6 个模型**不再是"全部为 `None`"**：
+`EngineModel` 结构体（`crates/toolforge-core/src/engine.rs`）中，`url` / `sha256` / `file_name` 都是 `Option<String>`。`onnx-models` 现在的模型清单是 **8 个**（抠图 5 个 + 超分 3 个），其中 **5 个有完整来源**：
 
-- **`u2net`、`u2netp`、`isnet-general` 三个已有完整来源**：`url` 指向 `https://github.com/danielgatis/rembg/releases/download/v0.0.0/<资产名>`（release tag 字面就是 `v0.0.0`），`sha256` 是**真实下载后自己算出来的**，不是从网页抄的；`file_name` 单独一个字段，因为 GitHub 的资产名与模型 id **并不一致**（`isnet-general` 的资产是 `isnet-general-use.onnx`）。文件落在 `<data_dir>/models/<model_id>/<file_name>`。
-- **`birefnet-general`、`modnet-portrait`、`realesrgan-x4plus` 三个刻意没有 url/hash**（`url: None` / `sha256: None` / `file_name: None`）。这是**有意的**：哈希还没核对过，而放一个"没核对过的哈希"等于放一个必然失败的下载按钮。UI 对它们显示「无下载源」并把下载按钮**置灰**。
-- 单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name **三者全有或全无**，哈希必须是 64 位小写十六进制，且 `file_name` 不得重复。
+- **`u2net`、`u2netp`、`isnet-general` 三个抠图权重已有完整来源**：`url` 指向 `https://github.com/danielgatis/rembg/releases/download/v0.0.0/<资产名>`（release tag 字面就是 `v0.0.0`），`sha256` 是**真实下载后自己算出来的**，不是从网页抄的；`file_name` 单独一个字段，因为 GitHub 的资产名与模型 id **并不一致**（`isnet-general` 的资产是 `isnet-general-use.onnx`）。
+- **`realesr-general-x4v3`、`realesrgan-anime6b` 两个超分权重也有完整来源**：它们从 Hugging Face 取（`resolve/main/<资产名>`），哈希同样是**真实下载后算出来的**。这两条的输入尺寸都是**动态**的，所以不需要切块补边就能对任意尺寸直接推理 —— 这也是它们被选为默认与备选的原因（见第 4 节）。
+- 文件统一落在 `<data_dir>/models/<model_id>/<file_name>`。
+- **`birefnet-general`、`modnet-portrait`、`realesrgan-x4plus` 三个刻意没有 url/hash**（`url: None` / `sha256: None` / `file_name: None`）。`birefnet-general` 与 `modnet-portrait` 缺的是"还没核对过的哈希"；**`realesrgan-x4plus` 的原因完全不同**，它缺的是**能用的 ONNX 导出**：找到的每一份 x4plus 导出都是**固定输入尺寸**（64×64 或 128×128），要跑通必须先补上"补齐到固定尺寸 → 推理 → 裁回去"这一步，而补边质量直接决定边缘块的结果。与其先上一个会留下网格状接缝的版本，不如先把两个动态尺寸的模型做扎实。UI 对这三条显示「无下载源」并把下载按钮**置灰**。
+- 单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name **三者全有或全无**，哈希必须是 64 位小写十六进制，且 `file_name` 不得重复；同一个测试里还要求 `url` **必须以 `file_name` 结尾**，并要求每条权重写明非空的 `used_by`。
 
 ```rust
 // 代码里 URL 用常量拼接：url: Some(format!("{REMBG_RELEASE}/u2net.onnx"))
@@ -66,10 +69,13 @@ EngineModel {
     sha256: Some("8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491".into()),
     file_name: Some("u2net.onnx".into()),
     installed: false,
+    used_by: vec!["image.remove-background".into()],
 },
 ```
 
-**结论：只有上面三个模型能在本文档里写出具体的 URL 与 SHA-256**（第 4 节逐条列出）。其余三个模型的这两列继续标注「待定」，因为代码里就是 `None` —— 写进本文档就是臆造。补齐它们必须先核对真实哈希，再改代码，最后同步本文档（1.1 的维护约定）。
+**结论：上面五个模型能在本文档里写出具体的 URL 与 SHA-256**（第 4 节逐条列出）。剩下三个模型的这两列继续标注「待定」，因为代码里就是 `None` —— 写进本文档就是臆造。补齐它们必须先核对真实哈希（x4plus 还得先解决固定输入尺寸），再改代码，最后同步本文档（1.1 的维护约定）。
+
+**`used_by` 这个字段值得单独说一句**：它记的是"这个权重是给哪个节点用的"，而且是**逐条手写**的。在此之前归属是**推断**出来的（"这个权重属于哪个引擎，就服务于那个引擎声明的能力"），而 `onnx-models` 同时承载抠图与超分 —— 推断于是把 `u2netp`（一个分割模型）也算成了 `ai.upscale` 的来源。`models_list` 现在直接读 `used_by`，不再做任何推断。
 
 另外有两点必须如实说明：
 
@@ -110,9 +116,9 @@ EngineModel {
 | `7zip` | 7-Zip（核心引擎） | 压缩解压，覆盖 zip / 7z / rar / tar 等格式。 | `LGPL-2.1+（含 unRAR 限制条款）` | unRAR 代码禁止用于开发 RAR 压缩器；解压用途不受影响。 | 约 5 MB | **仅探测系统已安装**（下载源已移除，见 1.3 节） | `archive.pack`<br>`archive.unpack` | Windows / macOS / Linux | 否 |
 | `calibre` | Calibre | 电子书格式转换与元数据管理（EPUB / MOBI / AZW3）。 | `GPL-3.0` | GPL-3.0 为强 copyleft。仅以独立进程调用；如要随包分发请先做合规评审。 | 约 180 MB | 仅探测系统已安装 | `ebook.convert` | Windows / macOS / Linux | 是 |
 | `python` | Python 运行时 | L3 插件的执行环境（独立 3.11 运行时，与系统 Python 隔离）。 | `PSF-2.0` | 宽松许可；注意随包分发的第三方 wheel 各自的许可证。 | 约 150 MB | 应用按需下载 | `image.remove-background`<br>`ai.upscale`<br>`doc.ocr` | Windows / macOS / Linux | 否 |
-| `onnx-models` | ONNX 模型包 | 抠图 / 超分 / 分割用的模型权重。**不随安装包分发，首次使用时下载**。 | `各模型不同（见下表）` | 代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。 | 约 180 MB | 应用按需下载 | `image.remove-background`<br>`ai.upscale` | Windows / macOS / Linux | 是 |
+| `onnx-models` | ONNX 模型包 | 抠图 / 超分 / 分割用的模型权重。**不随安装包分发，首次使用时下载**。 | `各模型不同（见下表）` | 代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。 | 约 180 MB（引擎级估算） | 应用按需下载 | `image.remove-background`<br>`ai.upscale` | Windows / macOS / Linux | 是 |
 | `tesseract` | Tesseract OCR | 离线 OCR。中文识别质量一般，但完全免费且无需联网。 | `Apache-2.0` | 语言数据包（tessdata）另有许可，chi_sim 为 Apache-2.0。 | 约 60 MB | 仅探测系统已安装 | `doc.ocr` | Windows / macOS / Linux | 否 |
-| `ai-provider` | AI 服务提供方 | OpenAI 兼容接口的大模型服务，用于插件生成、图像描述等。 | `依服务商条款` | API Key 只存在本机加密存储中，不会随插件或日志外泄。**⚠️ 这句注意事项原文已过期**（没有加密存储、没有钥匙串；见 3.6） | 约 0 MB（无本地二进制） | 远程服务无本地二进制 | `ai.describe` | Windows / macOS / Linux | 否 |
+| `ai-provider` | AI 服务提供方 | OpenAI 兼容接口的大模型服务，用于插件生成、图像描述等。 | `依服务商条款` | API Key 默认只存在内存里（重启要重填）。打开「记住 API Key」后会以**明文**另存到数据目录下的 `ai-key.txt` —— 系统钥匙串尚未接入。它不会随插件或日志外泄。 | 约 0 MB（无本地二进制） | 远程服务无本地二进制 | `ai.describe` | Windows / macOS / Linux | 否 |
 
 ### 2.1 总表读法
 
@@ -163,17 +169,34 @@ EngineModel {
 
 #### Python 运行时 + ONNX 模型包（抠图与超分）—— **ONNX 路径，不属于三层降级链**
 
-- 见 3.6 中的 `python` 与 `onnx-models` 条目。图像域的 `image.remove-background`（抠图去背景）**同时要求两个引擎**（`requiresEngines: ["python", "onnx-models"]`），任一缺失即不可用，且没有降级路径。
-- **它不属于上面那张 `libvips → ImageMagick → 纯 Rust` 的表**。这一条很容易被误读，必须写清楚：**抠图是第四条路（ONNX 推理），三层降级一格都不覆盖它。** libvips / ImageMagick 再全，也做不了"从图里判断哪个像素是主体"这件事——那是模型的工作，不是图像处理库的工作。反过来，装齐两个引擎也**不会**让抠图在缺 libvips 时变慢，因为它压根不经过 `pick_image_backend()`。
-- **执行方式**：`nodes.rs::image_remove_background` 不自己做推理，而是把推理交给一个 **Python 子进程**（`python` 引擎）。
-  - 推理脚本是 `crates/toolforge-engines/py/rembg.py`，用 `include_str!` 编进二进制，运行时释放到 `<data>/cache/onnx-runtime/rembg.py`。**刻意不做成 Tauri 的 bundle resource**：资源路径在开发态 / 打包态 / 各平台之间都不一样，而这个脚本只有几 KB，一旦"从包里找不到"就是一个极难查的运行时故障——编进二进制就不会丢。
+- 见 3.6 中的 `python` 与 `onnx-models` 条目。图像域的 `image.remove-background`（抠图去背景）与 `ai.upscale`（AI 超分）**都同时要求两个引擎**（`requiresEngines: ["python", "onnx-models"]`），任一缺失即不可用，且没有降级路径。
+- **它们不属于上面那张 `libvips → ImageMagick → 纯 Rust` 的表**。这一条很容易被误读，必须写清楚：**这是第四条路（ONNX 推理），三层降级一格都不覆盖它。** libvips / ImageMagick 再全，也做不了"从图里判断哪个像素是主体"或者"把细节补出来"这两件事——那是模型的工作，不是图像处理库的工作。反过来，装齐两个引擎也**不会**让推理在缺 libvips 时变慢，因为它们压根不经过 `pick_image_backend()`。
+- **执行方式**：两个节点都不自己做推理，而是把推理交给一个 **Python 子进程**（`python` 引擎），并各自带一个推理脚本。
+  - 抠图用 `crates/toolforge-engines/py/rembg.py`；超分用 `crates/toolforge-engines/py/upscale.py`。两者都用 `include_str!` 编进二进制，运行时释放到 `<data>/cache/onnx-runtime/`。**刻意不做成 Tauri 的 bundle resource**：资源路径在开发态 / 打包态 / 各平台之间都不一样，而这些脚本只有几 KB，一旦"从包里找不到"就是一个极难查的运行时故障——编进二进制就不会丢。
   - **为什么不写在 Rust 里**：Rust 的 ONNX 绑定 `ort` 会在**构建期**下载预编译原生库。那会让离线 / 内网构建直接失败，而"构建失败"的代价远大于"多一个运行时依赖"。Python 的 `onnxruntime` 是成熟、可验证、进程内隔离的路径，而且 L3 插件运行时本来就要求一个受管 Python——复用它不引入新的东西。
-- **首次运行要准备两件事**，都会写进任务日志：
+- **超分的分块逻辑（`upscale.py`）与它自己的自检**：
+  - **256 px 分块、16 px 重叠、只取中心区域贴回**（`tile` / `overlap` / `scale` 都是节点参数）。重叠的意义是让每块推理时都能看到周围上下文，而"只取中心贴回"是为了让边缘不留接缝。
+  - 脚本会返回一份 JSON 报告，节点读它并入日志：`modelScale`（模型真实的放大倍数）、`targetScale`（用户要的倍数）、`uncoveredRatio`（**没有任何一块覆盖到的像素比例**）。`uncoveredRatio > 0.0001` 时节点会发一条 warn —— 那种情况属于**我们自己的分块 bug**，不该悄悄交付给用户。
+  - **`scale=2|3` 的语义是"先用 4 倍推理，再用 Lanczos 缩回去"**：模型原生只有 4 倍，但缩回来的是**模型真算出来的细节**，比直接插值好得多。所以报告里 `modelScale` 恒为 4，`targetScale` 才是用户要的那个。
+  - **脚本会自己验模型**：输入张量必须是 `[N,3,H,W]`、输出必须是 **3 通道**、输出的空间倍数必须是**整数且 ≥ 2**；不满足就**报错退出并打印模型真实的输出形状**。这段自检是被一次真实的错误逼出来的 —— 详见 3.2 的"一个全绿但结果是垃圾的检查"。
+- **首次运行要准备两件事**，两个节点共用同一套准备（都会写进任务日志）：
   1. **模型权重**：用户在「设置 → 引擎管理 → 模型权重」里自己下（见第 4 节）。节点不会替用户偷偷下载权重。
   2. **依赖**：应用会在 `<data>/cache/onnx-runtime/` 下**另建一个独立 venv**，`pip install onnxruntime numpy pillow`（约 30 MB，一次性）。用独立 venv 是为了**不动用户自己的 Python**，卸载也只是删掉这个目录。
-  - ⚠️ **这一步需要联网**。第一次跑抠图时才会发生，而且只有这一个节点会触发；此后推理**完全本地、不联网、不上传图片**。**没有网络的机器在依赖就位之前用不了这个节点。**
+  - ⚠️ **这一步需要联网**。第一次跑这两个节点之一时才会发生；此后推理**完全本地、不联网、不上传图片**。**没有网络的机器在依赖就位之前用不了这两个节点。**（与 `ai.describe` / `doc.ocr` 的 AI 路径相反：那两个**会把图片上传给 AI 服务商**，见 `docs/SECURITY.md`。）
 - **Python 版本要求：3.9 ~ 3.13**。原因是 `onnxruntime` 没有 3.14 的 wheel。若机器上只有 3.14，节点会返回一条明确的 `EngineMissing`，告诉用户去装应用托管的 Python 3.11，而不是抛一个看不懂的 pip 报错。
 - **「探测到可用」不等于「满足我的要求」**：系统里那个 3.14 会被引擎管理显示为"可用"，但它跑不了 onnxruntime。因此 `EngineInstallRequest` 增加了 **`force`** 标志：`force: true` 会跳过「已经可用，不用下载」的短路，让用户**在系统 Python 之外**再装一份应用托管的副本。引擎卡片上对应一个「另外安装应用托管版本」按钮（当 `status.source === "system"` 且 `entry.managedAvailable` 时显示），背后是 `EngineEntry.managedAvailable` 与 `EngineRegistry::has_download_source()`。
+
+#### ⚠️ 一个全绿但结果是垃圾的检查（这一课值得单独记下来）
+
+这是本项目迄今最有教育意义的一次失误，因为它同时毁掉了"单元测试通过"与"验证脚本通过"这两个信号：
+
+1. **成因是"归属靠推断"**。验证脚本要挑一个超分权重来跑 `ai.upscale`，它挑模型的依据是"**这个权重服务于哪个节点**"—— 而这个归属当时是**从所属引擎推断**出来的。`onnx-models` 同时承载抠图与超分，于是推断得出：`u2netp`（一个**分割**模型）也服务于 `ai.upscale`。
+2. **于是脚本拿分割模型去超分**。脚本把图片喂进去，模型吐出的是单通道的 mask；脚本把这张 mask 当成普通图片，算出"倍数 = 1"，然后缩放到了目标尺寸 —— 而**每一条尺寸断言都通过了**。绿色对勾、零失败，输出是垃圾。
+3. **三处修复，缺一不可**：
+   - `EngineModel.used_by: Vec<String>` —— 每个权重的节点归属**逐条手写**，`models_list` 直接用它，不再做任何推断；`verified_sources_are_pinned` 里新增断言要求每条权重的 `used_by` 非空、且声明的节点必须在节点目录里真实存在（见 1.1、1.3）。
+   - `upscale.py` 的**自检**：输入必须是 `[N,3,H,W]`、输出必须是 **3 通道**、空间倍数必须是**整数且 ≥ 2**，否则**报错退出并打印模型真实的输出形状**。也就是说，喂错了模型现在会**当场失败**，而不是"算出一个倍数然后照做"。
+   - `verify-platform.mjs` 的**反向断言**：拿抠图权重去跑超分**必须失败、且不在磁盘上留下文件**；并且没有任何一个权重可以同时声称服务于 `image.remove-background` 与 `ai.upscale`。
+4. **结论（比修 bug 更重要）**：**"测过了"这句话本身要能被质疑**。这次失败不是断言写错了，而是**断言测的东西根本不是要验证的东西** —— 尺寸确实算对了，可是它算的是一个错误的输入。凡是"验证脚本自己挑数据"的地方，都要问一句：**这个挑选依据本身可靠吗？** 归属靠推断、名字靠猜、路径靠拼接，这三类依据在这个项目里都出过错。
 
 ### 3.3 文档域
 
@@ -195,7 +218,14 @@ EngineModel {
 
 - **主页**：https://github.com/tesseract-ocr/tesseract
 - **提供的节点（1 个）**：`doc.ocr`。
-- **缺失时会发生什么**：`doc.ocr` 的 `requiresEngines` 是 `["python"]`，`tesseract` 只列在 `optionalEngines` 中。因此：`tesseract` 缺失**不会**让节点失效；但 `python` 缺失会让节点完全不可用（无降级）。该节点的描述原文是「图片/扫描件转文字。默认走系统 OCR，装了 PaddleOCR 时质量更高。」——也就是说默认路径走系统 OCR，装了更高阶的方案（PaddleOCR）时质量更好。
+- **缺失时会发生什么**：`doc.ocr` 的 `requiresEngines` 是 `["python"]`，`tesseract` 只列在 `optionalEngines` 中。因此：`tesseract` 缺失**不会**让节点失效。该节点的描述原文是「图片/扫描件转文字。默认走系统 OCR，装了 PaddleOCR 时质量更高。」——描述里的 PaddleOCR 目前只是**文案**，执行器并没有这条路径（见下）。
+  > ✅ **这个节点现在真的有执行器了**（`nodes.rs::doc_ocr`），它的真实策略是**两条路**，各自诚实：
+  > - `engine` 参数为 `auto`（默认）或 `tesseract`：**装了 tesseract 就直接用它** —— 完全离线、不花钱、快，中文质量一般；
+  > - 没装 tesseract（且 `engine` 为 `auto` 或 `ai`）：**改用多模态模型**，日志会明确写一句「本机没有 Tesseract，改用多模态模型识别（图片会上传给 AI 服务商）」。这条路要联网、按 token 计费，输出里 `backend` 是 `ai-vision`；
+  > - 两条都不可用时报错会把**两个选项都列出来**（装 tesseract / 配 AI），而不是只说一句"OCR 引擎缺失"。
+  > - ⚠️ **PDF 输入被明确拒绝**：PDF 得先按页栅格化成图片，这条链路没做（需要 pdfium / poppler），所以节点直接报错而不是产出一堆乱码。
+  > - ⚠️ **参数表与实现有一处对不上（待对齐）**：节点目录里 `engine` 的枚举是 `auto` / `tesseract` / `paddleocr`，而执行器认的是 `auto` / `tesseract` / **`ai`**（`paddleocr` 既没实现、也不在错误提示里）。填 `ai` 在运行期有效但不在下拉选项里，填 `paddleocr` 能选中但会走到"两者都不满足"的报错分支。
+  > - ⚠️ **可用性判定比实现更严**：`requiresEngines` 写的是 `["python"]`，所以缺 Python 时 UI 会把整个节点标成不可用；但执行器的 **tesseract 那条路其实不碰 Python**（它只是 `ctx.engine("tesseract")` 起子进程）。也就是说"能用却被标灰"这个方向的可能性存在。这条没有改，如实记在这里。
 - **许可证与分发注意点**：`Apache-2.0`。语言数据包（tessdata）另有许可，`chi_sim` 为 Apache-2.0。`requiresLicenseAck: false`。仅探测系统安装，不提供应用内下载。
 
 ### 3.4 压缩包域
@@ -213,7 +243,10 @@ EngineModel {
 
 - **主页**：https://calibre-ebook.com/
 - **提供的节点（1 个）**：`ebook.convert`。
-- **缺失时会发生什么**：`ebook.convert` 的 `requiresEngines` 为空，`optionalEngines` 为 `["calibre", "pandoc"]`，即 `calibre` 是首选、`pandoc` 是兜底。`calibre` 缺失后降级到 `pandoc`，但 `pandoc` **只覆盖 EPUB/HTML**，**MOBI / AZW3 输出将不可用**。两个引擎都缺失时，该节点在代码层面仍不会被判为不可用（因为没有必需引擎），但实际上没有任何可用后端——这一边界需要在 `toolforge-engines` 的 `nodes` 模块里明确定义并反映到 UI 上。
+- **缺失时会发生什么**：`ebook.convert` 的 `requiresEngines` 为空，`optionalEngines` 为 `["calibre", "pandoc"]`，即 `calibre` 是首选、`pandoc` 是兜底。`calibre` 缺失后降级到 `pandoc`，但 `pandoc` **只覆盖 EPUB / DOCX / FB2 / HTML / Markdown / RTF / ODT / TXT**，**MOBI / AZW3 / LIT / PDF 输出将不可用**。两个引擎都缺失时，该节点在代码层面仍不会被判为不可用（因为没有必需引擎），但执行器会直接返回 `EngineMissing`（`engine_missing("calibre")`），detail 里把两个选项都写清楚 —— **不会静默产出空文件**。
+  > ✅ **这条边界现在已经定义好了（`nodes.rs::ebook_convert`），而且有一处必须记下来的教训。** `calibre` 优先（格式最全），缺了就退到 `pandoc`；但**在调用 pandoc 之前**，执行器会先按两张能力表（`PANDOC_EBOOK_IN` / `PANDOC_EBOOK_OUT`）检查输入输出扩展名，不通过就直接拒绝并要求装 Calibre。
+  > 理由是本项目遇到过的**最阴的一种失败模式**：pandoc 对认不出的输出扩展名**不报错** —— 它打一句 `[WARNING] Could not deduce format from file extension .mobi` + `Defaulting to html`，然后**退出码 0**，文件也真的生成了，只是那是一个 HTML 文件被命名成了 `.mobi`。要是把 `mobi` 直接交给它，用户会拿到一个"转换成功"的、扩展名骗人的坏文件。**它认不出输入格式时更糟：会把文件当纯文本读，产出垃圾。** 所以这里不能相信子进程的退出码，必须自己把关。
+  > **实测**（真机）：epub → docx 产出的是真正的 `PK` magic ZIP；epub → md 中文文本完整保留；epub → mobi 且没有 Calibre 时被**干净地拒绝**，磁盘上不留任何东西。`verify-platform.mjs` 的【9】号检查盯着这条降级与拦停。
 - **许可证与分发注意点**：`GPL-3.0`，强 copyleft。仅以独立进程调用；**如要随包分发请先做合规评审**。`requiresLicenseAck: true`。与 `libreoffice`、`tesseract` 一样，它也只有 `System` 一种安装方式。
 
 ### 3.6 AI 域与跨域运行时
@@ -230,17 +263,20 @@ EngineModel {
 
 - **主页**：https://onnxruntime.ai/
 - **提供的节点（2 个）**：`image.remove-background`、`ai.upscale`。
-- **缺失时会发生什么**：这两个节点不可用（与 `python` 一样是必需引擎）。它是**唯一带模型权重清单的引擎**（6 个模型，见第 4 节），也是唯一需要单独做许可证确认的模型入口。
+- **缺失时会发生什么**：这两个节点不可用（与 `python` 一样是必需引擎）。它是**唯一带模型权重清单的引擎**（**8 个模型**，见第 4 节），也是唯一需要单独做许可证确认的模型入口。
+- **每个权重都写明了自己服务于哪个节点**：`EngineModel.used_by`（`u2net*` / `isnet-general` / `birefnet-general` / `modnet-portrait` → `image.remove-background`；`realesr-general-x4v3` / `realesrgan-anime6b` / `realesrgan-x4plus` → `ai.upscale`）。这不是装饰：在这之前归属是从引擎推断的，而 `onnx-models` 同时承载抠图与超分，推断得出的结论是错的（见 1.3 末尾）。
 - **它是「虚拟引擎」，探测规则与别的引擎不同**：`onnx-models` 没有可执行文件，它只是权重文件的宿主，「有没有 `onnx-models.exe`」这个问题本身就是错的。
   > ✅ **这条曾经是坏的**：`probe()` 只对 `install_modes == [Remote]` 的引擎做特判，`onnx-models` 落到普通分支，于是**永远探测为 `Missing`** —— 后果是 `image.remove-background` 在界面上**永远显示不可用，哪怕用户已经把权重下好了**。现在 `probe()` 对 `onnx-models` 单独判：**至少有一个权重已安装 = 可用**，message 里也会点名当前是"还没下权重"还是"已下载 N 个"。这条规则写在 `registry.rs::probe()` 里。
-- **许可证与分发注意点**：许可证字段本身写的是「各模型不同（见下表）」，注意事项是「代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。」体积标注约 180 MB（这只是 `approxSizeMb` 字段给出的引擎级估算；注意 6 个模型逐个加起来远超此值，且模型按需下载、不随安装包分发）。`requiresLicenseAck: true`。
+- **许可证与分发注意点**：许可证字段本身写的是「各模型不同（见下表）」，注意事项是「代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。」体积标注约 180 MB（这只是 `approxSizeMb` 字段给出的引擎级估算；注意 **8 个**模型逐个加起来远超此值，且模型按需下载、不随安装包分发）。`requiresLicenseAck: true`。
 
 #### AI 服务提供方（`ai-provider`）
 
 - **主页**：https://platform.openai.com/docs/api-reference
 - **提供的节点（1 个）**：`ai.describe`。
 - **缺失时会发生什么**：`ai.describe` **不可用**，无降级路径（`requiresEngines: ["ai-provider"]`）。由于它是 `Remote` 模式的引擎，不存在「安装包」意义上的缺失，缺失等价于「未配置可用的服务商 / API Key」。
-- **许可证与分发注意点**：`依服务商条款`——许可证不取决于 ToolForge，而取决于用户接的是哪家服务。注意事项原文是「API Key 只存在本机加密存储中，不会随插件或日志外泄」，**这句话本身已经过期**（见 1.3 节末尾的说明与 `docs/SECURITY.md` 的凭据落盘一节）：仓库里**没有**加密存储，也没有 OS 钥匙串，Key 默认只在内存里，只有用户显式打开「记住 API Key」时才会明文写到 `<data_dir>/ai-key.txt`。`requiresLicenseAck: false`。
+  > ⚠️ **`doc.ocr` 的 AI 兜底路径也要靠这个引擎，但它没被声明**：`doc_ocr` 在没装 tesseract 时会调 `require_ai(ctx, "doc.ocr")`，也就是要求配好 AI 服务商；可是 `doc.ocr` 的 `optionalEngines` 只有 `["tesseract"]`，`ai-provider.provides` 里也只有 `ai.describe`。结果是：**没装 tesseract 又没配 AI 时，`doc.ocr` 在 UI 上不会被标成"缺引擎"**，只有运行到那一步才会报错（错误文案本身是清楚的，会把两个选项都列出来）。这是一处**声明与实现不一致**，如实记在这里，没有改。
+- **许可证与分发注意点**：`依服务商条款`——许可证不取决于 ToolForge，而取决于用户接的是哪家服务。注意事项字段现在写的是「API Key 默认只存在内存里（重启要重填）。打开「记住 API Key」后会以**明文**另存到数据目录下的 `ai-key.txt` —— 系统钥匙串尚未接入。它不会随插件或日志外泄。」
+  > ✅ **这句文案已经改对了**：它此前写的是「API Key 只存在本机加密存储中」，而仓库里**从来没有**加密存储、也没有 OS 钥匙串 —— 那是一句与实现不符的话。现在它如实描述了"默认只在内存、可选明文落盘"这个**能力降级**（细节见 `docs/SECURITY.md` 的凭据落盘一节）。`requiresLicenseAck: false`。
 
 ### 3.7 无引擎依赖的功能域
 
@@ -262,7 +298,9 @@ EngineModel {
 
 ## 4. 模型权重表
 
-`onnx-models` 引擎下共 6 个模型权重。模型刻意与引擎本身分开：权重体积大、许可证各异，而且很多是「只有用了这个功能才需要」。
+`onnx-models` 引擎下共 **8 个**模型权重（抠图 5 个 + 超分 3 个）。模型刻意与引擎本身分开：权重体积大、许可证各异，而且很多是「只有用了这个功能才需要」。
+
+下面的 URL 与 SHA-256 全部**逐字取自 `engine_catalog()`**，没有推测补全。
 
 | 模型 id | 名称 | 用途 | 体积 | 权重许可证 | 是否可商用 | 下载地址 | SHA-256 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -271,24 +309,32 @@ EngineModel {
 | `isnet-general` | IS-Net General | 通用抠图，对复杂边缘处理更好 | 约 176 MB | `Apache-2.0` | 是 | `…/rembg/releases/download/v0.0.0/isnet-general-use.onnx` | `60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a`（178,648,008 字节） |
 | `birefnet-general` | BiRefNet | 当前抠图 SOTA，发丝级边缘 | 约 900 MB | `MIT（代码）/ 权重另有条款` | **否** | **无下载源**（`url` / `sha256` / `file_name` 均为 `None`，UI 显示「无下载源」且下载按钮置灰） | 同上 |
 | `modnet-portrait` | MODNet Portrait | 人像专用抠图（视频会议 / 证件照场景） | 约 25 MB | `Apache-2.0（代码）/ 学术用途权重` | **否** | **无下载源**（同上一行） | 同上 |
-| `realesrgan-x4plus` | Real-ESRGAN x4plus | 通用图像超分辨率放大 | 约 67 MB | `BSD-3-Clause` | 是 | **无下载源**（同上一行） | 同上 |
+| `realesr-general-x4v3` | Real-ESRGAN general x4v3 | 通用 4 倍超分（轻量）。**输入尺寸动态**，不需要切块补边；**默认选它** | 约 5 MB（实测 4.87 MB） | `BSD-3-Clause` | 是 | `https://huggingface.co/Heliosoph/realesrgan-onnx/resolve/main/realesr-general-x4v3.onnx` | `09b757accd747d7e423c1d352b3e8f23e77cc5742d04bae958d4eb8082b76fa4` |
+| `realesrgan-anime6b` | Real-ESRGAN anime 6B | 动漫 / 插画 4 倍超分（6 个残差块，完整版 23 个），输入尺寸同样动态 | 约 18 MB（实测 18.35 MB） | `BSD-3-Clause` | 是 | `https://huggingface.co/RekluzLabs/realesrgan_anime6b.onnx/resolve/main/realesrgan_anime6b.onnx` | `45bd54934aeabe8df744c8fdacb9e8846c9b55cb4e60c499db77405d1625a667` |
+| `realesrgan-x4plus` | Real-ESRGAN x4plus | 完整版通用超分，质量最好的一档 | 约 67 MB | `BSD-3-Clause` | 是 | **无下载源**（同 `birefnet-general`） | 同上 |
 
-> 「下载地址」与「SHA-256」两列的说明见第 1.3 节。前三个模型的地址与哈希来自 `engine_catalog()`，且哈希是**真实下载后算出来的**（不是抄网页）；下载路径是 `<data_dir>/models/<model_id>/<file_name>`，`file_name` 与模型 id 不同名。后三个模型在代码里就是 `None`，**不得凭推测填写**；单测 `verified_sources_are_pinned` 守着"三个字段全有或全无"这条纪律。
+> **`realesrgan-x4plus` 为什么被排除（这一条要说明白，动机与另外两个完全不同）**：`birefnet-general` / `modnet-portrait` 缺的是"还没核对过的哈希"，而这一个缺的是**能用的 ONNX 导出**。找到的每一份 x4plus 导出都是**固定输入尺寸**（64×64 或 128×128），要跑通必须先补上「补齐到固定尺寸 → 推理 → 裁回去」这一步；而**补边的质量直接决定边缘块的结果**，先上一个会留下网格状接缝的版本，不如先把两个**动态尺寸**的模型做扎实 —— 它们对任意尺寸都能直接推理，不需要补边。要做 x4plus：补上补齐 + 裁切、重新跑一遍接缝检查，再填哈希（哈希必须来自真实下载）。这段理由与 `engine.rs` 里该条目的注释一致。
 >
-> **抠图节点的默认模型是 `u2netp`（4.4 MB），不是 `u2net`（168 MB）。** 这条是**改过**的：原来的默认是 `u2net`，等于"想试一下抠图，先下 168 MB"。既然这个功能的瓶颈就是"第一次能不能跑起来"，默认值就该给最轻的那个。`model` 参数的枚举只有 `u2netp` / `u2net` / `isnet-general` —— 三个有下载源的，其余三个没有来源的模型**不出现在选项里**。
+> 「下载地址」与「SHA-256」两列的说明见第 1.3 节。上面 5 条的哈希都是**真实下载后算出来的**（不是抄网页）；下载路径是 `<data_dir>/models/<model_id>/<file_name>`，`file_name` 与模型 id 可能不同名（`isnet-general` → `isnet-general-use.onnx`；`realesrgan-anime6b` 则刻意与远端资产名逐字一致，这样"URL 必须以文件名结尾"那条不变量才守得住）。**没有下载源的 3 条在代码里就是 `None`**，不得凭推测填写；单测 `verified_sources_are_pinned` 守着"三个字段全有或全无"与"URL 以文件名结尾"这两条纪律。
+>
+> **抠图节点的默认模型是 `u2netp`（4.4 MB），不是 `u2net`（168 MB）。** 这条是**改过**的：原来的默认是 `u2net`，等于"想试一下抠图，先下 168 MB"。既然这个功能的瓶颈就是"第一次能不能跑起来"，默认值就该给最轻的那个。`model` 参数的枚举只有 `u2netp` / `u2net` / `isnet-general` —— 三个有下载源的，其余两个抠图模型没有来源，**不出现在选项里**。
+>
+> **超分节点的默认模型是 `realesr-general-x4v3`（4.9 MB）**，`model` 参数的枚举只有 `realesr-general-x4v3` / `realesrgan-anime6b` —— 与 `engine_catalog()` 里 `ai.upscale` 名下的条目逐字对齐，`realesrgan-x4plus` 因为下不到所以不在选项里（见 `docs/ROADMAP.md` 的开放项）。
 
 ### 4.1 商业使用结论（必须落实到 UI）
 
 依据 `EngineModel.commercialUse` 字段：
 
-**可以商用（`commercialUse: true`，共 4 个）**
+**可以商用（`commercialUse: true`，共 6 个）**
 
 | 模型 id | 名称 | 权重许可证 |
 | --- | --- | --- |
 | `u2net` | U²-Net | `Apache-2.0` |
 | `u2netp` | U²-Net (轻量) | `Apache-2.0` |
 | `isnet-general` | IS-Net General | `Apache-2.0` |
-| `realesrgan-x4plus` | Real-ESRGAN x4plus | `BSD-3-Clause` |
+| `realesr-general-x4v3` | Real-ESRGAN general x4v3 | `BSD-3-Clause` |
+| `realesrgan-anime6b` | Real-ESRGAN anime 6B | `BSD-3-Clause` |
+| `realesrgan-x4plus` | Real-ESRGAN x4plus | `BSD-3-Clause`（**可商用但暂时下不到**，见第 4 节） |
 
 **不可商用（`commercialUse: false`，共 2 个）**
 
@@ -332,7 +378,7 @@ EngineModel {
 | `image.rotate` | 旋转 / 翻转（可选：`imagemagick`） | `imagemagick`（可选，非必需） | `libvips`（实现里也能接手，见下）→ `imagemagick` → 两者都缺失 → 纯 Rust `image` crate **只支持 90° 整数倍**，非直角直接报 `EngineMissing`（**✅ 实测走通**，节点输出含 `backend`） | 更慢、更吃内存；**只剩纯 Rust 时任意角度旋转能力丧失**（不是静默取整，而是明确报错要用户装引擎） |
 | `image.enhance` | 图像增强（可选：`libvips`） | `libvips`（可选，非必需） | 🚧 **没有降级链，只有纯 Rust 一条路**：该节点的实现既不问后端、也不调用 libvips（见下） | 与"降级"无关：无论装了什么引擎，`image.enhance` 都走内置卷积 |
 | `image.strip-metadata` | 清除元数据（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | 🚧 **同上一行：只有纯 Rust 实现**（重新编码即不保留 EXIF/IPTC/XMP），`pick_image_backend()` 没有被它调用 | 与"降级"无关：装不装引擎，行为都一样；对部分容器格式的元数据块清理可能不完整 |
-| `ebook.convert` | 电子书格式转换（可选：`calibre`、`pandoc`） | `calibre`（可选，非必需） | `calibre` 缺失 → `pandoc`（**仅覆盖 EPUB / HTML**）；`pandoc` 也缺失 → 没有任何可用后端 | **MOBI / AZW3 输出能力完全丧失**；只剩 EPUB/HTML 互转。两个后端都缺失时，该节点虽不被判为不可用，但实际无法完成任何转换（见第 6.3 节） |
+| `ebook.convert` | 电子书格式转换（可选：`calibre`、`pandoc`） | `calibre`（可选，非必需） | `calibre` 缺失 → `pandoc`（**只覆盖 EPUB / DOCX / FB2 / HTML / Markdown / RTF / ODT / TXT，且认不出的输入输出格式会被执行器在调用前拦下**）；`pandoc` 也缺失 → 没有任何可用后端 | **MOBI / AZW3 / LIT / PDF 输出能力完全丧失**；只剩 pandoc 覆盖的那些格式。两个后端都缺失时，节点虽不被判为不可用，但执行器会返回明确的 `EngineMissing`（detail 里列出 Calibre 与 Pandoc 各自的覆盖范围与体积），**不会静默产出空文件**（见 3.5） |
 | `flow.branch` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
 | `flow.set-var` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
 | `flow.log` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
@@ -385,7 +431,15 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 
 **不要为这一节编造降级方案。** 例如「`video.transcode` 缺失 FFmpeg 时改用纯 Rust 解码」这类说法在当前代码与依赖里没有任何依据：workspace 的依赖清单中没有纯 Rust 的音视频转码库，`toolforge-engines` 的模块注释也明确说明音视频/文档/压缩包没有纯 Rust 替代品。此类建议如需成立，必须先改代码、再改本文档（见 1.1 的维护约定）。
 
-**实现现状（快照，详见第 6.6、6.7 节）：** `crates/toolforge-engines/src/nodes.rs` 的 `run()` 分发函数已实现 28 个节点。本节涉及的节点中，`archive.pack` / `archive.unpack` 已实现且确实**硬依赖** `7zip`（实现里是 `ctx.engine("7zip").await?`，缺失即报错），与本节的「无降级路径」结论一致；`video.*` / `audio.*` / `doc.convert` / `doc.to-pdf` 同样以必需引擎为准；**`image.remove-background` 也已实现并在真机上跑通整条链路**（模型 + 独立 venv + ONNX 推理，见 3.2）。但 `doc.ocr`、`ai.upscale`、`ai.describe`（以及第 5.1 节的 `ebook.convert`）共 4 个节点仍会返回「尚未在 v0.1 中实现」的错误，因此它们的降级行为目前只能是规格，尚无可观察的运行时表现。
+**实现现状：这一节里的 15 个节点现在全都有执行器，`UNIMPLEMENTED_NODES` 是空数组。** `crates/toolforge-engines/src/nodes.rs` 的 `run()` 分发函数覆盖 `builtin_nodes()` 登记的全部 **32** 个节点，不再有 `not_implemented` 的落点。本节涉及的节点中：
+
+- `archive.pack` / `archive.unpack` 已实现且确实**硬依赖** `7zip`（实现里是 `ctx.engine("7zip").await?`，缺失即报错）；
+- `video.*` / `audio.*` / `doc.convert` / `doc.to-pdf` 同样以必需引擎为准；
+- **`image.remove-background` 已在真机上跑通整条链路**（模型 + 独立 venv + ONNX 推理，见 3.2）；
+- **`ai.upscale` 也已实现**（Real-ESRGAN + 分块推理，见 5.1 之后的说明与第 4 节）；
+- **`doc.ocr`、`ai.describe`、`ebook.convert` 三个本轮补上**：分别走「tesseract 或视觉模型」、「视觉模型」、「Calibre 或 Pandoc」三条路，其中 `doc.ocr` 明确拒绝 PDF 输入、`ebook.convert` 在调用 pandoc 前先按能力表把关（见 3.3、3.5、3.6）。
+
+因此本节每一行现在都有**可观察的运行时表现**，不再是"只有规格、没有实现"。不过要分清范围：**有执行器 ≠ 每一档环境都测过** —— `verify-platform.mjs`【8】覆盖抠图、【9】覆盖电子书的降级与拦停、【10】覆盖图像描述的请求形状、【11】覆盖超分的放大倍数，而 macOS、ImageMagick 档位、以及"两个可选引擎都缺失"的完整环境矩阵仍然没有基线。
 
 ### 5.3 引擎与许可证的组合风险
 
@@ -410,14 +464,11 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 
 本章记录核对过程中发现的问题。这些是**代码与代码之间、代码与本文档之间**的不一致，如实列出，不做补全推测。
 
-### 6.1 `ai.upscale` 的模型枚举与 `onnx-models` 模型清单不一致（待补齐）
+### 6.1 `ai.upscale` 的模型枚举与 `onnx-models` 模型清单不一致 ✅ 已消除
 
-- `crates/toolforge-core/src/pipeline.rs` 中 `ai.upscale` 节点的 `model` 参数是一个枚举，可选值为 4 个：
-  `realesrgan-x4plus`（默认值）、`realesrgan-x2plus`、`swinir-l`、`hat-l`。
-- 但 `crates/toolforge-core/src/engine.rs` 的 `engine_catalog()` 中，`onnx-models` 的 `models` 清单**只有 `realesrgan-x4plus` 一个超分模型**，另外 5 个是抠图类模型（`u2net`、`u2netp`、`isnet-general`、`birefnet-general`、`modnet-portrait`）。
-- 也就是说：**`realesrgan-x2plus`、`swinir-l`、`hat-l` 这三个模型 id 能被用户选中，但在引擎目录里没有对应的权重条目**（没有体积、许可证、是否可商用的信息，也就无从下载与校验）。
-- 处理方式：**待补齐**。要么在 `engine_catalog()` 的 `onnx-models.models` 里补上这三个模型的完整条目（含体积、许可证、`commercialUse`），要么收紧 `ai.upscale` 的枚举。**本文档不为它们补写任何数据**——补数据必须走代码，然后同步本文档（第 1.1 节维护约定）。
-- 补充：现有测试 `every_node_engine_reference_exists_in_catalog` 只校验节点引用的**引擎 id** 是否存在，不校验参数枚举里的**模型 id** 是否有对应权重条目，所以这个不一致目前不会被测试拦住。
+- **原来的问题**：`ai.upscale` 的 `model` 枚举里有 4 个值（`realesrgan-x4plus`、`realesrgan-x2plus`、`swinir-l`、`hat-l`），而 `engine_catalog()` 的 `onnx-models.models` 里**一个对应的权重条目都没有**（当时只有 `realesrgan-x4plus` 一条超分条目）。也就是说：三个模型 id 能被用户选中，却没有体积、许可证、`commercialUse`，因而无从下载与校验。
+- ✅ **现在两边对齐了，而且是双向的**：枚举收敛成 `realesr-general-x4v3`（默认）+ `realesrgan-anime6b`，这两个在 `engine_catalog()` 里都有**完整条目**（含真实下载后算出的 SHA-256）；反过来，目录里三个超分权重中**唯一没有下载源**的 `realesrgan-x4plus` 刻意不出现在枚举里 —— 列出一个永远下不到的模型，等于让用户选到一个必然失败的选项。`pipeline.rs` 里对这个枚举留了一行注释说明这条纪律：「枚举必须与 `engine_catalog()` 里 `onnx-models` 的模型表一致」。
+- **仍然存在的缺口（换了个方向）**：现有测试 `every_node_engine_reference_exists_in_catalog` 只校验节点引用的**引擎 id** 是否存在，**不校验参数枚举里的模型 id 是否有对应权重条目**，所以这条纪律目前靠代码注释与人工核对维持，没有测试拦住。`ai.upscale` 的执行器会在模型未被登记时返回 `NotFound` 并把可用的超分模型列出来，属于运行期兜底。
 
 ### 6.2 `provides` 声明与实现之间的两处对不上（`image.crop` / `image.enhance` + `image.strip-metadata`）
 
@@ -428,12 +479,12 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
   > 处理方式：**待补齐** —— 要么在实现里真的接上 libvips，要么把这两个能力从 `libvips.provides` 里撤掉。**在二选一完成之前，"libvips 提供图像增强/清除元数据"这句话只是声明**，使用者不该据此以为装了 libvips 这两步会提速。
 - 补充：现有测试 `every_provided_capability_maps_to_a_real_node` 只校验「`provides` 里的能力都有对应节点」这个方向，**不校验反方向，也不校验"实现里到底调没调"**，所以这两处不一致都不会被测试拦住。
 
-### 6.3 `ebook.convert` 在「两个可选引擎都缺失」时没有明确定义
+### 6.3 `ebook.convert` 在「两个可选引擎都缺失」时的行为 ✅ 已定义
 
 - `ebook.convert` 的 `requiresEngines` 为空、`optionalEngines` 为 `["calibre", "pandoc"]`。
-- 因此当 `calibre` 与 `pandoc` 都不在时，该节点在代码层面**不会**被标记为不可用，但实际上没有任何可用后端（`.convert` 的语义完全依赖外部转换器）。
-- 处理方式：**待明确**。需要在 `toolforge-engines` 的实现里定义这种情形的行为（是运行时失败，还是把「两个可选引擎都缺失」也升级为跨节点不可用并在 UI 提示），然后按结论更新第 5.1 节。
-- 本文档第 5.1 节已如实写出这一边界，未假设任何一种行为。
+- **原来的问题**：当 `calibre` 与 `pandoc` 都不在时，该节点在代码层面**不会**被标记为不可用，而当时也没有定义运行时行为。
+- ✅ **现在已经定义好了**：执行器 `nodes.rs::ebook_convert` 在两个引擎都不可用时返回 `EngineMissing`（subject 是 `calibre`），detail 逐条列出两个选择与各自的覆盖范围、体积；**不会产出空文件**。同理，`pandoc` 在但格式超出它的能力表时，也会在**调用之前**被拒绝（见 3.5）。
+- **仍然存在的边界**：这条降级只体现在**运行期**。节点可用性（`pipeline_nodes` 的 `availability`）依然只看 `requiresEngines`，所以"两个可选引擎都没装"的机器上，`ebook.convert` 在 UI 上仍显示为可用，直到运行才报错。第 5.1 节已如实写出这一点。
 
 ### 6.4 引擎最低版本要求未定义
 
@@ -441,17 +492,17 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 - 处理方式：**待定**。本文档因此不给出任何版本号要求（见第 1.3 节）。
 - ✅ **补一条已经修好的相关事实**：**版本号本身现在真的读得出来了**。此前 `toolforge-process` 的 `ExecOptions::quiet(true)` 会把子进程输出整段丢弃，于是 `probe_version` 什么都拿不到 —— 界面上**每个引擎的版本都显示「未知」**，引擎失败时 stderr 也是空的。`quiet` 现已改为「只保留尾部」，`probe_version` 有回归测试（`probe_version_returns_something`）钉住。注意区别：**"能读到版本号"已经成立，"低于多少算过旧"仍然没有定义**，所以 `EngineState::Outdated` 依旧不会被触发。
 
-### 6.5 模型下载地址与 SHA-256：三个已核对，三个刻意留空
+### 6.5 模型下载地址与 SHA-256：五个已核对，三个刻意留空
 
 - ~~见第 1.3 节：`engine_catalog()` 中 6 个模型的 `url` 与 `sha256` 全部为 `None`。~~
-  > ✅ **已修正（部分）**：`u2net`、`u2netp`、`isnet-general` 三个 rembg 权重现在有**真实下载后自己算出来的** SHA-256、固定 release tag 直链（`https://github.com/danielgatis/rembg/releases/download/v0.0.0/`）与独立的 `file_name` 字段（资产名与模型 id 不一致，如 `isnet-general` → `isnet-general-use.onnx`）。文件落在 `<data_dir>/models/<model_id>/<file_name>`。三条 IPC 也已补齐：`models_list` / `models_install` / `models_remove`。
+  > ✅ **已修正**：**5 个**权重现在有**真实下载后自己算出来的** SHA-256 与固定直链 —— 三个 rembg 抠图权重（`u2net` / `u2netp` / `isnet-general`，`https://github.com/danielgatis/rembg/releases/download/v0.0.0/`，tag 字面就是 `v0.0.0`）与两个 Hugging Face 超分权重（`realesr-general-x4v3` / `realesrgan-anime6b`）。它们都有独立的 `file_name` 字段（资产名与模型 id 可能不一致，如 `isnet-general` → `isnet-general-use.onnx`）。文件落在 `<data_dir>/models/<model_id>/<file_name>`。三条 IPC 也已补齐：`models_list` / `models_install` / `models_remove`。
   > **哈希不匹配即删文件**：`registry.rs::install_model` 用 `remove_file` + `IntegrityCheckFailed`，不保留没校验过的产物。
-  > **另外三个（`birefnet-general` / `modnet-portrait` / `realesrgan-x4plus`）刻意没有 url/hash**：哈希还没核对过，与其放一个"点了必然失败"的下载按钮，不如让 UI 显示「无下载源」并把按钮置灰。单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name 三者全有或全无、哈希为 64 位小写十六进制、`file_name` 不重复。
+  > **另外三个（`birefnet-general` / `modnet-portrait` / `realesrgan-x4plus`）刻意没有 url/hash**：前两个是哈希还没核对过；`realesrgan-x4plus` 是**找不到能用的 ONNX 导出**（所有导出都是固定输入尺寸，见第 4 节）。与其放一个"点了必然失败"的下载按钮，不如让 UI 显示「无下载源」并把按钮置灰。单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name 三者全有或全无、哈希为 64 位小写十六进制、`file_name` 不重复、URL 以 `file_name` 结尾。
   > **注意**：上一段关于"模型权重仍全部为 `null`"的旧结论已经不成立。
 - ~~另外 `engine-sources.json` 中 5 个引擎的候选 URL 虽然存在，但**每条 `sha256` 均为 `null`**，因此没有任何一个引擎具备可用的自动安装来源。~~
   > ✅ **已修正**：`engine-sources.json` 已回填 **6 条**带真实核对哈希 + 版本固定直链的来源（`ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux`）。因此 Windows 与 Linux 上的这 4 个引擎**现在可以自动安装**；macOS 三条与 `ffmpeg@linux` 仍为 `null`。详见 `docs/ROADMAP.md` §3。
-- 处理方式：**还剩三个模型待补齐**（补哈希必须先在真实环境下载核对，不能凭推测填写）。
-  > ✅ **另一件事已经不再成立**：这条原来说「依赖模型的节点执行器仍未实现，所以 v0.1 仍用不上模型」—— **抠图的执行器 已经实现并真机跑通**（`image_remove_background`：下权重 → 独立 venv 装 `onnxruntime` → ONNX 推理 → 出 RGBA PNG），所以模型现在**真的被用上了**。仍然没实现的是 `ai.upscale`（`realesrgan-x4plus` 连下载源都没有）。
+- 处理方式：**还剩三个模型待补齐来源**（补哈希必须先在真实环境下载核对，不能凭推测填写；`realesrgan-x4plus` 还得先解决固定输入尺寸）。
+  > ✅ **另一件事已经不再成立**：这条原来说「依赖模型的节点执行器仍未实现，所以 v0.1 仍用不上模型」—— **抠图与超分两个执行器都已实现并真机跑通**（`image_remove_background` / `ai_upscale`：下权重 → 独立 venv 装 `onnxruntime` → ONNX 推理 → 出结果），所以模型现在**真的被用上了**。本轮新填的两个超分权重（`realesr-general-x4v3` / `realesrgan-anime6b`）就是为 `ai.upscale` 服务的。
 
 **下载链路上后来加的三件事（都是实测逼出来的）：**
 
@@ -468,32 +519,38 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 - 处理方式：**待对齐**。要么真的实现系统 `tar` 兜底（注意 `tar` 只能覆盖 tar 系列与部分 zip，**无法处理 7z / rar**，因此仍需保留 `requiresEngines` 的语义或在 UI 上区分），要么改掉 `nodes.rs` 的模块文档表。
 - 附带问题：`nodes.rs` 的表还声称自己是降级矩阵的「唯一真相来源」，而本文档声明的依据是 `pipeline.rs` 的 `requiresEngines` / `optionalEngines`。建议统一口径为「`builtin_nodes()` 的字段是权威数据，`nodes.rs` 的表只是实现的简化摘要」，否则两份表会持续漂移：`doc.ocr` 的 `tesseract` 是可选引擎、`ebook.convert` 的 `calibre` → `pandoc` 顺序、`image.enhance` 与 `image.strip-metadata` 其实完全不走降级链（见 5.1、6.2），这些都没有体现在 `nodes.rs` 的表里。
 
-### 6.7 `nodes.rs` 中仍有 4 个内置节点未实现（`image.remove-background` 已出列）
+### 6.7 `nodes.rs` 里已经**没有**未实现的内置节点（`UNIMPLEMENTED_NODES` 是空数组）
 
-- `nodes.rs` 的 `run()` 分发函数实现了 28 个节点，其余 4 个会落到 `not_implemented()`，返回 `ErrorCode::Internal` 与消息「内置节点 `xxx` 尚未在 v0.1 中实现」。
-- 这 4 个节点是：`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`。清单的**唯一真相来源**是 `toolforge_core::pipeline::UNIMPLEMENTED_NODES`（原来它在四个地方各存一份，漏同步过一次）。
-- ✅ **本条原来写的是 5 个，第一个是 `image.remove-background`** —— 它是产品的招牌功能，**此前从未真正工作过**。现在它有了执行器 `image_remove_background`，并已在真机上跑通整条链路。
-  - **实测数据**（真机、非推断）：托管 Python 由应用装成 **3.11.16 / 145.2 MB / tar.gz 路径**；venv + pip 自动装上 `onnxruntime-1.30.0`、`numpy-2.4.6`、`pillow-12.3.0`；对一张 **400×300**（白底 + 一个红椭圆）的测试图，输出是 **RGBA PNG（colorType 6）、400×300、椭圆中心 alpha 254、角落 alpha 0、前景覆盖 18.87%** —— 与椭圆的真实面积吻合。**运行时就绪后单张推理约 0.7 秒**（含 pip 的首次运行为约 32 秒）。
-  - **一张渐变图测不出显著性模型**：在没有明显主体的渐变图上，模型如实报告约 0% 覆盖并让节点发一条警告说明这一点。所以验收脚本必须用**有真实主体**的图 —— 拿渐变图测显著性模型，测出来的是"模型坏了"这种假象。
-  - 参数也已对齐实现：现在是 `model` / `mode`（`alpha` | `color`）/ `background` / `threshold` / `feather`。**旧的 `alphaMatting` 参数已被删除** —— 它从登记那天起就没有任何实现，是个**假参数**：用户在 UI 里勾上它，什么都不会发生。
-  - `python` 版本区间是 **3.9 ~ 3.13**（`onnxruntime` 没有 3.14 的 wheel），首次运行需要在 `<data>/cache/onnx-runtime/` 建独立 venv 并联网 `pip install`，详见 3.2。
-- ✅ **新增了一条防回归测试**：`unimplemented_list_matches_the_dispatch_table` 会**遍历真实分发表**，对 `UNIMPLEMENTED_NODES` 里的每个节点断言它**确实**还落在 `not_implemented` 上。它守住的失误形态是"实现完了却忘了从名单里删掉"（以及反方向）—— 那种错会让用户看到与真实行为相反的提示，而**这个项目已经因此踩过一次坑**。同名的兄弟测试 `unimplemented_list_matches_actual_dispatch` 也在守同一件事。
-- **曾经的 `flow.foreach` 不在这个名单里 —— 它被整个删除了**，不是"留着不实现"。它的语义在平铺的步骤列表里无法定义，描述里的「宿主会按并发度并行调度」也是假的；批量改由宿主在命令层做（`expand_batches`：多文件与目录输入都扇出成单文件批次，`${batch.index}` 取序号）。`UNIMPLEMENTED_NODES` 里只留了一行注释记录原因，防止有人再加回来。
-- 这是**刻意的设计**：`not_implemented()` 的注释明确说明「刻意**不返回假的成功**」，否则会出现「流水线显示跑通了但没产出文件」这种最难排查的问题。
-- 处理方式：**待实现**。剩下这 4 个覆盖的是 OCR、电子书转换、AI 超分、AI 描述，因此它们仍是 `ai-provider`、`calibre` 这几个引擎落地程度的直接体现；`ai.upscale` 是**最有可能接着做的一个**（它可以照抄抠图这条"模型 + 推理"链，缺的只是 `realesrgan-x4plus` 的下载源）。`not_implemented()` 的错误提示把实现进度指向 `docs/ROADMAP.md`。
-- **别把"抠图通了"读成"AI 媒体能力都通了"**：`ai.upscale` / `ai.describe` / `doc.ocr` / `ebook.convert` 四个**仍然会返回未实现错误**，界面上也仍然按未实现标注。
+- **结论（本轮）**：`nodes.rs` 的 `run()` 分发函数覆盖 `builtin_nodes()` 登记的全部 **32** 个节点，`toolforge_core::pipeline::UNIMPLEMENTED_NODES` 现在是**空的 `&[&str]`**。读者不应再从本文档里找"哪些节点还没做"—— 现在一个都没有。
+- **`UNIMPLEMENTED_NODES` 为什么还留着**：因为它同时是前端"标灰未实现节点"的**数据来源**（通过 IPC 的 `NodeCatalogResponse.unimplemented`）。删掉这个常量会让前端那句"该能力尚未实现"的提示失去依据；留一个空数组，语义正好是"现在没有"。`pipeline.rs` 里那段注释也写了下一步怎么做：**谁下次加了节点却忘了实现执行器，就把节点名加进这个数组** —— `nodes::run` 的兜底分支、节点面板的灰显、以及下面那条测试会一起跟上，这是刻意设计的"一处声明、多处生效"。
+- **历史（这条必须保留，因为它是这个项目最有价值的一课）**：这份名单曾经有过 6 个、5 个、4 个。逐个说清楚它们的去向：
+  1. **`flow.foreach`** —— **不是被实现，而是被整个删除**。它的语义在平铺的步骤列表里无法定义（循环体含哪些步骤？循环后面的收尾步骤怎么办？），而描述里的「宿主会按并发度并行调度」是**假的**；批量改由宿主在命令层做（`expand_batches`：多文件与目录输入都扇出成单文件批次，`${batch.index}` 取序号）。`pipeline.rs` 在原名单位置留了一段注释记录原因，防止有人再把它加回来。引用它的清单现在**连 `validate()` 都过不去**（`STEP_UNKNOWN_NODE`）。
+  2. **`image.remove-background`** —— 产品的招牌功能，却长期"登记了但执行器没写"。现在有了 `image_remove_background`，并已在真机上跑通整条链路。
+     - **实测数据**（真机、非推断）：托管 Python 由应用装成 **3.11.16 / 145.2 MB / tar.gz 路径**；venv + pip 自动装上 `onnxruntime-1.30.0`、`numpy-2.4.6`、`pillow-12.3.0`；对一张 **400×300**（白底 + 一个红椭圆）的测试图，输出是 **RGBA PNG（colorType 6）、400×300、椭圆中心 alpha 254、角落 alpha 0、前景覆盖 18.87%** —— 与椭圆的真实面积吻合。**运行时就绪后单张推理约 0.7 秒**（含 pip 的首次运行为约 32 秒）。
+     - **一张渐变图测不出显著性模型**：在没有明显主体的渐变图上，模型如实报告约 0% 覆盖并让节点发一条警告说明这一点。所以验收脚本必须用**有真实主体**的图 —— 拿渐变图测显著性模型，测出来的是"模型坏了"这种假象。
+     - 参数也已对齐实现：现在是 `model` / `mode`（`alpha` | `color`）/ `background` / `threshold` / `feather`。**旧的 `alphaMatting` 参数已被删除** —— 它从登记那天起就没有任何实现，是个**假参数**：用户在 UI 里勾上它，什么都不会发生。
+  3. **`ebook.convert`** —— 本轮补上，Calibre 优先、Pandoc 兜底，并且**在调用 pandoc 之前**按能力表把关（pandoc 对认不出的输出扩展名会打印一句 warning、写一个 HTML 出来、**退出码仍为 0**，见 3.5）。
+  4. **`ai.describe`** —— 本轮补上，走视觉模型；图片会先按 `maxSide`（默认 1024）缩小并转成 **JPEG q85** 再内联发送（视觉计费随像素增长，见 `docs/SECURITY.md`）。
+  5. **`doc.ocr`** —— 本轮补上，tesseract 优先、否则用视觉模型；**PDF 输入明确拒绝**（要先按页栅格化，这条链路没做）。
+  6. **`ai.upscale`** —— 本轮补上，Real-ESRGAN + 分块推理（`py/upscale.py`，256 px 分块、16 px 重叠、只取中心贴回），并配了两个**动态输入尺寸**的权重。
+- **防回归测试**：`unimplemented_list_matches_actual_dispatch` 会**遍历真实分发表**，对名单里的每个节点断言它**确实**还落在 `not_implemented` 上（反方向也查）。名字不同但守同一件事的还有一条 `unimplemented_list_matches_the_dispatch_table`。它们守的失误形态是"实现完了却忘了从名单里删掉"（或反方向）—— 那种错会让用户看到与真实行为相反的提示，而**这个项目已经因此踩过一次坑**。
+- **`not_implemented()` 里曾经有一条 `debug_assert!`，已经删掉**：它的意图是抓"实现了却还挂在名单上"，但那件事已由上一条测试完整覆盖（跑真实分发、双向校验），而这个断言带来两个真问题：
+  1. `run()` 的兜底分支对「**拼错的节点名**」与「已登记但未实现的节点」是**同一条出口** —— 断言让前者从"一句干净的报错"变成了 **debug 构建下的崩溃**；
+  2. `UNIMPLEMENTED_NODES` 现在是空的，任何节点名都会撞上它。
+  现在 `not_implemented()` 只负责构造一个错误，并且**会区分两种处境**：名字不在节点目录里 → 提示"多半是清单里写错了名字，或者这份清单是给更新版本写的"；名字在目录里 → 提示"执行器还没实现，实现进度见 `docs/ROADMAP.md`"。**"没实现"和"名字写错了"是两种完全不同的处境，不该混成一句话。**
+- **仍然是刻意的设计**：`not_implemented()` 的注释明确写着「刻意**不返回假的成功**」，否则会出现「流水线显示跑通了但没产出文件」这种最难排查的问题。这句话在名单为空之后依然有效 —— 它现在的实际用武之地只剩"节点名拼错"这一种情况。
 
-### 6.8 桌面端入口已补齐，但前端仍缺失
+### 6.8 桌面端与前端均已补齐（本条整体已过期，保留为历史）
 
-> **状态更新**：本条最初写作时 `apps/desktop/src-tauri/src/` 与 `crates/toolforge-ai` 都还不存在，随后被并行开发补齐。以下保留原判断并标注最新观察结果。
+> **状态更新**：本条最初写作时 `apps/desktop/src-tauri/src/`、`crates/toolforge-ai` 与 `apps/desktop/src/` 都还不存在，随后被并行开发补齐。以下保留原判断并标注最新观察结果。
 >
-> ⚠️ **另外注意**：下面"没有运行过 `cargo test`、第 5 章未经过测试回归验证"这句**已经过期**（保留作为历史）。当前有可复核的实测数据：`cargo test --workspace` **215 passed / 0 failed**、`scripts/devtools/verify-platform.mjs` **41 项检查全通过**、一次真实的 libvips 一键安装、以及抠图整条链路的真机验证（见 1.3、3.2、5.1）。不过要分清范围：**测试全绿 ≠ 第 5 章每一行都验证过** —— 图像域那 4 个节点的后端选择有【6】、【7】两条运行时检查，抠图有【8】，其余各行仍然没有专门的运行时检查。
+> ⚠️ **下面"没有运行过 `cargo test`、第 5 章未经过测试回归验证"这句已经过期**（保留作为历史）。当前有可复核的实测数据：`cargo test --workspace` **214 passed / 0 failed**、`scripts/devtools/verify-platform.mjs` **69 项检查全通过**（【1】–【11】，其中【8】抠图、【9】电子书、【10】AI 视觉、【11】超分）、一次真实的 libvips 一键安装、以及抠图/超分整条链路的真机验证（见 1.3、3.2、5.1）。不过要分清范围：**测试全绿 ≠ 第 5 章每一行都验证过** —— 图像域那 4 个节点的后端选择有【6】、【7】两条运行时检查，抠图有【8】，其余各行仍然没有专门的运行时检查（ImageMagick 档位与 macOS 始终没有环境基线）。
 
-- 根 `Cargo.toml` 的 `members = ["crates/*", "apps/desktop/src-tauri"]`：两个模式现在都有对应目录。`apps/desktop/src-tauri/src/` 已存在（`main.rs` / `lib.rs` / `commands.rs` / `ipc.rs` / `state.rs` / `bin/`）。
-- 但**前端 `apps/desktop/src/` 仍不存在**（没有 `package.json`、没有 `dist/`、没有生成的 `bindings.ts`），所以根 `package.json` 里指向 `@toolforge/desktop` 的脚本跑不起来。
+- 根 `Cargo.toml` 的 `members = ["crates/*", "apps/desktop/src-tauri"]`：两个模式都有对应目录。`apps/desktop/src-tauri/src/` 已存在（`main.rs` / `lib.rs` / `commands.rs` / `ipc.rs` / `state.rs` / `settings_store.rs` / `bin/`）。
+- ✅ **前端 `apps/desktop/src/` 现在存在**（React 18 + TS + Vite，含 `package.json`、生成的 `bindings.ts`），根 `package.json` 里指向 `@toolforge/desktop` 的脚本因此可以解析。本条原文说"仍不存在"是当时的快照。
 - `crates/toolforge-ai` 也已存在（`lib.rs` / `provider.rs` / `review.rs`），不再是缺失依赖。
 - 影响（**已过期，见上**）：本文档**没有运行过 `cargo build` / `cargo test`**，因此不对「当前能否构建」下结论；也正因为如此，第 5 章的降级矩阵与第 2、4 节的数据目前都**没有经过测试回归验证**。
-- 处理方式：**待实现**（补齐前端工程）。已知的编译阻塞与实测结论见 `docs/ROADMAP.md` 的「当前阻塞项」。
+- 处理方式：**已关闭**（前端工程已补齐）。已知的编译阻塞与实测结论见 `docs/ROADMAP.md` 的「当前阻塞项」与「基线再更新」。
 
 ---
 
@@ -501,16 +558,19 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 
 | 路径 | 与本文档的关系 |
 | --- | --- |
-| `crates/toolforge-core/src/engine.rs` | 第 2、4 节的权威来源：`engine_catalog()`、`EngineDescriptor`、`EngineModel`、`EngineState`、`EngineSource`、`EngineInstallMode` |
-| `crates/toolforge-core/src/pipeline.rs` | 第 5 节的权威来源：`builtin_nodes()`（32 个节点）、`NodeDescriptor.requiresEngines` / `optionalEngines`、`UNIMPLEMENTED_NODES`（4 个，唯一真相来源） |
+| `crates/toolforge-core/src/engine.rs` | 第 2、4 节的权威来源：`engine_catalog()`、`EngineDescriptor`、`EngineModel`（含 `used_by` 与 `file_name`）、`EngineState`、`EngineSource`、`EngineInstallMode`；单测 `verified_sources_are_pinned` 守 URL/哈希/文件名的完整性与 `used_by` 纪律，`model_licenses_are_explicit` 守"至少有一个不可商用的模型" |
+| `crates/toolforge-core/src/pipeline.rs` | 第 5 节的权威来源：`builtin_nodes()`（32 个节点）、`NodeDescriptor.requiresEngines` / `optionalEngines`、`UNIMPLEMENTED_NODES`（**空数组**，仍保留给前端做灰显数据源，见 6.7） |
+| `crates/toolforge-core/src/ai.rs` | `VisionClient` / `VisionRequest` / `BoxFut` 抽象。`toolforge-engines` **不能**依赖 `toolforge-ai`（会构成 `cyclic package dependency`），所以"看图说话"这件事通过这个 trait 注入（`NodeCtx.vision`），见 3.6 与 `docs/ARCHITECTURE.md` 的决策 10 |
 | `crates/toolforge-engines/src/lib.rs` | 引擎层的职责划分与图像域三层降级设计的说明；`MANAGED_LAYOUT`、`version_args()` |
 | `crates/toolforge-engines/src/registry.rs` | 引擎探测 / 下载 / 校验的实现；`EngineSourceSpec`、`ModelSpec`、`EngineRegistry`（含「`sha256` 为 `None` 时拒绝下载」的规则与 `has_download_source()`）；`probe()` 里对 `onnx-models` 这个**虚拟引擎**的特判也在这里（见 3.6） |
-| `crates/toolforge-engines/src/nodes.rs` | 节点执行实现：`run()` 分发已实现 28 个节点；`pick_image_backend()` / `ImageBackend` 是第 5.1 节那张三层图的**真实实现**（四个节点走它，两个不走）；`image_remove_background` 是**第 3.2 节那条 ONNX 路径**（不经过三层链）；模块文档自带一张降级表，但与实现存在出入，见第 6.6、6.7 节 |
-| `crates/toolforge-engines/py/rembg.py` | ONNX 推理脚本，用 `include_str!` 编进二进制、运行时释放到 `<data>/cache/onnx-runtime/rembg.py`；见第 3.2 节 |
+| `crates/toolforge-engines/src/nodes.rs` | 节点执行实现：`run()` 分发**覆盖全部 32 个节点**（`not_implemented` 只剩"名字拼错"这一种落点，见 6.7）；`pick_image_backend()` / `ImageBackend` 是第 5.1 节那张三层图的**真实实现**（四个节点走它，两个不走）；`image_remove_background` 与 `ai_upscale` 是**第 3.2 节那条 ONNX 路径**（不经过三层链）；`ebook_convert` / `doc_ocr` / `ai_describe` 是本轮新增的三个执行器；模块文档自带一张降级表，但与实现存在出入，见第 6.6 节 |
+| `crates/toolforge-engines/py/rembg.py` | 抠图推理脚本，用 `include_str!` 编进二进制、运行时释放到 `<data>/cache/onnx-runtime/`；见第 3.2 节 |
+| `crates/toolforge-engines/py/upscale.py` | 超分推理脚本（256 px 分块、16 px 重叠、只取中心贴回），同样 `include_str!` 编进二进制；自带输入/输出形状自检，并返回 `modelScale` / `targetScale` / `uncoveredRatio` 报告；见第 3.2 节 |
 | `crates/toolforge-process/src/exec.rs` | 子进程执行：`resolve_program()`（裸名字走 PATH、显式路径不回退）、`ExecOptions::quiet` 的"只留尾部"语义、`ExecResult` 的输出裁剪；见第 1.3 节 |
 | `crates/toolforge-engines/engine-sources.json` | 下载来源清单：**6 条已回填真实哈希 + 版本固定直链**（Windows/Linux 的 ffmpeg/libvips/pandoc/python），macOS 三条与 `ffmpeg@linux` 仍为 `null`（安装时返回 `HashRequired`）。见第 1.3 与 6.5 节 |
 | `crates/toolforge-process/` | 外部进程调用（执行、RPC、进程监管），是引擎被真正调用的下层 |
-| `scripts/devtools/verify-platform.mjs` | 真机运行时验收脚本（`scripts/devtools/run.mjs` 的第 5 个），**41 项检查**；其中【6】验证"图片后端与引擎状态一致"、【7】验证任意角度旋转不静默取整、【8】验证抠图整条 ONNX 链路真的出透明背景。第 5.1 节的实测结论来自它，第 3.2 节的抠图实测数据来自【8】 |
+| `scripts/devtools/verify-platform.mjs` | 真机运行时验收脚本（`scripts/devtools/run.mjs` 的第 5 个），**69 项检查**（【1】–【11】）；【6】验证"图片后端与引擎状态一致"、【7】验证任意角度旋转不静默取整、【8】验证抠图整条 ONNX 链路真的出透明背景、【9】验证电子书转换的降级与拦停、【10】验证图像描述的请求形状、【11】验证超分真的按倍数放大；第 5.1 节的实测结论来自它，第 3.2 节的抠图实测数据来自【8】 |
+| `scripts/devtools/mock-openai.mjs` | **假 OpenAI 兼容端点**，只服务于验收脚本：`verify-platform.mjs`【10】把应用的 AI 设置临时指向它（provider 选 `ollama` —— 本地提供方，因此不需要 API Key），跑一次 `ai.describe`，然后断言**我们自己可控的那部分**：恰好收到 1 次请求、请求里恰好 1 张图、以**内联 data URL** 发送（不是 multipart 也不是外链）、MIME 是 `image/jpeg`（说明本地确实重新编码过）、体积落在 1 KB ~ 200 KB 的合理区间（实测约 6.9 KB）、带系统提示词、用户提示词原样送达、`stream: false`，最后还验证描述真的流到了下游（净化 → 拼名 → 改名，产出 1 个文件且文件名里没有标点）。跑完会把**用户的 AI 设置恢复原状**。这个假端点**永远不会看到真实用户图片** —— 它是"不依赖 API Key 也能验证 AI 节点"的办法，见 `docs/SECURITY.md` |
 | `docs/ROADMAP.md` | `nodes.rs` 的 `not_implemented()` 错误提示所指向的实现进度文档（本文档未引用其内容，也不与其重复记录进度） |
 | `Cargo.toml`（根） | workspace 成员与依赖声明，见第 1.2 与 6.8 节 |
 
