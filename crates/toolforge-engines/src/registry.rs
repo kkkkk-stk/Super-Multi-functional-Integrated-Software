@@ -378,7 +378,7 @@ impl EngineRegistry {
         }
 
         let mut s = EngineStatus::missing(&desc.id);
-        s.message = Some(install_hint(&desc));
+        s.message = Some(install_hint(&desc, self.has_download_source(&desc.id)));
         s.probed_at = Some(toolforge_core::job::now_iso());
         self.cache.insert(engine_id.to_string(), s.clone());
         s
@@ -1214,14 +1214,35 @@ fn platform_candidates(engine_id: &str) -> Vec<PathBuf> {
     out
 }
 
-fn install_hint(desc: &EngineDescriptor) -> String {
+/// 给"这个引擎缺失"配一句可操作的提示。
+///
+/// ## 为什么它要看 `has_source`
+///
+/// 它原来只看 `install_modes`，于是**只要引擎声明了 `Download` 就说"可一键下载"** ——
+/// 而"声明了下载模式"与"当前平台真的配了下载源"是两件事。
+/// 实测踩到的：`imagemagick` 声明 `[System, Download]`，但当时
+/// `engine-sources.json` 里**没有** imagemagick 的条目，界面于是显示
+/// 「可在引擎管理里一键下载安装」，用户点下去得到的是"当前平台没有配置下载源"。
+///
+/// 提示语的唯一职责是**别把用户指错方向**，所以调用方必须把
+/// "这个平台到底有没有来源"告诉它（`EngineRegistry::has_download_source`）。
+fn install_hint(desc: &EngineDescriptor, has_source: bool) -> String {
     match desc.install_modes.as_slice() {
         [EngineInstallMode::System] => format!(
             "需要手动安装：{}（安装后回到「引擎管理」点重新探测）",
             desc.homepage
         ),
         modes if modes.contains(&EngineInstallMode::Download) => {
-            "可在「引擎管理」里一键下载安装".to_string()
+            if has_source {
+                "可在「引擎管理」里一键下载安装".to_string()
+            } else {
+                // 声明了下载模式却没有来源 —— 说清楚是"这个平台没配"，
+                // 并给出唯一可行的替代路径（手动装），而不是让用户去点一个必然失败的按钮
+                format!(
+                    "当前平台没有配置下载源，请手动安装：{}（安装后回到「引擎管理」点重新探测）",
+                    desc.homepage
+                )
+            }
         }
         _ => "当前平台不支持".to_string(),
     }
@@ -1289,6 +1310,70 @@ mod tests {
                 s.id,
                 s.platform
             );
+        }
+    }
+
+    /// 声明了「可下载」的引擎，在**当前平台**就必须真的配上下载源。
+    ///
+    /// 这条不变量是被一个真实缺陷逼出来的：`imagemagick` 声明了
+    /// `install_modes: [System, Download]`，而 `engine-sources.json` 里当时没有它 ——
+    /// 于是界面显示「可在引擎管理里一键下载安装」，用户点下去拿到的是
+    /// "当前平台没有配置下载源"。**提示语把用户指错了方向。**
+    ///
+    /// 虚拟引擎（`onnx-models` / `ai-provider`）没有本地可执行文件，不受这条约束。
+    #[test]
+    fn download_mode_engines_have_a_source_for_this_platform() {
+        let paths = AppPaths::new(std::env::temp_dir().join("tf-sources-invariant"));
+        let reg = EngineRegistry::new(paths);
+
+        for desc in engine_catalog() {
+            if desc.install_modes == vec![EngineInstallMode::Remote] {
+                continue;
+            }
+            if VIRTUAL_ENGINES.contains(&desc.id.as_str()) {
+                continue;
+            }
+            if !desc.install_modes.contains(&EngineInstallMode::Download) {
+                continue;
+            }
+            assert!(
+                reg.has_download_source(&desc.id),
+                "引擎 `{}` 声明了 Download，但 engine-sources.json 在 {} 平台没有它的条目 —— \
+                 界面会说「可一键下载安装」，而用户点下去必然失败。\n\
+                 要么补上来源（哈希必须真实下载后算出来），要么把 Download 从 install_modes 里去掉。",
+                desc.id,
+                EngineSourceSpec::platform_key()
+            );
+        }
+    }
+
+    /// 提示语不能把用户指错方向：有来源才说"可一键下载"。
+    #[test]
+    fn install_hint_only_promises_a_download_when_a_source_exists() {
+        let paths = AppPaths::new(std::env::temp_dir().join("tf-hint-invariant"));
+        let reg = EngineRegistry::new(paths);
+
+        for desc in engine_catalog() {
+            let hint = install_hint(&desc, reg.has_download_source(&desc.id));
+            if desc.install_modes.contains(&EngineInstallMode::Download) {
+                if reg.has_download_source(&desc.id) {
+                    assert!(
+                        hint.contains("一键下载"),
+                        "`{}` 有下载源，提示语应当告诉用户可以一键下载：{hint}",
+                        desc.id
+                    );
+                } else {
+                    assert!(
+                        !hint.contains("一键下载"),
+                        "`{}` 没有下载源，提示语**不能**说可一键下载（用户会白点一次）：{hint}",
+                        desc.id
+                    );
+                    assert!(
+                        hint.contains("手动安装"),
+                        "没有下载源时应当给出手动安装的出路：{hint}",
+                    );
+                }
+            }
         }
     }
 

@@ -52,6 +52,16 @@
   },
 
   {
+    "id": "imagemagick",
+    "platform": "windows",
+    "url": "https://github.com/ImageMagick/ImageMagick/releases/download/7.1.2-31/ImageMagick-7.1.2-31-portable-Q16-x64.7z",
+    "sha256": "33d8b47bb404a6b30c672195795e64a8ce0c807f9bba084e359ff086d6c5d50d",
+    "archive": "7z",
+    "stripComponents": 0,
+    "binSubdir": ".",
+    "note": "便携版（11.7 MB）。**三点实测结论**：① 官方**不提供 zip**，Windows 便携包只有 .7z —— 而 Windows 自带的 `tar`（bsdtar / libarchive）**能读 7z**，实测 `tar -xf` 退出码 0、`magick.exe -version` 正常输出，所以不依赖 7-Zip 也能装；② 压缩包里**没有顶层目录**，所以 stripComponents 必须是 0（不是习惯上的 1）；③ 哈希为实际下载后计算，与官方发布的 11739115 字节一致。发布方**没有**提供校验和（release 里只有 SBOM 与 in-toto 证明，都不含产物摘要），所以这个哈希是我们自己算的 —— 换版本时必须重算。"
+  },
+  {
     "id": "pandoc",
     "platform": "windows",
     "url": "https://github.com/jgm/pandoc/releases/download/3.11/pandoc-3.11-windows-x86_64.zip",
