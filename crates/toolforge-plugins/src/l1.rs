@@ -38,7 +38,11 @@ use toolforge_engines::EngineRegistry;
 use crate::store::PluginRecord;
 
 /// 一次流水线运行的输入。
-#[derive(Debug, Clone)]
+///
+/// 手写 `Debug`：`vision` 是 `dyn` trait 对象，没有（也不该有）`Debug` ——
+/// 它背后是 HTTP 连接池与 API Key，打印出来只会是噪音或者泄漏。
+/// 这里只报"配没配"。
+#[derive(Clone)]
 pub struct PipelineRunRequest {
     /// 输入端口 id -> 真实文件路径列表
     pub inputs: HashMap<String, Vec<String>>,
@@ -58,6 +62,26 @@ pub struct PipelineRunRequest {
     pub batch_index: u32,
     /// 本批次总项数，`${batch.total}`
     pub batch_total: u32,
+    /// 视觉客户端，注入给 `ai.describe` / `doc.ocr` 这类需要多模态模型的节点。
+    ///
+    /// 为 `None` 是**正常状态**（用户没配 AI）—— 那类节点会报一条可操作的错误，
+    /// 而不是 panic，也不影响其它任何节点。
+    pub vision: Option<Arc<dyn toolforge_core::ai::VisionClient>>,
+}
+
+impl std::fmt::Debug for PipelineRunRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineRunRequest")
+            .field("inputs", &self.inputs)
+            .field("outputs", &self.outputs)
+            .field("params", &self.params)
+            .field("input_root", &self.input_root)
+            .field("output_root", &self.output_root)
+            .field("batch_index", &self.batch_index)
+            .field("batch_total", &self.batch_total)
+            .field("vision", &self.vision.as_ref().map(|v| v.model_name()))
+            .finish()
+    }
 }
 
 impl PipelineRunRequest {
@@ -77,6 +101,7 @@ impl PipelineRunRequest {
             workspace_root: workspace_root.into(),
             batch_index: 1,
             batch_total: 1,
+            vision: None,
         }
     }
 }
@@ -167,6 +192,7 @@ pub async fn run_pipeline(
     let mut ctx = NodeCtx {
         job: job.clone(),
         engines,
+        vision: req.vision.clone(),
         resolver,
         guard,
         params,

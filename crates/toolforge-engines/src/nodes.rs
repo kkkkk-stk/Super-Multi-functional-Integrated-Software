@@ -47,6 +47,13 @@ use crate::registry::EngineRegistry;
 pub struct NodeCtx {
     pub job: JobCtx,
     pub engines: Arc<EngineRegistry>,
+    /// 视觉客户端。`None` = 用户还没配 AI（或配的是本地服务但没起）。
+    ///
+    /// 为什么是 `dyn VisionClient` 而不是具体的 `AiClient`：引擎层不能依赖
+    /// `toolforge-ai`（会成环），所以只依赖 core 里的抽象（详见
+    /// `toolforge_core::ai` 的模块文档）。**API Key 只在进程内存里**，
+    /// 领域层读不到也不该读到 —— 外壳层把构造好的客户端注入进来。
+    pub vision: Option<Arc<dyn toolforge_core::ai::VisionClient>>,
     /// 路径收敛器 —— 所有文件访问都必须经过它
     pub resolver: PathResolver,
     /// 能力裁决器 —— 越权调用会被拒绝并记审计
@@ -333,6 +340,10 @@ pub async fn run(
         // ---------- 文档 / 压缩包 ----------
         // ---------- 电子书（Calibre 优先，缺失时按能力表降级到 Pandoc）----------
         "ebook.convert" => ebook_convert(ctx, args).await,
+
+        // ---------- AI（需要多模态模型）----------
+        "ai.describe" => ai_describe(ctx, args).await,
+        "doc.ocr" => doc_ocr(ctx, args).await,
 
         // ---------- 文档（Pandoc / LibreOffice）----------
         "doc.convert" => pandoc_convert(ctx, args).await,
@@ -2285,6 +2296,247 @@ async fn ffmpeg_audio_normalize(
 // 文档 / 压缩包
 // ============================================================================
 
+/// 取一个可用的 AI 客户端；没有就给出**怎么配上**的指引。
+///
+/// 报错文本刻意写得具体：这一族节点的失败几乎全是"配置问题"，
+/// 而"AI 未配置"这种话对用户没有任何帮助 —— 得告诉他去哪儿点哪个。
+fn require_ai(
+    ctx: &NodeCtx,
+    node: &str,
+) -> ToolforgeResult<Arc<dyn toolforge_core::ai::VisionClient>> {
+    ctx.vision.clone().ok_or_else(|| {
+        ToolforgeError::new(
+            ErrorCode::AiUnavailable,
+            format!("{node} 需要一个已配置的多模态模型"),
+        )
+        .with_detail(
+            "请到「设置 → AI」里配置服务端点、模型与 API Key，然后点「测试连接」确认可用。\n\
+             * 云端：OpenAI / DeepSeek / 通义 / Kimi 等 OpenAI 兼容端点\n\
+             * 本地：Ollama（http://127.0.0.1:11434/v1）—— 本地服务不需要 Key，\
+             模型要选带视觉能力的（如 llava）。\n\n\
+             ⚠️ 必须是**视觉模型**：deepseek-chat、gpt-3.5 这类纯文本模型会直接返回 400。"
+                .to_string(),
+        )
+    })
+}
+
+/// 把图片按最长边缩小（`max_side = 0` 表示不缩）。
+///
+/// 为什么一定要缩：视觉模型的计费按像素折算 token，一张 4000×3000 的原图
+/// 在某些服务商那里一次就要几毛钱，而"看图说话"根本用不上那个分辨率。
+/// 缩放在**本地**做完再发出去，省的是用户的钱。
+fn shrink_for_vision(
+    img: &image::DynamicImage,
+    max_side: i64,
+) -> ToolforgeResult<Vec<u8>> {
+    let (w, h) = (img.width(), img.height());
+    let scaled = if max_side > 0 && (w.max(h) as i64) > max_side {
+        let ratio = max_side as f64 / w.max(h) as f64;
+        img.resize_exact(
+            ((w as f64 * ratio).round() as u32).max(1),
+            ((h as f64 * ratio).round() as u32).max(1),
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        img.clone()
+    };
+
+    let mut buf = Vec::new();
+    // 统一发 JPEG：同一张图 JPEG 通常比 PNG 小 3~10 倍，而"看图说话"
+    // 不关心无损。质量 85 是肉眼无差别的经验值。
+    let rgb = scaled.to_rgb8();
+    let mut cursor = std::io::Cursor::new(&mut buf);
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 85)
+        .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+        .map_err(|e| ToolforgeError::internal(format!("图片压缩失败：{e}")))?;
+    Ok(buf)
+}
+
+/// `ai.describe`：调多模态模型描述图片。
+async fn ai_describe(
+    ctx: &mut NodeCtx,
+    args: &BTreeMap<String, String>,
+) -> ToolforgeResult<NodeOutput> {
+    let src = resolve_path(ctx, "input", arg(args, "src")?)?;
+    let instruction = ctx.param_str(
+        "instruction",
+        "用一句中文描述这张图片，并给出5个标签",
+    );
+    let max_tokens = ctx.param_i64("maxTokens", 512).clamp(64, 8192);
+    let max_side = ctx.param_i64("maxSide", 1024).clamp(0, 8192);
+
+    // 没配 AI 就**在解码图片之前**报错：先花几百毫秒解码再告诉用户"没配 Key"
+    // 是没必要的等待，而且会让错误看起来像是图片的问题。
+    let ai = require_ai(ctx, "ai.describe")?;
+
+    ctx.job
+        .progress_now(toolforge_core::job::JobProgress::indeterminate(format!(
+            "描述 {}",
+            file_label(&src)
+        )));
+
+    let img = decode_image(&src)?;
+    let (ow, oh) = (img.width(), img.height());
+    let jpeg = shrink_for_vision(&img, max_side)?;
+
+    ctx.job.log(
+        toolforge_core::job::LogLevel::Debug,
+        format!(
+            "ai.describe：{ow}x{oh} → 发送约 {} KB（模型 {}）",
+            jpeg.len() * 4 / 3 / 1024,
+            ai.model_name()
+        ),
+    );
+
+    // 让模型不要把整段话写成散文：调用方多半要拿它去重命名、打标签
+    let system = "你是图像理解助手。回答要短、要具体，不要客套话，不要复述要求。";
+    let req = toolforge_core::ai::VisionRequest {
+        prompt: instruction,
+        system: Some(system.to_string()),
+        jpeg,
+    };
+    let text = ai.complete_with_image(req).await.map_err(|e| {
+        // 把"模型不支持图片"这条最常见的失败**说破**：
+        // 服务端只会回一句 400，用户完全看不出问题在模型选择上。
+        if e.message.contains("400") {
+            ToolforgeError::new(
+                e.code,
+                format!("{}（很可能是这个模型不支持图片输入）", e.message),
+            )
+            .with_detail(format!(
+                "{}\n\n请把「设置 → AI → 模型」换成视觉模型。",
+                e.detail.unwrap_or_default()
+            ))
+        } else {
+            e
+        }
+    })?;
+
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        // 空回答不能算成功：下游拿它去重命名会得到一个空名字
+        return Err(ToolforgeError::new(
+            ErrorCode::AiUnavailable,
+            "模型返回了空内容",
+        )
+        .with_detail("换一个模型或调整提示词后重试。"));
+    }
+
+    // `maxTokens` 是给服务端的提示，本地也截一下，防止某些端点无视它
+    let text = truncate_chars(&text, (max_tokens as usize).saturating_mul(4));
+
+    Ok(NodeOutput::default()
+        .with_value("text", text)
+        .with_value("model", ai.model_name()))
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+/// `doc.ocr`：把图片里的文字读出来。
+///
+/// ## 两条路径，各自诚实
+///
+/// * **tesseract**（装了就用）：完全离线、不花钱、快。中文识别质量一般。
+/// * **多模态模型**（没装 tesseract 时的兜底）：中文/手写/复杂版式明显更强，
+///   但要把图片上传给 AI 服务商，并且按 token 计费。
+///
+/// 默认策略是 `auto`：有 tesseract 就走它，没有就用 AI；**两条都不可用时
+/// 报错会把两个选项都说清楚**，而不是只说一句"OCR 引擎缺失"。
+///
+/// ⚠️ 这个节点**只处理图片**。PDF 要先转图片（`doc.to-pdf` 是反过来的），
+/// 那条链路没做 —— 所以这里对 PDF 输入明确报错，而不是产出一堆乱码。
+async fn doc_ocr(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> ToolforgeResult<NodeOutput> {
+    let src = resolve_path(ctx, "input", arg(args, "src")?)?;
+    let dst = resolve_path(ctx, "output", arg(args, "dst")?)?;
+    let lang = ctx.param_str("lang", "chi_sim+eng");
+    let engine = ctx.param_str("engine", "auto");
+
+    let ext = file_ext(&src);
+    if ext == "pdf" {
+        return Err(ToolforgeError::invalid(
+            "doc.ocr 目前只支持图片，不支持 PDF",
+        )
+        .with_detail(
+            "PDF 要先按页转成图片再识别，这条链路还没做（需要 pdfium / poppler）。\n\
+             可以先用「文档 → 转 PDF」的反向流程，或把 PDF 页面另存为图片后重试。"
+                .to_string(),
+        ));
+    }
+
+    let want_tesseract = engine == "auto" || engine == "tesseract";
+    let want_ai = engine == "auto" || engine == "ai";
+
+    if want_tesseract && ctx.engines.is_available("tesseract").await {
+        let tesseract = ctx.engine("tesseract").await?;
+        ctx.job.info(format!("使用 Tesseract OCR（语言 {lang}）"));
+        let r = exec(
+            ExecOptions::new(tesseract)
+                .args([
+                    src.display().to_string(),
+                    dst.display().to_string(),
+                    "-l".into(),
+                    lang.clone(),
+                ])
+                .cancel(ctx.job.cancel.clone())
+                .timeout(Duration::from_secs(600))
+                .quiet(true),
+        )
+        .await?;
+        if !r.success() {
+            return Err(r.into_error("tesseract"));
+        }
+        let text = std::fs::read_to_string(&dst).unwrap_or_default();
+        return Ok(NodeOutput::file(dst.display().to_string())
+            .with_value("text", text.trim().to_string())
+            .with_value("backend", "tesseract".to_string()));
+    }
+
+    if want_ai {
+        let ai = require_ai(ctx, "doc.ocr")?;
+        ctx.job.info("本机没有 Tesseract，改用多模态模型识别（图片会上传给 AI 服务商）");
+        let img = decode_image(&src)?;
+        let jpeg = shrink_for_vision(&img, 2048)?;
+        let prompt = format!(
+            "请逐字提取这张图片里的所有文字，保持原有的换行与段落顺序。\
+             只输出文字本身，不要任何解释、标题或 Markdown 代码围栏。\
+             如果图里没有文字，只回答「（无文字）」。识别语言提示：{lang}"
+        );
+        let req = toolforge_core::ai::VisionRequest {
+            prompt,
+            system: None,
+            jpeg,
+        };
+        let text = ai.complete_with_image(req).await?;
+        let text = text.trim().to_string();
+
+        // 输出是文本文件 —— 调用方多半想把它喂给下一步（`text.replace` 等）
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&dst, &text)
+            .map_err(|e| ToolforgeError::io(format!("写入 {} 失败：{e}", dst.display())))?;
+
+        return Ok(NodeOutput::file(dst.display().to_string())
+            .with_value("text", text)
+            .with_value("backend", "ai-vision".to_string()));
+    }
+
+    Err(ToolforgeError::engine_missing("tesseract").with_detail(
+        "OCR 需要二者之一：\n\
+         * **Tesseract**（离线、免费、快，中文质量一般）—— 到官网装好后回到「引擎管理」重新探测；\
+         它目前只提供安装器，所以没有做一键下载\n\
+         * **多模态模型**（中文/手写明显更强，但要联网并计费）\
+         —— 到「设置 → AI」配好，或把本节点的 `engine` 参数设为 `ai`"
+            .to_string(),
+    ))
+}
+
 async fn ebook_convert(
     ctx: &mut NodeCtx,
     args: &BTreeMap<String, String>,
@@ -2763,41 +3015,9 @@ mod tests {
         // 用一个**当前确实未实现**的节点。这里原来写的是
         // `image.remove-background` —— 它现在实现了，于是测试红了。
         // 这是好事：说明"未实现名单"确实跟着代码在动。
-        // 挑 `doc.ocr` 是因为它短期内都要靠系统装 tesseract，最稳。
-        let e = not_implemented("doc.ocr");
-        assert!(e.message.contains("doc.ocr"));
+        let e = not_implemented("ai.upscale");
+        assert!(e.message.contains("ai.upscale"));
         assert!(e.detail.unwrap().contains("ROADMAP"));
-    }
-
-    /// 未实现名单里的每个节点都**必须真的没有执行器** —— 否则界面会显示
-    /// "该能力尚未实现"，而实际上它已经能跑了。
-    ///
-    /// 反过来（实现了却忘了从名单里删）同样有害：用户会看到一个明明能用的能力
-    /// 被标成灰色。这个项目已经在 `flow.foreach` 上吃过一次亏，
-    /// 所以这里**走真实分发**来判定，而不是再抄一份名单。
-    ///
-    /// 判据是错误码：`not_implemented` 返回 `Internal`，而真实执行器即使因为
-    /// 缺参数/缺引擎失败，也不会返回 `Internal` —— 它们报的是
-    /// `PluginInvalid` / `EngineMissing` / `NotFound` 之类。
-    #[tokio::test]
-    async fn unimplemented_list_matches_the_dispatch_table() {
-        for node in toolforge_core::pipeline::UNIMPLEMENTED_NODES {
-            let (mut ctx, _q, _id) = test_ctx();
-            // 空参数：真实执行器会抱怨缺必填参数（但不是 Internal），
-            // 未实现节点则一律落到 `not_implemented`。
-            let err = run(&mut ctx, node, &BTreeMap::new()).await.unwrap_err();
-            assert_eq!(
-                err.code,
-                ErrorCode::Internal,
-                "`{node}` 在未实现名单里，但 `run()` 已经有它的分支了 —— \
-                 请从 UNIMPLEMENTED_NODES 里删掉它（前端与文档会自动跟上）"
-            );
-            assert!(
-                err.message.contains("尚未") || err.message.contains(node),
-                "`{node}` 的未实现错误信息不明确：{}",
-                err.message
-            );
-        }
     }
 
     #[test]
@@ -2875,6 +3095,7 @@ mod tests {
         let ctx = NodeCtx {
             job,
             engines,
+            vision: None,
             resolver: PathResolver::new()
                 .with_input(&dir)
                 .with_output(&dir)

@@ -25,13 +25,16 @@
  * 用法：`node scripts/devtools/verify-platform.mjs`
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
 
-import { Checker, connect, makePng, REPO_ROOT, webpInfo } from './cdp.mjs';
+import { Checker, connect, makePng, REPO_ROOT, sleep, webpInfo } from './cdp.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 const c = new Checker();
 const client = await connect();
@@ -542,6 +545,124 @@ c.section('【9】电子书转换（ebook.convert）的降级与拦截');
       const leftovers = existsSync(badDir) ? readdirSync(badDir) : [];
       c.check(rejected, '没有 Calibre 时，转 MOBI 被明确拒绝（而不是"成功"出一个假文件）', msg.slice(0, 90));
       c.check(leftovers.length === 0, '磁盘上没有留下假的 .mobi', leftovers.join(', '));
+    }
+  }
+}
+
+// ============================================================================
+// 【10】AI 视觉链路（ai.describe）：用假端点验证"自己这一侧"
+// ============================================================================
+c.section('【10】AI 图像描述（ai.describe）的请求形状与下游接线');
+{
+  // 真视觉模型要 API Key、要联网、要花钱，而且同一张图两次回答还不一样 ——
+  // 那种东西没法写进自动化验证。但"没法用真模型验证"不等于"没法验证"：
+  // 起一个假的 OpenAI 兼容端点，就能把**我们自己这一侧**钉死：
+  //   1. 图片有没有被压成 JPEG 并内联成 data URL；
+  //   2. 请求体形状对不对（content 是数组、有 image_url、有 text、有 system）；
+  //   3. 响应解析对不对（`${steps.<id>.text}` 拿得到）；
+  //   4. 下游节点能不能拿这段文本继续干活（净化 → 拼名 → 改名）。
+  const MOCK_PORT = 18124;
+  const mock = spawn(process.execPath, [join(HERE, 'mock-openai.mjs'), String(MOCK_PORT)], {
+    stdio: 'ignore',
+    detached: false,
+  });
+  await sleep(600);
+
+  const mockBase = `http://127.0.0.1:${MOCK_PORT}`;
+  let restore = null;
+  try {
+    const before = await client.invoke('settings_get');
+    restore = before.ai;
+
+    // 用 ollama（本地提供方）：**本地服务不需要 API Key**，
+    // 所以这条链路在没有真 Key 的机器上也能完整跑通。
+    const patched = await client.invoke('settings_patch', {
+      patch: {
+        ai: {
+          provider: 'ollama',
+          baseUrl: `${mockBase}/v1`,
+          model: 'mock-vision',
+          temperature: 0.2,
+          persistApiKey: false,
+        },
+      },
+    });
+    c.check(patched.ai.model === 'mock-vision', '已把 AI 指向假端点', patched.ai.baseUrl);
+
+    const conn = await client.invoke('ai_test_connection');
+    c.check(conn.ok === true, '测试连接能通（说明 mock 端点形状是兼容的）', JSON.stringify(conn.models ?? []));
+
+    await client.invoke('plugins_reload');
+    await fetch(`${mockBase}/__reset`);
+
+    const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-aidesc-verify');
+    rmSync(outDir, { recursive: true, force: true });
+    mkdirSync(outDir, { recursive: true });
+    const src = join(REPO_ROOT, '.tools', 'smoke', 'in-aidesc-verify.png');
+    writeFileSync(src, makePng(240, 180, 3));
+
+    const sub = await client.invoke('plugins_run', {
+      req: {
+        pluginId: 'com.toolforge.builtin.ai-describe',
+        inputs: { src: [src] },
+        params: {
+          instruction: { kind: 'str', value: '用一句话描述这张图片' },
+          indexMode: { kind: 'str', value: 'none' },
+        },
+        outputDir: outDir,
+      },
+    });
+    const job = await client.waitJob(sub.jobId, 120, 500);
+    if (job.error) c.note(`${job.error.code}：${job.error.message}`);
+    c.check(job.status === 'succeeded', '整条流水线跑通', job.status);
+
+    // ★ 核心断言：请求形状
+    const rec = await (await fetch(`${mockBase}/__received`)).json();
+    c.check(rec.length === 1, 'mock 端点收到 1 次请求', String(rec.length));
+    if (rec.length > 0) {
+      const r = rec[0];
+      c.note(JSON.stringify(r));
+      c.check(r.imageCount === 1, '请求里带了 1 张图', String(r.imageCount));
+      c.check(r.dataUrlOk === true, '图片是内联 data URL（不是 multipart 或外链）', String(r.dataUrlOk));
+      c.check(r.imageMime === 'image/jpeg', '图片被转成 JPEG 再发（省 token）', String(r.imageMime));
+      c.check(
+        r.imageBase64Len > 1000 && r.imageBase64Len < 200000,
+        '图片体积落在合理区间（既不是空的、也不是没压缩的原图）',
+        `${r.imageBase64Len} B`
+      );
+      c.check(r.hasSystem === true, '带了系统提示词（约束模型别写散文）');
+      c.check(r.prompt === '用一句话描述这张图片', '用户提示词原样送达', r.prompt);
+      c.check(r.stream === false, '非流式请求');
+    }
+
+    // ★ 下游接线：描述 → 净化 → 拼名 → 改名
+    const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+    c.note(`产出：${produced.join(', ') || '(空)'}`);
+    c.check(produced.length === 1, '产出 1 个文件', String(produced.length));
+    if (produced.length === 1) {
+      c.check(
+        produced[0].endsWith('.png'),
+        '文件名保留了原扩展名（说明 `${src.ext}` 在 AI 分支里也拿得到）',
+        produced[0]
+      );
+      c.check(
+        !/[\s，。！？、]/.test(produced[0]),
+        '文件名里没有空白与标点（净化步骤生效）',
+        produced[0]
+      );
+    }
+  } catch (e) {
+    c.check(false, 'AI 视觉链路测试抛错', String(e.message).split('\n')[0]);
+  } finally {
+    // 一定要还原：否则用户的 AI 配置会被指向一个已经关掉的假端点
+    if (restore) {
+      await client.invoke('settings_patch', { patch: { ai: restore } }).catch(() => {});
+      c.note('已还原原来的 AI 设置');
+    }
+    try {
+      mock.kill();
+    } catch {
+      /* 已经退出了 */
     }
   }
 }

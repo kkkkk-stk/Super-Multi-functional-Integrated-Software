@@ -19,6 +19,7 @@
 //! 所有跨进程/跨沙箱的东西都在上层 crate 里。这样领域模型可以被单元测试、
 //! 被未来的 CLI 复用，也不会因为换掉某个引擎而跟着动。
 
+pub mod ai;
 pub mod engine;
 pub mod error;
 pub mod events;

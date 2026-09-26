@@ -11,6 +11,11 @@ description = "ToolForge 能力引擎层：探测 / 按需下载 / 降级调用 
 [dependencies]
 toolforge-core = { workspace = true }
 toolforge-process = { workspace = true }
+# 注意：这里**不能**依赖 `toolforge-ai` ——
+# `toolforge-ai` → `toolforge-plugins` → `toolforge-engines` 已经是一条链，
+# 再加一条就成环（`cyclic package dependency`）。
+# 节点需要的视觉能力走 `toolforge_core::ai::VisionClient` 这个抽象，
+# 由外壳层把 `AiClient` 注入进来。
 
 serde = { workspace = true }
 serde_json = { workspace = true }

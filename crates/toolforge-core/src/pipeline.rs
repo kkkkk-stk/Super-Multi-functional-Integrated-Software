@@ -538,11 +538,6 @@ pub const UNIMPLEMENTED_NODES: &[&str] = &[
     // `verified_sources_are_pinned`（它要求 url / sha256 / file_name 三件套齐全）。
     // 抠图那条链路（模型下载 + Python 推理）已经通了，超分可以照抄它。
     "ai.upscale",
-    // 依赖 AI 服务提供方；`ai_test_connection` 已经能连通，但"看图说话"这一步没写
-    "ai.describe",
-    // 依赖 tesseract，而 tesseract 只提供**安装器**（不是压缩包），
-    // 没有配置下载源 —— 见 engine.rs 里 tesseract 那条的说明
-    "doc.ocr",
 ];
 
 // `flow.foreach` 曾经在这里，现在**整个节点都删掉了**。留个记录，免得有人再把它加回来：
@@ -984,7 +979,10 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "ai.describe".into(),
         label: "AI 图像描述".into(),
-        description: "调用多模态模型生成图片描述 / 标签，可用于自动重命名与归档。".into(),
+        description: "调用多模态模型生成图片描述与标签，可用于自动重命名与归档。\
+                      **需要视觉模型**：普通文本模型（如 deepseek-chat）会直接报 400，\
+                      请把「设置 → AI → 模型」换成支持图片输入的（gpt-4o / qwen-vl-max / llava 等）。\
+                      图片会先按 `maxSide` 缩小再内联发送 —— 图片会上传到你的 AI 服务商，这是本节点唯一联网的地方。".into(),
         category: NodeCategory::Ai,
         requires_engines: vec![engine("ai-provider")],
         optional_engines: vec![],
@@ -992,7 +990,10 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         outputs: vec![port("text", "描述", PortType::Text, false)],
         params: vec![
             param("instruction", "提示词", ParamType::Textarea, Some("用一句中文描述这张图片，并给出5个标签".into()), false),
-            param("maxTokens", "最大输出长度", ParamType::Int, Some(512i64.into()), false),
+            range_param("maxTokens", "最大输出长度（token）", ParamType::Int, 512.0, 64.0, 8192.0),
+            // 图片越大花掉的 token 越多，而"看图说话"不需要原始分辨率。
+            // 默认 1024 是"看得清"和"不太贵"之间的经验平衡点。
+            range_param("maxSide", "发送前缩到最长边（px，0 = 不缩）", ParamType::Int, 1024.0, 0.0, 8192.0),
         ],
     });
 

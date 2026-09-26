@@ -167,6 +167,86 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// 一张要发给视觉模型的图片。
+///
+/// 只存**编码后的字节**与 MIME，不存路径 —— 这样它不可能被误当成
+/// 文件系统句柄传来传去，也不可能在日志里打印出一个可读的本地路径。
+#[derive(Debug, Clone)]
+pub struct ImagePart {
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+impl ImagePart {
+    pub fn png(bytes: Vec<u8>) -> Self {
+        Self {
+            mime: "image/png".into(),
+            bytes,
+        }
+    }
+
+    pub fn jpeg(bytes: Vec<u8>) -> Self {
+        Self {
+            mime: "image/jpeg".into(),
+            bytes,
+        }
+    }
+
+    /// 按扩展名猜 MIME。猜不出来时按 PNG 处理（视觉端点对 PNG 的支持最稳）。
+    pub fn from_ext(ext: &str, bytes: Vec<u8>) -> Self {
+        let mime = match ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "bmp" => "image/bmp",
+            _ => "image/png",
+        };
+        Self {
+            mime: mime.into(),
+            bytes,
+        }
+    }
+
+    /// 组装成 OpenAI 兼容的内联 data URL。
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, base64_encode(&self.bytes))
+    }
+
+    /// 编码后的体积（KB），用于"请求会不会太大"的判断与日志
+    pub fn encoded_kb(&self) -> usize {
+        self.bytes.len() * 4 / 3 / 1024
+    }
+}
+
+/// 标准 base64 编码（带 `=` 填充）。
+///
+/// 自己写而不是引一个 crate：只此一处用到，二十行就能覆盖，
+/// 而多一个依赖就多一份供应链面积 —— 这个项目对"为了省几行代码引入依赖"
+/// 是明确反对的（见 SECURITY.md 的依赖策略）。
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 impl ChatMessage {
     pub fn system(c: impl Into<String>) -> Self {
         Self {
@@ -184,6 +264,44 @@ impl ChatMessage {
         Self {
             role: "assistant".into(),
             content: c.into(),
+        }
+    }
+}
+
+/// 把 `AiClient` 接上引擎层需要的视觉抽象。
+///
+/// 这一句 `impl` 是**跨 crate 依赖方向**的关键：`toolforge-engines` 不允许
+/// 依赖 `toolforge-ai`（会成环，见 `toolforge_core::ai` 的模块文档），
+/// 所以由 `ai` 侧主动实现 core 里的 trait，外壳层再把它注入 `NodeCtx`。
+impl toolforge_core::ai::VisionClient for AiClient {
+    fn model_name(&self) -> String {
+        self.config.model.clone()
+    }
+
+    fn complete_with_image(
+        &self,
+        req: toolforge_core::ai::VisionRequest,
+    ) -> toolforge_core::ai::BoxFut<ToolforgeResult<String>> {
+        // 这里不能写 `async move { ... }` 再返回：`self` 是借用，
+        // 必须把需要的东西克隆出来，future 才能 'static + Send。
+        let this = self.clone_for_call();
+        Box::pin(async move {
+            let part = ImagePart::jpeg(req.jpeg);
+            this.complete_with_images(&req.prompt, &[part], req.system.as_deref())
+                .await
+        })
+    }
+}
+
+impl AiClient {
+    /// 造一个可 `'static` 的调用句柄（克隆配置与连接池，不复制任何状态）。
+    ///
+    /// reqwest 的 `Client` 内部是 `Arc`，克隆很便宜；`AiProviderConfig`
+    /// 只有几个字符串。这样视觉调用可以脱离 `&self` 的生命周期。
+    fn clone_for_call(&self) -> AiClient {
+        AiClient {
+            config: self.config.clone(),
+            http: self.http.clone(),
         }
     }
 }
@@ -216,9 +334,6 @@ impl AiClient {
 
     /// 发一次对话补全，返回助手文本。
     pub async fn complete(&self, messages: &[ChatMessage]) -> ToolforgeResult<String> {
-        let base = self.config.effective_base_url()?;
-        let url = format!("{base}/chat/completions");
-
         let body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
@@ -226,6 +341,71 @@ impl AiClient {
             // 插件清单是结构化输出，低温更稳
             "stream": false,
         });
+        self.post_chat(body).await
+    }
+
+    /// 带图片的对话补全（视觉模型）。
+    ///
+    /// ## 为什么单独一个方法，而不是给 `ChatMessage.content` 换个类型
+    ///
+    /// OpenAI 兼容协议里，带图的消息 `content` **不再是字符串**，而是一个数组：
+    ///
+    /// ```json
+    /// {"role":"user","content":[
+    ///   {"type":"text","text":"图里有什么？"},
+    ///   {"type":"image_url","image_url":{"url":"data:image/png;base64,...."}}
+    /// ]}
+    /// ```
+    ///
+    /// 把 `content` 改成 `serde_json::Value` 会让**所有**调用点都失去类型保护
+    /// （`ai_generate` 那几条链路本来就不需要图），所以这里保留纯文本那条路径不动，
+    /// 另开一个方法。多出来的是一个函数，少掉的是"每个调用点都可能传错"。
+    ///
+    /// ## 图片怎么传：data URL，不是 multipart
+    ///
+    /// OpenAI 兼容端点接受 `data:image/png;base64,<...>` 这种内联形式，
+    /// 而 multipart 上传是**另一套非标准接口**（各家路径都不一样）。
+    /// 内联的代价是请求体大约膨胀 4/3，但换来的是"所有兼容端点都支持"。
+    /// 调用方负责把图片压到合理大小（见 `ai.describe` 的 `maxSide` 参数）。
+    pub async fn complete_with_images(
+        &self,
+        prompt: &str,
+        images: &[ImagePart],
+        system: Option<&str>,
+    ) -> ToolforgeResult<String> {
+        if images.is_empty() {
+            return Err(ToolforgeError::invalid("complete_with_images 至少需要一张图片"));
+        }
+
+        let mut content: Vec<serde_json::Value> = Vec::with_capacity(images.len() + 1);
+        content.push(serde_json::json!({ "type": "text", "text": prompt }));
+        for img in images {
+            content.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": img.data_url() },
+            }));
+        }
+
+        let mut messages: Vec<serde_json::Value> = Vec::with_capacity(2);
+        if let Some(s) = system {
+            messages.push(serde_json::json!({ "role": "system", "content": s }));
+        }
+        messages.push(serde_json::json!({ "role": "user", "content": content }));
+
+        let body = serde_json::json!({
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature,
+            "stream": false,
+        });
+        self.post_chat(body).await
+    }
+
+    /// 发一个 `/chat/completions` 请求并取出助手文本。两个 `complete*` 共用。
+    async fn post_chat(&self, body: serde_json::Value) -> ToolforgeResult<String> {
+        let base = self.config.effective_base_url()?;
+        let url = format!("{base}/chat/completions");
+        let text_len = body.to_string().len();
 
         let mut req = self.http.post(&url).json(&body);
         if !self.config.api_key.trim().is_empty() {
@@ -237,7 +417,10 @@ impl AiClient {
                 ErrorCode::AiUnavailable,
                 format!("无法连接 {}：{}", self.config.kind.describe(), redact(&e.to_string())),
             )
-            .with_detail(format!("端点：{url}"))
+            .with_detail(format!(
+                "端点：{url}\n请求体约 {} KB。带图请求被打断时，先确认服务端接受这个大小。",
+                text_len / 1024
+            ))
         })?;
 
         let status = resp.status();
@@ -253,8 +436,12 @@ impl AiClient {
             let hint = match status.as_u16() {
                 401 => "API Key 无效或已过期。",
                 403 => "该 Key 没有访问此模型的权限。",
+                // 带图请求最常见的一条：模型不支持视觉输入
                 404 => "端点或模型名不存在，请检查 baseUrl 与 model。",
+                413 => "请求体太大 —— 图片可能压得不够小，把「最长边」调小一些。",
                 429 => "触发限流，请稍后重试或更换模型。",
+                400 => "请求被拒绝。如果这条请求带了图片，很可能是**这个模型不支持图片输入**，\
+                        请换成视觉模型（如 gpt-4o / qwen-vl-max / llava 等）。",
                 _ => "服务端返回错误。",
             };
             return Err(ToolforgeError::new(code, format!("AI 服务返回 HTTP {status}"))

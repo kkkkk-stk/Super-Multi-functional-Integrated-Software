@@ -1,0 +1,140 @@
+# ToolForge L1 插件（声明式编排，零代码）
+#
+# ── 按图片内容自动重命名 ─────────────────────────────────────────────────
+# 这是"AI 描述"最实用的一个用法：让多模态模型看一眼图，然后**用它的描述
+# 当文件名**。整理一堆 `IMG_1234.jpg` 时比任何规则都省事。
+#
+# 流水线四步，每一步都很小：
+#   1. `ai.describe`   —— 图片 → 一句描述（需要配好视觉模型）
+#   2. `text.replace`  —— 把空白与标点归一成 `_`（文件名里不能有这些）
+#   3. `name.build`    —— 拼上前后缀、序号、大小写，产出文件名
+#   4. `fs.move`       —— 按新名字落到输出目录
+#
+# ── 两个容易踩的地方 ─────────────────────────────────────────────────────
+# * **必须用视觉模型**。deepseek-chat、gpt-3.5 这类纯文本模型会直接返回 400；
+#   节点会把这条最常见的失败单独指出来，但更省事的做法是先在
+#   「设置 → AI」里点一次「测试连接」。
+# * **图片会上传给 AI 服务商** —— 这是本插件唯一联网的地方，也是它唯一的
+#   隐私代价。要完全离线就用 `image.remove-background`（本地推理）。
+#   插件本身**不申请** net 能力：联网发生在宿主的节点里，不在插件进程里。
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.builtin.ai-describe
+  name: AI 描述并重命名
+  version: 0.1.0
+  description: 让多模态模型看一眼图片，用它的描述作为新文件名。整理 IMG_1234.jpg 这类无意义文件名时最省事。需要配好视觉模型，图片会上传给 AI 服务商。
+  author: ToolForge
+  license: MIT
+  icon: sparkles
+  category: ai
+  tags: [AI, 图像描述, 自动命名, 多模态]
+
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+
+io:
+  inputs:
+    - id: src
+      label: 图片
+      type: file
+      accept: ["image/*"]
+      multiple: true
+      required: true
+      description: 可一次拖入多张，宿主按并发度逐张处理。
+  outputs:
+    - id: dst
+      label: 重命名后的文件
+      type: file
+      required: false
+      description: 文件名来自 AI 的描述，落在输出目录下。
+  params:
+    # 参数 id 与 `ai.describe` / `text.replace` / `name.build` 读取的键名逐字一致
+    - id: instruction
+      label: 提示词
+      type: textarea
+      description: 提示词直接决定文件名长什么样。想要短名字就别让它写整段话。
+      default: { kind: str, value: "用不超过 12 个字概括这张图片的主题，只输出概括本身，不要标点、不要解释。" }
+      required: false
+    - id: prefix
+      label: 文件名前缀
+      type: text
+      default: { kind: str, value: "" }
+      required: false
+    - id: indexMode
+      label: 追加序号
+      type: enum
+      description: 描述可能重复（比如两张都是"一只猫"），加序号可以避免互相覆盖。
+      default: { kind: str, value: batch }
+      options:
+        - { value: none, label: 不加 }
+        - { value: batch, label: 加批次序号（从 1 开始） }
+      required: false
+    - id: indexPad
+      label: 序号补零位数
+      type: int
+      default: { kind: int, value: 3 }
+      min: 0
+      max: 12
+      step: 1
+      required: false
+
+runtime:
+  kind: pipeline
+  pipeline:
+    description: 描述 → 净化为文件名 → 拼装 → 移动到位。
+    onError: continue
+    # 每次调用都要过一次模型，网络慢时可能要十几秒
+    timeoutMs: 300000
+    steps:
+      - id: describe
+        uses: ai.describe
+        label: 让模型看一眼
+        with:
+          src: "${src}"
+          instruction: "${params.instruction}"
+          # 文件名不需要高清：缩到 768 已经足够判断"这是什么"，
+          # 而 token 花费与像素成正比 —— 这一步是在替用户省钱。
+          maxSide: "768"
+          maxTokens: "256"
+
+      # 把描述变成安全的文件名主干。
+      #
+      # `[\s\p{P}]+` = 连续的空白或标点 → 一个下划线。
+      # 用 `\p{P}` 而不是只列 ASCII 标点，是因为模型经常回中文标点（，。！），
+      # 而那些字符在文件名里同样要出事。
+      - id: sanitize
+        uses: text.replace
+        label: 净化为文件名
+        with:
+          input: "${steps.describe.text}"
+          pattern: "[\\s\\p{P}]+"
+          replacement: "_"
+          useRegex: "true"
+          # 大小写不敏感在这里没有意义（标点不分大小写），但显式写出来更清楚
+          caseSensitive: "true"
+
+      - id: build
+        uses: name.build
+        label: 拼装文件名
+        with:
+          stem: "${steps.sanitize.text}"
+          ext: "${src.ext}"
+          prefix: "${params.prefix}"
+          index: "${params.indexMode}"
+          indexPad: "${params.indexPad}"
+          # 序号放后面：文件名主体是描述，序号只是去重
+          indexPosition: "suffix"
+          case: "keep"
+
+      - id: move
+        uses: fs.move
+        label: 落到输出目录
+        with:
+          src: "${src}"
+          dst: "${steps.build.value}"

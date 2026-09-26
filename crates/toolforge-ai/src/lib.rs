@@ -35,7 +35,7 @@
 pub mod provider;
 pub mod review;
 
-pub use provider::{AiProviderConfig, AiProviderKind, ChatMessage};
+pub use provider::{AiClient, AiProviderConfig, AiProviderKind, ChatMessage, ImagePart};
 // GenerationRequest 定义在本文件里（因为它同时被 review 与外壳层使用），
 // 不需要从 provider 再导出一次。
 pub use review::{review_draft, AiDraft, DraftFile, SecurityReview};

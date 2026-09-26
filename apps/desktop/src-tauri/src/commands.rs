@@ -729,6 +729,12 @@ fn submit_plugin_run(
     let engines = app.engines.clone();
     let paths = app.paths.clone();
     let plugin_id = req.plugin_id.clone();
+    // 在锁外克隆一份句柄：`AiClient` 在 `RwLock` 里，持锁跨 await 会饿死设置保存
+    let vision: Option<Arc<dyn toolforge_core::ai::VisionClient>> = app
+        .ai
+        .read()
+        .as_ref()
+        .map(|c| c.clone() as Arc<dyn toolforge_core::ai::VisionClient>);
 
     app.queue.spawn(job, move |ctx| async move {
         let workspace = paths.job_workspace(ctx.id.as_str());
@@ -793,6 +799,10 @@ fn submit_plugin_run(
                         // 对"给每个文件编号"这类重命名需求是必需的。
                         batch_index: (idx + 1) as u32,
                         batch_total: total as u32,
+                        // 视觉能力（`ai.describe` / `doc.ocr` 要用）。
+                        // 没配 AI 时是 `None` —— 那类节点会报一条可操作的错误，
+                        // 其余节点完全不受影响。
+                        vision: vision.clone(),
                     };
                     let result =
                         toolforge_plugins::l1::run_pipeline(&record, &pipeline_req, engines.clone(), &ctx)
