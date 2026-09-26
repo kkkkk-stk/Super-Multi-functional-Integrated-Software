@@ -313,6 +313,33 @@ permissions:
 > 曾经这里写的是"`vars.*` 未实现，请改用 `steps.*`" —— 那个说法当时是对的，
 > 现在已随 `l1.rs` 的修复失效。节点目录里 `flow.set-var` 的承诺现在是事实。
 
+#### 批处理变量：`${batch.*}`（清单里**不需要**循环节点）
+
+宿主在**命令层**把一次运行扇出成 N 个单文件批次（`commands.rs::expand_batches`），
+每个批次单独调用一次本流水线。流水线自己不知道"我跑了几次"，所以序号由宿主注入：
+
+| 语法 | 含义 |
+|---|---|
+| `${batch.index}` | 当前批次序号，**从 1 起**（`l1.rs` 保证最小为 1） |
+| `${batch.zeroIndex}` | 当前批次序号，从 0 起（做"第一个之外"这类判断时比 `index - 1` 干净） |
+| `${batch.total}` | 批次总数，即本次任务要处理的文件数（最小为 1） |
+
+**两条展开规则**（都在命令层，清单里看不到）：
+
+1. **目录 → 里面的文件**。拖进一个**文件夹**时，宿主先把它展开成其中的文件，再逐个处理 —— 所以"拖一个文件夹进去"就是"逐个处理里面每个文件"，不需要循环节点。
+   - **只展开一层**（不递归：递归会让"我拖了个文件夹"变成"翻遍整个照片库"；需要递归就自己选下级目录）；
+   - 只收普通文件，**跳过子目录、符号链接和 `.` 开头的隐藏文件**（含 macOS 的 `._` 资源叉）；
+   - 结果**排序**（目录枚举顺序在文件系统之间没有保证，不排序的话 `${batch.index}` 每次都不同）；
+   - **上限 5000 个文件，超过直接报错**（`INVALID_ARGUMENT`，提示"请分批拖入，或者先按子目录拆开"）。**刻意不静默截断** —— 截断会让你以为处理完了。
+   - 授权根也跟着变严：输入是目录时，`input_root` 取**那个目录自身**，不再是它的父级。
+2. **多文件 → 逐文件**。选**文件数最多**的那个输入端口作主端口来扇出，其余端口的值在每一批里原样保留。单文件输入退化为一次调用。
+   - 因此**主端口在每一批里只剩一个路径**：`${src}`、`${input.<port>}` 与 `${input.<port>.first}` 在批处理下指的都是**当前批次那一个文件**（不会再出现"逗号连接的一长串"）。
+
+> 所以 `plugins/builtin/batch-rename` 那种"批量重命名"需求，正确写法是用
+> `${batch.index}` / `${src.stem}` 构造新文件名，而**不是**去找一个循环节点。
+> （`${src.stem}` / `${src.ext}` / `${src.name}` 由宿主按**当前批次**的输入文件注入，
+> 见 `l1.rs` 的模板上下文构造。）
+
 **`when` 条件**（`eval_condition`）刻意不做通用表达式引擎——通用表达式意味着通用执行：
 
 | 写法 | 含义 |
@@ -409,10 +436,11 @@ permissions:
 
 ⚠️ 两点必须先知道：
 
-1. **登记 ≠ 已实现**。下面 31 个节点都登记在节点目录里（所以流程编辑器能拖出来、
+1. **登记 ≠ 已实现**。下面 32 个节点都登记在节点目录里（所以流程编辑器能拖出来、
    清单也能通过校验），但 `toolforge-engines/src/nodes.rs` 的 `run()` 目前只实现了
-   **25 个**；标 🚧 的 6 个会返回
-   「内置节点 `X` 尚未在 v0.1 中实现」。
+   **27 个**；标 🚧 的 5 个会返回
+   「内置节点 `X` 尚未在 v0.1 中实现」（名单的唯一真相来源是
+   `toolforge_core::pipeline::UNIMPLEMENTED_NODES`）。
 2. **节点参数写在 `with` 里或 `io.params` 里都可以，`with` 优先**。
    执行器用 `ctx.param_str("format", "webp")` 这类调用取值，它会**先看当前步骤的 `with`、
    再看插件自己的 `io.params`（按同名 id）、最后回退默认值**（见 `NodeCtx::arg_scope`）。
@@ -490,7 +518,15 @@ permissions:
 | `flow.branch` | 条件分支 | — | — | `condition` | 见下方说明 |
 | `flow.set-var` | 设置变量 | — | — | `name`、`value` | 写入流水线变量；产出 `${steps.<id>.value}` |
 | `flow.log` | 写日志 | — | — | `message`、`level` | 见下方说明 |
-| `flow.foreach` | 批量循环 🚧 | — | — | `concurrency` | **v0.1 未实现**（见下方说明） |
+
+> ⚠️ 这里原来还有一行 `flow.foreach`（批量循环）。**这个节点已经被整个删除**，
+> 不是"留着不实现" —— 所以清单里写 `uses: flow.foreach` 现在会直接**校验不过**
+> （未知节点），而不是装完之后运行时才报 `not_implemented`。
+>
+> 删掉的理由：L1 的步骤列表是**平铺的有序列表**，没有嵌套结构，"对剩下的步骤循环 N 次"
+> 这句话没法定义（循环体包含哪些步骤？循环之后那些"只想跑一次"的收尾步骤怎么办？）；
+> 而且它旧描述里的「宿主会按并发度并行调度」是**假话**，宿主不在流水线内部调度。
+> 批量已经由宿主在命令层做完了，见 1.6 节的目录展开与 `${batch.*}`。
 
 > ✅ **流程控制节点的真实状态**（曾经三条都写着"未实现/空实现"，现已修复）：
 >
@@ -499,7 +535,7 @@ permissions:
 > | `flow.set-var` | ✅ 可用 | 写入 `vars.<名称>`，后续步骤用 `${vars.<名称>}` 引用 |
 > | `flow.log` | ✅ 可用 | **真的往任务日志写一条**（`message` 为空时报 `PluginInvalid`） |
 > | `flow.branch` | ✅ 可用 | 求值 `condition`，产出 `${steps.<id>.active}` = `"true"`/`"false"` |
-> | `flow.foreach` | 🚧 未实现 | 落到 `not_implemented`。**批量由命令层展开**，清单里不需要它 |
+> | `flow.foreach` | ❌ **节点已删除** | 不再存在这个节点，写了会在校验阶段报 `STEP_UNKNOWN_NODE`。**批量由宿主在命令层展开**（多文件与目录输入都扇出成单文件批次），清单里不需要它 |
 >
 > `flow.log` 与 `flow.branch` 曾经是**空实现** —— 直接返回空的 `NodeOutput`，
 > 不报错也不做事。那是最难排查的一类行为：用户以为节点在跑，日志里却什么都没有、
@@ -979,7 +1015,7 @@ runtime:
 
 | 想看什么 | 去哪里 |
 |---|---|
-| 可以直接抄的完整例子 | `plugins/builtin/image-convert/`（L1 单节点）、`plugins/builtin/video-to-gif/`（L1 多步 + `${steps.x.y}`）、`plugins/builtin/batch-rename/`（批量循环形状）、`plugins/builtin/remove-bg/`（引擎依赖 + 模型选择）、`plugins/wasm-example/`（L2）、`plugins/python-example/`（L3） |
+| 可以直接抄的完整例子 | `plugins/builtin/image-convert/`（L1 单节点）、`plugins/builtin/video-to-gif/`（L1 多步 + `${steps.x.y}`）、`plugins/builtin/batch-rename/`（批量编号形状：`${batch.index}` + `${src.stem}`）、`plugins/builtin/remove-bg/`（引擎依赖 + 模型选择）、`plugins/wasm-example/`（L2）、`plugins/python-example/`（L3） |
 | 引擎与许可证矩阵、降级路径 | `docs/ENGINE-MATRIX.md` |
 | 架构与数据流 | `docs/ARCHITECTURE.md` |
 | 安全模型与权限风险 | `docs/SECURITY.md` |

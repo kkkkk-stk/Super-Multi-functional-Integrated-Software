@@ -26,6 +26,7 @@ import { toToolforgeError } from "@/lib/ipc";
  * | `["jobStats"]` | `JobStats` | 任务终结后 invalidate |
  * | `["engines"]` | `EngineEntry[]` | 探测 / 安装事件 patch |
  * | `["engine", id]` | `EngineStatus` | `engines_probe` 单点刷新 |
+ * | `["models"]` | `ModelEntry[]` | 模型下载 / 删除后 invalidate |
  * | `["plugins"]` | `PluginsSnapshot` | pluginChanged 事件 invalidate |
  * | `["plugin", id]` | `PluginDetail` | 授权 / 启用后精确刷新 |
  * | `["nodes"]` | `NodeCatalogResponse` | 引擎状态变化后 invalidate |
@@ -40,6 +41,7 @@ export const queryKeys = {
   jobStats: ["jobStats"] as const,
   engines: ["engines"] as const,
   engine: (id: string) => ["engine", id] as const,
+  models: ["models"] as const,
   plugins: ["plugins"] as const,
   plugin: (id: string) => ["plugin", id] as const,
   nodes: ["nodes"] as const,

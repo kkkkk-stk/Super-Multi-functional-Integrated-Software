@@ -113,17 +113,33 @@ pub async fn settings_get(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Se
     Ok(s)
 }
 
+/// 局部更新设置。
+///
+/// ## 顺序是有讲究的
+///
+/// 1. **改内存**（用户立刻看到效果）
+/// 2. **落盘**（关掉应用还在）
+/// 3. **把变化作用到运行时**（并发度 → 队列；AI 配置 → 重建客户端）
+///
+/// 第 3 步不能漏：`AiClient` 在构造时就把 base_url / 模型 / Key 固化进连接池了，
+/// 只改 `settings` 不重建客户端，界面上显示"已改成 gpt-4o"，
+/// 实际请求还打给老模型 —— 这类"设置了但没生效"的 bug 最难被发现。
 #[tauri::command]
 #[specta::specta]
 pub async fn settings_patch(
     state: State<'_, Arc<AppState>>,
     patch: SettingsPatch,
 ) -> ToolforgeResult<Settings> {
+    // `patch.ai` 后面还要用来判断"AI 配置变了吗"，先取出来避免部分移动
+    let ai_patch = patch.ai;
+    let ai_changed = ai_patch.is_some();
+
     {
         let mut s = state.settings.write();
         if let Some(v) = patch.concurrency {
             s.concurrency = v.clamp(1, 64);
-        }        if let Some(v) = patch.theme {
+        }
+        if let Some(v) = patch.theme {
             s.theme = v;
         }
         if let Some(v) = patch.accent {
@@ -141,7 +157,7 @@ pub async fn settings_patch(
         if let Some(v) = patch.probe_engines_on_startup {
             s.probe_engines_on_startup = v;
         }
-        if let Some(ai) = patch.ai {
+        if let Some(ai) = ai_patch {
             s.ai = ai;
         }
     }
@@ -152,33 +168,20 @@ pub async fn settings_patch(
         state.queue.set_concurrency(v.clamp(1, 64) as usize);
     }
 
-    // Key 单独处理：写进 AI 客户端的内存态，不落到会序列化的结构体里
+    // Key 单独处理：它不在 `Settings` 里（那个结构体会被序列化给前端）
     if let Some(key) = patch.ai_api_key {
-        let mut ai = state.ai.write();
-        if key.trim().is_empty() {
-            *ai = None;
-        } else {
-            let s = state.settings.read().clone();
-            let mut cfg =
-                toolforge_ai::AiProviderConfig::new(s.ai.provider);
-            if !s.ai.base_url.trim().is_empty() {
-                cfg.base_url = s.ai.base_url.clone();
-            }
-            if !s.ai.model.trim().is_empty() {
-                cfg.model = s.ai.model.clone();
-            }
-            cfg.temperature = s.ai.temperature;
-            cfg.api_key = key;
-            cfg.has_key = true;
-            match toolforge_ai::provider::AiClient::new(cfg) {
-                Ok(c) => *ai = Some(Arc::new(c)),
-                Err(e) => {
-                    *ai = None;
-                    return Err(e);
-                }
-            }
-        }
+        state.set_api_key(Some(key));
     }
+
+    // 提供方 / base_url / 模型 / 温度变了 → 用同一个 Key 重建客户端
+    if ai_changed {
+        state.rebuild_ai_client();
+    }
+
+    // 最后落盘。放在运行时变更之后，是为了让"磁盘上的那份"与"正在跑的那份"
+    // 尽可能一致：如果先落盘再改运行时，中间崩掉就会出现
+    // "文件说改了、下次启动生效"的错位。
+    state.persist_settings();
 
     settings_get(state).await
 }
@@ -342,6 +345,137 @@ pub async fn engines_install(
     });
 
     Ok(job_id)
+}
+
+// ============================================================================
+// 模型权重
+// ============================================================================
+
+/// 列出全部模型权重及其状态。
+///
+/// `downloadable` 是给界面用的：**没有配置下载源的模型必须提前显示为不可下载**，
+/// 而不是让用户点一下、等几秒、再收到一个"没有配置 SHA-256"的错误。
+#[tauri::command]
+#[specta::specta]
+pub async fn models_list(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Vec<ModelEntry>> {
+    let nodes = builtin_nodes();
+    let registered: HashMap<String, toolforge_engines::ModelSpec> = state
+        .engines
+        .models()
+        .into_iter()
+        .map(|m| (m.id.clone(), m))
+        .collect();
+
+    let mut out = Vec::new();
+    for desc in engine_catalog() {
+        for m in desc.models {
+            let registered_spec = registered.get(&m.id);
+            let path = state.engines.model_path(&m.id);
+            let installed_size = path
+                .as_ref()
+                .filter(|p| p.exists())
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|meta| meta.len() as f64 / (1024.0 * 1024.0));
+
+            let used_by_nodes: Vec<String> = nodes
+                .iter()
+                .filter(|n| {
+                    // 模型与节点的关联写在两处：目录里的 `provides` 只到引擎粒度，
+                    // 节点粒度靠 `requires_engines` / `optional_engines`。
+                    // 这里按"该模型所属引擎被谁用"来算，是最不容易漂移的口径。
+                    n.requires_engines.contains(&desc.id) || n.optional_engines.contains(&desc.id)
+                })
+                .map(|n| n.name.clone())
+                .collect();
+
+            out.push(ModelEntry {
+                id: m.id.clone(),
+                name: m.name.clone(),
+                purpose: m.purpose.clone(),
+                license: m.license.clone(),
+                commercial_use: m.commercial_use,
+                approx_size_mb: m.approx_size_mb,
+                installed: installed_size.is_some(),
+                installed_size_mb: installed_size,
+                downloadable: registered_spec.is_some() && m.sha256.is_some(),
+                used_by_nodes,
+                engine_id: desc.id.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// 下载一个模型权重。
+#[tauri::command]
+#[specta::specta]
+pub async fn models_install(
+    state: State<'_, Arc<AppState>>,
+    req: ModelInstallRequest,
+) -> ToolforgeResult<String> {
+    let ModelInstallRequest {
+        model_id,
+        license_accepted,
+    } = req;
+
+    // 找到目录里的那一条（顺便拿到许可证信息）
+    let spec = engine_catalog()
+        .into_iter()
+        .flat_map(|d| d.models)
+        .find(|m| m.id == model_id)
+        .ok_or_else(|| ToolforgeError::not_found(format!("未知模型 {model_id}")))?;
+
+    // 不可商用的权重必须显式确认 —— 与引擎安装同一套硬门
+    if !spec.commercial_use && !license_accepted {
+        return Err(ToolforgeError::denied(format!(
+            "{} 的权重不允许商用，请先确认你了解它的许可条款",
+            spec.name
+        ))
+        .with_detail(format!("{}：{}", spec.license, spec.purpose)));
+    }
+
+    // 没有下载源就**当场拒绝**，不要排一个注定失败的下载任务
+    if spec.url.is_none() || spec.sha256.is_none() {
+        return Err(ToolforgeError::not_found(format!(
+            "{} 还没有配置可校验的下载源",
+            spec.name
+        ))
+        .with_detail(
+            "为了避免「下载来路不明的模型」，本项目只接受能核对 SHA-256 的来源；\
+             这个模型的哈希还没被核对过（见 crates/toolforge-core/src/engine.rs 里 \
+             verified_sources_are_pinned 的说明）。",
+        ));
+    }
+
+    let job = state.queue.create(
+        JobKind::ModelDownload {
+            model_id: model_id.clone(),
+        },
+        format!("下载模型 · {}", spec.name),
+        1,
+    );
+    let job_id = job.id.to_string();
+    let engines = state.engines.clone();
+    let name = spec.name.clone();
+
+    state.queue.spawn(job, move |ctx| async move {
+        ctx.info(format!("开始下载 {name}（约 {} MB）", spec.approx_size_mb));
+        let path = engines.install_model(&model_id, &ctx, false).await?;
+        ctx.info(format!("模型就绪：{}", path.display()));
+        Ok(vec![path.display().to_string()])
+    });
+
+    Ok(job_id)
+}
+
+/// 删除一个已下载的模型权重，释放磁盘。
+#[tauri::command]
+#[specta::specta]
+pub async fn models_remove(
+    state: State<'_, Arc<AppState>>,
+    model_id: String,
+) -> ToolforgeResult<bool> {
+    state.engines.remove_model(&model_id)
 }
 
 // ============================================================================
@@ -569,8 +703,8 @@ fn submit_plugin_run(
     // 哈希校验：与安装时不一致就直接拒绝并禁用
     app.plugins.quarantine_if_changed(&req.plugin_id)?;
 
-    // 把多文件输入展开成单文件批次
-    let batches = expand_batches(&req.inputs);
+    // 把多文件输入展开成单文件批次（目录会先展开成里面的文件）
+    let batches = expand_batches(&req.inputs)?;
     let total_items = batches.len().max(1) as u32;
 
     let output_dir = resolve_output_dir(app, &req)?;
@@ -651,6 +785,11 @@ fn submit_plugin_run(
                         output_root: output_dir.clone(),
                         plugin_data_root: paths.plugin_data(&plugin_id),
                         workspace_root: workspace.clone(),
+                        // 批量由命令层扇出，序号也从这里注入 ——
+                        // 流水线自己不知道"我跑了几次"，但 `${batch.index}`
+                        // 对"给每个文件编号"这类重命名需求是必需的。
+                        batch_index: (idx + 1) as u32,
+                        batch_total: total as u32,
                     };
                     let result =
                         toolforge_plugins::l1::run_pipeline(&record, &pipeline_req, engines.clone(), &ctx)
@@ -699,35 +838,105 @@ fn submit_plugin_run(
     })
 }
 
+/// 一个输入端口最多展开多少个文件。
+///
+/// 拖进来一个含几万张图的目录时，"立刻创建几万个批次"会把任务队列和界面一起
+/// 拖垮。这里设一个上限并**明确报错**（而不是静默截断）—— 静默截断会让用户
+/// 以为"处理完了"，实际只处理了前一部分。
+const MAX_DIR_EXPANSION: usize = 5000;
+
+/// 把一个目录展开成它里面的文件列表（**只展开一层**）。
+///
+/// ## 为什么只展开一层
+///
+/// 递归展开会让"我拖了一个文件夹"变成"它翻遍了我整个照片库的每一层"，
+/// 这既慢又违背意图。一层是最符合"拖进一堆文件"直觉的语义；
+/// 真需要递归的用户可以自己选目录里的子目录。
+///
+/// 结果**排序**是为了可复现：目录项的枚举顺序在文件系统之间没有保证，
+/// 不排序的话 `${batch.index}` 每次跑出来的编号都不一样。
+fn expand_dir(dir: &std::path::Path) -> ToolforgeResult<Vec<String>> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| ToolforgeError::io(format!("读取目录 {} 失败：{e}", dir.display())))?;
+
+    let mut files: Vec<String> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        // 只收普通文件：子目录（不递归）、符号链接、设备文件都跳过
+        let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        // 跳过隐藏文件与 macOS 的 `._` 资源叉：用户不会指望它们被处理
+        if name.starts_with('.') {
+            continue;
+        }
+        files.push(path.display().to_string());
+        if files.len() > MAX_DIR_EXPANSION {
+            return Err(ToolforgeError::invalid(format!(
+                "目录 {} 里的文件超过 {MAX_DIR_EXPANSION} 个，一次装不下",
+                dir.display()
+            ))
+            .with_detail("请分批拖入，或者先按子目录拆开。"));
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
 /// 把多文件输入展开成"一批一个文件"。
 ///
-/// 选**文件数最多的那个输入端口**作为主端口来扇出：这是唯一能在插件的输入契约
-/// （可能同时有 `image` 与 `mask` 两个端口）下保持行为可预测的规则。
-/// 其余端口的值在每一批里原样保留。
+/// ## 两条展开规则
+///
+/// 1. **目录 → 里面的文件**：`build_io` 会把输入根收敛成"输入文件的公共父目录"，
+///    如果直接把目录当输入，那个根会退化成**目录的父级**（选了 `D:\照片` 就授权到
+///    `D:\`）。先展开成文件，根就正好是那个目录本身 —— 权限更紧，行为也更符合
+///    "拖进一个文件夹，逐个处理"的直觉。
+/// 2. **多文件 → 逐文件**：选**文件数最多的那个输入端口**作为主端口来扇出。
+///    这是唯一能在插件的输入契约（可能同时有 `image` 与 `mask` 两个端口）下
+///    保持行为可预测的规则。其余端口的值在每一批里原样保留。
 ///
 /// 单文件输入时退化为一次调用，与之前行为一致。
-fn expand_batches(inputs: &HashMap<String, Vec<String>>) -> Vec<HashMap<String, Vec<String>>> {
-    let primary = inputs
+fn expand_batches(inputs: &HashMap<String, Vec<String>>) -> ToolforgeResult<Vec<HashMap<String, Vec<String>>>> {
+    // 第一步：目录展开（这一步会先做，因为它会改变"哪个端口最大"）
+    let mut expanded: HashMap<String, Vec<String>> = HashMap::new();
+    for (port, paths) in inputs {
+        let mut out: Vec<String> = Vec::new();
+        for p in paths {
+            if std::path::Path::new(p).is_dir() {
+                out.extend(expand_dir(std::path::Path::new(p))?);
+            } else {
+                out.push(p.clone());
+            }
+        }
+        expanded.insert(port.clone(), out);
+    }
+
+    let primary = expanded
         .iter()
         .max_by_key(|(_, v)| v.len())
         .map(|(k, _)| k.clone());
 
     let Some(primary) = primary else {
-        return vec![inputs.clone()];
+        return Ok(vec![expanded]);
     };
-    let items = inputs.get(&primary).cloned().unwrap_or_default();
+    let items = expanded.get(&primary).cloned().unwrap_or_default();
+    // 目录展开后一个文件都没有时，不要返回空列表 —— 那会让整个任务零产出地"成功"。
+    // 这里保持原样交给下游，让"输入为空"以它本来该有的方式暴露出来。
     if items.len() <= 1 {
-        return vec![inputs.clone()];
+        return Ok(vec![expanded]);
     }
 
-    items
+    Ok(items
         .into_iter()
         .map(|item| {
-            let mut m = inputs.clone();
+            let mut m = expanded.clone();
             m.insert(primary.clone(), vec![item]);
             m
         })
-        .collect()
+        .collect())
 }
 
 /// 任务重试。仅对注册过重放闭包的任务有效（插件运行可以，引擎安装与 AI 生成不行）。
@@ -935,6 +1144,10 @@ fn resolve_output_dir(state: &AppState, req: &RunPluginRequest) -> ToolforgeResu
 ///
 /// 输入根目录 = 该批次所有输入文件的公共父目录。这是 [`PathResolver`] 的收敛边界：
 /// 插件只能读这个范围内（以及它自己的数据目录），读别的会被拒绝并记审计。
+///
+/// 有个容易写错的地方：输入**本身就是目录**时（`PortType::Directory` 的端口），
+/// 根必须是那个目录**自身**，而不是它的父级。用父级的话，"选了一个目录"
+/// 等于把手伸到了它外面一层 —— 授权范围白送一大圈。
 fn build_io(
     inputs: &HashMap<String, Vec<String>>,
     output_dir: &std::path::Path,
@@ -944,10 +1157,14 @@ fn build_io(
     for paths in inputs.values() {
         for p in paths {
             let path = PathBuf::from(p);
-            let parent = path.parent().map(|x| x.to_path_buf()).unwrap_or_default();
+            let scope = if path.is_dir() {
+                path.clone()
+            } else {
+                path.parent().map(|x| x.to_path_buf()).unwrap_or_default()
+            };
             input_root = Some(match input_root {
-                None => parent,
-                Some(cur) => common_prefix(&cur, &parent),
+                None => scope,
+                Some(cur) => common_prefix(&cur, &scope),
             });
         }
     }

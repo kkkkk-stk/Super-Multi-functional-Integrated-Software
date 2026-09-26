@@ -140,6 +140,13 @@ pub struct EngineModel {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// 落盘文件名。
+    ///
+    /// 单独一个字段是必需的：GitHub 上的资产名（`isnet-general-use.onnx`）
+    /// 经常和模型 id（`isnet-general`）**对不上**。靠 `format!("{id}.onnx")`
+    /// 猜文件名的话，下载成功、校验通过、然后"已安装"永远为假。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
     /// 该模型是否已下载（运行时填充）
     #[serde(default)]
     pub installed: bool,
@@ -215,6 +222,14 @@ impl EngineStatus {
         }
     }
 }
+
+/// `onnx-models` 的权重全部来自 rembg 的这一个 release。
+///
+/// 这个 tag 字面上就是 `v0.0.0`（**不是占位符**）：rembg 用一个固定 tag 挂模型资产，
+/// 每个资产名在模型条目里逐条写全。抽成常量是为了避免手抄时把 `v0.0.0`
+/// 打成 `v0.0.1` 这类低级错误 —— 那种错误的表现是"下载 404"，
+/// 而没人会想到去核对一个 tag。
+const REMBG_RELEASE: &str = "https://github.com/danielgatis/rembg/releases/download/v0.0.0";
 
 /// 内置引擎目录。
 ///
@@ -388,36 +403,41 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             requires_license_ack: true,
             models: vec![
                 EngineModel {
-                    id: "u2net".into(),
-                    name: "U²-Net".into(),
-                    purpose: "通用显著性目标检测 / 抠图，效果均衡".into(),
-                    approx_size_mb: 176,
-                    license: "Apache-2.0".into(),
-                    commercial_use: true,
-                    url: None,
-                    sha256: None,
-                    installed: false,
-                },
-                EngineModel {
                     id: "u2netp".into(),
                     name: "U²-Net (轻量)".into(),
-                    purpose: "U²-Net 的轻量版，速度快约 3 倍，边缘略糊".into(),
+                    purpose: "U²-Net 的轻量版，速度快约 3 倍，边缘略糊。**推荐先装这个**：只有 4.4 MB。".into(),
                     approx_size_mb: 5,
                     license: "Apache-2.0".into(),
                     commercial_use: true,
-                    url: None,
-                    sha256: None,
+                    // 哈希是**真实下载后算出来的**，不是抄来的。见下方 `verified_sources_are_pinned`。
+                    url: Some(format!("{REMBG_RELEASE}/u2netp.onnx")),
+                    sha256: Some("309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8".into()),
+                    file_name: Some("u2netp.onnx".into()),
+                    installed: false,
+                },
+                EngineModel {
+                    id: "u2net".into(),
+                    name: "U²-Net".into(),
+                    purpose: "通用显著性目标检测 / 抠图，效果均衡。168 MB。".into(),
+                    approx_size_mb: 176,
+                    license: "Apache-2.0".into(),
+                    commercial_use: true,
+                    url: Some(format!("{REMBG_RELEASE}/u2net.onnx")),
+                    sha256: Some("8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491".into()),
+                    file_name: Some("u2net.onnx".into()),
                     installed: false,
                 },
                 EngineModel {
                     id: "isnet-general".into(),
                     name: "IS-Net General".into(),
-                    purpose: "通用抠图，对复杂边缘处理更好".into(),
+                    purpose: "通用抠图，对杂乱背景与复杂边缘处理更好。170 MB。".into(),
                     approx_size_mb: 176,
                     license: "Apache-2.0".into(),
                     commercial_use: true,
-                    url: None,
-                    sha256: None,
+                    // 注意资产名是 `isnet-general-use.onnx`，与模型 id 不同
+                    url: Some(format!("{REMBG_RELEASE}/isnet-general-use.onnx")),
+                    sha256: Some("60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a".into()),
+                    file_name: Some("isnet-general-use.onnx".into()),
                     installed: false,
                 },
                 EngineModel {
@@ -427,8 +447,11 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     approx_size_mb: 900,
                     license: "MIT（代码）/ 权重另有条款".into(),
                     commercial_use: false,
+                    // 没配下载源：**不是遗漏，是不敢乱填**。
+                    // 哈希必须来自真实下载，见 `verified_sources_are_pinned` 的说明。
                     url: None,
                     sha256: None,
+                    file_name: None,
                     installed: false,
                 },
                 EngineModel {
@@ -440,6 +463,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     commercial_use: false,
                     url: None,
                     sha256: None,
+                    file_name: None,
                     installed: false,
                 },
                 EngineModel {
@@ -451,6 +475,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     commercial_use: true,
                     url: None,
                     sha256: None,
+                    file_name: None,
                     installed: false,
                 },
             ],
@@ -476,7 +501,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             description: "OpenAI 兼容接口的大模型服务，用于插件生成、图像描述等。".into(),
             homepage: "https://platform.openai.com/docs/api-reference".into(),
             license: "依服务商条款".into(),
-            license_note: "API Key 只存在本机加密存储中，不会随插件或日志外泄。".into(),
+            license_note: "API Key 默认只存在内存里（重启要重填）。打开「记住 API Key」后会以**明文**另存到数据目录下的 ai-key.txt —— 系统钥匙串尚未接入。它不会随插件或日志外泄。".into(),
             approx_size_mb: 0,
             core: false,
             provides: vec!["ai.describe".into()],
@@ -552,6 +577,97 @@ mod tests {
         }
         // 至少要有一个明确不可商用的，提醒用户
         assert!(onnx.models.iter().any(|m| !m.commercial_use));
+    }
+
+    /// 有下载源的模型必须**三件套齐全且互相自洽**。
+    ///
+    /// 这条测试的由来：`url` / `sha256` / `file_name` 三个字段里的任何一个缺席，
+    /// 表现都不是"报错"，而是**静默失效**：
+    ///
+    /// * 缺 `sha256` → `install_model` 报"没有配置 SHA-256，拒绝自动下载"；
+    /// * 缺 `file_name` → 下载成功、校验通过，但 `installed_models_for` 找不到它，
+    ///   界面上永远显示"未安装"，用户会重复下载 170 MB；
+    /// * `sha256` 不是 64 位十六进制 → 校验必然失败，且错误信息会让人以为下载坏了。
+    ///
+    /// 这些哈希都是**真实下载后算出来的**，不是从网页上抄的。改动它们之前请先
+    /// 重新下载核对 —— 校验失败会直接删除文件，用户端表现为"下载完就没了"。
+    #[test]
+    fn verified_sources_are_pinned() {
+        let onnx = find_engine("onnx-models").unwrap();
+
+        for m in &onnx.models {
+            match (&m.url, &m.sha256) {
+                (Some(url), Some(hash)) => {
+                    assert!(
+                        url.starts_with(REMBG_RELEASE),
+                        "模型 {} 的地址不在固定的 release 下：{url}",
+                        m.id
+                    );
+                    assert_eq!(hash.len(), 64, "模型 {} 的哈希长度不对", m.id);
+                    assert!(
+                        hash.chars().all(|c| c.is_ascii_hexdigit()),
+                        "模型 {} 的哈希不是十六进制：{hash}",
+                        m.id
+                    );
+                    assert_eq!(hash, &hash.to_ascii_lowercase(), "模型 {} 的哈希要小写", m.id);
+                    assert!(
+                        m.file_name.is_some(),
+                        "模型 {} 有下载源却没有 file_name —— 装完了也不会被认出来",
+                        m.id
+                    );
+
+                    // ★ 这条断言是被一个**真机下载**逼出来的：
+                    //
+                    // `url` 曾经写成 `REMBG_RELEASE.to_string()`（也就是
+                    // `.../download/v0.0.0`）—— 少拼了资产文件名。它看起来完全正常
+                    // （是个像样的 GitHub 地址），单测也照样绿，因为没人会去"下载"。
+                    // 真跑的时候得到的是 `HTTP 404`，而错误信息只说"下载 u2netp 失败"。
+                    //
+                    // 要求"URL 必须以落盘文件名结尾"是最便宜的自洽检查：
+                    // 只要有人再漏拼一次资产名，这条会立刻红。
+                    let file_name = m.file_name.as_deref().unwrap_or_default();
+                    assert!(
+                        url.ends_with(file_name),
+                        "模型 {} 的下载地址没有以文件名 `{file_name}` 结尾：\n  {url}\n\
+                         多半是漏拼了资产名（GitHub 资产地址必须以具体文件名结尾，\
+                         指向 release tag 本身会 404）。",
+                        m.id
+                    );
+                }
+                // "没有下载源"是合法状态（还没核对过哈希），但必须**两个都没有**，
+                // 不能出现"有 url 没 hash"这种半成品。
+                (None, None) => {
+                    assert!(
+                        m.file_name.is_none(),
+                        "模型 {} 没有下载源却写了 file_name",
+                        m.id
+                    );
+                }
+                _ => panic!(
+                    "模型 {} 的 url / sha256 只配了一个 —— 要么都填，要么都留空",
+                    m.id
+                ),
+            }
+        }
+
+        // 至少要有两个可以直接下载的：一个是轻量版（默认推荐），一个是完整版。
+        let ready = onnx
+            .models
+            .iter()
+            .filter(|m| m.url.is_some() && m.sha256.is_some())
+            .count();
+        assert!(ready >= 2, "可下载的抠图模型太少（{ready} 个）");
+
+        // 文件名不能重复：两个模型写进同一个文件会互相覆盖
+        let mut names: Vec<&str> = onnx
+            .models
+            .iter()
+            .filter_map(|m| m.file_name.as_deref())
+            .collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "模型 file_name 有重复：{names:?}");
     }
 
     #[test]

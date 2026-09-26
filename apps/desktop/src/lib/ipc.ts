@@ -42,6 +42,8 @@ import type {
   JobStats,
   JobsListRequest,
   JobsSnapshot,
+  ModelEntry,
+  ModelInstallRequest,
   NodeCatalogResponse,
   PluginDetail,
   PluginSummary,
@@ -262,6 +264,20 @@ export const enginesProbe = (engineId: string): Promise<EngineStatus> =>
 /** 返回 jobId；下载进度通过 `engineDownloadProgress` 事件回流 */
 export const enginesInstall = (req: EngineInstallRequest): Promise<string> =>
   unwrap(commands.enginesInstall(req));
+
+// ============================================================================
+// 模型权重
+// ============================================================================
+
+export const modelsList = (): Promise<ModelEntry[]> => unwrap(commands.modelsList());
+
+/** 返回 jobId；进度同样走 `engineDownloadProgress` 事件（模型与引擎共用一条下载通道） */
+export const modelsInstall = (req: ModelInstallRequest): Promise<string> =>
+  unwrap(commands.modelsInstall(req));
+
+/** 删除已下载的权重；返回是否真的删掉了东西 */
+export const modelsRemove = (modelId: string): Promise<boolean> =>
+  unwrap(commands.modelsRemove(modelId));
 
 // ============================================================================
 // 插件

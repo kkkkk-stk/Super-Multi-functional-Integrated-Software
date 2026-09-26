@@ -14,7 +14,7 @@
 | 数据 | 权威来源 | 内容 |
 | --- | --- | --- |
 | 引擎目录（11 个）与模型清单（6 个） | `engine_catalog()`，位于 `crates/toolforge-core/src/engine.rs` | 返回 `Vec<EngineDescriptor>`：引擎的许可证、许可证注意事项、体积、安装方式、支持平台、`provides` 能力标签 |
-| 内置节点目录（31 个） | `builtin_nodes()`，位于 `crates/toolforge-core/src/pipeline.rs` | 返回 `Vec<NodeDescriptor>`：每个节点的 `requiresEngines`（必需引擎）与 `optionalEngines`（可选引擎），是本文档第 5 节降级矩阵的唯一依据 |
+| 内置节点目录（32 个） | `builtin_nodes()`，位于 `crates/toolforge-core/src/pipeline.rs` | 返回 `Vec<NodeDescriptor>`：每个节点的 `requiresEngines`（必需引擎）与 `optionalEngines`（可选引擎），是本文档第 5 节降级矩阵的唯一依据 |
 
 **维护约定：改代码必须同步改本文档。**
 
@@ -29,7 +29,7 @@
 
 | 组件 | 落地状态（快照） | 依据文件 |
 | --- | --- | --- |
-| `crates/toolforge-core` | 已落地 | 11 个源文件（`lib.rs` + 10 个模块），含 `src/engine.rs`（引擎目录）与 `src/pipeline.rs`（31 个内置节点） |
+| `crates/toolforge-core` | 已落地 | 11 个源文件（`lib.rs` + 10 个模块），含 `src/engine.rs`（引擎目录）与 `src/pipeline.rs`（32 个内置节点） |
 | `crates/toolforge-engines` | 已落地 | `Cargo.toml`、`src/lib.rs`、`src/registry.rs`、`src/nodes.rs`（节点执行实现）、`engine-sources.json` |
 | `crates/toolforge-process` | 已落地 | `src/lib.rs`、`src/exec.rs`、`src/rpc.rs`、`src/supervisor.rs` |
 | `crates/toolforge-plugins` | **已补齐** | 7 个源文件：`lib.rs`、`audit.rs`、`store.rs`、`l1.rs`、`runtimes.rs`、`runtimes/wasm.rs`、`runtimes/python.rs`（编写本文档时只有前 3 个） |
@@ -43,25 +43,31 @@
 
 > 核对说明：任务简报假定「仓库目前只存在 `crates/toolforge-core`，`toolforge-engines` / `toolforge-process` / `toolforge-plugins` / `toolforge-ai` 以及 `apps/desktop` 都还没落地」。实际核对后，这些组件中的多数已经存在（其中一部分正是在核对期间被并行写入的）。本节按仓库实际文件撰写，未沿用该假定。
 
-### 1.3 下载地址与校验哈希：全部待定
+### 1.3 下载地址与校验哈希：三个有、三个刻意没有
 
-`EngineModel` 结构体（`crates/toolforge-core/src/engine.rs`）中，`url` 与 `sha256` 都是 `Option<String>`。而在 `engine_catalog()` 里，`onnx-models` 的全部 6 个模型的这两个字段**都是 `None`**，写法完全一致：
+`EngineModel` 结构体（`crates/toolforge-core/src/engine.rs`）中，`url` / `sha256` / `file_name` 都是 `Option<String>`。`onnx-models` 的 6 个模型**不再是"全部为 `None`"**：
+
+- **`u2net`、`u2netp`、`isnet-general` 三个已有完整来源**：`url` 指向 `https://github.com/danielgatis/rembg/releases/download/v0.0.0/<资产名>`（release tag 字面就是 `v0.0.0`），`sha256` 是**真实下载后自己算出来的**，不是从网页抄的；`file_name` 单独一个字段，因为 GitHub 的资产名与模型 id **并不一致**（`isnet-general` 的资产是 `isnet-general-use.onnx`）。文件落在 `<data_dir>/models/<model_id>/<file_name>`。
+- **`birefnet-general`、`modnet-portrait`、`realesrgan-x4plus` 三个刻意没有 url/hash**（`url: None` / `sha256: None` / `file_name: None`）。这是**有意的**：哈希还没核对过，而放一个"没核对过的哈希"等于放一个必然失败的下载按钮。UI 对它们显示「无下载源」并把下载按钮**置灰**。
+- 单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name **三者全有或全无**，哈希必须是 64 位小写十六进制，且 `file_name` 不得重复。
 
 ```rust
+// 代码里 URL 用常量拼接：url: Some(format!("{REMBG_RELEASE}/u2net.onnx"))
 EngineModel {
     id: "u2net".into(),
     name: "U²-Net".into(),
-    purpose: "通用显著性目标检测 / 抠图，效果均衡".into(),
+    purpose: "通用显著性目标检测 / 抠图，效果均衡。168 MB。".into(),
     approx_size_mb: 176,
     license: "Apache-2.0".into(),
     commercial_use: true,
-    url: None,       // ← 占位，尚未填写
-    sha256: None,    // ← 占位，尚未填写
+    url: Some("https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx".into()),
+    sha256: Some("8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491".into()),
+    file_name: Some("u2net.onnx".into()),
     installed: false,
 },
 ```
 
-**结论：所有引擎与模型的下载地址、SHA-256 校验值在本文档中一律标注为「待定」**，需要在实现 `toolforge-engines` 的下载/安装链路时补齐。原因是当前代码里根本没有这些数据，任何具体 URL 或哈希都只能来自代码之外，写进本文档就是臆造。
+**结论：只有上面三个模型能在本文档里写出具体的 URL 与 SHA-256**（第 4 节逐条列出）。其余三个模型的这两列继续标注「待定」，因为代码里就是 `None` —— 写进本文档就是臆造。补齐它们必须先核对真实哈希，再改代码，最后同步本文档（1.1 的维护约定）。
 
 另外有两点必须如实说明：
 
@@ -101,7 +107,7 @@ EngineModel {
 | `python` | Python 运行时 | L3 插件的执行环境（独立 3.11 运行时，与系统 Python 隔离）。 | `PSF-2.0` | 宽松许可；注意随包分发的第三方 wheel 各自的许可证。 | 约 150 MB | 应用按需下载 | `image.remove-background`<br>`ai.upscale`<br>`doc.ocr` | Windows / macOS / Linux | 否 |
 | `onnx-models` | ONNX 模型包 | 抠图 / 超分 / 分割用的模型权重。**不随安装包分发，首次使用时下载**。 | `各模型不同（见下表）` | 代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。 | 约 180 MB | 应用按需下载 | `image.remove-background`<br>`ai.upscale` | Windows / macOS / Linux | 是 |
 | `tesseract` | Tesseract OCR | 离线 OCR。中文识别质量一般，但完全免费且无需联网。 | `Apache-2.0` | 语言数据包（tessdata）另有许可，chi_sim 为 Apache-2.0。 | 约 60 MB | 仅探测系统已安装 | `doc.ocr` | Windows / macOS / Linux | 否 |
-| `ai-provider` | AI 服务提供方 | OpenAI 兼容接口的大模型服务，用于插件生成、图像描述等。 | `依服务商条款` | API Key 只存在本机加密存储中，不会随插件或日志外泄。 | 约 0 MB（无本地二进制） | 远程服务无本地二进制 | `ai.describe` | Windows / macOS / Linux | 否 |
+| `ai-provider` | AI 服务提供方 | OpenAI 兼容接口的大模型服务，用于插件生成、图像描述等。 | `依服务商条款` | API Key 只存在本机加密存储中，不会随插件或日志外泄。**⚠️ 这句注意事项原文已过期**（没有加密存储、没有钥匙串；见 3.6） | 约 0 MB（无本地二进制） | 远程服务无本地二进制 | `ai.describe` | Windows / macOS / Linux | 否 |
 
 ### 2.1 总表读法
 
@@ -213,19 +219,23 @@ EngineModel {
 - **主页**：https://platform.openai.com/docs/api-reference
 - **提供的节点（1 个）**：`ai.describe`。
 - **缺失时会发生什么**：`ai.describe` **不可用**，无降级路径（`requiresEngines: ["ai-provider"]`）。由于它是 `Remote` 模式的引擎，不存在「安装包」意义上的缺失，缺失等价于「未配置可用的服务商 / API Key」。
-- **许可证与分发注意点**：`依服务商条款`——许可证不取决于 ToolForge，而取决于用户接的是哪家服务。注意事项写明「API Key 只存在本机加密存储中，不会随插件或日志外泄」，这是实现的硬约束。`requiresLicenseAck: false`。
+- **许可证与分发注意点**：`依服务商条款`——许可证不取决于 ToolForge，而取决于用户接的是哪家服务。注意事项原文是「API Key 只存在本机加密存储中，不会随插件或日志外泄」，**这句话本身已经过期**（见 1.3 节末尾的说明与 `docs/SECURITY.md` 的凭据落盘一节）：仓库里**没有**加密存储，也没有 OS 钥匙串，Key 默认只在内存里，只有用户显式打开「记住 API Key」时才会明文写到 `<data_dir>/ai-key.txt`。`requiresLicenseAck: false`。
 
 ### 3.7 无引擎依赖的功能域
 
-以下四类节点在 `builtin_nodes()` 中 `requiresEngines` 与 `optionalEngines` 都是空数组，它们不经过引擎层，永远可用：
+下表这些节点在 `builtin_nodes()` 中 `requiresEngines` 与 `optionalEngines` 都是空数组，它们不经过引擎层，永远可用：
 
 | 功能域 | 节点 | 说明 |
 | --- | --- | --- |
 | 文件操作 | `fs.copy`、`fs.move`、`fs.mkdir`、`fs.delete` | 纯 Rust 文件系统操作 |
 | 图片（探测） | `image.probe` | 读取图片信息，纯 Rust 解码 |
-| 流程控制 | `flow.branch`、`flow.set-var`、`flow.log`、`flow.foreach` | 流程编排原语，不涉及外部进程 |
+| 流程控制 | `flow.branch`、`flow.set-var`、`flow.log` | 流程编排原语，不涉及外部进程 |
+| 文本 | `text.replace` | 纯 Rust 字符串替换，不涉及外部进程 |
+| 命名 | `name.build` | 纯 Rust 拼装文件名（可用 `${batch.index}` / `${src.stem}`） |
 
-这四个 `flow.*` 节点是保证「即使一个引擎都没装，流程编辑器仍然能用」的底线能力。
+这三个 `flow.*` 节点是保证「即使一个引擎都没装，流程编辑器仍然能用」的底线能力。
+
+> ⚠️ 这里曾经还有第 4 个：`flow.foreach`。它已经被**整个删除**，不是"留着不实现"。原因是它的语义在 L1 里没法定义（步骤列表是平铺的，循环体到底包含哪些步骤、循环之后的收尾步骤怎么办都没有答案），而它描述里写的「宿主会按并发度并行调度」是**假的** —— 宿主不在流水线内部调度。批量已经由宿主在**命令层**解决：`commands.rs::expand_batches` 把多文件输入与**目录输入**扇出成单文件批次，逐批调用流水线，清单里用 `${batch.index}` 取序号。所以节点目录里不需要循环节点。
 
 ---
 
@@ -235,14 +245,14 @@ EngineModel {
 
 | 模型 id | 名称 | 用途 | 体积 | 权重许可证 | 是否可商用 | 下载地址 | SHA-256 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `u2net` | U²-Net | 通用显著性目标检测 / 抠图，效果均衡 | 约 176 MB | `Apache-2.0` | 是 | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） |
-| `u2netp` | U²-Net (轻量) | U²-Net 的轻量版，速度快约 3 倍，边缘略糊 | 约 5 MB | `Apache-2.0` | 是 | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） |
-| `isnet-general` | IS-Net General | 通用抠图，对复杂边缘处理更好 | 约 176 MB | `Apache-2.0` | 是 | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） |
-| `birefnet-general` | BiRefNet | 当前抠图 SOTA，发丝级边缘 | 约 900 MB | `MIT（代码）/ 权重另有条款` | **否** | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） |
-| `modnet-portrait` | MODNet Portrait | 人像专用抠图（视频会议 / 证件照场景） | 约 25 MB | `Apache-2.0（代码）/ 学术用途权重` | **否** | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） |
-| `realesrgan-x4plus` | Real-ESRGAN x4plus | 通用图像超分辨率放大 | 约 67 MB | `BSD-3-Clause` | 是 | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） | 待定（当前 `EngineModel.url` / `EngineModel.sha256` 为 `None`） |
+| `u2net` | U²-Net | 通用显著性目标检测 / 抠图，效果均衡 | 约 176 MB | `Apache-2.0` | 是 | `…/rembg/releases/download/v0.0.0/u2net.onnx` | `8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491`（175,997,641 字节） |
+| `u2netp` | U²-Net (轻量) | U²-Net 的轻量版，速度快约 3 倍，边缘略糊 | 约 5 MB | `Apache-2.0` | 是 | `…/rembg/releases/download/v0.0.0/u2netp.onnx` | `309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8`（4,574,861 字节） |
+| `isnet-general` | IS-Net General | 通用抠图，对复杂边缘处理更好 | 约 176 MB | `Apache-2.0` | 是 | `…/rembg/releases/download/v0.0.0/isnet-general-use.onnx` | `60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a`（178,648,008 字节） |
+| `birefnet-general` | BiRefNet | 当前抠图 SOTA，发丝级边缘 | 约 900 MB | `MIT（代码）/ 权重另有条款` | **否** | **无下载源**（`url` / `sha256` / `file_name` 均为 `None`，UI 显示「无下载源」且下载按钮置灰） | 同上 |
+| `modnet-portrait` | MODNet Portrait | 人像专用抠图（视频会议 / 证件照场景） | 约 25 MB | `Apache-2.0（代码）/ 学术用途权重` | **否** | **无下载源**（同上一行） | 同上 |
+| `realesrgan-x4plus` | Real-ESRGAN x4plus | 通用图像超分辨率放大 | 约 67 MB | `BSD-3-Clause` | 是 | **无下载源**（同上一行） | 同上 |
 
-> 「下载地址」与「SHA-256」两列的说明见第 1.3 节：`engine_catalog()` 中这 6 个模型的 `url` 与 `sha256` 全部为 `None`，因此这两列**只能**是待定。补齐它们属于实现 `toolforge-engines` 时的任务，不得凭推测填写。
+> 「下载地址」与「SHA-256」两列的说明见第 1.3 节。前三个模型的地址与哈希来自 `engine_catalog()`，且哈希是**真实下载后算出来的**（不是抄网页）；下载路径是 `<data_dir>/models/<model_id>/<file_name>`，`file_name` 与模型 id 不同名。后三个模型在代码里就是 `None`，**不得凭推测填写**；单测 `verified_sources_are_pinned` 守着"三个字段全有或全无"这条纪律。
 
 ### 4.1 商业使用结论（必须落实到 UI）
 
@@ -282,7 +292,7 @@ EngineModel {
 - **必需引擎缺失 → 该节点不可用。** UI 里显示「需要安装 XXX」。
 - **可选引擎缺失 → 自动降级，功能仍在。**
 
-### 5.1 无必需引擎：始终可用或可降级的节点（16 个）
+### 5.1 无必需引擎：始终可用或可降级的节点（17 个）
 
 下表节点的 `requiresEngines` 均为空数组，因此**不会因为任何引擎缺失而变成不可用**。
 
@@ -303,14 +313,17 @@ EngineModel {
 | `flow.branch` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
 | `flow.set-var` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
 | `flow.log` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
-| `flow.foreach` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
+| `text.replace` | 无（纯 Rust 文本处理） | 无 | 不适用——永远可用 | 无 |
+| `name.build` | 无（纯 Rust 字符串拼装） | 无 | 不适用——永远可用 | 无 |
 
-**关于图像域的补充说明：** `image.convert` / `image.resize` / `image.crop` / `image.rotate` / `image.enhance` / `image.strip-metadata` 这 6 个节点是「纯 Rust `image` crate 打底」，缺失可选引擎时**仍然工作**，只是更慢、更吃内存。整个 `toolforge-engines` 的降级设计就是围绕这一点展开的（见该 crate `src/lib.rs` 的模块注释）——图像处理是唯一真正三层降级的领域，因为纯 Rust 路径能兜住基础能力：
+**关于图像域的补充说明：** `image.convert` / `image.resize` / `image.crop` / `image.rotate` / `image.enhance` / `image.strip-metadata` 这 6 个节点是「纯 Rust `image` crate 打底」，缺失可选引擎时**仍然工作**，只是更慢、更吃内存。整个 `toolforge-engines` 的降级**设计**就是围绕这一点展开的（见该 crate `src/lib.rs` 的模块注释）——图像处理是唯一设想中做三层降级的领域，因为纯 Rust 路径能兜住基础能力：
 
 ```text
 libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全）  ──缺失──►  纯 Rust image crate
                                                                       （零依赖，始终可用）
 ```
+
+> 🚧 **但这条链路目前只有最后一档在跑。** `nodes.rs` 里**真正被解析和调用的引擎只有 ffmpeg / pandoc / libreoffice / 7zip 四个**，`libvips` 与 `imagemagick` **没有任何一处被 resolve 或调用**（`image.rotate` 的非直角分支不是降级到 ImageMagick，而是直接返回 `engine_missing("imagemagick")`）。所以上表「`libvips` 缺失 → ImageMagick → 纯 Rust」这几列描述的是**声明与规格**，不是可观察的运行时行为；`toolforge-engines/src/lib.rs` 模块注释里那张三层图同理，属于**待落地**而不是现状。要改成正向结论，必须先真的在节点里调用这两个引擎（见 `docs/ROADMAP.md` 的「不一致 2」）。
 
 但要注意每个节点的可选引擎清单并不相同：`image.rotate` 与 `image.enhance` **只有 imagemagick / libvips 一个可选项**，不存在第二个外部兜底，一旦该引擎缺失就直接落到纯 Rust 路径。
 
@@ -338,7 +351,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 
 **不要为这一节编造降级方案。** 例如「`video.transcode` 缺失 FFmpeg 时改用纯 Rust 解码」这类说法在当前代码与依赖里没有任何依据：workspace 的依赖清单中没有纯 Rust 的音视频转码库，`toolforge-engines` 的模块注释也明确说明音视频/文档/压缩包没有纯 Rust 替代品。此类建议如需成立，必须先改代码、再改本文档（见 1.1 的维护约定）。
 
-**实现现状（快照，详见第 6.6、6.7 节）：** `crates/toolforge-engines/src/nodes.rs` 的 `run()` 分发函数已实现 25 个节点。本节涉及的节点中，`archive.pack` / `archive.unpack` 已实现且确实**硬依赖** `7zip`（实现里是 `ctx.engine("7zip").await?`，缺失即报错），与本节的「无降级路径」结论一致；`video.*` / `audio.*` / `doc.convert` / `doc.to-pdf` 同样以必需引擎为准。但 `image.remove-background`、`doc.ocr`、`ai.upscale`、`ai.describe`（以及第 5.1 节的 `ebook.convert`、`flow.foreach`）共 6 个节点仍会返回「尚未在 v0.1 中实现」的错误，因此它们的降级行为目前只能是规格，尚无可观察的运行时表现。
+**实现现状（快照，详见第 6.6、6.7 节）：** `crates/toolforge-engines/src/nodes.rs` 的 `run()` 分发函数已实现 27 个节点。本节涉及的节点中，`archive.pack` / `archive.unpack` 已实现且确实**硬依赖** `7zip`（实现里是 `ctx.engine("7zip").await?`，缺失即报错），与本节的「无降级路径」结论一致；`video.*` / `audio.*` / `doc.convert` / `doc.to-pdf` 同样以必需引擎为准。但 `image.remove-background`、`doc.ocr`、`ai.upscale`、`ai.describe`（以及第 5.1 节的 `ebook.convert`）共 5 个节点仍会返回「尚未在 v0.1 中实现」的错误，因此它们的降级行为目前只能是规格，尚无可观察的运行时表现。
 
 ### 5.3 引擎与许可证的组合风险
 
@@ -353,7 +366,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 | ONNX 权重（学术 / 训练集条款）+ 闭源商用产品 | `onnx-models.licenseNote`：代码许可与权重许可是两回事；第 4.1 节列出 `birefnet-general` 与 `modnet-portrait` 为 `commercialUse: false` | 这是「代码许可证看起来没问题、权重许可证有问题」的典型组合。**必须按模型逐个校验**，不能因为 ONNX Runtime 或推理脚本的许可证宽松就认为权重也可商用 |
 | Python 运行时（PSF-2.0）+ 第三方 wheel | `python.licenseNote`：宽松许可；注意随包分发的第三方 wheel 各自的许可证 | 运行时本身宽松，但 L3 插件依赖的 wheel 各自带许可证，其中可能含 GPL / 学术条款。随包分发前需要清点实际打进去的 wheel 清单 |
 | LibreOffice（MPL-2.0）+ Calibre（GPL-3.0） | `libreoffice.licenseNote`：MPL 是文件级 copyleft，独立进程调用无传染风险；`calibre.licenseNote` | 不存在额外传染风险，但两者都**只有系统安装模式**，所以产品实际上不会分发它们，只需要在 UI 里把「请自行安装」讲清楚，并避免暗示应用自带这些组件 |
-| `ai-provider`（依服务商条款）+ 用户数据出境 | `ai-provider.licenseNote`：API Key 只存在本机加密存储中，不会随插件或日志外泄 | 许可证取决于用户接的服务商，产品无法代为保证。实现上必须保证：API Key 仅本地加密存储、不写入插件、不写入日志——这一条是代码注释里的硬约束，不能因为「方便调试」而破坏 |
+| `ai-provider`（依服务商条款）+ 用户数据出境 | `ai-provider.licenseNote`：API Key 只存在本机加密存储中，不会随插件或日志外泄（⚠️ 这句原文与实现不符，见 3.6） | 许可证取决于用户接的服务商，产品无法代为保证。实现上必须保证：API Key **不写入插件、不写入日志**（`AiProviderConfig::api_key` 带 `skip_serializing`，审计写入点也不含凭据）。**注意别再把"加密存储"当成事实**：当前既没有加密存储也没有钥匙串，默认只存在内存；用户可选的 `ai.persistApiKey` 是**明文**落盘，属于能力降级 |
 
 **通用结论：** `requiresLicenseAck: true` 的 5 个引擎（`ffmpeg`、`pandoc`、`libreoffice`、`calibre`、`onnx-models`）覆盖了本文档第 5 章几乎所有高风险项。UI 在用户点击「下载 / 安装」之前必须先展示许可证与注意事项，这是 `EngineDescriptor` 中 `licenses`、`licenseNote`、`requiresLicenseAck` 三个字段共同的设计意图。
 
@@ -392,12 +405,16 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 - `EngineState` 中有 `Outdated`（「版本过旧」）状态，`EngineStatus` 中有 `version` 字段，但 `EngineDescriptor` 中**没有最低版本字段**，也没有任何地方定义「过旧」的判定标准。
 - 处理方式：**待定**。本文档因此不给出任何版本号要求（见第 1.3 节）。
 
-### 6.5 模型下载地址与 SHA-256 全部缺失
+### 6.5 模型下载地址与 SHA-256：三个已核对，三个刻意留空
 
-- 见第 1.3 节：`engine_catalog()` 中 6 个模型的 `url` 与 `sha256` 全部为 `None`。
+- ~~见第 1.3 节：`engine_catalog()` 中 6 个模型的 `url` 与 `sha256` 全部为 `None`。~~
+  > ✅ **已修正（部分）**：`u2net`、`u2netp`、`isnet-general` 三个 rembg 权重现在有**真实下载后自己算出来的** SHA-256、固定 release tag 直链（`https://github.com/danielgatis/rembg/releases/download/v0.0.0/`）与独立的 `file_name` 字段（资产名与模型 id 不一致，如 `isnet-general` → `isnet-general-use.onnx`）。文件落在 `<data_dir>/models/<model_id>/<file_name>`。三条 IPC 也已补齐：`models_list` / `models_install` / `models_remove`。
+  > **哈希不匹配即删文件**：`registry.rs::install_model` 用 `remove_file` + `IntegrityCheckFailed`，不保留没校验过的产物。
+  > **另外三个（`birefnet-general` / `modnet-portrait` / `realesrgan-x4plus`）刻意没有 url/hash**：哈希还没核对过，与其放一个"点了必然失败"的下载按钮，不如让 UI 显示「无下载源」并把按钮置灰。单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name 三者全有或全无、哈希为 64 位小写十六进制、`file_name` 不重复。
+  > **注意**：上一段关于"模型权重仍全部为 `null`"的旧结论已经不成立。
 - ~~另外 `engine-sources.json` 中 5 个引擎的候选 URL 虽然存在，但**每条 `sha256` 均为 `null`**，因此没有任何一个引擎具备可用的自动安装来源。~~
-  > ✅ **已修正**：`engine-sources.json` 已回填 **6 条**带真实核对哈希 + 版本固定直链的来源（`ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux`）。因此 Windows 与 Linux 上的这 4 个引擎**现在可以自动安装**。**模型权重**（`onnx-models`）仍全部为 `null` —— 而依赖它们的节点执行器也还没实现，v0.1 不需要。详见 `docs/ROADMAP.md` §3。
-- 处理方式：**待补齐**。这也是「引擎层规格说明」与「待实现清单」双重定位的核心一项。
+  > ✅ **已修正**：`engine-sources.json` 已回填 **6 条**带真实核对哈希 + 版本固定直链的来源（`ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux`）。因此 Windows 与 Linux 上的这 4 个引擎**现在可以自动安装**；macOS 三条与 `ffmpeg@linux` 仍为 `null`。详见 `docs/ROADMAP.md` §3。
+- 处理方式：**还剩三个模型待补齐**（补哈希必须先在真实环境下载核对，不能凭推测填写）。注意下载链路本身已通，但**依赖模型的节点执行器仍未实现**，所以 v0.1 仍用不上模型。
 
 ### 6.6 `nodes.rs` 的模块文档表与实际实现不一致：`archive.*` 的「系统 tar」兜底并不存在
 
@@ -407,12 +424,13 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 - 处理方式：**待对齐**。要么真的实现系统 `tar` 兜底（注意 `tar` 只能覆盖 tar 系列与部分 zip，**无法处理 7z / rar**，因此仍需保留 `requiresEngines` 的语义或在 UI 上区分），要么改掉 `nodes.rs` 的模块文档表。
 - 附带问题：`nodes.rs` 的表还声称自己是降级矩阵的「唯一真相来源」，而本文档声明的依据是 `pipeline.rs` 的 `requiresEngines` / `optionalEngines`。建议统一口径为「`builtin_nodes()` 的字段是权威数据，`nodes.rs` 的表只是实现的简化摘要」，否则两份表会持续漂移：`image.rotate` 与 `image.enhance` 只有单一外部兜底、`doc.ocr` 的 `tesseract` 是可选引擎、`ebook.convert` 的 `calibre` → `pandoc` 顺序，这些都没有体现在 `nodes.rs` 的表里。
 
-### 6.7 `nodes.rs` 中仍有 6 个内置节点未实现
+### 6.7 `nodes.rs` 中仍有 5 个内置节点未实现
 
-- `nodes.rs` 的 `run()` 分发函数实现了 25 个节点，其余 6 个会落到 `not_implemented()`，返回 `ErrorCode::Internal` 与消息「内置节点 `xxx` 尚未在 v0.1 中实现」。
-- 这 6 个节点是：`image.remove-background`、`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`、`flow.foreach`。
+- `nodes.rs` 的 `run()` 分发函数实现了 27 个节点，其余 5 个会落到 `not_implemented()`，返回 `ErrorCode::Internal` 与消息「内置节点 `xxx` 尚未在 v0.1 中实现」。
+- 这 5 个节点是：`image.remove-background`、`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`。清单的**唯一真相来源**是 `toolforge_core::pipeline::UNIMPLEMENTED_NODES`（原来它在四个地方各存一份，漏同步过一次）。
+- **曾经的 `flow.foreach` 不在这个名单里 —— 它被整个删除了**，不是"留着不实现"。它的语义在平铺的步骤列表里无法定义，描述里的「宿主会按并发度并行调度」也是假的；批量改由宿主在命令层做（`expand_batches`：多文件与目录输入都扇出成单文件批次，`${batch.index}` 取序号）。`UNIMPLEMENTED_NODES` 里只留了一行注释记录原因，防止有人再加回来。
 - 这是**刻意的设计**：`not_implemented()` 的注释明确说明「刻意**不返回假的成功**」，否则会出现「流水线显示跑通了但没产出文件」这种最难排查的问题。
-- 处理方式：**待实现**。这 6 个恰好覆盖了本文档第 5 章里引擎最重的节点（抠图、OCR、电子书转换、AI 超分、AI 描述），因此它们也是 `python`、`onnx-models`、`ai-provider`、`calibre` 这几个引擎落地程度的直接体现。`not_implemented()` 的错误提示把实现进度指向 `docs/ROADMAP.md`。
+- 处理方式：**待实现**。这 5 个恰好覆盖了本文档第 5 章里引擎最重的节点（抠图、OCR、电子书转换、AI 超分、AI 描述），因此它们也是 `python`、`onnx-models`、`ai-provider`、`calibre` 这几个引擎落地程度的直接体现。`not_implemented()` 的错误提示把实现进度指向 `docs/ROADMAP.md`。
 
 ### 6.8 桌面端入口已补齐，但前端仍缺失
 
@@ -431,10 +449,10 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 | 路径 | 与本文档的关系 |
 | --- | --- |
 | `crates/toolforge-core/src/engine.rs` | 第 2、4 节的权威来源：`engine_catalog()`、`EngineDescriptor`、`EngineModel`、`EngineState`、`EngineSource`、`EngineInstallMode` |
-| `crates/toolforge-core/src/pipeline.rs` | 第 5 节的权威来源：`builtin_nodes()`（31 个节点）、`NodeDescriptor.requiresEngines` / `optionalEngines` |
+| `crates/toolforge-core/src/pipeline.rs` | 第 5 节的权威来源：`builtin_nodes()`（32 个节点）、`NodeDescriptor.requiresEngines` / `optionalEngines`、`UNIMPLEMENTED_NODES`（5 个，唯一真相来源） |
 | `crates/toolforge-engines/src/lib.rs` | 引擎层的职责划分与图像域三层降级设计的说明；`MANAGED_LAYOUT`、`version_args()` |
 | `crates/toolforge-engines/src/registry.rs` | 引擎探测 / 下载 / 校验的实现；`EngineSourceSpec`、`ModelSpec`、`EngineRegistry`（含「`sha256` 为 `None` 时拒绝下载」的规则） |
-| `crates/toolforge-engines/src/nodes.rs` | 节点执行实现（1464 行）：`run()` 分发已实现 25 个节点；模块文档自带一张降级表，但与实现存在出入，见第 6.6、6.7 节 |
+| `crates/toolforge-engines/src/nodes.rs` | 节点执行实现：`run()` 分发已实现 27 个节点；模块文档自带一张降级表，但与实现存在出入，见第 6.6、6.7 节 |
 | `crates/toolforge-engines/engine-sources.json` | 下载来源清单：**6 条已回填真实哈希 + 版本固定直链**（Windows/Linux 的 ffmpeg/libvips/pandoc/python），macOS 三条与 `ffmpeg@linux` 仍为 `null`（安装时返回 `HashRequired`）。见第 1.3 与 6.5 节 |
 | `crates/toolforge-process/` | 外部进程调用（执行、RPC、进程监管），是引擎被真正调用的下层 |
 | `docs/ROADMAP.md` | `nodes.rs` 的 `not_implemented()` 错误提示所指向的实现进度文档（本文档未引用其内容，也不与其重复记录进度） |

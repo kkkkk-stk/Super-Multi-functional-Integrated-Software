@@ -48,8 +48,12 @@ pub struct AppPathsDto {
 }
 
 /// 用户设置。全部字段都有默认值 —— 首次启动时不需要用户填任何东西。
+///
+/// `#[serde(default)]` 挂在结构体上（而不是逐字段挂）是**向后兼容的关键**：
+/// 以后新增字段时，老版本写下的 `settings.json` 照样能读出来，
+/// 缺的字段用默认值补，而不是让整份设置解析失败。
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     /// 任务队列并发度
     #[serde(default = "default_concurrency")]
@@ -69,7 +73,7 @@ pub struct Settings {
     /// 批量处理时是否保留源文件
     #[serde(default = "default_true")]
     pub keep_original: bool,
-    /// AI 配置（不含 Key —— Key 单独走钥匙串）
+    /// AI 配置（不含 Key —— Key 在这个结构体之外，见 [`AiSettings::persist_api_key`]）
     #[serde(default)]
     pub ai: AiSettings,
     /// 启动时自动重新探测引擎
@@ -110,10 +114,11 @@ impl Default for Settings {
     }
 }
 
-/// AI 设置。**API Key 不在这里** —— 它存在内存与 OS 钥匙串里，
-/// 绝不落到这个会序列化给前端的结构体上。
+/// AI 设置。**API Key 不在这里** —— 它存在内存里，只有用户显式打开
+/// 「记住 API Key」时才会另存到 `<数据目录>/ai-key.txt`。
+/// 无论如何它都不会落到这个会序列化给前端的结构体上。
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct AiSettings {
     pub provider: toolforge_ai::AiProviderKind,
     #[serde(default)]
@@ -125,6 +130,13 @@ pub struct AiSettings {
     pub has_key: bool,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    /// 是否把 Key 落盘（默认**否**）。
+    ///
+    /// 这个字段存在的原因是：原来的实现把 Key 只放在内存里，界面上却写着
+    /// 「存在本机内存与系统钥匙串里」—— 钥匙串从来没接过。与其继续骗人，
+    /// 不如把选择权交给用户，并说清代价：打开 = 明文存在数据目录下。
+    #[serde(default)]
+    pub persist_api_key: bool,
 }
 
 fn default_temperature() -> f32 {
@@ -139,6 +151,7 @@ impl Default for AiSettings {
             model: String::new(),
             has_key: false,
             temperature: 0.2,
+            persist_api_key: false,
         }
     }
 }
@@ -205,6 +218,48 @@ pub struct EngineInstallRequest {
     /// 是否允许安装没有 SHA-256 的来源（需要在 UI 上做二次确认）
     #[serde(default)]
     pub allow_unverified: bool,
+}
+
+// ============================================================================
+// 模型权重
+// ============================================================================
+
+/// 一个模型权重的完整状态 = 静态描述 + 是否已下载 + 谁需要它。
+///
+/// 为什么不直接把 `EngineModel` 发给前端：那个结构里没有"能不能下载"
+/// （`url` / `sha256` 是否齐全）这个**用户最关心**的字段 ——
+/// 缺下载源的模型点"下载"必然失败，界面必须提前把按钮禁掉并说明原因。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEntry {
+    pub id: String,
+    pub name: String,
+    pub purpose: String,
+    pub license: String,
+    pub commercial_use: bool,
+    /// 估算体积（MB），用于"要不要现在下"的判断
+    pub approx_size_mb: u32,
+    /// 是否已经下载到本机
+    pub installed: bool,
+    /// 已落盘的实际大小（MB）；未安装时为 `None`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_size_mb: Option<f64>,
+    /// 是否配置了可校验的下载源。`false` 时界面应禁用下载并说明原因。
+    pub downloadable: bool,
+    /// 依赖这个模型的节点名
+    pub used_by_nodes: Vec<String>,
+    /// 模型所属的引擎（通常是虚拟引擎 `onnx-models`）
+    pub engine_id: String,
+}
+
+/// 模型下载请求。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInstallRequest {
+    pub model_id: String,
+    /// 用户是否已确认该权重的许可证（部分权重不允许商用）
+    #[serde(default)]
+    pub license_accepted: bool,
 }
 
 // ============================================================================

@@ -81,8 +81,10 @@ fn main() {
 
     // ---- 守卫 2：`COMMAND_NAMES` 与真实注册的命令逐条对齐 ----
     //
-    // `lib.rs::run()` 里那条 `debug_assert_eq!(COMMAND_NAMES.len(), 29)` 只是比一个
-    // **魔数** —— 加命令时把它从 29 改成 30 就"通过了"，而漏注册的照旧漏。
+    // 这条守卫**取代**了 `lib.rs::run()` 里原来的
+    // `debug_assert_eq!(COMMAND_NAMES.len(), 29)`：那一句比的是魔数，
+    // 加命令时把它从 29 改成 30 就"通过了"，而漏注册的照旧漏；
+    // 更糟的是忘记改数字会让**应用在启动时直接 panic**（真机上发生过一次）。
     // 这里改成逐个核对名字，不能靠改数字蒙混过去。
     for name in toolforge_lib::COMMAND_NAMES {
         if !text.contains(&format!("__TAURI_INVOKE(\"{name}\"")) {

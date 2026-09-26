@@ -1,39 +1,46 @@
 # ToolForge L1 插件（声明式编排，零代码）
 #
-# ── 批量是怎么发生的（先读这段，别照抄 `flow.foreach`）─────────────────────
+# ── 这个插件**真的会重命名**（此前不会，见下）──────────────────────────────
+# 它用三个节点串起完整的重命名规则：
+#   1. `text.replace`  —— 按正则做查找替换，算出新主干
+#   2. `name.build`    —— 拼上前后缀、序号、大小写，产出**文件名**
+#   3. `fs.move`       —— 把文件搬到输出目录下那个新名字
+#
+# `name.build` 输出的是**相对路径**（只是个文件名），`fs.move` 的 `dst`
+# 因此会被宿主解析到本次任务的输出目录内 —— 既完成了重命名，
+# 又不会绕过路径收敛。
+#
+# ⚠️ **此前这个插件是"假的"**：流水线里只有一句 `fs.move`，`dst` 由宿主按
+# **原文件名**算出，所以它只是把文件挪了个位置、名字一点没变，
+# 而下面声明的 pattern / replacement / prefix / suffix / startIndex
+# **全部是装饰**。根因是 L1 当时没有任何能"算出一个值"的节点，
+# 命名规则无法用声明式表达。`text.replace` 与 `name.build` 补上了这块。
+#
+# ── 批量是怎么发生的 ──────────────────────────────────────────────────────
 # **多文件输入由宿主命令层扇出，清单里不需要写循环。**
-# `apps/desktop/src-tauri/src/commands.rs::expand_batches` 会把文件数最多的那个
-# 输入端口展开成 N 个单文件批次，逐批调用一次流水线，并用「处理 3/12」上报进度、
-# 在批次边界检查取消。所以本插件只要声明 `multiple: true` 并在流水线里
-# 处理**一张**图，批量语义就自动成立。
+# `commands.rs::expand_batches` 把文件数最多的输入端口展开成 N 个单文件批次，
+# 逐批调用一次流水线，并用「处理 3/12」上报进度、在批次边界检查取消。
+# 每一批都能通过 `${batch.index}`（1 起）拿到自己的序号。
 #
-# `flow.foreach` 节点仍然登记在节点目录里但**执行器未实现**（会返回
-# 「尚未在 v0.1 中实现」）。这里不用它 —— 用了反而跑不起来。
-#
-# ⚠️ 本项目踩过一次很危险的坑：宿主曾经把「12 张输入」塞进**一次**流水线调用，
-# 而 `${src}` 只绑定第一张，任务却显示 `· 12` 并**成功结束** —— 用户以为 12 张
-# 都处理了。现已由上述扇出修复，并有回归测试覆盖。
-#
-# ── 关于 `with` 与参数 ────────────────────────────────────────────────────
+# ── 参数写在哪 ───────────────────────────────────────────────────────────
 # 参数写在 `with` 里或 `io.params` 里**都生效**，`with` 里的显式字面量优先。
-# 推荐：路径接线（src / dst / path）放 `with`；用户可调的选项放 `io.params`
-# 并用 `"${params.<id>}"` 注入，这样它才会出现在 UI 表单里。
-#
-# 参数 id 必须与节点读取的键名逐字相同。
+# 推荐：用户可调的选项放 `io.params` 并用 `"${params.<id>}"` 注入，
+# 这样它才会出现在 UI 表单里。
 apiVersion: toolforge/v1
 kind: Plugin
 
 metadata:
   id: com.toolforge.builtin.batch-rename
   name: 批量重命名
-  version: 0.1.0
-  description: 按规则重命名一批文件：正则查找替换 + 序号/前后缀，然后落到输出目录。
+  version: 0.2.0
+  description: 按规则重命名一批文件：正则查找替换、前后缀、序号、大小写，然后落到输出目录。原生支持批量（宿主逐张扇出、自带进度）。
   author: ToolForge
   license: MIT
   icon: text-cursor-input
   category: system
   tags: [批量, 重命名, 正则]
 
+# 声明 ≠ 授权：用户还要在「插件详情 → 权限」里逐条勾选。
 permissions:
   capabilities:
     - kind: fsRead
@@ -48,31 +55,42 @@ io:
       type: files
       multiple: true
       required: true
+      description: 可一次拖入多份，宿主按并发度逐个处理。
   outputs:
     - id: dst
-      label: 输出目录
-      type: directory
+      label: 输出文件
+      type: file
       required: false
+      description: 新文件名由「命名规则」决定，落在输出目录下。
   params:
-    - id: find
-      label: 正则表达式
+    # ---------- 查找替换 ----------
+    - id: pattern
+      label: 查找（正则）
       type: text
-      description: 在文件名（不含扩展名）上匹配。留空表示不做替换。
+      description: 留空则不做替换，直接用原主干。
       default: { kind: str, value: "" }
-      placeholder: "IMG_(\\d+)"
+      placeholder: "例如 \\s+ 或 IMG_(\\d+)"
       required: false
-    - id: replace
+    - id: replacement
       label: 替换为
       type: text
-      description: 支持 $1 / $2 这类捕获组反向引用。
+      description: 支持 $1 / $2 这类捕获组引用。
       default: { kind: str, value: "" }
-      placeholder: "photo-$1"
+      placeholder: "例如 _$1"
       required: false
-    - id: ignoreCase
-      label: 忽略大小写
+    - id: useRegex
+      label: 按正则解释「查找」
       type: bool
-      default: { kind: bool, value: false }
+      description: 关掉则按纯字面量匹配（此时 $1 之类的引用无效）。
+      default: { kind: bool, value: true }
       required: false
+    - id: caseSensitive
+      label: 区分大小写
+      type: bool
+      default: { kind: bool, value: true }
+      required: false
+
+    # ---------- 前后缀 ----------
     - id: prefix
       label: 前缀
       type: text
@@ -83,36 +101,94 @@ io:
       type: text
       default: { kind: str, value: "" }
       required: false
-    - id: startIndex
-      label: 起始序号（0 = 不追加序号）
+
+    # ---------- 序号 ----------
+    - id: indexMode
+      label: 序号
+      type: enum
+      description: 「按批次序号」用 ${batch.index}，与本批次里的第几个文件一致。
+      default: { kind: str, value: none }
+      options:
+        - { value: none, label: 不加序号 }
+        - { value: batch, label: 追加批次序号（从 1 开始） }
+      required: false
+    - id: indexPad
+      label: 序号补零位数
       type: int
-      default: { kind: int, value: 0 }
+      default: { kind: int, value: 3 }
       min: 0
-      max: 1000000
+      max: 12
       step: 1
       required: false
-    # ⚠️ 这里**不再**声明 `concurrency`。
-    #
-    # 并发度是**任务队列**的属性（设置页的「并发数」+ `JobQueue` 的信号量），
-    # 不是插件的可调参数。曾经它被透传给 `flow.foreach` 节点，但：
-    #   ① 那个节点没有执行器实现；
-    #   ② 更重要 —— 并发调度属于队列的职责，混进流水线会让取消与进度上报
-    #      变得极难推理（一个节点内部并行跑 N 个子任务，`${steps.x.y}` 该取谁？）。
-    # 现在批量由命令层逐批扇出，队列负责限流。
+    - id: indexPosition
+      label: 序号位置
+      type: enum
+      default: { kind: str, value: suffix }
+      options:
+        - { value: suffix, label: 主体之后（报告-001.pdf） }
+        - { value: prefix, label: 主体之前（001-报告.pdf） }
+      required: false
+
+    # ---------- 其它 ----------
+    - id: case
+      label: 大小写
+      type: enum
+      default: { kind: str, value: keep }
+      options:
+        - { value: keep, label: 保持不变 }
+        - { value: lower, label: 全小写 }
+        - { value: upper, label: 全大写 }
+        - { value: title, label: 首字母大写 }
+      required: false
+    - id: separator
+      label: 把空格替换成
+      type: text
+      description: 留空则不动。填 _ 会把「我的 报告.pdf」变成「我的_报告.pdf」。
+      default: { kind: str, value: "" }
+      required: false
 
 runtime:
   kind: pipeline
   pipeline:
-    description: 单文件重命名 + 移动到输出目录；批量由宿主逐文件扇出。
+    description: 查找替换 → 拼装文件名 → 移动到位。批量由宿主逐文件扇出。
+    # 单个文件失败不该让整批停下来：`continue` 会把失败原因写进
+    # `${steps.<id>.error}`，最终结果里也会明确列出哪些项被跳过。
     onError: continue
     steps:
-      # 这里**只处理一个文件**。批量语义来自命令层的扇出，不要写循环。
+      # 第一步：按规则算出新主干。
+      # `${src.stem}` 是宿主注入的"输入文件主干（不含扩展名）"。
+      # `pattern` 留空时 `text.replace` 会原样返回并记一条日志 —— 这比让
+      # 清单去写 `when` 条件更稳（模板条件表达式对含 `!=` 的正则会解析错）。
       - id: rename
+        uses: text.replace
+        label: 查找替换
+        with:
+          input: "${src.stem}"
+          pattern: "${params.pattern}"
+          replacement: "${params.replacement}"
+          useRegex: "${params.useRegex}"
+          caseSensitive: "${params.caseSensitive}"
+
+      # 第二步：拼装最终文件名。
+      # `stem` 优先用上一步的产出，上一步被跳过时回退到原主干。
+      - id: build
+        uses: name.build
+        label: 拼装文件名
+        with:
+          stem: "${steps.rename.text}"
+          ext: "${src.ext}"
+          prefix: "${params.prefix}"
+          suffix: "${params.suffix}"
+          index: "${params.indexMode}"
+          indexPad: "${params.indexPad}"
+          indexPosition: "${params.indexPosition}"
+          case: "${params.case}"
+          separator: "${params.separator}"
+
+      # 第三步：移动到位（真正的重命名）。
+      - id: move
         uses: fs.move
-        label: 重命名并移动
+        label: 移动到输出目录
         with:
           src: "${src}"
-          dst: "${output.dst}"
-        # 单个文件命名冲突时不中止整批：Continue 会把失败原因写进
-        # `${steps.rename.error}` 供后续步骤引用（见 `l1.rs`）
-        onError: continue
+          dst: "${steps.build.value}"

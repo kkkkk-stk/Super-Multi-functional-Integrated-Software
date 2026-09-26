@@ -101,8 +101,10 @@ pub fn system_prompt() -> String {
 10. **只能引用前面步骤的产出**，不允许前向引用。
 11. enum 参数必须给 `options`。
 12. **优先用 L1**。只有在内置节点完全无法表达计算逻辑时，才用 `runtime.kind: python`（不要用 wasm 做图像处理，WASM 里没有文件系统和 SIMD）。
-13. 如果某个节点的执行器尚未实现（`image.remove-background` / `doc.ocr` / `ebook.convert` / `ai.upscale` / `ai.describe` / `flow.foreach`），
+13. 如果某个节点的执行器尚未实现（`image.remove-background` / `doc.ocr` / `ebook.convert` / `ai.upscale` / `ai.describe`），
     你仍然可以生成引用它们的清单，但**必须在 `metadata.description` 里明确写出"该能力尚未实现"**，不要让用户以为能跑。
+14. **不要写批量循环**：多文件输入与目录输入由宿主自动逐文件扇出，每一批都能用
+    `${{batch.index}}`（从 1 起）拿到序号。清单里没有任何循环节点，也不需要。
 
 # 内置节点清单
 

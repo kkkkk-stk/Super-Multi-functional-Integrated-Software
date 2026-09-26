@@ -17,6 +17,9 @@ import {
   enginesInstall,
   enginesProbe,
   enginesProbeAll,
+  modelsInstall,
+  modelsList,
+  modelsRemove,
   toToolforgeError,
 } from "@/lib/ipc";
 import { queryKeys } from "@/lib/query-client";
@@ -26,6 +29,7 @@ import type {
   EngineInstallRequest,
   EngineStatus,
   Job,
+  ModelInstallRequest,
 } from "@/types/domain";
 
 export function useEngines() {
@@ -137,4 +141,74 @@ export function isEngineUsable(state: EngineStatus["state"]): boolean {
 /** 任务列表里正在跑的引擎安装任务（引擎卡片上显示"安装中"并给跳转） */
 export function findEngineInstallJob(jobs: Job[], engineId: string): Job | undefined {
   return jobs.find((j) => j.kind.kind === "engineInstall" && j.kind.engineId === engineId);
+}
+
+// ============================================================================
+// 模型权重
+// ============================================================================
+
+export function useModels() {
+  return useQuery({
+    queryKey: queryKeys.models,
+    queryFn: () => modelsList(),
+    // 模型是"下载一次就长期在"的东西，不需要频繁刷新；
+    // 下载完成后由下面的 mutation 主动 invalidate。
+    staleTime: 60_000,
+  });
+}
+
+/**
+ * 下载模型权重。
+ *
+ * 与引擎安装一样是**异步任务**：命令立刻返回 jobId，进度走
+ * `engineDownloadProgress` 事件（模型与引擎共用同一条下载通道）。
+ * 所以这里不能等 mutation 完成再刷新列表 —— 那时候下载还在跑。
+ * 真正的刷新时机是 `modelDownload` 任务结束时，由事件层 invalidate。
+ */
+export function useInstallModel() {
+  const client = useQueryClient();
+  const setEngineDownload = useUiStore((s) => s.setEngineDownload);
+
+  return useMutation({
+    mutationFn: (req: ModelInstallRequest) => modelsInstall(req),
+    onSuccess: (_jobId: string, req: ModelInstallRequest) => {
+      // 下载进度条按模型 id 单独显示，不与同名引擎冲突（模型 id 与引擎 id 不同名）
+      setEngineDownload(req.modelId, {
+        downloaded: 0,
+        total: 0,
+        speedBps: 0,
+        updatedAt: Date.now(),
+      });
+      toast.success("模型已开始下载", {
+        description: "进度在模型卡片与任务中心实时显示；完成后卡片会自动变成「已就绪」。",
+      });
+      void client.invalidateQueries({ queryKey: queryKeys.jobs });
+      void client.invalidateQueries({ queryKey: queryKeys.jobStats });
+    },
+    onError: (e) => {
+      const err = toToolforgeError(e);
+      toast.error("下载失败", { description: err.fullText, duration: 10_000 });
+    },
+  });
+}
+
+/**
+ * 删除已下载的权重。
+ *
+ * 后端返回 `false` 表示"文件本来就不在"——这在界面上不该被当成错误
+ * （用户可能是重复点了两次），所以两种情况都提示成功并刷新。
+ */
+export function useRemoveModel() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (modelId: string) => modelsRemove(modelId),
+    onSuccess: (removed: boolean, modelId: string) => {
+      toast.success(removed ? `已删除 ${modelId}` : `${modelId} 本来就没有下载`, {
+        description: removed ? "磁盘空间已释放。" : undefined,
+      });
+      void client.invalidateQueries({ queryKey: queryKeys.models });
+      void client.invalidateQueries({ queryKey: queryKeys.engines });
+    },
+    onError: (e) => toast.error("删除失败", { description: toToolforgeError(e).fullText }),
+  });
 }

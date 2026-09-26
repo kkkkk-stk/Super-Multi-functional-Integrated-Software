@@ -24,6 +24,8 @@ which = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 walkdir = { workspace = true }
+# `text.replace` 节点要按正则做查找替换（批量重命名的核心）
+regex = "1"
 image = { workspace = true, features = [
     "png",
     "jpeg",

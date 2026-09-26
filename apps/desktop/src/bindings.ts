@@ -8,6 +8,19 @@ export const commands = {
 	appPaths: () => typedError<AppPathsDto, ToolforgeError_Serialize>(__TAURI_INVOKE("app_paths")),
 	systemStatus: () => typedError<SystemStatus, ToolforgeError_Serialize>(__TAURI_INVOKE("system_status")),
 	settingsGet: () => typedError<Settings, ToolforgeError_Serialize>(__TAURI_INVOKE("settings_get")),
+	/**
+	 *  局部更新设置。
+	 * 
+	 *  ## 顺序是有讲究的
+	 * 
+	 *  1. **改内存**（用户立刻看到效果）
+	 *  2. **落盘**（关掉应用还在）
+	 *  3. **把变化作用到运行时**（并发度 → 队列；AI 配置 → 重建客户端）
+	 * 
+	 *  第 3 步不能漏：`AiClient` 在构造时就把 base_url / 模型 / Key 固化进连接池了，
+	 *  只改 `settings` 不重建客户端，界面上显示"已改成 gpt-4o"，
+	 *  实际请求还打给老模型 —— 这类"设置了但没生效"的 bug 最难被发现。
+	 */
 	settingsPatch: (patch: SettingsPatch_Deserialize) => typedError<Settings, ToolforgeError_Serialize>(__TAURI_INVOKE("settings_patch", { patch })),
 	jobsList: (req: JobsListRequest_Deserialize) => typedError<JobsSnapshot_Serialize, ToolforgeError_Serialize>(__TAURI_INVOKE("jobs_list", { req })),
 	jobsGet: (jobId: string) => typedError<{
@@ -44,6 +57,17 @@ export const commands = {
 	 *  下载进度通过 `toolforge://event` 里的 `engineDownloadProgress` 事件回流。
 	 */
 	enginesInstall: (req: EngineInstallRequest) => typedError<string, ToolforgeError_Serialize>(__TAURI_INVOKE("engines_install", { req })),
+	/**
+	 *  列出全部模型权重及其状态。
+	 * 
+	 *  `downloadable` 是给界面用的：**没有配置下载源的模型必须提前显示为不可下载**，
+	 *  而不是让用户点一下、等几秒、再收到一个"没有配置 SHA-256"的错误。
+	 */
+	modelsList: () => typedError<ModelEntry_Serialize[], ToolforgeError_Serialize>(__TAURI_INVOKE("models_list")),
+	/**  下载一个模型权重。 */
+	modelsInstall: (req: ModelInstallRequest) => typedError<string, ToolforgeError_Serialize>(__TAURI_INVOKE("models_install", { req })),
+	/**  删除一个已下载的模型权重，释放磁盘。 */
+	modelsRemove: (modelId: string) => typedError<boolean, ToolforgeError_Serialize>(__TAURI_INVOKE("models_remove", { modelId })),
 	pluginsList: () => typedError<PluginsSnapshot_Serialize, ToolforgeError_Serialize>(__TAURI_INVOKE("plugins_list")),
 	pluginsGet: (pluginId: string) => typedError<{
 	summary: PluginSummary_Serialize,
@@ -227,16 +251,25 @@ export type AiProviderKind =
 "custom";
 
 /**
- *  AI 设置。**API Key 不在这里** —— 它存在内存与 OS 钥匙串里，
- *  绝不落到这个会序列化给前端的结构体上。
+ *  AI 设置。**API Key 不在这里** —— 它存在内存里，只有用户显式打开
+ *  「记住 API Key」时才会另存到 `<数据目录>/ai-key.txt`。
+ *  无论如何它都不会落到这个会序列化给前端的结构体上。
  */
 export type AiSettings = {
-	provider: AiProviderKind,
+	provider?: AiProviderKind,
 	baseUrl?: string,
 	model?: string,
 	/**  只读：是否已经配置过 Key */
 	hasKey?: boolean,
 	temperature?: number | null,
+	/**
+	 *  是否把 Key 落盘（默认**否**）。
+	 * 
+	 *  这个字段存在的原因是：原来的实现把 Key 只放在内存里，界面上却写着
+	 *  「存在本机内存与系统钥匙串里」—— 钥匙串从来没接过。与其继续骗人，
+	 *  不如把选择权交给用户，并说清代价：打开 = 明文存在数据目录下。
+	 */
+	persistApiKey?: boolean,
 };
 
 export type AiTestConnectionResponse = AiTestConnectionResponse_Serialize | AiTestConnectionResponse_Deserialize;
@@ -606,6 +639,14 @@ export type EngineModel_Deserialize = {
 	/**  下载地址与校验值 */
 	url?: string | null,
 	sha256?: string | null,
+	/**
+	 *  落盘文件名。
+	 * 
+	 *  单独一个字段是必需的：GitHub 上的资产名（`isnet-general-use.onnx`）
+	 *  经常和模型 id（`isnet-general`）**对不上**。靠 `format!("{id}.onnx")`
+	 *  猜文件名的话，下载成功、校验通过、然后"已安装"永远为假。
+	 */
+	fileName?: string | null,
 	/**  该模型是否已下载（运行时填充） */
 	installed?: boolean,
 };
@@ -627,6 +668,14 @@ export type EngineModel_Serialize = {
 	/**  下载地址与校验值 */
 	url?: string | null,
 	sha256?: string | null,
+	/**
+	 *  落盘文件名。
+	 * 
+	 *  单独一个字段是必需的：GitHub 上的资产名（`isnet-general-use.onnx`）
+	 *  经常和模型 id（`isnet-general`）**对不上**。靠 `format!("{id}.onnx")`
+	 *  猜文件名的话，下载成功、校验通过、然后"已安装"永远为假。
+	 */
+	fileName?: string | null,
 	/**  该模型是否已下载（运行时填充） */
 	installed: boolean,
 };
@@ -980,6 +1029,76 @@ export type JobsSnapshot_Serialize = {
 
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error";
 
+/**
+ *  一个模型权重的完整状态 = 静态描述 + 是否已下载 + 谁需要它。
+ * 
+ *  为什么不直接把 `EngineModel` 发给前端：那个结构里没有"能不能下载"
+ *  （`url` / `sha256` 是否齐全）这个**用户最关心**的字段 ——
+ *  缺下载源的模型点"下载"必然失败，界面必须提前把按钮禁掉并说明原因。
+ */
+export type ModelEntry = ModelEntry_Serialize | ModelEntry_Deserialize;
+
+/**
+ *  一个模型权重的完整状态 = 静态描述 + 是否已下载 + 谁需要它。
+ * 
+ *  为什么不直接把 `EngineModel` 发给前端：那个结构里没有"能不能下载"
+ *  （`url` / `sha256` 是否齐全）这个**用户最关心**的字段 ——
+ *  缺下载源的模型点"下载"必然失败，界面必须提前把按钮禁掉并说明原因。
+ */
+export type ModelEntry_Deserialize = {
+	id: string,
+	name: string,
+	purpose: string,
+	license: string,
+	commercialUse: boolean,
+	/**  估算体积（MB），用于"要不要现在下"的判断 */
+	approxSizeMb: number,
+	/**  是否已经下载到本机 */
+	installed: boolean,
+	/**  已落盘的实际大小（MB）；未安装时为 `None` */
+	installedSizeMb?: number | null,
+	/**  是否配置了可校验的下载源。`false` 时界面应禁用下载并说明原因。 */
+	downloadable: boolean,
+	/**  依赖这个模型的节点名 */
+	usedByNodes: string[],
+	/**  模型所属的引擎（通常是虚拟引擎 `onnx-models`） */
+	engineId: string,
+};
+
+/**
+ *  一个模型权重的完整状态 = 静态描述 + 是否已下载 + 谁需要它。
+ * 
+ *  为什么不直接把 `EngineModel` 发给前端：那个结构里没有"能不能下载"
+ *  （`url` / `sha256` 是否齐全）这个**用户最关心**的字段 ——
+ *  缺下载源的模型点"下载"必然失败，界面必须提前把按钮禁掉并说明原因。
+ */
+export type ModelEntry_Serialize = {
+	id: string,
+	name: string,
+	purpose: string,
+	license: string,
+	commercialUse: boolean,
+	/**  估算体积（MB），用于"要不要现在下"的判断 */
+	approxSizeMb: number,
+	/**  是否已经下载到本机 */
+	installed: boolean,
+	/**  已落盘的实际大小（MB）；未安装时为 `None` */
+	installedSizeMb?: number | null,
+	/**  是否配置了可校验的下载源。`false` 时界面应禁用下载并说明原因。 */
+	downloadable: boolean,
+	/**  依赖这个模型的节点名 */
+	usedByNodes: string[],
+	/**  模型所属的引擎（通常是虚拟引擎 `onnx-models`） */
+	engineId: string,
+};
+
+/**  模型下载请求。 */
+export type ModelInstallRequest = {
+	modelId: string,
+	/**  用户是否已确认该权重的许可证（部分权重不允许商用） */
+	licenseAccepted?: boolean,
+};
+
 /**  内置节点目录（流程编辑器的节点面板） */
 export type NodeCatalogResponse = NodeCatalogResponse_Serialize | NodeCatalogResponse_Deserialize;
 
@@ -1027,7 +1146,7 @@ export type NodeCatalogResponse_Serialize = {
 	unimplemented: string[],
 };
 
-export type NodeCategory = "file" | "image" | "video" | "audio" | "document" | "archive" | "ebook" | "ai" | "flow";
+export type NodeCategory = "file" | "image" | "video" | "audio" | "document" | "archive" | "ebook" | "text" | "ai" | "flow";
 
 /**  一个内置节点的元描述。流程编辑器的节点面板、参数表单、引擎缺失提示全部由它驱动。 */
 export type NodeDescriptor = NodeDescriptor_Serialize | NodeDescriptor_Deserialize;
@@ -1572,7 +1691,13 @@ export type SecurityReview_Serialize = {
 	capabilities: string[],
 };
 
-/**  用户设置。全部字段都有默认值 —— 首次启动时不需要用户填任何东西。 */
+/**
+ *  用户设置。全部字段都有默认值 —— 首次启动时不需要用户填任何东西。
+ * 
+ *  `#[serde(default)]` 挂在结构体上（而不是逐字段挂）是**向后兼容的关键**：
+ *  以后新增字段时，老版本写下的 `settings.json` 照样能读出来，
+ *  缺的字段用默认值补，而不是让整份设置解析失败。
+ */
 export type Settings = {
 	/**  任务队列并发度 */
 	concurrency?: number,
@@ -1586,7 +1711,7 @@ export type Settings = {
 	defaultOutputDir?: string,
 	/**  批量处理时是否保留源文件 */
 	keepOriginal?: boolean,
-	/**  AI 配置（不含 Key —— Key 单独走钥匙串） */
+	/**  AI 配置（不含 Key —— Key 在这个结构体之外，见 [`AiSettings::persist_api_key`]） */
 	ai?: AiSettings,
 	/**  启动时自动重新探测引擎 */
 	probeEnginesOnStartup?: boolean,

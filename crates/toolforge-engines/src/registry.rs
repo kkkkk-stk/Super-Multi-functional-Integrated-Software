@@ -203,11 +203,41 @@ impl EngineRegistry {
                 }
             }
         }
+
+        // 模型权重表**直接从引擎目录推导**，不再单独存一份。
+        //
+        // 之前这里是个空 `HashMap`，只能靠 `register_model` 填 —— 而**没有任何人调用它**。
+        // 结果是：界面列得出 6 个模型，但 `install_model` 对每一个都回答
+        // "未在注册表里登记"。两份数据（目录 + 注册表）必然漂移，
+        // 所以现在只有目录这一份。
+        let mut models = HashMap::new();
+        for desc in engine_catalog() {
+            for m in desc.models {
+                let Some(url) = m.url.clone() else { continue };
+                models.insert(
+                    m.id.clone(),
+                    ModelSpec {
+                        id: m.id.clone(),
+                        engine_id: desc.id.clone(),
+                        url,
+                        sha256: m.sha256.clone(),
+                        file_name: m
+                            .file_name
+                            .clone()
+                            // 兜底只在"确实有下载源"时才会走到；
+                            // 没写 file_name 的模型上面已经被 continue 掉了。
+                            .unwrap_or_else(|| format!("{}.onnx", m.id)),
+                        commercial_use: m.commercial_use,
+                    },
+                );
+            }
+        }
+
         Self {
             paths,
             cache: DashMap::new(),
             sources,
-            models: HashMap::new(),
+            models,
             tx: None,
         }
     }
@@ -431,11 +461,52 @@ impl EngineRegistry {
             .map(|e| {
                 e.models
                     .iter()
-                    .filter(|m| self.paths.model_dir(&m.id).join(format!("{}.onnx", m.id)).exists())
+                    .filter(|m| self.model_path(&m.id).map(|p| p.exists()).unwrap_or(false))
                     .map(|m| m.id.clone())
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// 某个模型权重应当落盘的位置。
+    ///
+    /// 目录用 **模型自己的 id** 而不是 `engine_id`：`onnx-models` 是个虚拟引擎，
+    /// 把 6 个模型全塞进同一个目录，删一个就会连坐。
+    /// 路径推导只此一处 —— 之前 `install_model` 用 `model_dir(engine_id)` +
+    /// `file_name`，而 `installed_models_for` 用 `model_dir(model_id)` +
+    /// `format!("{id}.onnx")`，两边**对不上**，装完了也认不出来。
+    pub fn model_path(&self, model_id: &str) -> Option<PathBuf> {
+        let spec = self.models.get(model_id)?;
+        Some(self.paths.model_dir(&spec.id).join(&spec.file_name))
+    }
+
+    /// 已登记的模型清单（供 `models_*` 命令使用）
+    pub fn models(&self) -> Vec<ModelSpec> {
+        let mut out: Vec<ModelSpec> = self.models.values().cloned().collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// 某个模型是否已经下载好
+    pub fn is_model_installed(&self, model_id: &str) -> bool {
+        self.model_path(model_id).map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// 删除一个已下载的模型，返回是否真的删掉了东西。
+    pub fn remove_model(&self, model_id: &str) -> ToolforgeResult<bool> {
+        let Some(path) = self.model_path(model_id) else {
+            return Err(ToolforgeError::not_found(format!(
+                "模型 {model_id} 未在注册表里登记"
+            )));
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(ToolforgeError::io(format!(
+                "删除 {} 失败：{e}",
+                path.display()
+            ))),
+        }
     }
 
     // ---------------- 安装 ----------------
@@ -646,7 +717,17 @@ impl EngineRegistry {
         )))
     }
 
-    /// 下载一个模型权重
+    /// 下载一个模型权重。
+    ///
+    /// ## 已经装过就不重下
+    ///
+    /// 本地已有那份文件时，先**把它自己哈希一遍**再决定要不要下载。
+    /// 为什么不是"文件存在就当已安装"：模型权重是会被用户手工替换、
+    /// 被同步工具截断、被磁盘错误写坏的东西，而"拿一个损坏的权重去跑推理"
+    /// 得到的是乱码结果而不是错误 —— 那比下载失败难查得多。
+    ///
+    /// 为什么不是"一律重下"：`u2net` 是 168 MB。用户在界面上多点一次下载，
+    /// 不该付一次完整下载的代价。
     pub async fn install_model(
         &self,
         model_id: &str,
@@ -669,10 +750,35 @@ impl EngineRegistry {
             ));
         }
 
-        let dir = self.paths.model_dir(&spec.engine_id);
+        let dir = self.paths.model_dir(&spec.id);
         std::fs::create_dir_all(&dir)
             .map_err(|e| ToolforgeError::io(format!("创建模型目录失败：{e}")))?;
         let dest = dir.join(&spec.file_name);
+
+        if let Some(exp) = &expected {
+            if dest.is_file() {
+                match hash_file(&dest) {
+                    Ok(local) if local.eq_ignore_ascii_case(exp) => {
+                        job.info(format!(
+                            "本地已有校验通过的 {model_id}（{}），跳过下载",
+                            describe_size(&dest)
+                        ));
+                        return Ok(dest);
+                    }
+                    Ok(local) => {
+                        // 留一条 warn：本地文件坏掉这件事本身值得被看见
+                        job.warn(format!(
+                            "本地 {model_id} 的哈希与预期不符（期望 {}…，实际 {}…），将重新下载",
+                            &exp[..8.min(exp.len())],
+                            &local[..8.min(local.len())]
+                        ));
+                    }
+                    Err(e) => {
+                        job.warn(format!("无法校验本地 {model_id}（{e}），将重新下载"));
+                    }
+                }
+            }
+        }
 
         let actual = download(&spec.url, &dest, model_id, job, self.tx.clone()).await?;
         if let Some(exp) = &expected {
@@ -689,11 +795,70 @@ impl EngineRegistry {
     }
 }
 
+/// 对一个已存在的文件算 SHA-256（同步、分块读，避免把 170 MB 整个读进内存）。
+fn hash_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 256];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// 文件大小的人类可读描述（读不到元数据时返回 `?`，绝不因此报错）
+fn describe_size(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(m) => format!("{:.1} MB", m.len() as f64 / (1024.0 * 1024.0)),
+        Err(_) => "? MB".to_string(),
+    }
+}
+
 // ============================================================================
 // 下载实现
 // ============================================================================
 
+/// 是否值得重试的状态码。
+///
+/// GitHub 的 release 资产是 302 跳到 `release-assets.githubusercontent.com` 的，
+/// 而那条链路**真的会间歇性返回 502/503**（本机实测过：同一个 URL 用 curl 拿 200，
+/// 用带 HTTP/2 的客户端拿 502，重试就好）。对"下载 170 MB 模型"这种操作来说，
+/// 一次 502 就放弃、让用户重新点一遍，是明显不合理的。
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// 流式下载到文件，同时计算 SHA-256，并按 500ms 节流上报进度。
+///
+/// ## 重试策略（**最多两次，第二次只用 HTTP/1.1**）
+///
+/// 第 1 次用默认客户端（允许 HTTP/2）。失败且是 5xx / 429 / 连接层错误时，
+/// 第 2 次换成 `http1_only` 的客户端重试。
+///
+/// ### 5xx 重试：有实测依据
+///
+/// 这不是"防御性编程"，是本机真实踩到的：同一个 GitHub release 资产地址，
+/// 第一次下载返回 **502 Bad Gateway**，过几分钟再下就是 200（字节数与哈希都对得上）。
+/// GitHub 的资产是 302 跳到 `release-assets.githubusercontent.com` 的，
+/// 那一段链路确实会间歇性 5xx。对"下载 170 MB 模型"这种操作来说，
+/// 一次 502 就让用户重新点一遍，是明显不合理的。
+///
+/// ### HTTP/1.1 兜底：依据较弱，但代价也极低
+///
+/// 观察到 502 的那次之后，我怀疑是中间设备（本机 github.com 被解析到
+/// `127.0.0.1:443`，显然有本地代理在做 MITM）破坏了 HTTP/2，于是加了这条兜底。
+/// **后来 502 没能复现，所以"是 HTTP/2 的问题"这个判断并没有被证实** ——
+/// 更可能只是瞬时 5xx。留着它的理由只有一个：这条路径只在第一次真的失败之后
+/// 才会走，干净网络上一行都不会多跑，而它确实能救某些把 h2 拆坏的企业代理。
+/// 如果你看到这段注释时它已经在生产里跑了一段时间却从未被触发过，
+/// 那就说明它没用，删掉即可 —— 别因为它"看起来保险"而留着。
 pub async fn download(
     url: &str,
     dest: &Path,
@@ -701,27 +866,77 @@ pub async fn download(
     job: &JobCtx,
     tx: Option<tokio::sync::broadcast::Sender<AppEvent>>,
 ) -> ToolforgeResult<String> {
-    use sha2::{Digest, Sha256};
+    let client = build_download_client(false)?;
+    match send_download(&client, url).await {
+        Ok(resp) if resp.status().is_success() => {
+            return stream_to_file(resp, dest, label, job, tx).await
+        }
+        Ok(resp) if is_retryable_status(resp.status()) => {
+            tracing::warn!(
+                url,
+                status = %resp.status(),
+                "下载失败，改用 HTTP/1.1 重试一次"
+            );
+        }
+        Ok(resp) => {
+            return Err(ToolforgeError::new(
+                ErrorCode::Network,
+                format!("下载 {label} 失败：HTTP {}", resp.status()),
+            )
+            .with_detail(format!("URL：{url}")));
+        }
+        Err(e) => {
+            tracing::warn!(url, err = %e.message, "下载请求失败，改用 HTTP/1.1 重试一次");
+        }
+    }
 
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("ToolForge/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(60 * 30))
-        .build()
-        .map_err(|e| ToolforgeError::new(ErrorCode::Network, format!("创建 HTTP 客户端失败：{e}")))?;
-
-    let resp = client.get(url).send().await.map_err(|e| {
-        ToolforgeError::new(ErrorCode::Network, format!("下载 {label} 失败：{e}"))
-            .with_detail(format!("URL：{url}"))
-    })?;
-
+    let fallback = build_download_client(true)?;
+    let resp = send_download(&fallback, url).await?;
     if !resp.status().is_success() {
         return Err(ToolforgeError::new(
             ErrorCode::Network,
-            format!("下载 {label} 失败：HTTP {}", resp.status()),
+            format!(
+                "下载 {label} 失败：HTTP {}（HTTP/1.1 重试后仍然失败）",
+                resp.status()
+            ),
         )
-        .with_detail(format!("URL：{url}")));
+        .with_detail(format!(
+            "URL：{url}\n\n\
+             如果这个网络有代理 / 透明加速，请把它对本应用放行；\
+             也可以手动下载该文件后放进引擎目录。"
+        )));
     }
+    stream_to_file(resp, dest, label, job, tx).await
+}
+
+fn build_download_client(http1_only: bool) -> ToolforgeResult<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
+        .user_agent(concat!("ToolForge/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(60 * 30));
+    if http1_only {
+        b = b.http1_only();
+    }
+    b.build()
+        .map_err(|e| ToolforgeError::new(ErrorCode::Network, format!("创建 HTTP 客户端失败：{e}")))
+}
+
+async fn send_download(client: &reqwest::Client, url: &str) -> ToolforgeResult<reqwest::Response> {
+    client.get(url).send().await.map_err(|e| {
+        ToolforgeError::new(ErrorCode::Network, format!("请求下载地址失败：{e}"))
+            .with_detail(format!("URL：{url}"))
+    })
+}
+
+/// 把响应体流式写盘，边写边算 SHA-256。
+async fn stream_to_file(
+    resp: reqwest::Response,
+    dest: &Path,
+    label: &str,
+    job: &JobCtx,
+    tx: Option<tokio::sync::broadcast::Sender<AppEvent>>,
+) -> ToolforgeResult<String> {
+    use sha2::{Digest, Sha256};
 
     let total = resp.content_length().unwrap_or(0);
     let mut file = tokio::fs::File::create(dest)

@@ -65,10 +65,10 @@ Rust 工作区：
 ```mermaid
 flowchart TD
     FE["apps/desktop/src<br/>React 18 + TS + Vite 5<br/>✅ 92 个文件"]
-    BIND["apps/desktop/src/bindings.ts<br/>specta 生成的 TS 类型<br/>✅ 已生成（29 命令）"]
+    BIND["apps/desktop/src/bindings.ts<br/>specta 生成的 TS 类型<br/>✅ 已生成（32 命令）"]
 
     subgraph Shell["Tauri 外壳 · crate toolforge / lib toolforge_lib"]
-        CMD["commands.rs<br/>28 个 tauri::command"]
+        CMD["commands.rs<br/>32 个 tauri::command"]
         IPCDTO["ipc.rs<br/>IPC 契约 DTO"]
         ST["state.rs<br/>AppState"]
         LIBRS["lib.rs<br/>spawn_event_bridge<br/>specta_builder"]
@@ -152,7 +152,7 @@ flowchart TD
 **图注**
 
 - **`apps/desktop/src`（React 前端）已落地**（92 个文件），「前端 → `invoke`」与「`listen` → 前端」两条边都已接通。唯一的纪律是：**只有 `lib/ipc.ts` 允许接触 `bindings` / `invoke`**，其它 91 个文件一律从它导入具名函数。
-- **`bindings.ts` 已生成并入库**（29 个命令，1621 行）。两个生成入口：调试构建时 `lib.rs` 自动导出；无 GUI 环境用 `cargo run -p toolforge --bin export-bindings`（即 `pnpm bindings`）。CI 有一个专门的 job 校验它没有漂移。
+- **`bindings.ts` 已生成并入库**（32 个命令）。两个生成入口：调试构建时 `lib.rs` 自动导出；无 GUI 环境用 `cargo run -p toolforge --bin export-bindings`（即 `pnpm bindings`）。CI 有一个专门的 job 校验它没有漂移。
 - **L1 不是进程也不是沙箱**：它是 `toolforge-plugins::l1::run_pipeline` 在宿主进程内解释一段数据。图中把它与 L2/L3 并列，是为了对齐三级运行时的概念模型；实现上 L1 **没有**独立的运行时实体。
 - `NET` 节点代表 `toolforge-engines` 与 `toolforge-ai` 各自对 `reqwest` 的依赖。**领域层没有这条边**（`toolforge-core` 不依赖 `reqwest`）。
 - `ENGINES --> PROC` 表示 `nodes.rs` 通过 `toolforge-process::exec` 起子进程，而不是自己 `Command::new`。
@@ -164,7 +164,7 @@ flowchart TD
 ```text
  ┌───────────────────────────────────────────────────────────────────────────┐
  │  apps/desktop/src                       React 18 + TS + Vite 5            │
- │  ✅ 92 个文件；唯一 IPC 出口 = lib/ipc.ts（29 个具名函数包住全部命令）      │
+ │  ✅ 93 个文件；唯一 IPC 出口 = lib/ipc.ts（32 个具名函数包住全部命令）      │
  │  types/domain.ts 是 bindings.ts 的别名层，不重复定义任何结构               │
  └──────────────────────────────────┬────────────────────────────────────────┘
                                     ┆ invoke / listen（已接通）
@@ -173,7 +173,7 @@ flowchart TD
  │                                    lib name     = toolforge_lib            │
  │  ┌──────────────┬──────────────┬───────────────┬───────────────────────┐  │
  │  │ commands.rs  │ ipc.rs       │ state.rs      │ lib.rs                │  │
- │  │ 28 个命令    │ 契约 DTO     │ AppState 组装 │ 事件桥 + specta 导出  │  │
+ │  │ 32 个命令    │ 契约 DTO     │ AppState 组装 │ 事件桥 + specta 导出  │  │
  │  └──────────────┴──────────────┴───────────────┴───────────────────────┘  │
  └───┬──────────┬──────────────┬───────────────┬──────────────────┬──────────┘
      │          │              │               │                  │
@@ -231,7 +231,7 @@ flowchart TD
   - `plugin.rs`：`PluginManifest`（`from_yaml` / `to_yaml` / `validate`）、`PluginMetadata`、`PluginCategory`、`PluginIo` / `IoPort` / `PortType` / `ParamSpec` / `ParamType` / `ParamOption` / `ParamValue`、`PluginRuntime` / `RuntimeKind` / `WasmRuntimeDef` / `PythonRuntimeDef`、`AiProvenance`、`ValidationReport` / `ValidationIssue` / `Severity`、`PluginSummary` / `PluginDetail`、`PluginSource` / `BundleFile` / `FileEncoding`。
   - `pipeline.rs`：`PipelineDef` / `PipelineStep` / `StepPosition` / `OnErrorPolicy`、`extract_vars` / `TemplateContext` / `render_template` / `eval_condition`、`NodeCategory` / `NodeDescriptor` / `builtin_nodes()` / `find_node()` / `engines_referenced()`。
   - `engine.rs`：`EngineInstallMode` / `EngineState` / `EngineSource` / `EngineDescriptor` / `EngineModel` / `EngineStatus` / `engine_catalog()` / `find_engine()`。
-  - `paths.rs`：`AppPaths`（`plugins` / `plugin_dir` / `plugin_data` / `plugin_venv` / `engines` / `engine_dir` / `models` / `model_dir` / `audit` / `logs` / `cache` / `work_root` / `job_workspace` / `ensure_all` / `describe`）、`sanitize_id`。
+  - `paths.rs`：`AppPaths`（`plugins` / `plugin_dir` / `plugin_data` / `plugin_venv` / `engines` / `engine_dir` / `models` / `model_dir` / `audit` / `logs` / `cache` / `work_root` / `job_workspace` / `settings_file` / `ai_key_file` / `settings_backup_file` / `ensure_all` / `describe`）、`sanitize_id`。
   - `lib.rs`：`PLUGIN_API_VERSION = "toolforge/v1"`、`AppInfo`，以及 re-export。
 - **依赖了谁**：`serde` `serde_json` `serde_yaml` `thiserror` `tracing` `tokio` `parking_lot` `dashmap` `uuid` `chrono` `semver` `globset` `specta`（见 `crates/toolforge-core/Cargo.toml`）。**没有** `tauri` / `extism` / `reqwest`。
 - **被谁依赖**：`toolforge-process`、`toolforge-engines`、`toolforge-plugins`、`toolforge-ai`、`apps/desktop/src-tauri` —— 全部。
@@ -267,10 +267,11 @@ flowchart TD
 ### 3.6 `apps/desktop/src-tauri` —— Tauri 外壳
 
 - **职责**：`lib.rs` 的文档写得很硬：「**做**：组装各个 `toolforge-*` crate、把领域事件桥接到 WebView、暴露 IPC 命令、把 Rust 类型导出成 TypeScript。**不做**：任何业务逻辑 —— 一行都不该有；任何直接的 `Command::new(...)` —— 一律经 `toolforge-process` / `toolforge-engines`。」
-- **公开入口**：`COMMAND_NAMES`（28 项）、`specta_builder()`、`run()`、`commands::*`（28 个 `#[tauri::command]`）、`state::AppState`、`ipc::*` DTO、`spawn_event_bridge()`。
+- **公开入口**：`COMMAND_NAMES`（32 项）、`specta_builder()`、`run()`、`commands::*`（32 个 `#[tauri::command]`）、`state::AppState`、`ipc::*` DTO、`spawn_event_bridge()`。
 - **注意命名**：`Cargo.toml` 里 `[package] name = "toolforge"`、`[lib] name = "toolforge_lib"`、两个 bin：`toolforge`（`src/main.rs`）与 `export-bindings`（`src/bin/export_bindings.rs`）。**没有名为 `toolforge-desktop` 的 package**（见 4.11 的脚本不一致项）。
 - **依赖了谁**：全部 5 个内部 crate + `tauri` 2.11（feature `specta`）+ `tauri-plugin-{fs,dialog,shell,store,log,opener}` + 可选 `tauri-plugin-updater`（feature `updater`，默认关闭）+ `specta` / `specta-typescript` / `tauri-specta` + `tokio` `parking_lot` `dirs` `uuid` 等。
 - **被谁依赖**：无（它是叶子）。
+- **设置的持久化**：`state.rs` 里 `AppState.settings` 曾经**只在内存里**（改完主题、并发度、默认输出目录，关掉应用就全没了），而设置页写着「所有设置都会立即写入本机配置文件」——那是一句假话。现在由新模块 `settings_store.rs` 负责：非机密设置写 `<data_dir>/settings.json`，**原子写**（同目录临时文件 + `rename` + `sync_all`）；解析失败的文件被**隔离**成 `settings.broken.json` 并回退默认值，**启动不会因为坏设置文件而失败**；缺字段按字段级默认值补齐，所以旧配置文件继续能用。**API Key 不在这个文件里**（详见 `docs/SECURITY.md` 的凭据落盘一节）。
 
 ### 3.7 单列：`toolforge-core` 的硬约束
 
@@ -405,9 +406,9 @@ flowchart TD
 | `jobs_list` / `jobs_get` / `jobs_cancel` / `jobs_clear_finished` / `jobs_stats` | `commands.rs` 同名函数 | 任务中心与重连对账 |
 | `engines_catalog` / `engines_probe_all` / `engines_probe` / `engines_install` | `commands.rs` 同名函数 | 引擎面板与安装 |
 
-完整的 28 个命令（`lib.rs::COMMAND_NAMES`，与 `collect_commands!` 一一对应，`run()` 里有 `debug_assert_eq!(COMMAND_NAMES.len(), 28)`）：
+完整的 32 个命令（`lib.rs::COMMAND_NAMES`，与 `collect_commands!` 一一对应，`run()` 里有 `debug_assert_eq!(COMMAND_NAMES.len(), 32)`）：
 
-`app_info` `app_paths` `system_status` | `settings_get` `settings_patch` | `jobs_list` `jobs_get` `jobs_cancel` `jobs_clear_finished` `jobs_stats` | `engines_catalog` `engines_probe_all` `engines_probe` `engines_install` | `plugins_list` `plugins_get` `plugins_reload` `plugins_validate` `plugins_install` `plugins_grant` `plugins_set_enabled` `plugins_uninstall` `plugins_audit` `plugins_run` | `pipeline_nodes` | `ai_test_connection` `ai_generate` `ai_review_draft`
+`app_info` `app_paths` `system_status` | `settings_get` `settings_patch` | `jobs_list` `jobs_get` `jobs_cancel` `jobs_clear_finished` `jobs_stats` `jobs_retry` | `engines_catalog` `engines_probe_all` `engines_probe` `engines_install` | `models_list` `models_install` `models_remove` | `plugins_list` `plugins_get` `plugins_reload` `plugins_validate` `plugins_install` `plugins_grant` `plugins_set_enabled` `plugins_uninstall` `plugins_audit` `plugins_run` | `pipeline_nodes` | `ai_test_connection` `ai_generate` `ai_review_draft`
 
 - **状态**：✅ 外壳命令层**已落地**。⛔ 但**调用方（前端）不存在**，所以整条链路目前无法从 UI 端跑通。若要在没有前端的情况下验证，只能靠 Rust 侧单测或自行构造调用。
 
@@ -417,13 +418,22 @@ flowchart TD
 
 1. `state.plugins.runnable(&req.plugin_id)?` —— `store.rs::PluginStore::runnable` 检查四件事：记录存在（否则 `NotFound`）→ `validation.ok`（否则把 `ValidationReport::into_result()` 的错误抛出去）→ `state.enabled`（否则 `PermissionDenied` "已被禁用"）→ `summary().has_pending_permissions`（否则 `PermissionDenied`，`detail` 里逐条列出未授权能力的中文描述）。
 2. `state.plugins.quarantine_if_changed(&req.plugin_id)?` —— `store.rs::PluginStore::quarantine_if_changed`（配合 `verify_integrity` / `audit::content_hash`）检查插件目录内容哈希是否被改动过。
-3. `total_items` = 所有输入端口路径数之和，`.max(1)`。
-4. `resolve_output_dir(&state, &req)` —— 优先 `req.output_dir`，其次设置里的 `default_output_dir`，兜底 `state.paths.root().join("output")`。**绝不往用户没指定的地方写文件。**
-5. `std::fs::create_dir_all(&output_dir)`。
-6. `build_io(&req, &output_dir)` —— 推导 `input_root` = 所有输入文件的**公共父目录**（用 `common_prefix` 逐组件比对），并算出 `outputs` 映射（`"dst" -> output_dir/<源文件名主干>.<params.format 或原扩展名>`）。
+3. `expand_batches(&req.inputs)` —— **命令层扇出**。这是修过的一个坑：第一版把「12 个输入文件」塞进**一次** `run_pipeline`，而 `l1.rs` 的 `${src}` 只绑定第一个路径，于是任务标题写着 `插件名 · 12`、实际只处理 1 张、然后**成功结束**。现在两条展开规则：**① 目录 → 里面的文件**（只展开一层、跳过子目录与 `.` 开头的隐藏文件、结果排序保证可复现，见下）；**② 多文件 → 逐文件**（取文件数最多的那个输入端口作主端口，展开成 N 个单文件批次，其余端口的值每批原样保留）。单文件输入退化为一次调用，行为与之前一致。
+   - 每个批次通过 `PipelineRunRequest.batch_index` / `batch_total` 拿到序号，清单里可用 `${batch.index}`（从 1 起）/ `${batch.total}` 引用 —— 流水线自己不知道"我跑了几次"，而这个序号对"给每个文件编号"的重命名需求是必需的。
+   - 取消放在**批次边界**检查（`ctx.check()?`），这是"取消秒级生效"的关键；进度用 `ctx.step("处理 3/12 · <文件名>")` 上报。
+4. `total_items` = `batches.len().max(1)`（**不再是输入路径数之和**——批次数才是真实的工作量）。
+5. `resolve_output_dir(&state, &req)` —— 优先 `req.output_dir`，其次设置里的 `default_output_dir`，兜底 `state.paths.root().join("output")`。**绝不往用户没指定的地方写文件。**
+6. `std::fs::create_dir_all(&output_dir)`。
+7. `build_io(&req, &output_dir)` —— **每个批次各算一次**：`input_root` = 该批次输入文件的**公共父目录**（用 `common_prefix` 逐组件比对），并算出 `outputs` 映射（`"dst" -> output_dir/<源文件名主干>.<params.format 或原扩展名>`）。**输入本身就是目录时，根取那个目录自身、而不是它的父级** —— 用父级的话，"选了一个目录"等于把手伸到了它外面一层（选了 `D:\照片` 就授权到 `D:\`），授权范围白送一大圈。
+
+**目录展开的三条硬规则**（`commands.rs::expand_dir`，常量 `MAX_DIR_EXPANSION`）：
+
+- **只展开一层**。递归展开会让"我拖了一个文件夹"变成"它翻遍了我整个照片库的每一层"，既慢又违背意图；需要递归的用户自己选下级目录。
+- **只收普通文件**，跳过子目录、符号链接、设备文件与 `.` 开头的隐藏文件（含 macOS 的 `._` 资源叉）。
+- **上限 5000 个，超了直接报错**（`InvalidArgument`，detail 提示"请分批拖入，或者先按子目录拆开"）。**刻意不静默截断** —— 静默截断会让用户以为"处理完了"，实际只处理了前一部分。
 
 - **状态**：✅ 已实现。
-- **与图注的一致性**：`build_io` 的注释明确写了「输入根目录 = 所有输入文件的公共父目录。这是 `PathResolver` 的收敛边界：插件只能读这个范围内（以及它自己的数据目录）。」——与 `permission.rs::PathResolver` 的设计一致。
+- **与图注的一致性**：`build_io` 的注释明确写了「输入根目录 = 该批次所有输入文件的公共父目录。这是 `PathResolver` 的收敛边界：插件只能读这个范围内（以及它自己的数据目录）。」——与 `permission.rs::PathResolver` 的设计一致。
 
 ### 步骤 4 —— `JobQueue::create` 建任务，`JobQueue::spawn` 入队
 
@@ -445,7 +455,7 @@ flowchart TD
 
   即：**runner 只返回 `Vec<String>`（产出文件路径）或一个错误**；状态机与事件全部由 `spawn` 统一处理。
 - `JobKind::PluginRun { plugin_id }` 来自 `core/job.rs::JobKind`；L1 流水线走同一个 `PluginRun`（`commands.rs` 里没有为 L1 单开 `JobKind::PipelineRun`——`PipelineRun` 变体在 `JobKind` 里存在，但 `plugins_run` 用的是 `PluginRun`）。
-- **注意**：`commands.rs::plugins_run` **没有**调用 `state.queue.set_retry(...)`。因此 `JobQueue::retry` 对插件任务会返回 `InvalidArgument`（"任务 {id} 不支持重试"）。同时外壳**没有暴露 `jobs_retry` 命令**（`COMMAND_NAMES` 里没有）。→ 🚧 `JobQueue::retry` / `set_retry` 目前是**从 IPC 侧不可达**的能力。
+- **注意**：`commands.rs::plugins_run` **没有**调用 `state.queue.set_retry(...)` —— 它在 `submit_plugin_run` 之外、由命令入口注册重放闭包（`plugins_run` 里 `app.queue.set_retry(&response.job_id, ...)`），重试闭包与首次提交共用同一个 `submit_plugin_run`。`jobs_retry` 命令**已存在并注册**（`COMMAND_NAMES` 里有），前端任务中心的「重试」按钮因此可用。`AiGenerate` 与 `EngineInstall` 仍然**不**可重试（有副作用/成本）：`JobQueue::retry` 对它们会返回 `InvalidArgument`（"任务 {id} 不支持重试"）。
 - **状态**：✅ 已实现。
 
 ### 步骤 5 —— 队列的两个闸门
@@ -637,15 +647,13 @@ std::fs::create_dir_all(&workspace).ok();
    - 步骤 1、2（调用侧）、9 因此全部是「契约已定、实现待定」。
 2. ⛔ **`bindings.ts` 未生成**。`lib.rs::run()` 在 `#[cfg(debug_assertions)]` 下会尝试写 `apps/desktop/src/bindings.ts`，`src/bin/export_bindings.rs` 提供 CI 用的无 GUI 入口；`apps/desktop/src/` 不存在时这一步会失败（`lib.rs` 里对失败只 `tracing::warn!`，不会中断启动）。`.gitignore` 末尾还写着「前端自动生成的 TS 绑定**要入库**」，但该文件当前不存在。
 3. 🚧 **`package.json` 的 bindings 脚本用了错误的 package 名**：`"bindings": "cargo run -p toolforge-desktop --bin export-bindings"`。实际的 `[package] name` 是 **`toolforge`**（`apps/desktop/src-tauri/Cargo.toml`），`export_bindings.rs` 自己的文档也写的是 `cargo run -p toolforge --bin export-bindings`。所以该脚本目前会失败。
-4. 🚧 **`flow.foreach` 的展开没有实现，而且注释与代码不一致**：
-   - `core/pipeline.rs::builtin_nodes()` 里登记了 `flow.foreach`（描述写着「宿主会按并发度并行调度」）；
-   - `engines/nodes.rs::run` 的 `match` **没有** `flow.foreach` 分支 → 会落到 `not_implemented`；
-   - `plugins/l1.rs` 的模块文档第 6 条声称它「由**批量驱动层**（`apps/desktop` 的命令层）展开，执行器只把它当直通」——但 `commands.rs::plugins_run` 里**没有任何 foreach 展开逻辑**，它只调一次 `run_pipeline`。
-   - 结论：这条注释描述的是**尚未存在的代码**。
-5. 🚧 **多文件输入不会逐项执行**。`plugins/builtin/image-convert/plugin.yaml` 把 `src` 端口标成 `multiple: true`，注释写「可一次拖入多张，宿主按并发度逐个执行本流水线」；但 `l1.rs` 里 `${src}` 绑定的是 `req.inputs.values().find_map(|v| v.first())`，即**第一个文件**，`input.<port>` 则是逗号连接的整串。`commands.rs::plugins_run` 也只 `run_pipeline` 一次。所以拖入 12 张 PNG 时，**当前实现只会处理第 1 张**（`total_items` 会显示 12，但实际只跑一次）。这属于 capability gap，不是 bug 报告，但必须知道。
-6. 🚧 **6 个节点已登记但未实现**。清单在 `toolforge_core::pipeline::UNIMPLEMENTED_NODES`，`nodes::run` 的 `match` 覆盖其余 25 个；命中的一律返回 `not_implemented`：
+4. ✅ **`flow.foreach` 节点已被整个删除**（不是"留着不实现"）。它曾经的描述写着「宿主会按并发度并行调度」，那是**假话** —— 宿主不在流水线内部调度。更根本的问题是语义没法定义：L1 的步骤列表是**平铺的有序列表**，没有嵌套结构，"对剩下的步骤循环 N 次"到底是哪几步？循环后面那些"只想跑一次"的收尾步骤怎么办？
+   - 结论是**删掉节点**，而不是继续挂着。真正需要批量的场景**已经由宿主在命令层解决**（`commands.rs::expand_batches`，见步骤 3）：多文件输入与**目录输入**都扇出成单文件批次，逐批调用流水线、上报「处理 3/12」、在批次边界检查取消，清单里可以用 `${batch.index}` 取序号。**清单里从来不需要写循环**，也就不需要这个节点。
+   - `pipeline.rs` 在 `UNIMPLEMENTED_NODES` 原位留了一段注释记录这件事，防止有人再把它加回来。
+5. ✅ **多文件与目录输入现在会逐项执行**（曾经的实现只处理第 1 张）。`commands.rs::expand_batches` 在命令层扇出，`${src}` 只绑定**当前批次**的那一个文件，`total_items` 也改成批次数。目录输入会被展开成其中的文件（**只一层**、排序、跳过隐藏文件、上限 5000 且**超限报错而不是静默截断**）；`build_io` 对目录输入改用**目录自身**作为授权根，而不是它的父级。
+6. 🚧 **5 个节点已登记但未实现**。清单在 `toolforge_core::pipeline::UNIMPLEMENTED_NODES`，`nodes::run` 的 `match` 覆盖其余 27 个；命中的一律返回 `not_implemented`：
 
-   `image.remove-background`、`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`、`flow.foreach`
+   `image.remove-background`、`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`
 
    ✅ **这份名单现在有唯一真相来源**：`UNIMPLEMENTED_NODES`（`pipeline.rs`）同时被三处消费 —— `nodes::run` 的兜底分支、IPC 的 `NodeCatalogResponse.unimplemented`、以及前端的节点面板/画布/Inspector（前端**不再硬编**）。以前它在**四个地方**各存一份（Rust 执行器、SDK 文档、示例清单注释、前端的 `node-support.ts`），每实现一个节点要手工同步四处。
    两条测试守着它与真实分发表的一致性：`unimplemented_list_matches_actual_dispatch`（遍历节点目录，断言"名单里的确实走 not_implemented、名单外的不走"）与 `is_implemented_is_the_complement_of_the_list`。
@@ -655,7 +663,11 @@ std::fs::create_dir_all(&workspace).ok();
 9. ✅ **`settings_patch` 改并发度已作用到队列**。新增 `JobQueue::set_concurrency()` 并在命令层调用。**降低并发是渐近生效的**（`Semaphore::forget_permits` 只能收回空闲许可），这一点写在该方法的文档注释里。
 10. ✅ **打包后内置插件会被分发**。`tauri.conf.json` 的 `bundle.resources` 已改为 `{ "../../../plugins/builtin": "plugins/builtin" }`，与 `resolve_builtin_plugins()` 打包态查找的 `resource_dir()/plugins/builtin` 对齐。
 11. ✅ **引擎下载源已回填 6 条**（此前每一项的 `sha256` 都是 `null`，导致任何引擎都装不上）。现在 `ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux` 都带**实际核对过的哈希 + 版本固定直链**；macOS 三条与 `ffmpeg@linux` 仍为 `null`，`install` 对它们返回 `EngineInstallOutcome::HashRequired`（由 `commands.rs::engines_install` 映射成 `ErrorCode::IntegrityCheckFailed`）。`allow_unverified = true` 时才会走未校验路径。详见 README「已知风险」第 2 条与 `docs/ROADMAP.md` §3。
-12. 🚧 **模型权重下载未落地**。`engine.rs::EngineModel` 的 `url` 与 `sha256` 在 `engine_catalog()` 里**全部是 `None`**，`installed: false`。`EngineRegistry::install_model` 存在，但没有对应 IPC 命令（`COMMAND_NAMES` 里没有 `models_*`）。**v0.1 不需要它**：依赖模型的节点（`image.remove-background` / `ai.upscale`）执行器本身也还没实现。
+12. ✅ **模型权重下载已落地**。以前 `EngineRegistry.models` 是一张**永远空的 map**（只有 `register_model` 能填，而没有任何调用点），于是 UI 列出 6 个模型、每次点下载都答「未在注册表里登记」。现在 `EngineRegistry::new` 直接从 `toolforge_core::engine::engine_catalog()` 建这张表（**注册表 map 这个"第二真相来源"已被删掉**），并新增三条 IPC：`models_list` / `models_install` / `models_remove`。
+    - `EngineModel` 增加了 `file_name`：GitHub 的资产名与模型 id **不一致**（`isnet-general` 的资产是 `isnet-general-use.onnx`），文件落在 `<data_dir>/models/<model_id>/<file_name>`。
+    - `u2netp` / `u2net` / `isnet-general` 三条已带**真实下载后算出来的** SHA-256 与固定 tag（`v0.0.0`）直链；**哈希不匹配就删文件**（`registry.rs::install_model` 用 `remove_file` + `IntegrityCheckFailed`），绝不"下坏了也凑合用"。
+    - `birefnet-general` / `modnet-portrait` / `realesrgan-x4plus` **刻意没有** url/hash（哈希尚未核对），UI 显示「无下载源」并**禁用**下载按钮 —— 宁可按钮是灰的，也不放一个"点了必然失败"的按钮。单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name 三者全有或全无、哈希是 64 位小写十六进制、且 `file_name` 不重复。
+    - 依赖模型的节点（`image.remove-background` / `ai.upscale`）执行器**仍然没实现**（见上面第 6 条），所以 v0.1 仍然用不上模型。
 13. ⚠️ **生产 CSP 与 Vite 开发模式的冲突（已解决，但容易被人"清理"掉）**。
 
     `app.security.csp` 里的 `script-src 'self'` 会拦掉 `@vitejs/plugin-react`
@@ -682,7 +694,7 @@ std::fs::create_dir_all(&workspace).ok();
 
 | 级别 | 载体 | 能力边界 | 适用场景 | 安全等级 | 资源限制 | 是否可做图像处理 |
 |---|---|---|---|---|---|---|
-| **L1** `PluginRuntime::Pipeline` | **YAML 编排内置节点**。`PipelineDef { steps, on_error, timeout_ms }`，步骤是 `PipelineStep { id, uses, with, when, on_error, retry, timeout_ms, depends_on, position }`。**是数据，不是代码**：宿主在 `l1.rs::run_pipeline` 里逐节点执行，节点的能力边界**编译期写死在 `nodes::run` 的 `match` 里**。 | 受限于内置节点目录（`core/pipeline.rs::builtin_nodes()`，31 个已登记 / 25 个已实现）。可以调用 `fs.*`、`image.*`（纯 Rust + 可选 libvips/ImageMagick）、`video.*`/`audio.*`（FFmpeg）、`doc.convert`（Pandoc）、`doc.to-pdf`（LibreOffice）、`archive.*`（7-Zip）。不能表达任意算法。 | 格式转换、批量重命名、缩放裁剪、打包解压 —— 任何「组合现有引擎」的需求。**也是 AI 生成产物的首选形态**（`plugins/lib.rs`：「数据不是代码，**AI 生成的最优形态**：没有任意代码执行面」）。 | **最高**。没有任意代码执行面。安全依赖 `CapabilityGuard` + `PathResolver`。`l1.rs` 在跑之前先做 fs 能力硬检查，缺 `FsRead` 就 `audit::record_violation` + 返回 `violation` 错误。 | 单步 `timeout_ms` 走 **`tokio::time::timeout`（墙钟）**；流水线级 `timeout_ms`（0 = 不限）；`retry` 次数；由 `JobQueue::gate` 限并发。**资源上限靠外部引擎自己 + 队列并发度**，没有内存上限。 | ✅ **可以，而且这是它的主场**。图片节点默认走纯 Rust `image` crate，检测到 libvips / ImageMagick 时自动切换（`ENGINE-MATRIX` 与 `engine.rs` 的 `optional_engines` 都记录了这个降级链）。 |
+| **L1** `PluginRuntime::Pipeline` | **YAML 编排内置节点**。`PipelineDef { steps, on_error, timeout_ms }`，步骤是 `PipelineStep { id, uses, with, when, on_error, retry, timeout_ms, depends_on, position }`。**是数据，不是代码**：宿主在 `l1.rs::run_pipeline` 里逐节点执行，节点的能力边界**编译期写死在 `nodes::run` 的 `match` 里**。 | 受限于内置节点目录（`core/pipeline.rs::builtin_nodes()`，32 个已登记 / 27 个已实现）。可以调用 `fs.*`、`image.*`（纯 Rust + 可选 libvips/ImageMagick）、`video.*`/`audio.*`（FFmpeg）、`doc.convert`（Pandoc）、`doc.to-pdf`（LibreOffice）、`archive.*`（7-Zip）。不能表达任意算法。 | 格式转换、批量重命名、缩放裁剪、打包解压 —— 任何「组合现有引擎」的需求。**也是 AI 生成产物的首选形态**（`plugins/lib.rs`：「数据不是代码，**AI 生成的最优形态**：没有任意代码执行面」）。 | **最高**。没有任意代码执行面。安全依赖 `CapabilityGuard` + `PathResolver`。`l1.rs` 在跑之前先做 fs 能力硬检查，缺 `FsRead` 就 `audit::record_violation` + 返回 `violation` 错误。 | 单步 `timeout_ms` 走 **`tokio::time::timeout`（墙钟）**；流水线级 `timeout_ms`（0 = 不限）；`retry` 次数；由 `JobQueue::gate` 限并发。**资源上限靠外部引擎自己 + 队列并发度**，没有内存上限。 | ✅ **可以，而且这是它的主场**。图片节点**目前只走纯 Rust `image` crate 这一条路** —— `optional_engines` 里声明的 libvips / ImageMagick 至今**没有任何一处被 resolve 或调用**（`nodes.rs` 真正用到的引擎只有 ffmpeg / pandoc / libreoffice / 7zip），所以"检测到 libvips 时自动切换"这句降级链目前**是规格、不是事实**，详见 `docs/ENGINE-MATRIX.md` 第 5.1 节与 `docs/ROADMAP.md` 的「不一致 2」。 |
 | **L2** `PluginRuntime::Wasm` | **Extism WASM**（wasmtime 后端）。`WasmRuntimeDef { path, entry（默认 `"run"`）, memory_limit_mb（默认 `64`）, timeout_ms（默认 `5_000`）, allow_host_functions（默认空）}`。装载：`WasmPlugin::load` 用 `extism::PluginBuilder::new(manifest).with_wasi(false).with_fuel_limit(fuel_for_timeout(timeout_ms))`。 | `runtimes.rs` 逐条列出：❌ **没有文件系统**（连 `open` 都没有）、❌ **没有网络**、❌ **没有线程**（WASM 线程需要 shared memory + COOP/COEP，Extism 未启用）、⚠️ **没有 SIMD**（"wasmtime 默认不开 `simd` 特性给 Extism 模块"）；✅ 有确定性的整数/浮点运算；✅ 通过宿主函数白名单可以 `log` 与读写自己的 KV。**结论：只适合"输入一串字节，输出一串字节"的纯计算。** | 文本变换、哈希、编码解码、规则计算、数据校验。`plugins/lib.rs` 的三级表把「真沙箱，但**没有文件系统/网络/SIMD**，做不了图像解码」写成一句话总结。 | **高**。关闭 WASI + 白名单宿主函数。`wasm.rs` 的注释给出了关闭 WASI 的理由：「打开 WASI 就等于把宿主的文件描述符暴露给插件。」**v0.1 不注入任何自定义宿主函数** —— 原文理由：「宿主函数是**唯一**能从沙箱里伸出手来的口子，每加一个都要单独评估。宁可不加。」 | **① 燃料（fuel）做上界，不是墙钟超时。** `fuel_for_timeout(timeout_ms)`：`FUEL_PER_SEC = 100_000_000`（注释说是保守估计）、`MIN_FUEL = 10_000_000`，`secs = (timeout_ms/1000.0).max(0.05)`。理由（`wasm.rs` 原文）：关掉 WASI 后 WASM **无法阻塞**（没有 I/O、没有网络、没有 `sleep`），"它唯一能做的就是烧 CPU"；用墙钟超时把调用丢进另一个线程再 `timeout`，「超时后那个线程还在烧 CPU，我们只是不再等它 —— 那是**假装**超时，会积压线程」。燃料耗尽会 trap，`Plugin::call` 直接返回错误。**② 内存上限走 `Manifest::with_memory_max(pages)`，单位是 64KiB 页**（`pages_for_memory(mb)` = `mb*1MiB/65536`，`clamp(16, 65_536)`，即 1 MiB .. 4 GiB）。**③ payload 有 16MB 上限**：`call` 里 `const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;`，超了返回 `InvalidArgument`，detail 是「WASM 插件适合处理小数据。大文件请走 L1 内置节点或 L3 Python 插件。」 | ❌ **不能**。见第 6 节决策 3。注意 `core/plugin.rs::validate_runtime` 会对「声明了 fs/net 权限却选 WASM 运行时」发 `WASM_WITH_PERMISSIONS` **警告**（"通常是多余或设计错误"）。 |
 | **L3** `PluginRuntime::Python` | **独立 Python 进程 + JSON-RPC over stdio**。`PythonRuntimeDef { entry, python_version（默认 `"3.11"`）, requirements, timeout_ms（默认 `300_000`）, workers（默认 `1`）, allow_network（默认 `false`）}`。协议走 `toolforge_process::rpc` 的 **JSON-RPC 2.0 按行分帧**，stdout 只跑协议、stderr 是自由日志。方法：`initialize`（宿主→插件，返回 `-32601` 表示插件不实现握手则按无状态处理）、`run`（宿主→插件）、`shutdown`（宿主→插件）；通知：`progress`（`{value, stage}`）、`log`（`{level, message}`）、`host.request`（**一律拒绝**，见下）。 | 受 `core::permission` 约束。`runtimes.rs` 的三级表：「能力最强也最危险，靠 `toolforge_core::permission` 约束 + 进程隔离兜底」。可做 AI 推理、重模型、需要生态库的场景。`plugin.rs` 的枚举文档写「受 [`crate::permission`] 约束」。 | **低（三者中最低），而且必须诚实说明**。`runtimes.rs` 的原文：「**但是**：这不是内核级沙箱。一个蓄意的插件可以直接用 `socket` 绕过代理环境变量、可以读它进程能读的任何文件。真正的隔离需要 Windows Job Object + AppContainer、或 macOS `sandbox-exec`、或 Linux seccomp —— 这些在 v0.2 的路线图里（见 ROADMAP）。**因此 L3 插件的安全依赖两件事**：1. 用户在授权前真的看了权限清单（所以 UI 必须把高危能力标红）；2. 审计日志能事后追溯。**不要对用户宣称"L3 是沙箱"。**」`toolforge-process/src/lib.rs` 有同样的声明：「本 crate **不是**操作系统级沙箱。`clear_env` + 锁定 `cwd` + 断网环境变量只能挡住"顺手而为"的越权，挡不住蓄意攻击。」 | 宿主实际做的（`python.rs::launch` + `supervisor.rs`）：**① 清空继承的环境变量**（`spec.clear_env = true` → `cmd.env_clear()`），**只留 `PATH`**（`supervisor.rs`：「至少要给 PATH，否则 Windows 上子进程自己起程序会失败」），另外固定注入 `PYTHONUNBUFFERED=1` / `PYTHONIOENCODING=utf-8` / `PYTHONDONTWRITEBYTECODE=1`，以及 `TOOLFORGE_PLUGIN_ID`、`TOOLFORGE_CAPABILITIES`（逗号连接的能力短标签）、`PYTHONNOUSERSITE=1`（"不给 `PYTHONPATH`，避免插件意外 import 到宿主的包"）。**② 锁定 cwd**（`spec.cwd = Some(plugin_dir)`；不存在则先 `create_dir_all`，再 `cmd.current_dir(cwd)`）。**③ 默认断网**（`spec.deny_network = !(def.allow_network && granted.wants_network())`；`supervisor.rs` 设 `HTTP_PROXY` / `HTTPS_PROXY` / `http_proxy` / `https_proxy` = `http://127.0.0.1:1`、`NO_PROXY=""`，并写 `TOOLFORGE_NETWORK=denied`／`allowed`）。**④ 超时后杀进程**（`PythonPlugin::call` 在 `Err(e) if e.code == ErrorCode::Timeout` 时 `drop(call)` + `self.supervisor.kill().await`，注释「超时的进程已经不可信（可能卡在 native 代码里），必须回收」；`shutdown(grace)` 是「先 `shutdown` 再关 stdin，最后才 kill」）。**⑤ 每个插件独立 venv**（`plugin_dir/.venv`；`prepare_venv` 用 `python_exe -m venv`，再 `venv_python -m pip install --no-input --disable-pip-version-check --only-binary=:all: <requirements>`；超时分别 180s / 1800s；venv 存在就复用）。**⑥ 运行期提权一律拒绝**（`handle_notification` 的 `"host.request"` 分支只 `job.warn(...)`：「插件在运行中想申请新能力。**我们不会满足它** —— 能力必须在装载前由用户授权，运行期提权是"点击劫持"的经典入口。」） | ✅ **可以**。这是做图像/模型重活的推荐层。`engine.rs` 的 `python` 引擎 `provides` 就写着 `image.remove-background` / `ai.upscale` / `doc.ocr`。 |
 
@@ -775,7 +787,7 @@ if !probe.function_exists(&def.entry) { return Err(PluginInvalid(...)) }
   - 需要**纯计算**且要强隔离 → **L2**（Extism WASM，关 WASI，燃料上界）。
   - 需要**任意逻辑 / 重依赖 / 模型推理** → **L3**（Python 独立进程 + JSON-RPC），用 `CapabilityGuard` + `PathResolver` + 清空环境变量 + 锁 cwd + 默认断网 + 超时杀进程兜底，并且**明确不宣称它是沙箱**。
 - **代价**：
-  - L1 表达力有限（只能编排 25 个已实现节点）；一旦需求超出节点目录，就必须写 L2/L3。
+  - L1 表达力有限（只能编排 27 个已实现节点）；一旦需求超出节点目录，就必须写 L2/L3。
   - L2 的性能与能力面都很窄（见决策 3）。
   - L3 的隔离是"尽力而为"，安全性最终依赖**用户真的看了权限清单**和**审计日志可追溯**（`runtimes.rs` 原文）。这对 UI 提出了硬要求（高危能力必须标红：`permission.rs::RiskLevel` 四档 `Low`/`Medium`/`High`/`Critical`，`Capability::risk()` 里 `Exec` 是 `Critical`、`Net { hosts: [] }` 是 `High`、`FsRead { scope: Explicit(_) }` 是 `High`）。
   - 每个 L3 插件一个 Python 进程 + 一个独立 venv，内存与磁盘成本明显高于 L1/L2；`ensure_loaded` 的实例缓存与"调用后放回去"的写法就是在为这个成本做缓解。
@@ -837,7 +849,7 @@ if !probe.function_exists(&def.entry) { return Err(PluginInvalid(...)) }
    - **必须用户确认许可证**：`core/engine.rs::EngineDescriptor::requires_license_ack` 是一个硬门，`commands.rs::engines_install` 里对 `descriptor.requires_license_ack && !license_accepted` 直接返回 `PermissionDenied`，注释写「许可证确认是硬门：不能靠前端自觉」。`onnx-models` 的 `requires_license_ack` 是 `true`。
    - **权重与引擎分开**：`EngineModel` 的注释原文：「**刻意与引擎本身分开** —— 权重体积大、许可证各异，而且很多是"只有用了这个功能才需要"。」`EngineModel` 有独立的 `license` 与 `commercial_use` 字段，注释甚至标了「权重许可证（可能与代码许可证不同！）」。
    - **代码许可 ≠ 权重许可**：`onnx-models` 的 `license_note` 原文：「代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。」`engine.rs` 的单测 `model_licenses_are_explicit` 强制「至少要有一个明确不可商用的（模型），提醒用户」。
-   - **当前状态**：`engine_catalog()` 里所有 `EngineModel` 的 `url` 与 `sha256` 都是 `None`，`installed: false`；没有 `models_*` IPC 命令（见 4.11 第 12 条）。
+   - **当前状态**：✅ 下载链路已经落地（`models_list` / `models_install` / `models_remove`；`u2net` / `u2netp` / `isnet-general` 三条带**真实核对过的** SHA-256 + 固定 tag 直链，文件落在 `<data_dir>/models/<model_id>/<file_name>`，**哈希不匹配即删文件**）。"不自动下载"仍然成立：`models_install` 是用户点出来的动作，`requires_license_ack` 依旧是硬门，另外 3 个模型（`birefnet-general` / `modnet-portrait` / `realesrgan-x4plus`）**没有任何下载源**，UI 把按钮置灰（见 4.11 第 12 条）。
 6. **不把缺失引擎伪装成可用**。
    - `toolforge-engines/src/lib.rs` 原文：「音视频/文档/压缩包没有纯 Rust 替代品，所以走「必需引擎缺失 → 该节点不可用」并在 UI 上直接引导安装。**不假装能跑**。」
    - `EngineState::is_usable()` 只在 `Detected | Installed` 时为真；`resolve` 找不到就返回 `EngineMissing` 并给出安装指引。
@@ -855,8 +867,8 @@ if !probe.function_exists(&def.entry) { return Err(PluginInvalid(...)) }
 9. **不允许插件在运行期提权**。`python.rs::handle_notification` 对 `host.request` 只 `job.warn(...)` 并明确拒绝，理由：「能力必须在装载前由用户授权，运行期提权是"点击劫持"的经典入口。」`CapabilityGuard::check` 返回 `Deny` 时，`permission.rs` 的注释要求调用方「**一定要向上冒泡成 `ErrorCode::PluginCapabilityViolation`**，由调用方同时写审计日志。静默降级（比如"读不到就当空文件"）会让攻击面隐形。」
 10. **不允许 AI 产出直接落盘或自动安装**。`commands.rs::ai_generate` 的文档原文：「这个命令**不写盘、不装载**。它返回 `AiGenerateResponse`：原始草稿 + 审核报告。安装必须由用户在前端确认后另调 `plugins_install`。这样即使模型被提示词注入攻陷，它也只能产出"用户看得见的一份草稿"。」对应的两道硬门在 `plugins_install`：`permissions_acknowledged` 必须为 `true`；L3 还必须 `executable_code_acknowledged`。`PluginManifest::validate` 是纯函数（不碰磁盘、不联网），注释解释这是「"先校验再落盘"的关键」。
 11. **不允许前端直接执行任意命令**。`capabilities/default.json` 里 `shell:allow-execute` 的白名单只有一项：`{ "name": "toolforge-open-folder", "cmd": "explorer", "args": true }`。README 的第 5 条理由：「前端（以及将来可能注入的插件 UI）如果能执行任意命令，前面所有的权限模型都是摆设。」`commands.rs` 的文档也把「前端拿不到裸 shell」列为设计纪律第 3 条。
-12. **不允许 AI / 日志泄露 API Key**。`AiSettings` 的注释：「**API Key 不在这里** —— 它存在内存与 OS 钥匙串里，绝不落到这个会序列化给前端的结构体上。」`settings_patch` 里 Key 单独处理：「写进 AI 客户端的内存态，不落到会序列化的结构体里」。`toolforge-ai::provider::redact` 是一个独立的脱敏函数。
-    - **当前状态**：🚧 Key **只在进程内存里**（`state.rs::AppState::ai` + `ai_api_key()`），重启后需重填；注释写「v0.2 会接 OS 钥匙串（Windows DPAPI / macOS Keychain）—— 见 ROADMAP」。
+12. **不允许 AI / 日志泄露 API Key**。`AiSettings` 的注释原文（已随实现改过一遍）：「**API Key 不在这里** —— 它存在内存里，只有用户显式打开「记住 API Key」时才会另存到 `<数据目录>/ai-key.txt`。」`settings_patch` 里 Key 单独处理：「写进 AI 客户端的内存态，不落到会序列化的结构体里」。`toolforge-ai::provider::redact` 是一个独立的脱敏函数。
+    - **当前状态**：Key **默认只在进程内存里**（`state.rs::AppState` + `ai_api_key()`），重启后需重填。新增设置 `ai.persistApiKey`（**默认 `false`**）允许用户把它**明文**写到 `<data_dir>/ai-key.txt`；关掉这个开关会**删除**那个文件。OS 钥匙串（Windows DPAPI / macOS Keychain）**仍未实现**，它是 ROADMAP 上的待办 —— 明文落盘是相对钥匙串的**能力降级**，所以默认不开启，这一点在 `docs/SECURITY.md` 里写明了。
 13. **不在插件里支持 URL / VCS / 本地路径依赖**。`plugin.rs::validate_runtime` 对 `python.requirements` 里含 `://`、以 `-` 开头、或含 ` @ ` 的条目报 `PY_REQ_UNSAFE` 错误（"禁止 URL / VCS / 本地路径依赖"）；`prepare_venv` 装依赖时还加了 `--only-binary=:all:`。
 14. **不在插件目录之外写文件**。`commands.rs::resolve_output_dir` 的兜底注释：「兜底：数据目录下的 output/（**绝不往用户没指定的地方写文件**）」。
 15. **不做"压缩包解出到目标目录之外"**。`core/pipeline.rs` 的 `archive.unpack` 节点描述：「**内置 Zip Slip 防护**：拒绝解出到目标目录之外的条目。」（防护实现在 `engines/nodes.rs` 的 `sevenzip_unpack` 里。）

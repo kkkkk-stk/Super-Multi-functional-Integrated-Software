@@ -48,12 +48,19 @@
 Rust 没有稳定 ABI，Windows 还有文件锁 —— 原生插件的热重载**必然崩**，而且一崩就是整个应用。
 如果你确实需要，正确的方向是「独立进程 + IPC」，那其实就是 L3。
 
-### 4. 图片处理是唯一做了三层降级的领域，其余引擎缺失就是缺失
+### 4. 图片处理的目标是三层降级，但**目前只有纯 Rust 那一层在跑**
 
 ```
 libvips（快、省内存） ──缺失──▶ ImageMagick（格式最全） ──缺失──▶ 纯 Rust image crate
                                                                     （零依赖，永远可用）
 ```
+
+> 🚧 **诚实说明**：上面这张图是**设计目标**。`nodes.rs` 里真正被调用的引擎只有
+> ffmpeg / pandoc / libreoffice / 7zip 四个，`libvips` 与 `imagemagick`
+> **没有任何一处被 resolve 或调用** —— 图像节点全部只走纯 Rust 路径。
+> 所以"装了 libvips 就自动提速"现在**不成立**。详见
+> [docs/ENGINE-MATRIX.md](docs/ENGINE-MATRIX.md) 第 5.1 节与
+> [docs/ROADMAP.md](docs/ROADMAP.md) 的「不一致 2」。
 
 音视频 / 文档 / 压缩包没有纯 Rust 替代品，所以 FFmpeg 缺失时**直接告诉用户去装**，
 而不是假装能跑。同理，v0.1 里没实现的节点会返回明确的 `未实现` 错误，
@@ -85,7 +92,7 @@ ToolForge 想用**一个统一入口**解决这件事，并且解决得更彻底
 │  ├─ src/                    React 18 + TS + Vite 5（UI 与交互）        │
 │  └─ src-tauri/src/          IPC 命令层（只做编排，无业务逻辑）           │
 │     ├─ ipc.rs               前端可见的契约类型                          │
-│     ├─ commands.rs          28 个命令                                  │
+│     ├─ commands.rs          32 个命令                                  │
 │     ├─ state.rs             组装各子系统                                │
 │     └─ lib.rs               事件桥 + specta 类型导出                    │
 └────────────────────────────┬─────────────────────────────────────────┘
@@ -107,7 +114,7 @@ ToolForge 想用**一个统一入口**解决这件事，并且解决得更彻底
 ### 一次「拖入文件 → 转换完成」的完整链路
 
 ```
-用户拖入 12 张 PNG
+用户拖入 12 张 PNG（拖入一个文件夹也一样：宿主把它展开成里面的文件，逐个处理）
    │
    ▼  React 拿到路径 → dropStore 收集 → 用户点「开始转换」
    ▼  ipc.pluginsRun({ pluginId, inputs: { src: [...12 个路径] }, params })
@@ -116,7 +123,10 @@ ToolForge 想用**一个统一入口**解决这件事，并且解决得更彻底
    │    ├─ plugins.runnable(id)        已安装？已启用？权限齐？校验通过？
    │    ├─ plugins.quarantine_if_changed(id)   内容哈希是否被改过？
    │    ├─ resolve_output_dir()        输出目录（绝不往用户没指定的地方写）
+   │    ├─ expand_batches()            多文件/目录输入先扇出成 N 个单文件批次
+   │    │     └─ 目录只展开一层，跳过隐藏文件，上限 5000 个（超了报错，不静默截断）
    │    ├─ build_io()                  推导输入根目录 = PathResolver 的收敛边界
+   │    │     └─ 目录输入时根取目录自身（不是父级，避免多授权一层）
    │    ├─ queue.create(...)           → 立即返回 jobId
    │    └─ queue.spawn(...)            → 丢进 tokio
    │
@@ -125,14 +135,15 @@ ToolForge 想用**一个统一入口**解决这件事，并且解决得更彻底
    │    ├─ 状态迁移 Queued → Running（非法迁移被拒且不 panic）
    │    └─ 执行 runner
    │
-   ▼  L1 流水线执行器（toolforge-plugins::l1）
+   ▼  L1 流水线执行器（toolforge-plugins::l1）—— 每批调用一次，逐批上报「处理 3/12」
    │    ├─ CapabilityGuard 裁决每次能力请求
    │    ├─ PathResolver 把逻辑路径翻译成真实路径（挡 `../../`）
    │    ├─ 逐步：when 条件 → 模板渲染 → 超时/重试 → 执行节点
-   │    └─ 每步产出写入 ${steps.<id>.<key>}，只允许后向引用
+   │    ├─ 每步产出写入 ${steps.<id>.<key>}，只允许后向引用
+   │    └─ 批次序号由宿主注入：${batch.index}（从 1 起）/ ${batch.total}
    │
    ▼  nodes::run（toolforge-engines）
-   │    ├─ image.*  → 纯 Rust image crate（libvips/ImageMagick 存在时走它们）
+   │    ├─ image.*  → 纯 Rust image crate（libvips/ImageMagick 至今没有被调用）
    │    ├─ video.*  → 构造 ffmpeg 命令行 + 解析 -progress 输出为百分比
    │    └─ 取消令牌贯穿到子进程，UI 点"取消"秒级生效
    │
@@ -339,8 +350,9 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
 - [x] 可视化流程编辑器（React Flow）
 - [x] AI 生成插件 + 安全审核门
 - [ ] 抠图 / 超分 / OCR —— **节点已登记，执行器待实现**（v0.2，见 [ROADMAP](docs/ROADMAP.md)）
+- [x] 模型权重下载（`models_list` / `models_install` / `models_remove`）：已核对哈希的三个 rembg 权重可下载，**哈希不匹配即删文件**；另外三个没有下载源，UI 直接禁用按钮（不让你点了才失败）
 - [ ] LibreOffice 常驻 UNO listener（当前是每次冷启动）
-- [ ] OS 钥匙串存储 API Key（当前仅内存）
+- [ ] OS 钥匙串存储 API Key —— **仍未实现**。Key 默认只存在内存；可选开关「记住 API Key」把它**明文**写到 `<数据目录>/ai-key.txt`（默认关闭，关掉即删文件）
 
 ---
 
@@ -362,9 +374,16 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
    > `every_declared_hash_is_a_wellformed_sha256` 守着这两条纪律。
 3. **模型权重不随包分发**。U²-Net 是 Apache-2.0 可商用，MODNet / BiRefNet 的**权重**许可不同，
    首次使用时会下载并单独确认许可证。
-4. **`--stripComponents` / 解压依赖系统 `tar`**。Windows 10 1803+ 自带 bsdtar；
+   下载文件**逐个校验 SHA-256**（`u2net` / `u2netp` / `isnet-general` 三条的哈希是真实下载后算出来的），
+   **不匹配就删除文件并报错**，不留没校验过的产物。`birefnet-general` / `modnet-portrait` /
+   `realesrgan-x4plus` 还没有核对过的哈希，因此 UI 显示「无下载源」并把下载按钮**置灰**。
+4. **设置会真的落盘**。非机密设置写 `<数据目录>/settings.json`（原子写：临时文件 + rename）；
+   文件损坏时被隔离成 `settings.broken.json` 并用默认值启动，**不会因为一个坏 JSON 就打不开应用**。
+   API Key **不在这个文件里**：默认只在内存，只有显式打开「记住 API Key」才**明文**写到
+   `<数据目录>/ai-key.txt`，关掉该开关会删除这个文件（OS 钥匙串尚未实现）。
+5. **`--stripComponents` / 解压依赖系统 `tar`**。Windows 10 1803+ 自带 bsdtar；
    更老的系统会退回到 7-Zip；都没有时给出明确的手动解压指引。
-5. **AVIF 编码默认关闭**（rav1e 编译要几分钟）。需要时开 `toolforge-engines` 的 `avif` feature。
+6. **AVIF 编码默认关闭**（rav1e 编译要几分钟）。需要时开 `toolforge-engines` 的 `avif` feature。
 
 ---
 

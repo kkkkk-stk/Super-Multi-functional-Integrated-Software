@@ -54,6 +54,7 @@ const CATEGORY_ORDER: NodeCategory[] = [
   "document",
   "archive",
   "ebook",
+  "text",
   "ai",
   "flow",
 ];
@@ -67,6 +68,7 @@ export function nodeCategoryLabel(category: NodeCategory): string {
     document: "文档",
     archive: "压缩包",
     ebook: "电子书",
+    text: "文本与命名",
     ai: "AI",
     flow: "流程控制",
   };
@@ -91,6 +93,7 @@ export const CATEGORY_COLORS: Record<NodeCategory, { ring: string; text: string;
   document: { ring: "ring-amber-400/40", text: "text-amber-300", bg: "bg-amber-500/15" },
   archive: { ring: "ring-orange-400/40", text: "text-orange-300", bg: "bg-orange-500/15" },
   ebook: { ring: "ring-teal-400/40", text: "text-teal-300", bg: "bg-teal-500/15" },
+  text: { ring: "ring-lime-400/40", text: "text-lime-300", bg: "bg-lime-500/15" },
   ai: { ring: "ring-fuchsia-400/40", text: "text-fuchsia-300", bg: "bg-fuchsia-500/15" },
   flow: { ring: "ring-zinc-400/40", text: "text-zinc-300", bg: "bg-zinc-500/15" },
 };

@@ -12,9 +12,11 @@
 //! 5. **`flow.branch`**：把 `steps.<id>.active` 写成 `"true"` / `"false"`，
 //!    后续步骤通过 `when: ${steps.<id>.active} == true` 使用它。
 //!    **刻意不做隐式控制流** —— 隐式分支是调试噩梦。
-//! 6. **`flow.foreach`**：由**批量驱动层**（`apps/desktop` 的命令层）展开，
-//!    执行器只把它当直通。原因是并发调度属于任务队列的职责，混进流水线执行器会让
-//!    取消与进度上报变得极难推理。
+//! 6. **批量**：**清单里不需要写循环，也没有循环节点**。多文件输入（以及目录输入）
+//!    由命令层 `apps/desktop/src-tauri/src/commands.rs::expand_batches` 展开成
+//!    N 个单文件批次，逐批调用一次本函数；每批通过 `${batch.index}` 拿到序号。
+//!    执行器本身不做并发调度 —— 那是任务队列的职责，混进来会让取消与进度上报
+//!    变得无法推理。
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -48,6 +50,14 @@ pub struct PipelineRunRequest {
     pub output_root: PathBuf,
     pub plugin_data_root: PathBuf,
     pub workspace_root: PathBuf,
+    /// 本次调用是批量的第几项（**1-based**）。非批量时为 1。
+    ///
+    /// 批量由命令层扇出（每个文件一次调用），流水线本身看不到"我跑了几次"。
+    /// 但"给每个文件编个号"是最常见的重命名需求，所以把序号显式传进来，
+    /// 由 `${batch.index}` 暴露给清单。
+    pub batch_index: u32,
+    /// 本批次总项数，`${batch.total}`
+    pub batch_total: u32,
 }
 
 impl PipelineRunRequest {
@@ -65,6 +75,8 @@ impl PipelineRunRequest {
             output_root: output_root.into(),
             plugin_data_root: plugin_data_root.into(),
             workspace_root: workspace_root.into(),
+            batch_index: 1,
+            batch_total: 1,
         }
     }
 }
@@ -162,6 +174,8 @@ pub async fn run_pipeline(
         // 每次调用 `nodes::run` 前会被覆写成该步骤的 `with` 块，
         // 这里给个空的就行（见 NodeCtx::arg_scope 的文档）。
         arg_scope: BTreeMap::new(),
+        batch_index: req.batch_index.max(1),
+        batch_total: req.batch_total.max(1),
     };
 
     // ---- 模板上下文初始值 ----
@@ -198,6 +212,42 @@ pub async fn run_pipeline(
     }
     if let Some(v) = first_output {
         tctx.insert("dst", v);
+    }
+
+    // ---- 批次数 ----
+    // "给每个文件编个号"是最常见的重命名需求，而流水线本身看不到"我跑了几次"。
+    tctx.insert("batch.index", req.batch_index.max(1).to_string());
+    tctx.insert(
+        "batch.zeroIndex",
+        req.batch_index.saturating_sub(1).to_string(),
+    );
+    tctx.insert("batch.total", req.batch_total.max(1).to_string());
+
+    // ---- 输入文件的路径信息 ----
+    // `${src.stem}` / `${src.ext}` 让"基于原文件名构造新文件名"可以纯声明式地写出来 ——
+    // 这正是 `batch-rename` 之前做不到的事（它只能把文件原样挪个位置）。
+    if let Some(src) = tctx.get("src").map(|s| s.to_string()) {
+        let p = std::path::Path::new(&src);
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ext = p
+            .extension()
+            .map(|s| format!(".{}", s.to_string_lossy()))
+            .unwrap_or_default();
+        let name = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let dir = p
+            .parent()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        tctx.insert("src.stem", stem);
+        tctx.insert("src.ext", ext);
+        tctx.insert("src.name", name);
+        tctx.insert("src.dir", dir);
     }
 
     let mut result = PipelineRunResult::default();

@@ -377,6 +377,7 @@ pub enum NodeCategory {
     Document,
     Archive,
     Ebook,
+    Text,
     Ai,
     Flow,
 }
@@ -391,6 +392,7 @@ impl NodeCategory {
             NodeCategory::Document => "文档",
             NodeCategory::Archive => "压缩包",
             NodeCategory::Ebook => "电子书",
+            NodeCategory::Text => "文本与命名",
             NodeCategory::Ai => "AI",
             NodeCategory::Flow => "流程控制",
         }
@@ -532,16 +534,34 @@ fn engine(name: &str) -> String {
 /// **新增节点时的正确顺序**：先实现执行器 → 再把它从这里删掉 →
 /// 前端与文档会自动跟上。
 pub const UNIMPLEMENTED_NODES: &[&str] = &[
-    // 需要 ONNX 运行时；模型分发链路（models_* IPC）也还没落地
+    // 需要 ONNX 运行时。模型分发链路（`models_*` IPC + 真实校对过 SHA-256 的
+    // 三个抠图权重）**已经落地**，缺的是"跑推理"这一段：
+    // 要么接 Python sidecar（3.11 运行时 + onnxruntime，可通过引擎安装拿到），
+    // 要么引 Rust 的 ort。两件都还没做，所以这里照旧。
     "image.remove-background",
+    // 同上：Real-ESRGAN 权重连下载源都还没核对，见 engine.rs 的
+    // `verified_sources_are_pinned`（它要求 url / sha256 / file_name 三件套齐全）
     "ai.upscale",
+    // 依赖 AI 服务提供方；`ai_test_connection` 已经能连通，但"看图说话"这一步没写
     "ai.describe",
+    // 依赖 tesseract，而 tesseract 目前只支持系统安装（没有配置下载源）
     "doc.ocr",
+    // 依赖 calibre，同样只支持系统安装
     "ebook.convert",
-    // 批量语义现在由命令层逐文件扇出解决（见 commands.rs::expand_batches），
-    // 这个节点保留只是给流程编辑器留一个显式循环标记的位置
-    "flow.foreach",
 ];
+
+// `flow.foreach` 曾经在这里，现在**整个节点都删掉了**。留个记录，免得有人再把它加回来：
+//
+// 当初的设想是"在流水线里对文件列表循环"，但 L1 的步骤列表是**平铺的**，
+// 根本没有嵌套结构 —— "对每一步剩下的步骤循环 N 次"这句话没法定义：
+// 循环体到底包含哪些步骤？循环后面那些"只想跑一次"的收尾步骤怎么办？
+// 而它描述里写的"宿主会按并发度并行调度"更是假的：宿主不在流水线内部调度。
+//
+// 真正需要批量的场景**已经由宿主解决了**：`commands.rs::expand_batches`
+// 在命令层把多文件输入（以及目录输入）扇出成 N 个单文件批次，
+// 逐批调用流水线、上报「处理 3/12」、在批次边界检查取消。
+// 所以清单里从来不需要写循环，也不需要这个节点。
+
 
 /// 某个节点的执行器是否已实现
 pub fn is_implemented(node: &str) -> bool {
@@ -961,6 +981,57 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         ],
     });
 
+    // ---------------- 文本 / 命名（纯计算，供其它节点消费）----------------
+    //
+    // 这一族节点解决的是 L1 的一个结构性短板：**原来没有任何节点能"算出一个值"**。
+    // 所有节点要么读写文件、要么调引擎，于是像"批量重命名"这种需要
+    // "根据规则算出新文件名"的需求根本无法用声明式表达 ——
+    // `plugins/builtin/batch-rename` 就因此退化成了一句 `fs.move`，
+    // 声明的 regex / 前缀 / 后缀 / 序号参数全是装饰。
+    n.push(NodeDescriptor {
+        name: "text.replace".into(),
+        label: "文本替换".into(),
+        description: "对字符串做查找替换，支持正则与大小写控制。\
+                      纯计算、不碰文件，输出可被 `${steps.<id>.text}` 引用。".into(),
+        category: NodeCategory::Text,
+        requires_engines: vec![],
+        optional_engines: vec![],
+        inputs: vec![],
+        outputs: vec![port("text", "结果", PortType::Text, false)],
+        params: vec![
+            param("input", "输入文本（通常写 ${src.stem}）", ParamType::Text, None, true),
+            param("pattern", "查找内容（正则或字面量）", ParamType::Text, None, true),
+            param("replacement", "替换为", ParamType::Text, Some("".into()), false),
+            param("useRegex", "按正则解释 pattern", ParamType::Bool, Some(true.into()), false),
+            param("caseSensitive", "区分大小写", ParamType::Bool, Some(true.into()), false),
+            param("all", "替换全部（关掉只替换第一个）", ParamType::Bool, Some(true.into()), false),
+        ],
+    });
+    n.push(NodeDescriptor {
+        name: "name.build".into(),
+        label: "拼装文件名".into(),
+        description: "把主干、扩展名、前缀、后缀、序号拼成一个**文件名**（不含目录）。\
+                      纯计算。把它接到 `fs.move` 的 `dst` 上即可完成重命名 —— \
+                      因为输出的是相对路径，宿主会把它解析到输出目录内。".into(),
+        category: NodeCategory::Text,
+        requires_engines: vec![],
+        optional_engines: vec![],
+        inputs: vec![],
+        outputs: vec![port("value", "文件名", PortType::Text, false)],
+        params: vec![
+            param("stem", "主干（通常写 ${src.stem}）", ParamType::Text, None, true),
+            param("ext", "扩展名（含点，通常写 ${src.ext}）", ParamType::Text, Some("".into()), false),
+            param("prefix", "前缀", ParamType::Text, Some("".into()), false),
+            param("suffix", "后缀（插在扩展名之前）", ParamType::Text, Some("".into()), false),
+            param("index", "序号（0 = 不追加；可写 ${batch.index}）", ParamType::Int, Some(0i64.into()), false),
+            param("indexPad", "序号补零位数", ParamType::Int, Some(3i64.into()), false),
+            param("indexSeparator", "序号与主体的分隔符", ParamType::Text, Some("-".into()), false),
+            enum_param("indexPosition", "序号位置", "suffix", &["suffix", "prefix"]),
+            enum_param("case", "大小写", "keep", &["keep", "lower", "upper", "title"]),
+            param("separator", "把空格等替换成该字符（留空 = 不动）", ParamType::Text, Some("".into()), false),
+        ],
+    });
+
     // ---------------- 流程控制 ----------------
     n.push(NodeDescriptor {
         name: "flow.branch".into(),
@@ -1003,17 +1074,6 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
             param("message", "消息", ParamType::Text, None, true),
             enum_param("level", "级别", "info", &["debug", "info", "warn", "error"]),
         ],
-    });
-    n.push(NodeDescriptor {
-        name: "flow.foreach".into(),
-        label: "批量循环".into(),
-        description: "对输入文件列表逐个执行后续步骤。**批量处理的性能取决于此处** —— 宿主会按并发度并行调度。".into(),
-        category: NodeCategory::Flow,
-        requires_engines: vec![],
-        optional_engines: vec![],
-        inputs: vec![port("items", "文件列表", PortType::Files, true)],
-        outputs: vec![port("item", "当前项", PortType::File, false)],
-        params: vec![range_param("concurrency", "并发度", ParamType::Int, 4.0, 1.0, 64.0)],
     });
 
     n

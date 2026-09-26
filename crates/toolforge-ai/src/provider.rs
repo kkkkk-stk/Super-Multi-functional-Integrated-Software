@@ -152,7 +152,10 @@ impl AiProviderConfig {
                 ErrorCode::AiUnavailable,
                 format!("{} 需要 API Key", self.kind.describe()),
             )
-            .with_detail("请在「设置 → AI」中填写。Key 只保存在本机加密存储里。"));
+            .with_detail(
+                "请在「设置 → AI」中填写。默认只存在内存里，\
+                 勾选「记住 API Key」后才会另存到数据目录下的 ai-key.txt（明文）。",
+            ));
         }
         Ok(())
     }

@@ -20,6 +20,7 @@ import * as React from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { EngineGrid } from "@/components/engines/engine-grid";
+import { ModelPanel } from "@/components/engines/model-panel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -104,8 +105,10 @@ export function SettingsPage() {
       <header className="space-y-1">
         <h1 className="text-lg font-semibold">设置</h1>
         <p className="text-xs text-muted-foreground">
-          所有设置都会立即写入本机配置文件（不联网）。AI 的 API Key 单独存放，
-          永远不会出现在任何返回给界面的结构里。
+          设置改动会立刻写入本机数据目录下的{" "}
+          <span className="font-mono">settings.json</span>（原子写，不联网）。
+          AI 的 API Key 不在那个文件里：它默认只存在内存中，只有你打开「记住 API Key」
+          时才会另存到 <span className="font-mono">ai-key.txt</span>。
         </p>
       </header>
 
@@ -130,6 +133,9 @@ export function SettingsPage() {
           </TabsContent>
           <TabsContent value="engines" className="mt-2">
             <EngineGrid />
+            <div className="mt-6 border-t border-border/60 pt-5">
+              <ModelPanel />
+            </div>
           </TabsContent>
           <TabsContent value="security" className="mt-2">
             <SecuritySection />
@@ -413,6 +419,9 @@ function AiSection() {
   // 这里提前收窄一次，后面的表单就能拿到确定的类型，不需要满页面写 `??`。
   if (!settings.data?.ai) return <SkeletonCard lines={5} />;
   const ai = settings.data.ai;
+  // `provider` 同样可能缺席（比如手改过的 settings.json）。后端 `Default` 给的是
+  // OpenAI；前端这里用同一个兜底值，免得出现 `PROVIDER_DEFAULT_*[undefined]`。
+  const provider: AiProviderKind = ai.provider ?? "openAi";
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -428,16 +437,16 @@ function AiSection() {
           )}
         </div>
         <Select
-          value={ai.provider}
+          value={provider}
           onChange={(e) => {
-            const provider = e.target.value as AiProviderKind;
+            const next = e.target.value as AiProviderKind;
             // 换提供方时把端点和模型填成该家的默认值，省得用户手抄
             patch.mutate({
               ai: {
                 ...ai,
-                provider,
-                baseUrl: PROVIDER_DEFAULT_BASE_URL[provider] || ai.baseUrl,
-                model: PROVIDER_DEFAULT_MODEL[provider] || ai.model,
+                provider: next,
+                baseUrl: PROVIDER_DEFAULT_BASE_URL[next] || ai.baseUrl,
+                model: PROVIDER_DEFAULT_MODEL[next] || ai.model,
               },
             });
           }}
@@ -458,7 +467,7 @@ function AiSection() {
             id="ai-base-url"
             value={ai.baseUrl}
             onChange={(e) => patch.mutate({ ai: { ...ai, baseUrl: e.target.value } })}
-            placeholder={PROVIDER_DEFAULT_BASE_URL[ai.provider]}
+            placeholder={PROVIDER_DEFAULT_BASE_URL[provider]}
             className="mt-1 h-8 font-mono text-xs"
             aria-label="AI 端点"
           />
@@ -474,7 +483,7 @@ function AiSection() {
             id="ai-model"
             value={ai.model}
             onChange={(e) => patch.mutate({ ai: { ...ai, model: e.target.value } })}
-            placeholder={PROVIDER_DEFAULT_MODEL[ai.provider]}
+            placeholder={PROVIDER_DEFAULT_MODEL[provider]}
             className="mt-1 h-8 font-mono text-xs"
             aria-label="AI 模型"
           />
@@ -544,9 +553,28 @@ function AiSection() {
             )}
           </div>
           <p className="mt-1 text-[11px] text-muted-foreground">
-            Key 只存在本机内存与系统钥匙串里：它「不在」任何会序列化给界面的结构体上，
-            也不会写进日志或插件。清除后需要重新填写。
+            Key 不会出现在任何序列化给界面的结构体里，也不会写进日志或插件。
+            默认只存在本次运行的内存中；是否落盘由下面的开关决定。
           </p>
+        </div>
+
+        <div className="flex items-start gap-3">
+          <Switch
+            id="ai-persist-key"
+            className="mt-0.5"
+            checked={ai.persistApiKey ?? false}
+            onCheckedChange={(v) => patch.mutate({ ai: { ...ai, persistApiKey: v } })}
+            aria-label="记住 API Key"
+          />
+          <div className="space-y-0.5">
+            <Label htmlFor="ai-persist-key">记住 API Key（重启后仍然可用）</Label>
+            <p className="text-[11px] text-muted-foreground">
+              默认关闭：Key 只存在本次运行的内存里，重启要重填。
+              打开后会被<span className="text-foreground">明文</span>写进数据目录下的{" "}
+              <span className="font-mono">ai-key.txt</span>；关掉开关会立刻删掉那个文件。
+              系统钥匙串（Windows DPAPI / macOS Keychain）还没接 —— 见路线图。
+            </p>
+          </div>
         </div>
 
         <div className="flex items-center gap-3">

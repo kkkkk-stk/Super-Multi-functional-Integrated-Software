@@ -22,6 +22,7 @@
 
 pub mod commands;
 pub mod ipc;
+pub mod settings_store;
 pub mod state;
 
 use std::sync::Arc;
@@ -58,6 +59,10 @@ pub const COMMAND_NAMES: &[&str] = &[
     "engines_probe_all",
     "engines_probe",
     "engines_install",
+    // 模型权重
+    "models_list",
+    "models_install",
+    "models_remove",
     // 插件
     "plugins_list",
     "plugins_get",
@@ -99,6 +104,9 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::engines_probe_all,
             commands::engines_probe,
             commands::engines_install,
+            commands::models_list,
+            commands::models_install,
+            commands::models_remove,
             commands::plugins_list,
             commands::plugins_get,
             commands::plugins_reload,
@@ -256,14 +264,19 @@ pub fn run() {
         }
     }
 
-    // 命令注册与 COMMAND_NAMES 的一致性自检。
-    // 数量对不上 = 你加了命令却忘了登记（或反过来），两种情况都会让前端拿到
-    // "未定义的函数"，而且是运行时才炸。
-    debug_assert_eq!(
-        COMMAND_NAMES.len(),
-        29,
-        "COMMAND_NAMES 与 collect_commands! 的数量不一致 —— 加命令时请同时改这两处"
-    );
+    // 命令注册与 `COMMAND_NAMES` 的一致性**不在这里检查**。
+    //
+    // 这里原本有一条 `debug_assert_eq!(COMMAND_NAMES.len(), 29)`。它有两个问题，
+    // 第二个是它在真机上真实发生过的：
+    //
+    // 1. 它比的是一个**魔数**：加了命令就把它 29 改成 30 便"通过"，而漏注册的照旧漏；
+    // 2. 加命令但忘了改这个数字时，**调试构建的应用直接在启动时 panic** ——
+    //    报错信息是"数量不一致"，但人看到的是一句话都没来得及说就没了的窗口。
+    //    用一个和后端行为无关的常量去决定"应用能不能启动"，这个代价完全不成比例。
+    //
+    // 真正的守卫在 `apps/desktop/src-tauri/src/bin/export_bindings.rs`：
+    // 它逐个核对 `COMMAND_NAMES` 里的每个名字是否真的出现在生成的绑定里，
+    // 再比对总数 —— 既不能漏，也不能靠改数字蒙混。`pnpm bindings` 与 CI 都会跑它。
 
     let mut tauri_builder = tauri::Builder::default();
 

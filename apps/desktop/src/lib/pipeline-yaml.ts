@@ -58,6 +58,8 @@ function pluginCategoryOf(category: NodeCategory | undefined): PluginCategory {
       return "archive";
     case "ebook":
       return "ebook";
+    case "text":
+      return "text";
     case "ai":
       return "ai";
     default:

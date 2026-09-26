@@ -63,6 +63,14 @@ pub struct NodeCtx {
     /// 现在 `param_*` 取值时先看 `with`、再看用户参数：两种写法都对，
     /// 且 `with` 里的显式字面量优先（它更具体）。
     pub arg_scope: BTreeMap<String, String>,
+    /// 本批次是批量的第几项（1-based）。非批量时为 1。
+    ///
+    /// 批量由命令层扇出，**节点自己不知道"我跑了几次"**。而"给每个文件编号"
+    /// 是最常见的重命名需求，所以把它带进来，让 `name.build` 的
+    /// `index: "batch"` 能取到它。
+    pub batch_index: u32,
+    /// 本批次总项数
+    pub batch_total: u32,
 }
 
 impl NodeCtx {
@@ -324,6 +332,10 @@ pub async fn run(
         "archive.pack" => sevenzip_pack(ctx, args).await,
         "archive.unpack" => sevenzip_unpack(ctx, args).await,
 
+        // ---------- 文本 / 命名（纯计算）----------
+        "text.replace" => text_replace(ctx).await,
+        "name.build" => name_build(ctx).await,
+
         // ---------- 流程控制 ----------
         "flow.log" => flow_log(ctx).await,
         "flow.set-var" => flow_set_var(ctx, args).await,
@@ -450,6 +462,188 @@ async fn flow_set_var(
     ctx.vars.insert(name.to_string(), value.clone());
     // 同时把值放进本步骤的产出，这样 `${steps.<id>.value}` 也能引用
     Ok(NodeOutput::value("value", value))
+}
+
+// ============================================================================
+// 文本 / 命名节点（纯计算）
+//
+// 这一族节点补的是 L1 的一个**结构性**短板：原来没有任何节点能"算出一个值" ——
+// 所有节点要么读写文件、要么调外部引擎。于是"批量重命名"这种
+// "按规则算出新文件名"的需求无法用声明式表达，
+// `plugins/builtin/batch-rename` 就退化成了一句 `fs.move`，
+// 声明的 regex / 前缀 / 后缀 / 序号参数**全是装饰**（实际只把文件挪了个位置，
+// 文件名一点没变）。
+//
+// 加这两个节点之后，命名规则可以被完整地声明出来。
+// ============================================================================
+
+/// `text.replace`：查找替换，支持正则与大小写控制。
+///
+/// **空 `pattern` 视为"不替换"，原样返回**，并写一条 warn 日志。
+/// 为什么不报错：`"pattern 留空 = 不做替换"` 是清单里很自然的写法
+/// （用户可能只想加个前缀），逼作者用 `when` 去判断会引入一个更脆的东西 ——
+/// 模板条件表达式对含 `!=` 的模式会解析错。而"什么都不做"必须**可见**，
+/// 所以留一条日志而不是静默通过。
+async fn text_replace(ctx: &mut NodeCtx) -> ToolforgeResult<NodeOutput> {
+    let input = ctx.param_str("input", "");
+    let pattern = ctx.param_str("pattern", "");
+    if pattern.is_empty() {
+        ctx.job.log(
+            toolforge_core::job::LogLevel::Debug,
+            "text.replace：pattern 为空，未做替换（原样返回）".to_string(),
+        );
+        return Ok(NodeOutput::value("text", input));
+    }
+    let replacement = ctx.param_str("replacement", "");
+    let use_regex = ctx.param_bool("useRegex", true);
+    let case_sensitive = ctx.param_bool("caseSensitive", true);
+    let replace_all = ctx.param_bool("all", true);
+
+    let out = if use_regex {
+        let mut builder = regex::RegexBuilder::new(&pattern);
+        builder.case_insensitive(!case_sensitive);
+        // 不让 `.` 匹配换行 —— 文件名里本来也没有换行，但输入可能是一整段文本
+        builder.dot_matches_new_line(false);
+        let re = builder.build().map_err(|e| {
+            ToolforgeError::plugin_invalid(format!("text.replace 的正则非法：{pattern}"))
+                .with_detail(e.to_string())
+        })?;
+        if replace_all {
+            re.replace_all(&input, replacement.as_str()).to_string()
+        } else {
+            re.replace(&input, replacement.as_str()).to_string()
+        }
+    } else if case_sensitive {
+        if replace_all {
+            input.replace(&pattern, &replacement)
+        } else {
+            input.replacen(&pattern, &replacement, 1)
+        }
+    } else {
+        // 字面量 + 忽略大小写：regex::escape 之后走正则路径，避免自己写一遍大小写折叠
+        let mut builder = regex::RegexBuilder::new(&regex::escape(&pattern));
+        builder.case_insensitive(true);
+        let re = builder
+            .build()
+            .map_err(|e| ToolforgeError::internal(format!("正则构造失败（不该发生）：{e}")))?;
+        if replace_all {
+            re.replace_all(&input, replacement.as_str()).to_string()
+        } else {
+            re.replace(&input, replacement.as_str()).to_string()
+        }
+    };
+
+    Ok(NodeOutput::value("text", out))
+}
+
+/// `name.build`：拼装文件名（不含目录）。
+///
+/// 输出是**相对路径**，所以接到 `fs.move` 的 `dst` 上时，
+/// 宿主会把它解析到本次任务的输出目录内 —— 既能完成重命名，
+/// 又不会绕过路径收敛。
+async fn name_build(ctx: &mut NodeCtx) -> ToolforgeResult<NodeOutput> {
+    let stem = ctx.param_str("stem", "");
+    if stem.trim().is_empty() {
+        return Err(ToolforgeError::plugin_invalid(
+            "name.build 的 `stem` 不能为空（通常写 `${src.stem}`）",
+        ));
+    }
+    let ext = ctx.param_str("ext", "");
+    let prefix = ctx.param_str("prefix", "");
+    let suffix = ctx.param_str("suffix", "");
+    // `index` 可以是数字，也可以是 `batch` —— 后者取本批次的序号。
+    //
+    // 为什么要支持字符串：清单里表达"要不要编号"最自然的方式是给一个 enum
+    // （`indexMode: none | batch`），而 enum 渲染出来是字符串。
+    // 让节点认这个伪值，比逼清单去写条件表达式干净得多。
+    let index_raw = ctx.param_str("index", "0");
+    let index = if index_raw.trim().eq_ignore_ascii_case("batch") {
+        ctx.batch_index as i64
+    } else {
+        parse_int(&index_raw).unwrap_or(0)
+    };
+    let pad = ctx.param_i64("indexPad", 3).clamp(0, 12) as usize;
+    let sep = ctx.param_str("indexSeparator", "-");
+    let position = ctx.param_str("indexPosition", "suffix");
+    let case = ctx.param_str("case", "keep");
+    let separator = ctx.param_str("separator", "");
+
+    let mut body = stem;
+
+    // 空格等替换成指定字符（把「我的 报告.pdf」变成「我的_报告.pdf」这类需求）
+    if !separator.is_empty() {
+        let mut out = String::with_capacity(body.len());
+        let mut last_was_sep = false;
+        for c in body.chars() {
+            // 空白与一批常见的文件系统敏感字符一起归一化
+            let is_sep = c.is_whitespace() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
+            if is_sep {
+                if !last_was_sep {
+                    out.push_str(&separator);
+                }
+                last_was_sep = true;
+            } else {
+                last_was_sep = false;
+                out.push(c);
+            }
+        }
+        // 去掉首尾分隔符，避免「_报告_.pdf」
+        let trimmed = out.trim_matches(|c: char| separator.contains(c)).to_string();
+        body = if trimmed.is_empty() { out } else { trimmed };
+    }
+
+    if index > 0 {
+        let numbered = format!("{}{:0width$}", "", index, width = pad);
+        body = if position == "prefix" {
+            format!("{numbered}{sep}{body}")
+        } else {
+            format!("{body}{sep}{numbered}")
+        };
+    }
+
+    let mut name = format!("{prefix}{body}{suffix}");
+    name = match case.as_str() {
+        "lower" => name.to_lowercase(),
+        "upper" => name.to_uppercase(),
+        "title" => name
+            .split_inclusive(|c: char| c == ' ' || c == '-' || c == '_')
+            .map(|word| {
+                let mut cs = word.chars();
+                match cs.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + cs.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect(),
+        _ => name,
+    };
+
+    // 扩展名归一：调用方可能写成 "png"、".png" 或 ""（没有扩展名）
+    let ext = ext.trim();
+    let ext = if ext.is_empty() {
+        String::new()
+    } else if ext.starts_with('.') {
+        ext.to_string()
+    } else {
+        format!(".{ext}")
+    };
+
+    // 文件名里不允许出现路径分隔符 —— 否则就成了"改写到别的目录"，
+    // 虽然 PathResolver 仍会拦住逃逸，但在这里挡掉能给出更清楚的错误
+    let final_name = format!("{name}{ext}");
+    if final_name.contains('/') || final_name.contains('\\') {
+        return Err(ToolforgeError::plugin_invalid(
+            "name.build 的结果里出现了路径分隔符 —— 它只能生成文件名，不能生成路径",
+        )
+        .with_detail(format!("实际结果：{final_name}")));
+    }
+    if final_name.trim().is_empty() || final_name == ext {
+        return Err(ToolforgeError::plugin_invalid(
+            "name.build 拼出的文件名为空（检查 stem / prefix / suffix 参数）",
+        ));
+    }
+
+    Ok(NodeOutput::value("value", final_name))
 }
 
 /// `flow.log`：向任务日志写一条消息。
@@ -1714,6 +1908,8 @@ mod tests {
             params: HashMap::new(),
             vars: HashMap::new(),
             arg_scope: BTreeMap::new(),
+            batch_index: 1,
+            batch_total: 1,
         };
         (ctx, queue, id)
     }

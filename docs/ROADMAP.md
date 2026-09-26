@@ -100,7 +100,7 @@
   - **L1 声明式**：`plugin.yaml` + 内置节点编排，零代码；
   - **L2 WASM**：Extism 沙箱，只允许纯计算（无文件系统、无网络、无 SIMD/线程）；
   - **L3 Python**：独立进程 + JSON-RPC over stdio，固定 Python 3.11。
-- 引擎策略：**按需下载 + 系统探测降级**；图片链路为「纯 Rust `image` crate 打底 → libvips 可选加速 → ImageMagick 兜底」。
+- 引擎策略：**按需下载 + 系统探测降级**；图片链路的目标形态是「纯 Rust `image` crate 打底 → libvips 可选加速 → ImageMagick 兜底」——**但现状只有第一档在跑**（libvips / imagemagick 从未被节点调用，见「不一致 2」）。
 - 安全模型：插件必须声明能力（Capability），用户**逐条授权**，运行时裁决 + 路径收敛。
 
 ---
@@ -240,6 +240,12 @@
   展开成 N 个单文件批次，逐批调用执行器，用 `ctx.step` 上报「处理 3/12」，
   产出累计。单文件时退化为一次调用，行为与之前一致。
   至此 `l1.rs` 模块文档里"批量由命令层展开"才成为事实。
+- **后续补强（`expand_batches` / `expand_dir`）**：**目录输入也会展开** —— 拖进一个文件夹就是逐个处理里面的文件。
+  规则是**只展开一层**（不递归）、只收普通文件、跳过 `.` 开头的隐藏文件（含 macOS `._` 资源叉）、结果排序
+  （不排序的话 `${batch.index}` 每次编号都不一样）、**上限 `MAX_DIR_EXPANSION = 5000` 且超限直接报错**
+  （刻意不静默截断：截断会让用户以为全处理完了）。同时 `build_io` 对目录输入改用**目录自身**作授权根，
+  不再用它的父级 —— 以前选 `D:\照片` 会把授权范围白送到 `D:\`。
+  每个批次还能从 `${batch.index}`（1 起）/ `${batch.total}` 取到序号，`batch-rename` 这类"给每个文件编号"的需求因此可以纯声明式写出来。
 
 ### 阻塞 10：并发度设置改了但队列不理会 ✅ 已修复
 
@@ -344,6 +350,10 @@ cargo run -p toolforge --bin export-bindings
   小计          → 12 项检查全通过
 ```
 
+> 更新：这份基线是**当时的实测记录**，保留原样。此后引擎层新增了三条模型命令
+> （`models_list` / `models_install` / `models_remove`，见 v0.5 的「模型文件管理」），
+> `COMMAND_NAMES` 因此从 29 变成 **32** —— 上面的「29 个命令」是历史值，不是现状。
+
 前端侧（`apps/desktop`）由并行开发补齐，验收命令是：
 
 ```bash
@@ -374,21 +384,26 @@ pnpm build          # tsc --noEmit && vite build
 
 这些不是「待实现的功能」，而是**代码已经写了、但与它自己的声明/文档/其它模块不一致**的地方。它们比缺功能更危险，因为会让人在运行时才发现。
 
-### 1. 节点登记 31 个，执行器只实现 25 个
+### 1. 节点登记 32 个，执行器实现 27 个
 
-- 权威目录 `toolforge_core::pipeline::builtin_nodes()` 登记 **31** 个节点（已逐条列出核对）。
-- `crates/toolforge-engines/src/nodes.rs` 的 `run()` 分发臂实际实现 **25** 个。
-- 差集（6 个）会落到 `other => Err(not_implemented(other))`，返回 `ErrorCode::Internal` + 「内置节点 `X` 尚未在 v0.1 中实现」：
+- 权威目录 `toolforge_core::pipeline::builtin_nodes()` 登记 **32** 个节点（已逐条列出核对）。
+- `crates/toolforge-engines/src/nodes.rs` 的 `run()` 分发臂实际实现 **27** 个。
+- 差集（5 个）会落到 `other => Err(not_implemented(other))`，返回 `ErrorCode::Internal` + 「内置节点 `X` 尚未在 v0.1 中实现」：
 
   `image.remove-background`、`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`
 
-  > 更新（修复阻塞 9 之后）：`flow.foreach` 仍然没有执行器实现，但**批量语义已经补上了** ——
-  > 命令层会把多文件输入展开成单文件批次逐批执行。也就是说清单里**不需要**写
-  > `flow.foreach` 也能得到正确的批量行为；该节点的定位仍是"给流程编辑器保留的
-  > 显式循环标记"，实现排在 v0.2。
+  > **结论（`flow.foreach` 已结案）**：这条当时写的是"6 个"，第 6 个是 `flow.foreach`。
+  > 后来它不是被实现，而是被**整个删除**了 —— L1 的步骤列表是平铺的，
+  > 「对剩下的步骤循环 N 次」没有可定义的语义（循环体含哪些步骤？循环后面的收尾步骤怎么办？），
+  > 而它旧描述里的「宿主会按并发度并行调度」是**假话**。
+  > 批量语义早已由命令层承担（见阻塞 9），并且现在**连目录输入也会展开**：
+  > `expand_batches` 把文件夹展开成其中的文件（**只一层**、排序、跳过隐藏文件、
+  > 上限 5000 个且**超限报错而不是截断**），逐批调用流水线，清单用 `${batch.index}` 取序号。
+  > 所以清单里从来不需要这个节点。`pipeline.rs` 在原名单位置留了一段注释记录原因。
 
-- 这 6 个恰好覆盖了抠图、OCR、电子书转换、AI 超分、AI 描述与批量循环——即 `python`、`onnx-models`、`ai-provider`、`calibre` 几个引擎的实际价值所在。
-- **设计上这是刻意的**（`not_implemented()` 的注释明确说明「不返回假的成功」），但**清单式插件可以合法引用它们并通过 `validate()`**，于是用户会看到「插件安装成功、运行即报错」。`plugins/builtin/batch-rename` 与 `plugins/builtin/remove-bg` 的 `plugin.yaml` 顶部注释已如实声明这一点。
+- 这 5 个恰好覆盖了抠图、OCR、电子书转换、AI 超分与 AI 描述——即 `python`、`onnx-models`、`ai-provider`、`calibre` 几个引擎的实际价值所在。
+- **设计上这是刻意的**（`not_implemented()` 的注释明确说明「不返回假的成功」），但**清单式插件可以合法引用它们并通过 `validate()`**，于是用户会看到「插件安装成功、运行即报错」。`plugins/builtin/remove-bg` 的 `plugin.yaml` 顶部注释已如实声明这一点。
+  - 顺带一提：因为 `flow.foreach` 是**被删除**而不是"未实现"，引用它的清单现在**连 `validate()` 都过不去**（`STEP_UNKNOWN_NODE`），这与上面"可以合法引用"的情况不同 —— 删除是更彻底的诚实。
 
 ### 2. 图像节点的「可选加速」只是声明，执行器从不调用 libvips / ImageMagick
 
@@ -430,7 +445,7 @@ pnpm build          # tsc --noEmit && vite build
 - 但 `apps/desktop/src-tauri/Cargo.toml` 的包名是 **`toolforge`**。
 - 已改为 `cargo run -p toolforge --bin export-bindings`，与
   `src/bin/export_bindings.rs` 的文档注释一致（说明是 `package.json` 一侧写错了）。
-- **实测**：`cargo run -p toolforge --bin export-bindings` 成功导出 29 个命令的绑定。
+- **实测**：`cargo run -p toolforge --bin export-bindings` 成功导出 29 个命令的绑定（**历史值**：加上后来的 `models_list` / `models_install` / `models_remove` 三条，现在是 32 个）。
 
 ### 6. 其它已核实的零散不一致
 
@@ -478,6 +493,8 @@ pnpm build          # tsc --noEmit && vite build
 - [ ] 🚧 `pnpm bindings` 可用：修掉不一致 5 的包名（`-p toolforge-desktop` → `-p toolforge`），并把 `bindings.ts` 生成到前端且**入库**
 - [ ] 🚧 `COMMAND_NAMES` 与 `collect_commands!` 的一致性自检在 CI 中生效
 - [ ] 🚧 补 `assets/icon-source.png`，使 `pnpm icons` 全链路成功
+- [x] ✅ **设置已持久化**（新模块 `apps/desktop/src-tauri/src/settings_store.rs`）：非机密设置写 `<data_dir>/settings.json`，**原子写**（同目录临时文件 + `rename` + `sync_all` —— 直接截断重写的话，写到一半断电就留下半截 JSON，用户全部设置一次性丢失）；解析失败的文件被**隔离**成 `settings.broken.json` 并回退默认值（**启动绝不因为坏设置文件而失败**，否则用户连能修它的界面都进不去）；缺字段按**字段级**默认值补齐，旧配置继续可用。API Key **不在这个文件里**（它默认只在内存，只有用户显式打开 `ai.persistApiKey`——默认 `false`——时才**明文**写到 `<data_dir>/ai-key.txt`，关掉开关即删除该文件；OS 钥匙串仍未实现。详见 `docs/SECURITY.md` 的凭据落盘一节）；`paths.rs` 新增 `settings_file()` / `ai_key_file()` / `settings_backup_file()`。
+  - 这条是**补债**：设置页原本写着「所有设置都会立即写入本机配置文件」，而 `AppState.settings` **只在内存里** —— 界面上写了一句假话，关掉应用设置就没了。
 
 **引擎与图片**
 
@@ -490,9 +507,12 @@ pnpm build          # tsc --noEmit && vite build
 
 - [x] ✅ 骨架完成：`PluginStore`（`reload` / `list` / `get` / `install` / `uninstall` / `set_enabled` / `set_granted` / `verify_integrity` / `quarantine_if_changed`）、`l1::run_pipeline`、`AuditLog`
 - [x] ✅ 6 个示例插件的 `plugin.yaml` 已就位
-- [ ] 🚧 装载示例插件并在「已实现的 25 个节点」范围内跑通一次真实流水线
+- [ ] 🚧 装载示例插件并在「已实现的 27 个节点」范围内跑通一次真实流水线
 - [ ] 🚧 权限声明 → 待授权列表 → 逐条授权的数据流打通（UI 可先极简）
-- [ ] 🚧 用未实现节点（如 `flow.foreach`）时给出**可读且可操作**的错误，而不是内部错误码裸抛
+- [x] ✅ 用未实现节点时给出**可读且可操作**的错误，而不是内部错误码裸抛
+  - ✅ **已部分结案**：批量循环那条支路（`flow.foreach`）彻底消失了 —— 节点被删除，
+    引用它的清单在校验阶段就报 `STEP_UNKNOWN_NODE`，根本走不到运行时。
+    剩下 5 个未实现节点仍走 `not_implemented`，错误文案指向本文档。
 
 **任务中心**
 
@@ -521,8 +541,9 @@ pnpm build          # tsc --noEmit && vite build
 7. **取消可验证**：对一张大图发起任务后立刻取消，任务状态在 2 秒内变为「已取消」，且目标目录**不留下**半个输出文件（临时文件被清理）。
 8. **不依赖外部二进制**：在未安装 ImageMagick / libvips / ffmpeg 的干净机器上，第 6 条闭环仍然成功（纯 Rust 路径打底）。
 9. **错误可读**：人为传入不存在的输入路径，前端展示的错误包含模块名与错误码，而不是 `undefined` 或裸 panic。
-10. **未实现节点诚实报错**：用 `flow.foreach` 构造一个插件并运行，前端明确显示「该内置节点尚未实现」及**指向本文档**的指引，而不是「任务成功但没产出文件」。
-11. **L1 示例可跑**：`plugins/builtin/image-convert` 与 `plugins/builtin/video-to-gif` 在**已实现的 25 个节点范围内**能完整执行并产出文件（后者需 ffmpeg；无 ffmpeg 时给出可操作的安装提示）。
+10. **未实现节点诚实报错**：用 `doc.ocr` 构造一个插件并运行，前端明确显示「该内置节点尚未实现」及**指向本文档**的指引，而不是「任务成功但没产出文件」。
+    > 注：这条原本用 `flow.foreach` 举例。那个节点**已被删除**，现在引用它的清单在校验阶段就报 `STEP_UNKNOWN_NODE`（更早、更彻底）；剩下 5 个未实现节点继续走 `not_implemented`，所以验收用例改用 `doc.ocr`。
+11. **L1 示例可跑**：`plugins/builtin/image-convert` 与 `plugins/builtin/video-to-gif` 在**已实现的 27 个节点范围内**能完整执行并产出文件（后者需 ffmpeg；无 ffmpeg 时给出可操作的安装提示）。
 12. **权限门可见**：示例插件的全部能力声明能在 UI 列出，未授权能力被执行时被拒绝并给出具体原因。
 13. `pnpm icons` 全链路成功（`assets/icon-source.png` 存在）。
 
@@ -604,10 +625,10 @@ pnpm build          # tsc --noEmit && vite build
 
 **AI 生成流水线**
 
-- [x] ✅ 骨架完成：`GenerationRequest` / `AiProviderConfig` / `ChatMessage`、系统提示词（把 31 个**真实**内置节点目录注入提示词，避免模型编造 `uses`）、`parse_model_output`（支持 `path=` 多文件代码块、裸 YAML 容错、缺 `plugin.yaml` 拒绝）
+- [x] ✅ 骨架完成：`GenerationRequest` / `AiProviderConfig` / `ChatMessage`、系统提示词（把 32 个**真实**内置节点目录注入提示词，避免模型编造 `uses`）、`parse_model_output`（支持 `path=` 多文件代码块、裸 YAML 容错、缺 `plugin.yaml` 拒绝）
 - [x] ✅ 骨架完成：`review_draft` / `SecurityReview`（能力清单 + 可疑模式 + 风险定级；需要 L3 时直接标 `Critical` 并提示逐行阅读）
 - [ ] 🚧 接真实 provider 并端到端跑通一次生成
-- [ ] 🚧 静态校验：schema 校验、API 版本校验、**节点白名单校验（尤其要挡住 6 个未实现节点）**、危险模式检测
+- [ ] 🚧 静态校验：schema 校验、API 版本校验、**节点白名单校验（尤其要挡住 5 个未实现节点；已被删除的 `flow.foreach` 由 `STEP_UNKNOWN_NODE` 直接拦掉）**、危险模式检测
 - [ ] 🚧 权限差异检测：对比旧版本能力集合，**任何扩权都必须重新确认**
 - [ ] 🚧 人工 diff 审阅：强制展示差异，未确认不得落盘
 - [ ] 🚧 落盘 + 哈希锁定：生成物记录内容哈希，装载时再校验一次（`store.rs` 已有 `verify_integrity` / `quarantine_if_changed` 可复用）
@@ -617,16 +638,24 @@ pnpm build          # tsc --noEmit && vite build
 - [ ] 🚧 AI 抠图（`image.remove-background`，当前 `not_implemented`）
 - [ ] 🚧 AI 超分（`ai.upscale`，当前 `not_implemented`）
 - [ ] 🚧 AI 描述（`ai.describe`，当前 `not_implemented`）
-- [ ] 🚧 模型文件管理：`/models/` 已忽略；`engine.rs` 已为 6 个模型声明许可证（含「权重许可 ≠ 代码许可」的说明），需补下载、校验与版本标识
+- [x] ✅ **模型文件管理（下载 / 校验 / IPC 部分已完成）**：`EngineRegistry.models` 以前是一张**永远空的 map**（只有 `register_model` 能填，而无人调用），于是 UI 列出 6 个模型、每次下载都答「未在注册表里登记」。现在 `EngineRegistry::new` 直接从 `engine_catalog()` 建表（"第二真相来源"已删除），新增 IPC `models_list` / `models_install` / `models_remove`；`EngineModel` 加 `file_name`（GitHub 资产名 ≠ 模型 id，如 `isnet-general` → `isnet-general-use.onnx`），文件落在 `<data_dir>/models/<model_id>/<file_name>`。
+  - `u2net` / `u2netp` / `isnet-general` 三个 rembg 权重带**真实下载后算出来的** SHA-256 与固定 tag 直链（`.../rembg/releases/download/v0.0.0/`）；**哈希不匹配就删文件**（`registry.rs::install_model`，`IntegrityCheckFailed`）。
+  - 单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name **全有或全无**、哈希为 64 位小写十六进制、`file_name` 不重复。
+- [ ] 🚧 补齐剩余 3 个模型的来源：`birefnet-general` / `modnet-portrait` / `realesrgan-x4plus` **刻意没有 url/hash**（尚未核对），UI 显示「无下载源」并把下载按钮**置灰**——宁可按钮是灰的，也不留一个"点了必然失败"的按钮。补齐必须先真实下载核对哈希。
+- [ ] 🚧 模型下载的 UI 状态与「版本标识」：已装 / 未装 / 下载进度 / 许可证确认（`requiresLicenseAck` 走 `onnx-models` 引擎）。
 
 **可视化流程编辑器**
 
 - [ ] 🚧 基于 React Flow（`@xyflow/react`）的节点编辑器
 - [ ] 🚧 节点 = 内置算子 / 插件节点；连线 = 数据流
-- [ ] 🚧 **未实现节点必须可视化禁用**（以 `nodes.rs` 的 25 个为准，6 个 `not_implemented` 标灰并给出原因），避免「拖出来能连、运行必失败」
+- [ ] 🚧 **未实现节点必须可视化禁用**（以 `nodes.rs` 的 27 个为准，5 个 `not_implemented` 标灰并给出原因），避免「拖出来能连、运行必失败」
 - [ ] 🚧 保存/加载流程定义，可导出为可复现的流水线描述
 - [ ] 🚧 保存前校验：非法连线、缺失参数、缺失权限
-- [ ] 🚧 批量循环（`flow.foreach`）实现并接入编辑器（当前 `not_implemented`）
+- [x] ✅ **批量循环（`flow.foreach`）：结论是「不实现，改为删除节点 + 宿主展开」**
+  - 选择删除而不是"留给编辑器当显式循环标记"，理由有两条：① L1 的步骤列表是**平铺的有序列表**，"对剩下的步骤循环 N 次"**没有可定义的语义**（循环体到底含哪几步？循环之后那些只想跑一次的收尾步骤怎么办？）；② 它旧描述里的「宿主会按并发度并行调度」是**假话** —— 宿主不在流水线内部调度。
+  - 批量本来就该由宿主做，而且**已经做了**：`commands.rs::expand_batches` 在命令层把多文件输入与**目录输入**扇出成 N 个单文件批次，逐批调用流水线、用 `ctx.step` 上报「处理 3/12」、在批次边界检查取消；清单用 `${batch.index}`（从 1 起）取序号。**拖一个文件夹进去就是逐个处理里面每个文件**，不需要循环节点。
+  - 目录展开的三条硬规则：**只展开一层**（不递归）、跳过隐藏文件（`.` 开头，含 macOS `._` 资源叉）、**上限 5000 个且超限直接报错**（`MAX_DIR_EXPANSION`，刻意不静默截断）。输入是目录时 `build_io` 用**目录自身**作授权根，不再用它的父级（以前选 `D:\照片` 会授权到 `D:\`）。
+  - 引用这个节点的清单现在**校验阶段**就报 `STEP_UNKNOWN_NODE`，比"运行时报 `not_implemented`"更早、更彻底。
 
 **批量与性能**
 
@@ -645,12 +674,13 @@ pnpm build          # tsc --noEmit && vite build
 1. `cargo test --workspace` 全绿，且 v0.1 / v0.2 的验收用例全部继续通过（**无回归**）。
 2. **生成闭环可复现**：给定同一段需求描述与固定模型版本，产出通过静态校验的插件草稿；在**未点击确认**时，磁盘上不存在该插件的最终文件（只有临时区内容）。
 3. **生成不越权**：`AiDraft` 无法自行写盘——需有一个测试证明「仅生成、不确认」不会在插件目录产生任何文件。
-4. **未实现节点被拦截**：让 AI 生成一个使用 `flow.foreach` / `doc.ocr` 的插件，必须在**静态校验阶段**就被拒绝（而不是运行时报 `not_implemented`）。
+4. **未实现节点被拦截**：让 AI 生成一个使用 `ai.upscale` / `doc.ocr` 的插件，必须在**静态校验阶段**就被拒绝（而不是运行时报 `not_implemented`）。
+   > 注：这条原本举 `flow.foreach`。该节点已**被删除**，引用它会报 `STEP_UNKNOWN_NODE`（同样在校验阶段，甚至早于"未实现"检查），所以用例改用两个仍然存在的未实现节点。
 5. **扩权必须重新确认**：构造一个升级版本新增 `net` 能力的插件，安装时必然出现权限差异提示；拒绝后运行该插件被拒绝。
 6. **哈希锁定有效**：手工修改已落盘插件的任一文件后，加载被拒绝并提示哈希不匹配（可复用 `verify_integrity` 的既有测试）。
 7. **静态校验有效**：至少覆盖 5 类恶意/错误样本（超范围能力声明、未白名单节点、错误 API 版本、非法插件 id、参数缺失选项），全部在落盘前被拦截。
 8. **编辑器可用**：在可视化编辑器中搭一条「缩放到 1920 宽 → 转 WebP → 输出到目录」的流程，保存后关闭并重开应用，流程可加载且执行结果与手写配置一致。
-9. **编辑器诚实标注**：6 个未实现节点在编辑器中**不可放置或明确标灰**，悬停能看到「尚未实现，见 ROADMAP」。
+9. **编辑器诚实标注**：5 个未实现节点在编辑器中**不可放置或明确标灰**，悬停能看到「尚未实现，见 ROADMAP」。已被删除的 `flow.foreach` 不需要标灰 —— 它根本不在节点目录里。
 10. **批量吞吐可测**：1000 张 1–2 MP 图片的批量转换任务，在公布的目标机型与目标引擎组合下达成约定的总耗时；峰值常驻内存不超过约定阈值（数值随首次基准测试结果固化并写入本文档，见下方注）。
 11. **批处理可中断且可恢复**：处理 1000 张的中途取消，已完成产物完整可用，未完成的**不留残留文件**；再次执行只处理未完成的部分，或明确说明从头开始。
 12. **AI 能力可用**：抠图与超分各在至少 3 张样例上产出符合预期（抠图边界无明显错误、超分输出尺寸与放大倍数一致）；模型许可证在首次使用前完成确认。

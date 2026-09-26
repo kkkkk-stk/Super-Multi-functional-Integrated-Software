@@ -76,7 +76,7 @@ test result: FAILED. 59 passed; 2 failed
 按重要性从高到低：
 
 1. **用户文件** —— 输入/输出目录、以及这些目录之外的任何可读文件（文档、照片、密钥文件如 `id_rsa`、`.env`）。
-2. **API Key 与凭据** —— 尤其是 AI 服务的 Key。它在宿主进程里以内存态保存：`AiProviderConfig::api_key` 带 `skip_serializing`（见 `crates/toolforge-ai/src/provider.rs`），不会随 `Settings` 序列化到前端。
+2. **API Key 与凭据** —— 尤其是 AI 服务的 Key。它的落盘方式见 §1.5：**默认只在进程内存里**（`AiProviderConfig::api_key` 带 `skip_serializing`，见 `crates/toolforge-ai/src/provider.rs`，不会随 `Settings` 序列化到前端），只有用户显式打开「记住 API Key」时才**明文**写到磁盘。
 3. **用户额度** —— `Capability::Ai` 的 `describe()` 原文就是「调用 AI 服务（消耗你的额度）」。被刷额度不致命但真实存在。
 4. **宿主进程** —— 插件跑在宿主进程内（L2）或作为子进程（L3）。宿主进程被打崩 = 任务丢失、数据可能未落盘。
 5. **机器** —— 任意代码执行、持久化驻留（开机自启）、横向移动到用户其它凭据。
@@ -142,6 +142,32 @@ test result: FAILED. 59 passed; 2 failed
 
 - **`PATH` 是被刻意保留的**。`crates/toolforge-process/src/supervisor.rs` 的 `ChildSupervisor::spawn()` 在 `env_clear()` 之后重新注入了 `PATH`，注释理由是「至少要给 PATH，否则 Windows 上子进程自己起程序会失败」。**这意味着 L3 插件可以用 `subprocess` 起 PATH 里的任何程序**。`Capability::Exec` 目前没有运行时强制（见 §3.4 与 §9）。
 - **不做原生动态库加载**。`ROADMAP.md` 的 Non-Goals 明确写了不做 `.dll` / `.so` / `.dylib` 加载，理由是"原生库一旦载入进程便拥有与应用同等的权限，无法做到逐条能力授权 + 运行时可裁决；这会直接废掉本项目安全模型的地基"。这条决定本身是一项**核心安全属性**，改动它等于换掉整个威胁模型。
+
+---
+
+### 1.5 凭据的落盘方式：`settings.json` 与 `ai-key.txt`
+
+这一节必须单独写，因为这里曾经有一句**假话**：设置页写着「所有设置都会立即写入本机配置文件」，`AiSettings` 的注释也写着「Key 存在内存与 OS 钥匙串里」——而当时 `AppState.settings` **只在内存里**，钥匙串**从来没接过**。现在实现是：
+
+**非机密设置 → `<data_dir>/settings.json`**（`apps/desktop/src-tauri/src/settings_store.rs`，路径来自 `paths.rs::AppPaths::settings_file()`）。三条纪律写在模块文档里：
+
+1. **原子写**：先写同目录下的临时文件（文件名带进程 ID），再 `rename` 覆盖，并 `sync_all`。直接截断重写的话，写到一半断电/崩溃就留下半截 JSON，下次启动读不出来 —— 用户的**全部**设置一次性丢失；
+2. **读失败绝不致命，但也绝不静默**：解析失败就把原文件改名成 `settings.broken.json`（`settings_backup_file()`）留证，然后用默认值启动。**启动路径上的"读设置"失败绝不能阻止应用启动** —— 一个坏掉的 JSON 让用户连界面都进不去，也就没有界面去修它。丢用户数据可以忍，丢"为什么会丢"的线索不行；
+3. **API Key 不进这个文件**。它单独放在 `ai-key.txt`（`ai_key_file()`），而且**只有用户显式勾选「记住 API Key」（`ai.persistApiKey`）时才写**。默认不落盘 —— 密钥的默认状态必须是最保守的那一种。
+
+缺字段的旧配置文件按**字段级默认值**补齐，所以老格式继续能用（这是"不因为新增一个设置就把用户的配置判死"的代价最小的做法）。
+
+**关于 `ai-key.txt`，必须明确说清三件事：**
+
+| 事项 | 事实 |
+| --- | --- |
+| 安全性 | **它是明文。** 没有任何加密、没有 DPAPI、没有 Keychain。能读这个文件的进程/用户就能拿到 Key。这是相对"OS 钥匙串"的**能力降级**，不是等价实现 |
+| 默认值 | **`ai.persistApiKey` 默认 `false`** —— 默认只存在内存，重启后需要重填 |
+| 关闭时 | **关掉开关会删除 `ai-key.txt`**（`save_api_key(paths, None)` → `remove_file`）。"清除 Key"必须真的把磁盘上那份删掉，只清内存里的那叫没清 |
+
+OS 钥匙串（Windows DPAPI / macOS Keychain）**仍未实现**，它是 `ROADMAP.md` 上的待办（§9 第 27 项）。在它落地之前，**任何界面文案、文档、错误提示都不许声称 Key 是"加密存储"的** —— 注意 `crates/toolforge-core/src/engine.rs` 里 `ai-provider` 引擎的 `licenseNote` 至今还写着「API Key 只存在本机加密存储中，不会随插件或日志外泄」，这句话与实现不符，属于**待修正的代码文案**。
+
+**这条措施能保证的部分**仍然是必守的：Key 不写进插件、不写进日志、不随 `Settings` 序列化给前端（`skip_serializing`），审计写入点也不含凭据（§7.4）。
 
 ---
 
@@ -618,6 +644,20 @@ Component::ParentDir => { if !out.pop() { out.push("..") } }
 
 **要点**：剥前缀只是"写法便利"，安全判定完全依赖随后的 `PathResolver`。剥完之后的字符串仍然会经过绝对路径拒绝与 `starts_with` 检查，所以 `/input/../../etc/passwd` 与直接写 `../../etc/passwd` 得到同样的结果（被拒）。
 
+### 4.7 输入根是怎么算出来的（授权范围的大小由这里决定）
+
+授权根不是插件决定的，是**命令层算出来**的：`commands.rs::build_io` 取**该批次**所有输入文件的公共父目录作为 `input_root`。这里有过一个**授权过宽**的问题：
+
+- **旧行为**：输入本身就是目录时（`PortType::Directory` 的端口），根会退化成那个目录的**父级** —— 用户选 `D:\照片`，插件实际拿到的是 `D:\` 的读取授权。这不是漏洞利用，但等于**白送一整层目录**；
+- **现行为**：目录输入用**目录自身**作根（`if path.is_dir() { path.clone() } else { path.parent() }`）。
+
+配套的**目录展开**（`commands.rs::expand_dir` + `expand_batches`）也按"收紧 + 可预期"来设计：
+
+- **只展开一层**，不递归（递归会让"拖了个文件夹"变成"翻遍整个照片库"）。展开之后 `input_root` 正好是用户选中那个目录本身；
+- 只收普通文件，**跳过符号链接、设备文件与 `.` 开头的隐藏文件**（含 macOS 的 `._` 资源叉）。跳过 symlink 是顺带的收益：目录里的链接不会被当作输入文件送进流水线；
+- 结果**排序**（枚举顺序在文件系统之间没有保证，不排序则 `${batch.index}` 每次不同）；
+- **硬上限 `MAX_DIR_EXPANSION = 5000`，超了直接报错**（`INVALID_ARGUMENT`，detail 提示"请分批拖入，或者先按子目录拆开"）。这是**可用性护栏**：一个含几万张图的目录会瞬间造出几万个批次，把队列与界面一起拖垮。**刻意不静默截断** —— 静默截断等于让用户以为"全处理完了"，这正是本项目最不能接受的那类缺陷（对照 §9 第 24 项的思路）。
+
 ---
 
 ## 5. 前端永远拿不到裸 shell
@@ -828,7 +868,7 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 
 - **只追加**。`AuditLog::try_record()` 用 `OpenOptions::new().create(true).append(true)`，只 `writeln!` 一行，从不重写文件；`tail()` / `files()` 只读。`files()` 按文件名排序后 `reverse()`，给出"按日期倒序"的文件列表；
 - **写入失败不能影响业务**。`record()` 吞掉错误并记一条 `tracing::error!`（注释：「磁盘满不该导致插件装不上」），并有单元测试 `audit_write_failure_does_not_panic` 锁定"指向不可创建的路径也不 panic"。**注意这个取舍的代价**：磁盘满/权限错误时审计会**静默缺失**，只有应用日志里有痕迹。如果将来要做"关键安全事件必须落盘"，需要为 `CapabilityViolation` / `IntegrityFailure` 这类事件单开一条**不允许静默失败**的路径；
-- **不记录 API Key 明文**。审计事件的 `detail` 全部由调用方显式构造，本次核对过的所有写入点都不含凭据；`AiProviderConfig::api_key` 带 `skip_serializing`（永不序列化到前端），Key 只以内存态存在于 `AppState`。**这条是"当前写入点如此"，不是"结构上不可能"**——`detail` 是自由的 `serde_json::Value`，任何人塞进去就会被记下来，所以**审阅新增的审计写入点时必须专门看一眼有没有塞敏感值**；
+- **不记录 API Key 明文**。审计事件的 `detail` 全部由调用方显式构造，本次核对过的所有写入点都不含凭据；`AiProviderConfig::api_key` 带 `skip_serializing`（永不序列化到前端），Key 默认只以内存态存在于 `AppState`（**例外**：用户显式打开 `ai.persistApiKey` 后它会明文落在 `<data>/ai-key.txt`，见 §1.5 —— 但**仍然不进审计日志**）。**这条是"当前写入点如此"，不是"结构上不可能"**——`detail` 是自由的 `serde_json::Value`，任何人塞进去就会被记下来，所以**审阅新增的审计写入点时必须专门看一眼有没有塞敏感值**；
 - **可在插件详情页回放给用户看**。`commands.rs` 的 `plugins_audit(limit)` 返回 `AuditSnapshot { events, files, dir }`，`limit` 被 clamp 到 `1..=2000`；`AuditLog::tail(limit)` 读当天的文件、按行解析、`rev()` 取最后 N 条后再 `reverse()`（即按时间正序返回），解析失败的行被 `filter_map` 丢掉（所以**一行坏了不会影响其它行**）。"安全"页面应当据此按时间顺序还原"生成 → 审阅 → 授权 → 执行"全过程（`ROADMAP.md` 的 v0.5 验收标准第 10 条就是这条）；
 - **审计文件是明文 NDJSON**，用户可以直接用文本编辑器打开。这意味着**审计日志本身不是机密材料**，不要往里写敏感值；它也意味着用户可以**删改**它（没有签名/防篡改链）。防篡改（哈希链、只追加文件属性、外部投递）属于**待定**事项。
 
@@ -900,6 +940,8 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | 24 | 内置节点里的 `fs.delete` / `fs.move` 在 `FsWrite` 授权下即可用，**没有"只允许写新文件、不允许覆盖/删除既有文件"的约束** | 输出目录若与输入目录相同（或输出目录里有用户的其它文件），可能造成数据丢失 | 输出目录由用户指定；`PathResolver` 限制在目录内 | 待定（建议加"覆盖既有文件需二次确认"） |
 | 25 | **L3 的文件访问完全不经宿主中介**：`PathResolver` 不在 L3 的文件读写路径上，且 `PluginRunner::resolver_for()`（自称"供 L3 使用"）没有任何调用点 | 对 L3 而言 `fsRead{scope}` / `fsWrite{scope}` 只是**约定**，不是强制；"文件访问被限制在授权目录内"这句话只对 L1/宿主侧成立 | 只有 §1.4 的三件事（清空环境变量、锁 cwd、代理断网）+ 用户在授权前的判断 | v0.2（"路径收敛落地"这一条应明确 L3 怎么办：要么加内核级隔离，要么把 L3 的权限语义如实改写） |
 | 26 | ~~`nodes.rs::libreoffice_to_pdf` 在 `dst` 没有父目录时回退到 `std::env::temp_dir()`~~ | —— | ✅ **已修复**：改为**直接报错**而不是回退到宿主机临时目录。宁可让调用方看到"输出路径没有父目录"，也不要在授权范围之外偷偷写文件 | 关闭 |
+| 27 | `ai.persistApiKey` 打开后，API Key **明文**写在 `<data>/ai-key.txt`；**没有加密、没有 DPAPI / Keychain** | 拿到该文件即可拿到 Key。这是相对系统钥匙串的**能力降级**，而代码里 `ai-provider` 的 `licenseNote` 仍写着「只存在本机加密存储中」，属于与实现不符的文案 | 开关**默认关闭**（`persistApiKey: false`，Key 默认只在内存）；关掉开关会**删除**该文件；Key 不进日志、不进审计、不序列化给前端 | 待定（OS 钥匙串仍是 ROADMAP 上的待办；在它落地前**不得**在任何文案里声称加密存储） |
+| 28 | 模型权重的下载**依赖服务端提供正确文件**，而 `birefnet-general` / `modnet-portrait` / `realesrgan-x4plus` **没有 url/hash** | 对后三者前端只能显示「无下载源」并禁用按钮（刻意的：宁可按钮是灰的，也不放一个点了必然失败的按钮） | 已核对的三个 rembg 权重带**真实下载后算出来的** SHA-256；**哈希不匹配即删除文件**（`registry.rs::install_model` → `IntegrityCheckFailed`），不留没校验过的产物 | 待定（补齐剩余三个模型的真实哈希后再放开按钮） |
 
 ### 附：本次核对中**没有**发现问题的部分（也值得记下来）
 
@@ -909,6 +951,8 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 - `finish_install()` 的"安装后一律禁用 + 零授权"，以及"升级后同样重置"；
 - `content_hash()` 的规则（跳过运行期目录、路径参与哈希、排序保证确定性）；
 - `safe_relative_path()` 的校验完整性（绝对路径、盘符、`..`、Windows 保留名）；
+- **模型权重的下载校验**：已核对的三个 rembg 权重带真实下载后算出的 SHA-256，**不匹配就删文件**；`verified_sources_are_pinned` 单测强制 `url` / `sha256` / `file_name` 三者全有或全无、哈希格式正确、文件名不重复 —— 结果就是**没有下载源的模型在前端是禁用状态**，而不是"点了报错"；
+- **输入的授权范围按"就紧不就松"取**：目录输入用目录自身作 `input_root`（不是父级），目录展开只走一层并跳过 symlink 与隐藏文件（见 §4.7）；
 - `WasmPlugin` 的 WASI 关闭 + fuel 上限 + 内存上限 + 载荷上限；
 - `PythonRuntimeDef::allow_network` 与 `SpawnSpec::deny_network` 的**默认安全值**（有单测锁定）；
 - `review.rs` 的"`eval`/`exec` 无任何能力可覆盖"这条判定（`CapabilityNeed::Code => false`）；
@@ -924,7 +968,10 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | 能力模型、裁决器、路径收敛 | `crates/toolforge-core/src/permission.rs`（`PathScope` / `Capability` / `RiskLevel` / `PermissionSet` / `CapabilityRequest` / `CapabilityVerdict` / `CapabilityGuard` / `host_matches` / `PathResolver` / `normalize_lexically`） |
 | 清单 schema 与校验码 | `crates/toolforge-core/src/plugin.rs`（`PluginManifest::validate` / `validate_runtime` / `is_valid_plugin_id` / `AiProvenance` / `PluginSource` / `BundleFile` / `PluginSummary::from_manifest` / `ValidationReport`） |
 | 错误码全集 | `crates/toolforge-core/src/error.rs`（`ErrorCode`：尤见 `PermissionDenied` / `PluginCapabilityViolation` / `IntegrityCheckFailed` / `AiRejected`；`ToolforgeError::violation`） |
-| 目录布局与 `sanitize_id` | `crates/toolforge-core/src/paths.rs`（`AppPaths::audit` / `plugin_dir` / `plugin_data` / `sanitize_id`） |
+| 目录布局与 `sanitize_id` | `crates/toolforge-core/src/paths.rs`（`AppPaths::audit` / `plugin_dir` / `plugin_data` / `sanitize_id` / `settings_file` / `ai_key_file` / `settings_backup_file`） |
+| 设置的持久化与凭据落盘 | `apps/desktop/src-tauri/src/settings_store.rs`（`load` / `save` / `load_api_key` / `save_api_key` / `write_atomic` / `quarantine`）、`apps/desktop/src-tauri/src/ipc.rs`（`AiSettings::persist_api_key`，默认 `false`） |
+| 输入的授权根与目录展开 | `apps/desktop/src-tauri/src/commands.rs`（`build_io` / `expand_batches` / `expand_dir` / `MAX_DIR_EXPANSION`） |
+| 模型权重的下载与校验 | `crates/toolforge-engines/src/registry.rs`（`install_model` / `model_path`）、`crates/toolforge-core/src/engine.rs`（`engine_catalog()` 的模型条目、单测 `verified_sources_are_pinned`） |
 | 运行时边界（L2/L3 诚实说明） | `crates/toolforge-plugins/src/runtimes.rs`（模块文档、`PluginRunner::ensure_loaded` / `call` / `resolver_for`） |
 | L2 沙箱 | `crates/toolforge-plugins/src/runtimes/wasm.rs`（`WasmPlugin::load` / `pages_for_memory` / `fuel_for_timeout`） |
 | L3 进程隔离 | `crates/toolforge-plugins/src/runtimes/python.rs`（`PythonPlugin::launch` / `handle_notification` / `prepare_venv`） |

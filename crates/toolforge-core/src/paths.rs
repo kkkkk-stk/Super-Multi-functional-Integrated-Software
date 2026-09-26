@@ -6,6 +6,8 @@
 //!
 //! ```text
 //! <data_root>/
+//! ├── settings.json            用户设置（**绝不含 API Key**）
+//! ├── ai-key.txt               API Key —— 仅当用户显式勾选「记住」时才存在
 //! ├── plugins/                 已安装插件（每个插件一个目录）
 //! │   └── com.example.foo/
 //! │       ├── plugin.yaml
@@ -72,6 +74,29 @@ impl AppPaths {
 
     pub fn model_dir(&self, model_id: &str) -> PathBuf {
         self.models().join(sanitize_id(model_id))
+    }
+
+    /// 用户设置文件。
+    ///
+    /// **只放非机密字段**：AI 的 API Key 单独一个文件（见 [`Self::ai_key_file`]），
+    /// 因为设置文件会被原样序列化给前端（`settings_get`），
+    /// 而 Key 一旦进了那个结构体就再也收不回来了。
+    pub fn settings_file(&self) -> PathBuf {
+        self.root.join("settings.json")
+    }
+
+    /// API Key 的落盘位置。
+    ///
+    /// **只有用户显式打开「记住 API Key」时这个文件才会存在**，
+    /// 默认情况下它是没有的 —— 这一点很重要：默认行为必须是"不落盘"，
+    /// 不能因为"方便"就把密钥悄悄写到磁盘上。
+    pub fn ai_key_file(&self) -> PathBuf {
+        self.root.join("ai-key.txt")
+    }
+
+    /// 设置文件损坏时的隔离位置（保留证据，不静默丢弃）
+    pub fn settings_backup_file(&self) -> PathBuf {
+        self.root.join("settings.broken.json")
     }
 
     pub fn audit(&self) -> PathBuf {
@@ -239,5 +264,17 @@ mod tests {
         assert!(p.plugin_data("x").starts_with(p.plugin_dir("x")));
         assert!(p.job_workspace("j").starts_with(p.work_root()));
         assert!(p.work_root().starts_with(p.cache()));
+    }
+
+    #[test]
+    fn settings_and_key_are_separate_files() {
+        // 不变量：密钥文件与设置文件**必须是两个文件**。
+        // 合并成一个的话，`settings_get` 返回的设置结构里迟早会带上 Key。
+        let p = AppPaths::new("/data");
+        assert_ne!(p.settings_file(), p.ai_key_file());
+        assert!(p.settings_file().starts_with(p.root()));
+        assert!(p.ai_key_file().starts_with(p.root()));
+        // 两个文件都不在会被打包/同步走的子目录里，就在数据根目录下
+        assert_eq!(p.settings_file().parent(), Some(p.root()));
     }
 }
