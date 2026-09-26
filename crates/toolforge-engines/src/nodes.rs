@@ -9,20 +9,37 @@
 //! 它们是从 YAML 模板渲染出来的，本质上就是字符串；在节点内部按需解析，
 //! 解析失败给出**指明参数名**的错误。
 //!
-//! ## 降级矩阵（本文件是唯一的真相来源）
+//! ## 降级矩阵
 //!
-//! | 节点族 | 首选 | 次选 | 兜底 |
+//! ⚠️ **这张表原来写着「本文件是唯一的真相来源」，而它自己是错的。**
+//! 它把 `image.*` 整族写成"libvips → ImageMagick → 纯 Rust"，实际上：
+//! 只有 4 个节点走那条链；`image.enhance` / `image.strip-metadata` 是纯 Rust
+//! 一条路；`image.remove-background` 走的是 ONNX + Python，跟那两个引擎无关。
+//! 它还漏了电子书、OCR、AI 三个节点族，并把 `archive.*` 的"次选"写成系统 tar ——
+//! 而 `archive.pack` / `archive.unpack` 是**无条件** `ctx.engine("7zip")`，
+//! 没有任何 tar 兜底（系统 tar 只用在"引擎安装包自己怎么解压"里）。
+//!
+//! **"权威"是靠与实现一致挣来的，不是靠一句自称。** 所以这张表现在按
+//! 每个节点**实际**会走的路径逐条写，并且只写能被代码验证的东西。
+//!
+//! | 节点 | 首选 | 次选 | 兜底 |
 //! |---|---|---|---|
-//! | `image.*` | libvips（快、省内存） | ImageMagick（格式最全） | **纯 Rust `image` crate（始终可用）** |
+//! | `image.convert` / `image.resize` / `image.crop` / `image.rotate` | libvips | ImageMagick | **纯 Rust `image` crate**（始终可用；用哪个由 `pick_image_backend()` 决定并写进输出值 `backend`） |
+//! | `image.probe` / `image.enhance` / `image.strip-metadata` | 纯 Rust | —— | ——（**不调用任何外部后端**，装了引擎也不会更快） |
+//! | `image.remove-background` | Python + ONNX 运行时（独立 venv） | —— | 无：缺权重 / 缺合适的 Python 时**明确报错**并指名去哪装 |
+//! | `ai.upscale` | Python + ONNX 运行时（同一个 venv） | —— | 无：同上；另外它**自检**权重是不是超分模型 |
+//! | `ai.describe` | 用户配置的视觉模型 | —— | 无：没配 AI 时给出去哪儿配的指引 |
+//! | `doc.ocr` | Tesseract（离线） | 视觉模型（AI，**会上传图片**） | 无：两者都不可用时，报错把两个选项都列出来 |
 //! | `video.*` / `audio.*` | FFmpeg | —— | 无（返回 `EngineMissing`） |
-//! | `doc.convert` | Pandoc | —— | 无 |
+//! | `doc.convert` | Pandoc（目标 `pdf_engine` 也还是它，需要本机有 LaTeX） | —— | 无 |
 //! | `doc.to-pdf` | LibreOffice | —— | 无 |
-//! | `archive.*` | 7-Zip | 系统 tar | 无 |
-//! | `fs.*` | 纯 Rust | —— | —— |
+//! | `ebook.convert` | Calibre（格式最全） | Pandoc（仅 EPUB / DOCX / FB2 / HTML / MD / RTF / ODT / TXT） | 无：Pandoc 覆盖不到的格式**在调用前就被挡下**（它会假装成功） |
+//! | `archive.pack` / `archive.unpack` | 7-Zip | —— | **没有**。系统 tar 不参与这两个节点 |
+//! | `text.replace` / `name.build` / `flow.*` / `fs.*` | 纯 Rust | —— | ——（纯计算或纯文件操作，永远可用） |
 //!
-//! `image.*` 是唯一能真正"没有外部依赖也跑得动"的家族，所以它必须**先**实现纯 Rust
-//! 路径，外部引擎只作为加速选项。反过来，音视频没有纯 Rust 替代品，
-//! 就不要假装能跑 —— 直接告诉用户去装 FFmpeg。
+//! 规律没变，但适用范围要说准：**图片的"格式与几何"操作**是唯一能"没有外部依赖
+//! 也跑得动"的一组，所以那条纯 Rust 路径必须先实现、外部引擎只作加速。
+//! 音视频没有纯 Rust 替代品，就不要假装能跑 —— 直接告诉用户去装 FFmpeg。
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
