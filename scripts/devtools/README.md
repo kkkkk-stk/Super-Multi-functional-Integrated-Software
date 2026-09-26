@@ -41,7 +41,7 @@ node scripts/devtools/inspect.mjs   # 单页体检
 node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
-node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（74 项）
+node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（82 项）
 ```
 
 `pnpm dev:cdp` 与 `pnpm verify:app` 是上面两条命令的简写。
@@ -128,7 +128,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 ### `verify-platform.mjs` —— 平台能力（**这一轮新增的主要内容**）
 
 `verify.mjs` 验的是**安全属性**，这个脚本验的是**平台声称能做到的事是不是真的做到了**。
-十二节，74 项：
+十三节，82 项：
 
 | 节 | 验什么 | 它抓到过什么 |
 |---|---|---|
@@ -144,11 +144,18 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 | 【10】 | AI 视觉链路的请求形状与下游接线 | 见下 |
 | 【11】 | 超分是否真的按倍数放大 | 见下 |
 | 【12】 | 中间档（ImageMagick）是否真的被挑中 | 三层降级图的中间那一格**从来没有单独测过**（本机没装 ImageMagick） |
+| 【13】 | 兜底档（纯 Rust `image` crate）是否真的接得住 | 这一档是"零依赖、始终可用"的那条，**装了引擎的机器上永远走不到它** —— 也正因如此它最难被验到（此前文档只敢写"三档里有两档有证据"） |
 
-**【12】的做法值得单说**：它把 `engines/libvips` **临时改名**藏起来，断言
-`image.convert` 的后端日志变成 `后端 = ImageMagick（格式最全）`（并且真的产出有损 VP8 WebP），
-然后在 `finally` 里改名还原 —— **失败也会还原**，否则一次失败的验证会永久污染这台机器的引擎状态。
-它只在 **libvips 与 imagemagick 都装了**的前提下才跑，否则**显式记为跳过**。
+**【12】与【13】的做法值得单说**：降级链的**后两档只能靠"临时把更优先的引擎藏起来"才测得到** ——
+libvips 只要在，`image.convert` 就永远走它，中间档与兜底档根本没有机会被执行。
+所以【12】把 `engines/libvips` **临时改名**，断言 `image.convert` 的后端日志变成
+`后端 = ImageMagick（格式最全）`（并且真的产出有损 VP8 WebP）；【13】把 `libvips` 与 `imagemagick` 的
+**托管目录都**改名，断言后端日志变成 `后端 = 纯 Rust image crate（零依赖，能力受限）`、
+任务**仍然成功**、产出**无损 VP8L**（这既是纯 Rust 后端的指纹，也是它的能力上限），
+并且节点如实提示「只有无损模式」。
+两者**都在 `finally` 里改名还原** —— **失败也会还原**，否则一次失败的验证会把引擎留在改名状态，
+污染这台机器后面每一个检查。只有**应用托管**（`source === "managed"`）的那一份藏得掉：
+系统装在 PATH 里的那份改名没用，所以可藏引擎为空时**显式记为跳过**。
 
 前置条件不满足时（没下权重、没装引擎）会**显式记为跳过**，
 而不是悄悄放过 —— "跳过"和"通过"是两回事。

@@ -688,7 +688,7 @@ std::fs::create_dir_all(&workspace).ok();
 
    > ✅ **这条原来是 4 个：`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`**（更早是 5 个，第一个是 `image.remove-background` —— 产品的招牌功能，此前从未真正工作过）。四个是**本轮一次补完**的：`ebook.convert` 走 Calibre 优先 / Pandoc 兜底并在调用 pandoc 前按能力表把关；`ai.describe` 走视觉模型；`doc.ocr` 走 tesseract 或视觉模型（**明确拒绝 PDF 输入**）；`ai.upscale` 走 Real-ESRGAN + 分块推理。逐个的实测与理由见 `docs/ENGINE-MATRIX.md` 第 3.2、3.3、3.5、6.7 节。
    >
-   > ⚠️ **但"全部实现"不等于"每一档环境都测过"**：`verify-platform.mjs`【8】覆盖抠图、【9】电子书、【10】AI 视觉、【11】超分、【12】中间档（ImageMagick）后端切换，而 macOS、以及"两个可选引擎都缺失"的完整环境矩阵仍然没有基线（ImageMagick 档位本轮已补上，见 11a）。
+   > ⚠️ **但"全部实现"不等于"每一档环境都测过"**：`verify-platform.mjs`【8】覆盖抠图、【9】电子书、【10】AI 视觉、【11】超分、【12】中间档（ImageMagick）后端切换、【13】纯 Rust 兜底档（把两个引擎的托管目录都藏起来），而 macOS 与完整的环境矩阵仍然没有基线（ImageMagick 档位已补上，见 11a；"两个可选引擎都缺失"这一档随后由【13】补上）。
 
    ✅ **这份名单有唯一真相来源**：`UNIMPLEMENTED_NODES`（`pipeline.rs`）同时被两处消费 —— `nodes::run` 的兜底分支与 IPC 的 `NodeCatalogResponse.unimplemented`（前端的节点面板/画布/Inspector 从 IPC 拿，**不再硬编**）。以前它在**四个地方**各存一份（Rust 执行器、SDK 文档、示例清单注释、前端的 `node-support.ts`），每实现一个节点要手工同步四处。它现在**保留为空数组**而不是删除，正是因为前端那句"该能力尚未实现"的提示还需要一个数据来源。
    两条测试守着它与真实分发表的一致性：`unimplemented_list_matches_actual_dispatch`（**遍历真实分发表**，对名单里的每个节点断言它确实还落在 `not_implemented` 上，反方向也查）与 `is_implemented_is_the_complement_of_the_list`。第一条守的正是本条刚刚发生过的那次失误形态 —— **实现完了却忘了从名单里删掉**（或反方向），那会让用户看到与真实行为相反的提示。
