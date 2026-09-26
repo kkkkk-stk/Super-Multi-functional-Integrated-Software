@@ -252,10 +252,12 @@ pub async fn engines_catalog(state: State<'_, Arc<AppState>>) -> ToolforgeResult
             .map(|n| n.name.clone())
             .collect();
         let status = state.engines.status(&d.id).await;
+        let managed_available = state.engines.has_download_source(&d.id);
         out.push(EngineEntry {
             descriptor: d,
             status,
             used_by_nodes: used_by,
+            managed_available,
         });
     }
     Ok(out)
@@ -291,6 +293,7 @@ pub async fn engines_install(
         engine_id,
         license_accepted,
         allow_unverified,
+        force,
     } = req;
 
     let descriptor = engine_catalog()
@@ -319,7 +322,7 @@ pub async fn engines_install(
 
     state.queue.spawn(job, move |ctx| async move {
         let outcome = engines
-            .install(&engine_id, &ctx, allow_unverified)
+            .install(&engine_id, &ctx, allow_unverified, force)
             .await?;
         match outcome {
             EngineInstallOutcome::Installed { path, version } => {

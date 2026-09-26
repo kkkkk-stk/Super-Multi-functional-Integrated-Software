@@ -308,6 +308,39 @@ impl EngineRegistry {
             return s;
         }
 
+        // `onnx-models` 是个**虚拟引擎**：它没有一个叫 "onnx-models.exe" 的东西，
+        // 只是一堆权重文件的宿主。按普通引擎去探测的话它永远是 Missing，
+        // 于是依赖它的节点（`image.remove-background`）会**永远显示不可用** ——
+        // 哪怕用户已经下好了权重。
+        //
+        // 它的可用性判据就是"有没有下过至少一个权重"。
+        if engine_id == "onnx-models" {
+            let installed = self.installed_models_for("onnx-models");
+            let usable = !installed.is_empty();
+            let s = EngineStatus {
+                id: desc.id.clone(),
+                state: if usable {
+                    EngineState::Installed
+                } else {
+                    EngineState::Missing
+                },
+                source: EngineSource::Managed,
+                path: None,
+                version: None,
+                message: Some(if usable {
+                    format!("已下载 {} 个模型权重", installed.len())
+                } else {
+                    "还没有下载任何模型权重。到「模型权重」里下 u2netp（4.4 MB）即可开始用抠图。"
+                        .into()
+                }),
+                installed_size_mb: None,
+                installed_models: installed,
+                probed_at: Some(toolforge_core::job::now_iso()),
+            };
+            self.cache.insert(engine_id.to_string(), s.clone());
+            return s;
+        }
+
         // ① 托管目录
         if let Some(p) = self.managed_binary(engine_id) {
             let version = probe_version_of(&p, engine_id).await;
@@ -492,6 +525,14 @@ impl EngineRegistry {
         self.model_path(model_id).map(|p| p.exists()).unwrap_or(false)
     }
 
+    /// 当前平台有没有这个引擎的可下载来源。
+    ///
+    /// 界面靠它决定要不要显示「安装托管版本」按钮 —— 没有来源却显示按钮，
+    /// 用户点一下只会拿到"当前平台没有配置下载源"。
+    pub fn has_download_source(&self, engine_id: &str) -> bool {
+        self.sources.contains_key(engine_id)
+    }
+
     /// 删除一个已下载的模型，返回是否真的删掉了东西。
     pub fn remove_model(&self, model_id: &str) -> ToolforgeResult<bool> {
         let Some(path) = self.model_path(model_id) else {
@@ -513,17 +554,29 @@ impl EngineRegistry {
 
     /// 按需安装引擎。
     ///
-    /// `allow_unverified` 必须显式传 `true` 才会接受没有哈希的来源 ——
-    /// 调用方（Tauri 命令层）会把它接到一个需要用户二次确认的 UI 上。
+    /// * `allow_unverified` 必须显式传 `true` 才会接受没有哈希的来源 ——
+    ///   调用方（Tauri 命令层）会把它接到一个需要用户二次确认的 UI 上。
+    /// * `force` = "即使系统上已经有一个可用的，也要装应用托管的那一份"。
+    ///
+    /// ## 为什么需要 `force`
+    ///
+    /// "已经可用"并不等于"满足我的要求"。最典型的例子是 Python：
+    /// 系统上装着 3.14，探测结果就是"可用"，于是安装请求被短路掉；
+    /// 但**抠图需要 onnxruntime，而它没有 3.14 的 wheel** ——
+    /// 用户会看到一个"Python 已可用"的绿标，然后抠图报"没有可用的 Python"。
+    ///
+    /// 托管版本是平台自己选的版本（Python 固定 3.11），可以保证依赖装得上。
+    /// 所以 `force = true` 时跳过"已有就不下载"这条捷径。
     pub async fn install(
         &self,
         engine_id: &str,
         job: &JobCtx,
         allow_unverified: bool,
+        force: bool,
     ) -> ToolforgeResult<EngineInstallOutcome> {
-        // 已经有得用就不下载
+        // 已经有得用就不下载（除非调用方明确要求托管版本）
         let st = self.probe(engine_id).await;
-        if st.state.is_usable() {
+        if !force && st.state.is_usable() {
             if let Some(p) = st.path {
                 return Ok(EngineInstallOutcome::AlreadyAvailable {
                     path: PathBuf::from(p),
@@ -1385,7 +1438,7 @@ mod tests {
             0,
         );
 
-        match reg.install("libvips", &ctx, false).await.unwrap() {
+        match reg.install("libvips", &ctx, false, false).await.unwrap() {
             // 本机装了 libvips 的话会走这条 —— 那也是正确行为
             EngineInstallOutcome::AlreadyAvailable { .. } => {}
             EngineInstallOutcome::HashRequired { reason } => {
@@ -1417,7 +1470,7 @@ mod tests {
             0,
         );
 
-        match reg.install("libreoffice", &ctx, false).await.unwrap() {
+        match reg.install("libreoffice", &ctx, false, false).await.unwrap() {
             EngineInstallOutcome::AlreadyAvailable { .. } => {}
             EngineInstallOutcome::NotConfigured { reason } => {
                 assert!(

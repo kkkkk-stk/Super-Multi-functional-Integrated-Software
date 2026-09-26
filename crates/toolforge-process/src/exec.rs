@@ -223,7 +223,15 @@ impl TailBuffer {
             return (self.head, self.truncated);
         }
         let mut s = self.head;
-        s.push_str("\n…（中间输出已省略）…\n");
+        // 只有**头部真的被丢掉过**才写这句提示。
+        //
+        // quiet 模式下头部恒为空，早期实现照样插一句"中间输出已省略"，
+        // 于是 `probe_version` 取到的"第一行非空文本"变成了这行提示本身 ——
+        // 界面上每个引擎的版本号都显示成「…（中间输出已省略）…」。
+        // 又一次印证：**错误信息本身也会变成错误数据**。
+        if !s.is_empty() {
+            s.push_str("\n…（中间输出已省略）…\n");
+        }
         for l in self.tail {
             s.push_str(&l);
             s.push('\n');
@@ -742,14 +750,19 @@ mod tests {
         #[cfg(not(windows))]
         let p = PathBuf::from("sh");
 
-        // `cmd /C ver` 会打印一行版本；`sh -c` 用 echo 模拟
+        // 用 `echo` 而不是 `ver`：`ver` 在中文 Windows 上输出的是本地化文本，
+        // 而且有些 shell 下会先打一个空行 —— 这里的目的是验 quiet 语义，
+        // 不是验 Windows 的版本命令。
         #[cfg(windows)]
-        let v = probe_version(&p, &["/C", "ver"]).await;
+        let args: &[&str] = &["/C", "echo 1.2.3"];
         #[cfg(not(windows))]
-        let v = probe_version(&p, &["-c", "echo 1.2.3"]).await;
+        let args: &[&str] = &["-c", "echo 1.2.3"];
 
-        assert!(v.is_some(), "版本探测应当拿到一段文本");
-        assert!(!v.unwrap().trim().is_empty());
+        let v = probe_version(&p, args).await;
+        assert!(v.is_some(), "版本探测应当拿到一段文本（args={args:?}）");
+        let v = v.unwrap();
+        assert!(!v.trim().is_empty());
+        assert!(v.contains("1.2.3"), "拿到的应当是输出内容本身，实际 `{v}`");
     }
 
     #[tokio::test]
@@ -838,5 +851,20 @@ mod tests {
         assert!(s.contains("line-19999-"), "尾部必须保留");
         assert!(!s.contains("line-0-"), "头部应当被丢掉");
         assert!(s.len() <= KEEP_TAIL + 4096, "长度应当只受尾部上限约束：{}", s.len());
+    }
+
+    /// 回归：**没有丢掉头部时不许出现"已省略"提示**。
+    ///
+    /// 这是 quiet 修复带出来的一个次生缺陷：quiet 下头部恒为空，
+    /// 但 `finish()` 照样插一句「…（中间输出已省略）…」。而
+    /// `probe_version` 取的是"第一行非空文本" —— 于是每个引擎的版本号都变成了
+    /// 「…（中间输出已省略）…」而不是真正的版本。
+    #[test]
+    fn no_ellipsis_marker_when_nothing_was_dropped() {
+        let mut b = TailBuffer::new();
+        b.push_line("Python 3.11.16", false);
+        let (s, _) = b.finish();
+        assert_eq!(s.trim(), "Python 3.11.16", "单行输出不该被加上省略提示");
+        assert!(!s.contains("省略"));
     }
 }

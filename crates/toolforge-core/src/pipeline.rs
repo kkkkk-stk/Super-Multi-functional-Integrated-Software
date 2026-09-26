@@ -534,13 +534,9 @@ fn engine(name: &str) -> String {
 /// **新增节点时的正确顺序**：先实现执行器 → 再把它从这里删掉 →
 /// 前端与文档会自动跟上。
 pub const UNIMPLEMENTED_NODES: &[&str] = &[
-    // 需要 ONNX 运行时。模型分发链路（`models_*` IPC + 真实校对过 SHA-256 的
-    // 三个抠图权重）**已经落地**，缺的是"跑推理"这一段：
-    // 要么接 Python sidecar（3.11 运行时 + onnxruntime，可通过引擎安装拿到），
-    // 要么引 Rust 的 ort。两件都还没做，所以这里照旧。
-    "image.remove-background",
-    // 同上：Real-ESRGAN 权重连下载源都还没核对，见 engine.rs 的
-    // `verified_sources_are_pinned`（它要求 url / sha256 / file_name 三件套齐全）
+    // Real-ESRGAN 权重连下载源都还没核对，见 engine.rs 的
+    // `verified_sources_are_pinned`（它要求 url / sha256 / file_name 三件套齐全）。
+    // 抠图那条链路（模型下载 + Python 推理）已经通了，超分可以照抄它。
     "ai.upscale",
     // 依赖 AI 服务提供方；`ai_test_connection` 已经能连通，但"看图说话"这一步没写
     "ai.describe",
@@ -735,16 +731,25 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "image.remove-background".into(),
         label: "抠图去背景".into(),
-        description: "AI 抠图。需要下载 U2Net / MODNet / BiRefNet 模型（首次使用时按需拉取）。".into(),
+        description: "AI 抠图（U²-Net / ISNet）。**权重与运行时都不随安装包分发**：\
+                      先在「模型权重」里下载一个（u2netp 只要 4.4 MB），\
+                      首次运行时会自动准备一个独立 Python 环境装 onnxruntime（约 30 MB）。\
+                      之后每张图是本地推理，不联网、不上传图片。".into(),
         category: NodeCategory::Image,
+        // onnx-models 是虚拟引擎（权重的宿主），python 是推理运行时。
+        // 两个都是**必需**的：少任何一个这个节点都跑不起来，所以不能放进 optional。
         requires_engines: vec![engine("python"), engine("onnx-models")],
         optional_engines: vec![],
         inputs: vec![in_file("src", "图片", &["image/*"])],
         outputs: vec![out_file("dst", "透明背景 PNG")],
         params: vec![
-            enum_param("model", "模型", "u2net", &["u2net", "u2netp", "isnet-general", "birefnet-general", "modnet-portrait"]),
-            param("alphaMatting", "边缘羽化（发丝级）", ParamType::Bool, Some(false.into()), false),
-            param("backgroundColor", "替换背景色（留空 = 透明）", ParamType::Color, Some("".into()), false),
+            // 默认给最轻的 u2netp：4.4 MB 就能试，而 u2net 是 168 MB。
+            // "先让它跑起来"比"一上来就要下 168 MB"重要得多。
+            enum_param("model", "模型", "u2netp", &["u2netp", "u2net", "isnet-general"]),
+            enum_param("mode", "输出方式", "alpha", &["alpha", "color"]),
+            param("background", "替换背景色（mode=color 时生效，如 #FFFFFF）", ParamType::Color, Some("#FFFFFF".into()), false),
+            range_param("threshold", "蒙版阈值（0 = 不卡，越大越干净但可能啃掉边缘）", ParamType::Int, 0.0, 0.0, 99.0),
+            range_param("feather", "边缘羽化强度（0 = 不羽化）", ParamType::Int, 0.0, 0.0, 50.0),
         ],
     });
 

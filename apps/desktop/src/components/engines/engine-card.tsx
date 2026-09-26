@@ -35,7 +35,13 @@ export function EngineCard({
   probing,
 }: {
   entry: EngineEntry;
-  onInstall: (entry: EngineEntry) => void;
+  /**
+   * 点「安装」。
+   *
+   * `force` = 系统上已经有一份可用的，但仍然要装应用托管的那一份
+   * （见卡片底部「另外安装应用托管版本」按钮上的说明）。
+   */
+  onInstall: (entry: EngineEntry, options?: { force?: boolean }) => void;
   onProbe: (engineId: string) => void;
   probing: boolean;
 }) {
@@ -265,6 +271,24 @@ export function EngineCard({
           <Badge variant="outline" className="px-2 py-1">
             该引擎由远程服务提供，无法本地安装
           </Badge>
+        )}
+        {/* 系统上那个版本不满足要求时的出口。
+            「已检测到系统安装」≠「满足我的要求」——最典型的是 Python：
+            系统装着 3.14 也会显示可用，但抠图需要的 onnxruntime 没有 3.14 的
+            wheel，而托管版本固定 3.11。没有这个按钮的话，用户只能看着
+            「Python 可用」的绿标，然后抠图报「没有找到可用的 Python」。 */}
+        {usable && status.source === "system" && entry.managedAvailable && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-8 gap-1.5 text-xs"
+            onClick={() => onInstall(entry, { force: true })}
+            disabled={installing}
+            title="系统上那一份会被保留；应用另装一份自己管理的，互不影响"
+          >
+            <Download className="h-3.5 w-3.5" />
+            另外安装应用托管版本
+          </Button>
         )}
         {status.path && (
           <Button

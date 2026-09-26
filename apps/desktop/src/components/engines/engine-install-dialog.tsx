@@ -33,13 +33,21 @@ export function EngineInstallDialog({
   open,
   onOpenChange,
   installing,
+  force = false,
   onConfirm,
 }: {
   entry: EngineEntry | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   installing: boolean;
-  onConfirm: (req: { engineId: string; licenseAccepted: boolean; allowUnverified: boolean }) => void;
+  /** 系统上已有一份可用，但用户要装应用托管的那一份（见 `EngineInstallRequest.force`） */
+  force?: boolean;
+  onConfirm: (req: {
+    engineId: string;
+    licenseAccepted: boolean;
+    allowUnverified: boolean;
+    force: boolean;
+  }) => void;
 }) {
   const [licenseAccepted, setLicenseAccepted] = React.useState(false);
   const [allowUnverified, setAllowUnverified] = React.useState(false);
@@ -62,12 +70,16 @@ export function EngineInstallDialog({
       <DialogContent className="max-w-xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            安装 {descriptor.name}
+            {force ? "安装应用托管版本" : "安装"} {descriptor.name}
             <Badge variant="outline">{formatMegabytes(descriptor.approxSizeMb)}</Badge>
           </DialogTitle>
           <DialogDescription>
-            下载会走应用托管目录，并尽可能做 SHA-256 校验；
-            安装过程是一个「任务」，可以在任务中心看到实时进度与日志。
+            {force
+              ? "系统上那一份会被原样保留，应用另外装一份自己管理的（两者互不影响）。" +
+                "用在「系统上那个版本不满足要求」的场景，例如抠图需要 onnxruntime，" +
+                "而系统 Python 3.14 没有对应的 wheel。"
+              : "下载会走应用托管目录，并尽可能做 SHA-256 校验；" +
+                "安装过程是一个「任务」，可以在任务中心看到实时进度与日志。"}
           </DialogDescription>
         </DialogHeader>
 
@@ -150,6 +162,7 @@ export function EngineInstallDialog({
                 engineId: descriptor.id,
                 licenseAccepted,
                 allowUnverified,
+                force,
               });
             }}
           >

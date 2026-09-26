@@ -586,6 +586,14 @@ export type EngineEntry_Deserialize = {
 	status: EngineStatus_Deserialize,
 	/**  依赖这个引擎的内置节点名列表（UI 上显示"装了它能解锁什么"） */
 	usedByNodes: string[],
+	/**
+	 *  当前平台是否配置了可下载的来源。
+	 * 
+	 *  界面靠它决定要不要显示「安装托管版本」—— 对一个没有下载源的引擎
+	 *  （如 7-Zip、tesseract、calibre）显示这个按钮，用户点了只会得到一句
+	 *  "当前平台没有配置下载源"，那是白白浪费一次点击。
+	 */
+	managedAvailable: boolean,
 };
 
 /**  引擎目录项 = 静态描述 + 运行时状态。 */
@@ -594,6 +602,14 @@ export type EngineEntry_Serialize = {
 	status: EngineStatus_Serialize,
 	/**  依赖这个引擎的内置节点名列表（UI 上显示"装了它能解锁什么"） */
 	usedByNodes: string[],
+	/**
+	 *  当前平台是否配置了可下载的来源。
+	 * 
+	 *  界面靠它决定要不要显示「安装托管版本」—— 对一个没有下载源的引擎
+	 *  （如 7-Zip、tesseract、calibre）显示这个按钮，用户点了只会得到一句
+	 *  "当前平台没有配置下载源"，那是白白浪费一次点击。
+	 */
+	managedAvailable: boolean,
 };
 
 /**  引擎的安装/获取方式 */
@@ -614,6 +630,14 @@ export type EngineInstallRequest = {
 	licenseAccepted?: boolean,
 	/**  是否允许安装没有 SHA-256 的来源（需要在 UI 上做二次确认） */
 	allowUnverified?: boolean,
+	/**
+	 *  即使系统上已经有一个可用的，也强制安装**应用托管**的那一份。
+	 * 
+	 *  用在"系统上那个版本不满足要求"的场景：最典型的是 Python ——
+	 *  系统装着 3.14 会被判为"已可用"，但抠图需要的 onnxruntime
+	 *  没有 3.14 的 wheel，而托管版本固定 3.11。
+	 */
+	force?: boolean,
 };
 
 /**

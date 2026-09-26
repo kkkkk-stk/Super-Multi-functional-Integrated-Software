@@ -26,7 +26,11 @@ export function EngineGrid() {
 
   const [filter, setFilter] = React.useState<Filter>("all");
   const [query, setQuery] = React.useState("");
-  const [pending, setPending] = React.useState<EngineEntry | null>(null);
+  // 待确认的安装请求：`force` 表示"系统上那份不算数，装托管版本"
+  const [pending, setPending] = React.useState<{
+    entry: EngineEntry;
+    force: boolean;
+  } | null>(null);
 
   const list = React.useMemo(() => {
     const all = engines ?? [];
@@ -122,7 +126,7 @@ export function EngineGrid() {
             <EngineCard
               key={entry.descriptor.id}
               entry={entry}
-              onInstall={setPending}
+              onInstall={(e, options) => setPending({ entry: e, force: options?.force ?? false })}
               onProbe={(id) => probeOne.mutate(id)}
               probing={probeOne.isPending && probeOne.variables === entry.descriptor.id}
             />
@@ -131,10 +135,11 @@ export function EngineGrid() {
       )}
 
       <EngineInstallDialog
-        entry={pending}
+        entry={pending?.entry ?? null}
         open={Boolean(pending)}
         onOpenChange={(open) => !open && setPending(null)}
         installing={install.isPending}
+        force={pending?.force ?? false}
         onConfirm={(req) => {
           install.mutate(req, { onSettled: () => setPending(null) });
         }}

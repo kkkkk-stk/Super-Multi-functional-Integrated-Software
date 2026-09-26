@@ -25,6 +25,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { deflateSync } from 'node:zlib';
 
 import { Checker, connect, makePng, REPO_ROOT, webpInfo } from './cdp.mjs';
 
@@ -365,5 +366,155 @@ c.section('【7】任意角度旋转在无重采样后端时是否明确报错')
   c.check(true, '能力边界已记录（详见 image.rotate 的错误文案）');
 }
 
+// ============================================================================
+// 【8】抠图：模型 + Python 运行时 + ONNX 推理整条链路
+// ============================================================================
+c.section('【8】AI 抠图（image.remove-background）是否真的能出透明背景');
+{
+  // 前置条件：一个装好依赖的 Python（3.9~3.13）与一个已下载的抠图权重。
+  // 这两样都可能要下载几十 MB，所以**没有前置时记为跳过而不是失败** ——
+  // 但这必须显式打出来，不能悄悄放过（"跳过"和"通过"是两回事）。
+  const engines = await client.invoke('engines_catalog');
+  const models = await client.invoke('models_list');
+  const bgModels = (models ?? []).filter(
+    (m) => m.installed && m.usedByNodes.includes('image.remove-background')
+  );
+  const runtimeReady = existsSync(
+    join(DATA_DIR, 'cache', 'onnx-runtime', 'Scripts', 'python.exe')
+  );
+
+  if (bgModels.length === 0 || !runtimeReady) {
+    c.note(
+      `跳过：${bgModels.length === 0 ? '没有已下载的抠图权重（到「模型权重」下 u2netp，4.4 MB）' : ''}` +
+        `${!runtimeReady ? ' 抠图运行时尚未初始化（首次运行会自动准备）' : ''}`
+    );
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    const modelId = bgModels[0].id;
+    const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-rembg-verify');
+    rmSync(outDir, { recursive: true, force: true });
+    mkdirSync(outDir, { recursive: true });
+
+    // 用**有明确主体**的图：白底 + 一个椭圆。
+    // 拿渐变色块去测抠图是没意义的 —— 它没有显著性目标，模型会（正确地）输出空蒙版。
+    const src = join(REPO_ROOT, '.tools', 'smoke', 'in-rembg-verify.png');
+    writeFileSync(src, makeSubjectPng(400, 300, [120, 60, 280, 240]));
+
+    const sub = await client.invoke('plugins_run', {
+      req: {
+        pluginId: 'com.toolforge.builtin.remove-bg',
+        inputs: { src: [src] },
+        params: {
+          model: { kind: 'str', value: modelId },
+          mode: { kind: 'str', value: 'alpha' },
+        },
+        outputDir: outDir,
+      },
+    });
+    const job = await client.waitJob(sub.jobId, 400, 1000);
+    if (job.error) c.note(`${job.error.code}：${job.error.message} ${String(job.error.detail ?? '').slice(0, 200)}`);
+    c.check(job.status === 'succeeded', `抠图任务成功（模型 ${modelId}）`, job.status);
+
+    const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+    c.check(produced.length === 1, '产出 1 个文件', produced.join(', '));
+
+    if (produced.length === 1) {
+      const buf = readFileSync(join(outDir, produced[0]));
+      const png = pngInfo(buf);
+      c.note(`${produced[0]}  ${buf.length} 字节  ${JSON.stringify(png)}`);
+      c.check(png?.width === 400 && png?.height === 300, '尺寸与原图一致 400x300', png ? `${png.width}x${png.height}` : '');
+      // ★ 核心：抠图必须真的产出**带 alpha**的 PNG，而不是一张不透明的原图
+      c.check(png?.colorType === 6, '输出是带 alpha 通道的 PNG（colorType 6 = RGBA）', String(png?.colorType));
+    }
+
+    // 前端占比也要在合理区间：全 0 或全 100 都说明模型没在工作
+    const line = (job.logs ?? [])
+      .map((l) => String(l.message))
+      .find((m) => m.includes('前景占比'));
+    if (line) {
+      const pct = Number((line.match(/([\d.]+)%/) ?? [])[1] ?? NaN);
+      c.note(line);
+      c.check(
+        Number.isFinite(pct) && pct > 1 && pct < 99,
+        '前景占比落在合理区间（既不是"什么都没找到"也不是"整张图都是前景"）',
+        `${pct}%`
+      );
+    }
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
+
+/**
+ * 生成"白底 + 一个纯色椭圆"的 PNG。
+ *
+ * 抠图测试**必须**用有显著性目标的图：U²-Net 是显著性检测模型，
+ * 喂一张渐变色块进去它会（正确地）什么都不选出来 —— 那样测出来的
+ * "占比 0%"是模型的正确行为，而不是缺陷。
+ */
+function makeSubjectPng(width, height, [x0, y0, x1, y1]) {
+  const stride = width * 3;
+  const raw = Buffer.alloc((stride + 1) * height);
+  const cx = (x0 + x1) / 2;
+  const cy = (y0 + y1) / 2;
+  const rx = (x1 - x0) / 2;
+  const ry = (y1 - y0) / 2;
+  for (let y = 0; y < height; y++) {
+    raw[y * (stride + 1)] = 0;
+    for (let x = 0; x < width; x++) {
+      const inside = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1;
+      const o = y * (stride + 1) + 1 + x * 3;
+      raw[o] = inside ? 205 : 248;
+      raw[o + 1] = inside ? 45 : 248;
+      raw[o + 2] = inside ? 45 : 248;
+    }
+  }
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', (() => {
+      const b = Buffer.alloc(13);
+      b.writeUInt32BE(width, 0);
+      b.writeUInt32BE(height, 4);
+      b[8] = 8;
+      b[9] = 2;
+      return b;
+    })()),
+    pngChunk('IDAT', deflateSync(raw, { level: 6 })),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+/** 极简 PNG 头解析：只要尺寸与 colorType（6 = RGBA） */
+function pngInfo(buf) {
+  if (buf.length < 26) return null;
+  if (buf.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') return null;
+  if (buf.subarray(12, 16).toString('ascii') !== 'IHDR') return null;
+  return {
+    width: buf.readUInt32BE(16),
+    height: buf.readUInt32BE(20),
+    bitDepth: buf[24],
+    colorType: buf[25],
+  };
+}
+
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length);
+  const tb = Buffer.from(type, 'ascii');
+  const cb = Buffer.alloc(4);
+  cb.writeUInt32BE(crc32(Buffer.concat([tb, data])));
+  return Buffer.concat([len, tb, data, cb]);
+}
+
+function crc32(buf) {
+  const t = [];
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  let c = 0xffffffff;
+  for (const b of buf) c = t[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}

@@ -308,7 +308,9 @@ pub async fn run(
         "fs.mkdir" => fs_mkdir(ctx, args).await,
         "fs.delete" => fs_delete(ctx, args).await,
 
-        // ---------- 图片（纯 Rust 兜底，永远可用）----------
+        // ---------- 图片 ----------
+        // 前五个按 libvips → ImageMagick → 纯 Rust 降级（见 `pick_image_backend`）；
+        // 后三个（enhance / strip-metadata）目前只有纯 Rust 路径。
         "image.probe" => image_probe(ctx, args).await,
         "image.convert" => image_convert(ctx, args).await,
         "image.resize" => image_resize(ctx, args).await,
@@ -316,6 +318,8 @@ pub async fn run(
         "image.rotate" => image_rotate(ctx, args).await,
         "image.enhance" => image_enhance(ctx, args).await,
         "image.strip-metadata" => image_strip_metadata(ctx, args).await,
+        // ONNX 推理，走独立 Python venv（见 `ensure_onnx_runtime`）
+        "image.remove-background" => image_remove_background(ctx, args).await,
 
         // ---------- 音视频（FFmpeg 硬依赖）----------
         "video.transcode" => ffmpeg_transcode(ctx, args).await,
@@ -1451,6 +1455,427 @@ async fn image_enhance(
     Ok(NodeOutput::file(dst.display().to_string()))
 }
 
+/// `image.remove-background`：U²-Net / ISNet 抠图。
+///
+/// ## 为什么是"Python 子进程"而不是 Rust
+///
+/// 宿主里没有 ONNX Runtime 的 Rust 绑定：`ort` 需要在**构建期**下载预编译动态库，
+/// 内网/离线环境会直接构建失败 —— 而"构建失败"意味着整个项目编译不过，
+/// 代价太大。Python 侧的 `onnxruntime` 是一条成熟、可校验、可隔离的路径，
+/// 而且 L3 插件运行时本来就要求一个托管 Python，这条链路是**复用**的。
+///
+/// ## 三个前置条件，缺一个都要给出可操作的错误
+///
+/// 1. **模型权重**（`models/<id>/<file>.onnx`）—— 在「设置 → 模型权重」里下载；
+/// 2. **能装 onnxruntime 的 Python**（3.9~3.13）—— 首选应用托管的 3.11，
+///    因为系统 Python 可能是 3.14，而 onnxruntime **还没有 3.14 的 wheel**；
+/// 3. **推理依赖**（onnxruntime / numpy / pillow）—— 首次运行时自动装进
+///    一个独立 venv（`<数据目录>/cache/onnx-runtime`），不污染用户的 Python。
+///
+/// 这三件事都必须"说得清、做得到"：任何一条缺失时的报错都要**指名道姓**
+/// 地告诉用户去哪儿点哪个按钮。含糊的报错会让人以为功能坏了。
+async fn image_remove_background(
+    ctx: &mut NodeCtx,
+    args: &BTreeMap<String, String>,
+) -> ToolforgeResult<NodeOutput> {
+    let src = resolve_path(ctx, "input", arg(args, "src")?)?;
+    let dst = resolve_path(ctx, "output", arg(args, "dst")?)?;
+
+    let model_id = ctx.param_str("model", "u2netp");
+    let mode = ctx.param_str("mode", "alpha");
+    if mode != "alpha" && mode != "color" {
+        return Err(ToolforgeError::invalid(format!(
+            "image.remove-background 的 mode 只能是 alpha 或 color，收到 `{mode}`"
+        )));
+    }
+    let background = ctx.param_str("background", "#FFFFFF");
+    let threshold = ctx.param_i64("threshold", 0).clamp(0, 99);
+    let feather = ctx.param_i64("feather", 0).clamp(0, 50);
+
+    // ---- ① 模型 ----
+    let model_path = ctx.engines.model_path(&model_id).ok_or_else(|| {
+        ToolforgeError::not_found(format!("模型 {model_id} 不在引擎目录里登记"))
+            .with_detail("可用的抠图模型：u2netp（最快）、u2net、isnet-general。")
+    })?;
+    if !model_path.is_file() {
+        return Err(ToolforgeError::not_found(format!(
+            "抠图模型 {model_id} 还没下载"
+        ))
+        .with_detail(
+            "请到「设置 → 引擎管理 → 模型权重」里点「下载」。\n\
+             u2netp 只有 4.4 MB，建议先装它；u2net / isnet-general 效果更好但约 170 MB。"
+                .to_string(),
+        ));
+    }
+
+    ctx.job.progress_now(toolforge_core::job::JobProgress::indeterminate(
+        format!("抠图 {}", file_label(&src)),
+    ));
+
+    // ---- ② Python 运行时 ----
+    let python = ensure_onnx_runtime(ctx).await?;
+
+    // ---- ③ 脚本 ----
+    let script = materialize_rembg_script(ctx)?;
+
+    // ---- ④ 跑推理 ----
+    let mut cmd_args = vec![
+        script.display().to_string(),
+        "--model".into(),
+        model_path.display().to_string(),
+        "--input".into(),
+        src.display().to_string(),
+        "--output".into(),
+        dst.display().to_string(),
+        "--mode".into(),
+        mode.clone(),
+        "--background".into(),
+        background.clone(),
+        "--threshold".into(),
+        threshold.to_string(),
+        "--feather".into(),
+        feather.to_string(),
+    ];
+    // `--mode color` 之外时背景色没有意义，去掉免得用户以为它生效了
+    if mode != "color" {
+        let pos = cmd_args.iter().position(|a| a == "--background");
+        if let Some(i) = pos {
+            cmd_args.drain(i..i + 2);
+        }
+    }
+
+    let job = ctx.job.clone();
+    let result = toolforge_process::exec_streaming(
+        ExecOptions::new(python.clone())
+            .args(cmd_args)
+            // 让 Python 不要把 .pyc 写进仓库/缓存目录（避免只读目录下报错）
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .cancel(ctx.job.cancel.clone())
+            // 首次可能要下载依赖，给足时间；正常推理是秒级
+            .timeout(Duration::from_secs(1800))
+            .quiet(true),
+        move |kind, line| {
+            // Python 侧的进度不逐行刷给用户，但失败时这些行就是全部线索
+            if kind == StreamKind::Stderr && !line.trim().is_empty() {
+                job.log(toolforge_core::job::LogLevel::Debug, line.to_string());
+            }
+        },
+    )
+    .await
+    .map_err(|e| {
+        ToolforgeError::engine_failed("python", format!("启动抠图脚本失败：{}", e.message))
+    })?;
+
+    if !result.success() {
+        // 脚本自己会把"为什么"写到 stderr（缺依赖 / 模型损坏 / 图片打不开），
+        // 原样带给用户 —— 换成一句"抠图失败"等于把最有用的信息扔掉。
+        let detail = if result.stderr.trim().is_empty() {
+            result.stdout.clone()
+        } else {
+            result.stderr.clone()
+        };
+        return Err(ToolforgeError::engine_failed("python", "抠图脚本执行失败")
+            .with_detail(detail.trim().to_string()));
+    }
+
+    // ---- ⑤ 解析脚本回传的 JSON ----
+    let report: serde_json::Value = result
+        .stdout
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .ok_or_else(|| {
+            ToolforgeError::internal("抠图脚本没有返回可解析的结果").with_detail(format!(
+                "stdout：{}\nstderr：{}",
+                result.stdout.trim(),
+                result.stderr.trim()
+            ))
+        })?;
+
+    if !dst.is_file() {
+        return Err(ToolforgeError::engine_failed(
+            "python",
+            format!("抠图结束但没有生成 {}", dst.display()),
+        ));
+    }
+
+    let coverage = report
+        .get("coveragePercent")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    // 前景占比异常时给一条提示：这几乎是"用户选错了模型或图里没有主体"的
+    // 唯一可观测信号，不说的话用户只会觉得"抠得不对"。
+    if coverage < 1.0 {
+        ctx.job.warn(format!(
+            "U²-Net 几乎没找到前景（占比 {coverage:.1}%）—— 可能是图里没有明显主体，\
+             或者这张图不适合这个模型（人像试试 isnet-general）。"
+        ));
+    } else if coverage > 99.0 {
+        ctx.job.warn(format!(
+            "U²-Net 把整张图都当成了前景（占比 {coverage:.1}%）—— \
+             可能是背景与主体对比度太低。"
+        ));
+    }
+
+    ctx.job.log(
+        toolforge_core::job::LogLevel::Debug,
+        format!(
+            "image.remove-background：模型 {model_id}；前景占比 {coverage:.2}%；输出 {mode}"
+        ),
+    );
+
+    Ok(NodeOutput::file(dst.display().to_string())
+        .with_value("path", dst.display().to_string())
+        .with_value("model", model_id)
+        .with_value("backend", "onnx-python")
+        .with_value("coveragePercent", format!("{coverage:.2}")))
+}
+
+/// 抠图脚本的正文。
+///
+/// 用 `include_str!` 编进二进制，**运行时再写到磁盘**，而不是走 Tauri 的
+/// resource 打包。理由：resource 路径在开发态/打包态/不同平台下是三套规则
+/// （`resolve_builtin_plugins` 里已经为此写过一段兼容代码），而一个 .py 文件
+/// 只有几 KB，编进去最省事，也**不可能出现"文件没被打进包"**这种故障。
+const REMBG_SCRIPT: &str = include_str!("../py/rembg.py");
+
+/// 把脚本写到缓存目录，返回路径。
+///
+/// 每次都重写（内容变了就自动生效），并用 `.toolforge` 之外的名字，
+/// 免得被插件的文件扫描当成用户数据。
+fn materialize_rembg_script(ctx: &NodeCtx) -> ToolforgeResult<PathBuf> {
+    let dir = ctx.engines.paths().cache().join("onnx-runtime");
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        ToolforgeError::io(format!("创建 {} 失败：{e}", dir.display()))
+    })?;
+    let path = dir.join("rembg.py");
+    std::fs::write(&path, REMBG_SCRIPT)
+        .map_err(|e| ToolforgeError::io(format!("写入 {} 失败：{e}", path.display())))?;
+    Ok(path)
+}
+
+/// 依赖安装完成的标记文件名。
+const ONNX_READY_MARKER: &str = "ready.json";
+
+/// 确保有一个**装了 onnxruntime 的** Python，返回其解释器路径。
+///
+/// ## 为什么单独建 venv
+///
+/// 直接往用户的系统 Python 里 `pip install` 是**入侵性**的：会改别人的环境、
+/// 可能撞版本、卸载时还得猜哪些包是自己装的。这里建一个独立 venv 放在
+/// 应用数据目录下，删掉目录就等于卸载干净。
+///
+/// ## 为什么优先用托管 Python
+///
+/// 系统上可能是 Python 3.14，而 onnxruntime **还没有 3.14 的 wheel** ——
+/// `pip install` 会直接报找不到匹配的发行版。托管 Python 固定 3.11，
+/// 依赖一定能装上。所以这里的顺序是「托管优先，系统兜底」，
+/// 并且兜底时会检查版本区间。
+async fn ensure_onnx_runtime(ctx: &NodeCtx) -> ToolforgeResult<PathBuf> {
+    let dir = ctx.engines.paths().cache().join("onnx-runtime");
+    let venv_python = venv_python_path(&dir);
+    let marker = dir.join(ONNX_READY_MARKER);
+
+    // 已经装好就直接复用。标记文件是必需的：只看 venv 目录存在的话，
+    // "venv 建好了但 pip 装了一半失败"会被误判成可用。
+    if marker.is_file() && venv_python.is_file() {
+        return Ok(venv_python);
+    }
+
+    let base = find_base_python(ctx).await?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ToolforgeError::io(format!("创建 {} 失败：{e}", dir.display())))?;
+
+    // ---- 建 venv ----
+    ctx.job.info(format!(
+        "首次使用抠图：正在准备独立 Python 环境（{}）",
+        dir.display()
+    ));
+    let out = toolforge_process::exec(
+        ExecOptions::new(base.clone())
+            .args(["-m", "venv", "--clear", &dir.display().to_string()])
+            .cancel(ctx.job.cancel.clone())
+            .timeout(Duration::from_secs(600))
+            .quiet(true),
+    )
+    .await?;
+    if !out.success() || !venv_python.is_file() {
+        return Err(ToolforgeError::engine_failed(
+            "python",
+            "创建抠图用的独立 Python 环境失败",
+        )
+        .with_detail(format!(
+            "解释器：{}\nstdout：{}\nstderr：{}",
+            base.display(),
+            out.stdout.trim(),
+            out.stderr.trim()
+        )));
+    }
+
+    // ---- 装依赖 ----
+    // 不指定版本：onnxruntime 的 ABI 与 Python 小版本绑定，写死版本号
+    // 反而会在某些 Python 上装不上。让 pip 自己挑这个解释器能用的最新版。
+    ctx.job.info("正在下载抠图依赖（onnxruntime / numpy / pillow，约 30 MB，仅首次）");
+    let job = ctx.job.clone();
+    let out = toolforge_process::exec_streaming(
+        ExecOptions::new(venv_python.clone())
+            .args([
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+                "onnxruntime",
+                "numpy",
+                "pillow",
+            ])
+            .cancel(ctx.job.cancel.clone())
+            .timeout(Duration::from_secs(1800))
+            .quiet(true),
+        move |_kind, line| {
+            if !line.trim().is_empty() {
+                job.log(toolforge_core::job::LogLevel::Debug, line.to_string());
+            }
+        },
+    )
+    .await?;
+
+    if !out.success() {
+        return Err(ToolforgeError::engine_failed(
+            "python",
+            "安装抠图依赖（onnxruntime / numpy / pillow）失败",
+        )
+        .with_detail(format!(
+            "{}\n\n常见原因：网络不通、公司代理拦截 pip、或这台机器上的 Python 版本\
+             太新（onnxruntime 未必有对应 wheel）。可以手动执行：\n  \
+             {} -m pip install onnxruntime numpy pillow",
+            out.stderr.trim(),
+            venv_python.display()
+        )));
+    }
+
+    std::fs::write(
+        &marker,
+        serde_json::json!({
+            "python": venv_python.display().to_string(),
+            "base": base.display().to_string(),
+            "packages": ["onnxruntime", "numpy", "pillow"],
+            "createdAt": toolforge_core::job::now_iso(),
+        })
+        .to_string(),
+    )
+    .map_err(|e| ToolforgeError::io(format!("写入标记文件失败：{e}")))?;
+
+    ctx.job.info("抠图依赖已就绪");
+    Ok(venv_python)
+}
+
+fn venv_python_path(venv_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        venv_dir.join("Scripts").join("python.exe")
+    } else {
+        venv_dir.join("bin").join("python")
+    }
+}
+
+/// onnxruntime 目前支持的 Python 版本区间（含）。
+///
+/// 写成常量而不是散在判断里：这条信息会直接出现在给用户的报错里，
+/// 而"为什么我的 Python 不行"是最容易被含糊过去的问题。
+const ONNX_PY_MIN: (u32, u32) = (3, 9);
+const ONNX_PY_MAX: (u32, u32) = (3, 13);
+
+/// 找一个能装 onnxruntime 的 Python。
+async fn find_base_python(ctx: &NodeCtx) -> ToolforgeResult<PathBuf> {
+    let managed = ctx.engines.paths().engines().join("python");
+    let mut candidates: Vec<(PathBuf, &'static str)> = Vec::new();
+
+    // 托管 Python 优先（固定 3.11，依赖一定能装上）
+    for rel in ["python.exe", "python", "bin/python.exe", "bin/python"] {
+        let p = managed.join(rel);
+        if p.is_file() {
+            candidates.push((p, "应用托管的 Python"));
+        }
+    }
+    // 系统 Python 兜底
+    if let Some(p) = ctx.engines.system_binary("python") {
+        candidates.push((p, "系统 Python"));
+    }
+    if candidates.is_empty() {
+        return Err(ToolforgeError::engine_missing("python").with_detail(
+            "抠图需要 Python 3.9~3.13（用来跑 ONNX Runtime）。\n\
+             请到「设置 → 引擎管理」安装「Python 运行时」（应用会装一个独立的 3.11，\
+             不会动你系统上的 Python）。"
+                .to_string(),
+        ));
+    }
+
+    let mut rejection: Option<String> = None;
+    for (path, source) in candidates {
+        match python_version(ctx, &path).await {
+            Some(v) if v >= ONNX_PY_MIN && v <= ONNX_PY_MAX => {
+                ctx.job.log(
+                    toolforge_core::job::LogLevel::Debug,
+                    format!(
+                        "抠图将使用{source}：{}（Python {}.{}）",
+                        path.display(),
+                        v.0,
+                        v.1
+                    ),
+                );
+                return Ok(path);
+            }
+            Some(v) => {
+                rejection = Some(format!(
+                    "{source} {} 是 Python {}.{}，超出了 onnxruntime 支持的区间",
+                    path.display(),
+                    v.0,
+                    v.1
+                ));
+            }
+            None => {
+                rejection = Some(format!("{source} {} 无法执行或读不出版本", path.display()));
+            }
+        }
+    }
+
+    Err(ToolforgeError::engine_missing("python").with_detail(format!(
+        "{}\n\n抠图需要 Python {}.{} ~ {}.{}。请到「设置 → 引擎管理」安装\
+         「Python 运行时」—— 应用会装一个独立的 3.11，不会动你系统上的 Python。",
+        rejection.unwrap_or_else(|| "没有找到可用的 Python".into()),
+        ONNX_PY_MIN.0,
+        ONNX_PY_MIN.1,
+        ONNX_PY_MAX.0,
+        ONNX_PY_MAX.1,
+    )))
+}
+
+/// 读出 Python 的 `(major, minor)`。
+async fn python_version(ctx: &NodeCtx, python: &Path) -> Option<(u32, u32)> {
+    let out = toolforge_process::exec(
+        ExecOptions::new(python)
+            .arg("--version")
+            .cancel(ctx.job.cancel.clone())
+            .timeout(Duration::from_secs(20))
+            .quiet(true),
+    )
+    .await
+    .ok()?;
+    let text = if out.stdout.trim().is_empty() {
+        out.stderr
+    } else {
+        out.stdout
+    };
+    // `Python 3.11.16`（stdout）或 `Python 3.11.16`（老版本走 stderr）
+    let ver = text.split_whitespace().find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    let mut it = ver.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// `image.strip-metadata`：清掉 EXIF / IPTC / XMP / ICC。
 async fn image_strip_metadata(
     ctx: &mut NodeCtx,
     args: &BTreeMap<String, String>,
@@ -2199,9 +2624,44 @@ mod tests {
 
     #[test]
     fn not_implemented_error_names_the_node() {
-        let e = not_implemented("image.remove-background");
-        assert!(e.message.contains("image.remove-background"));
+        // 用一个**当前确实未实现**的节点。这里原来写的是
+        // `image.remove-background` —— 它现在实现了，于是测试红了。
+        // 这是好事：说明"未实现名单"确实跟着代码在动。
+        // 挑 `doc.ocr` 是因为它短期内都要靠系统装 tesseract，最稳。
+        let e = not_implemented("doc.ocr");
+        assert!(e.message.contains("doc.ocr"));
         assert!(e.detail.unwrap().contains("ROADMAP"));
+    }
+
+    /// 未实现名单里的每个节点都**必须真的没有执行器** —— 否则界面会显示
+    /// "该能力尚未实现"，而实际上它已经能跑了。
+    ///
+    /// 反过来（实现了却忘了从名单里删）同样有害：用户会看到一个明明能用的能力
+    /// 被标成灰色。这个项目已经在 `flow.foreach` 上吃过一次亏，
+    /// 所以这里**走真实分发**来判定，而不是再抄一份名单。
+    ///
+    /// 判据是错误码：`not_implemented` 返回 `Internal`，而真实执行器即使因为
+    /// 缺参数/缺引擎失败，也不会返回 `Internal` —— 它们报的是
+    /// `PluginInvalid` / `EngineMissing` / `NotFound` 之类。
+    #[tokio::test]
+    async fn unimplemented_list_matches_the_dispatch_table() {
+        for node in toolforge_core::pipeline::UNIMPLEMENTED_NODES {
+            let (mut ctx, _q, _id) = test_ctx();
+            // 空参数：真实执行器会抱怨缺必填参数（但不是 Internal），
+            // 未实现节点则一律落到 `not_implemented`。
+            let err = run(&mut ctx, node, &BTreeMap::new()).await.unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::Internal,
+                "`{node}` 在未实现名单里，但 `run()` 已经有它的分支了 —— \
+                 请从 UNIMPLEMENTED_NODES 里删掉它（前端与文档会自动跟上）"
+            );
+            assert!(
+                err.message.contains("尚未") || err.message.contains(node),
+                "`{node}` 的未实现错误信息不明确：{}",
+                err.message
+            );
+        }
     }
 
     #[test]

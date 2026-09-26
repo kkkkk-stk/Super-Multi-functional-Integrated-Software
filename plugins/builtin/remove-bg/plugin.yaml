@@ -1,24 +1,31 @@
 # ToolForge L1 插件（声明式编排，零代码）
 #
-# ── 实现状态提醒 ─────────────────────────────────────────────────────────
-# `image.remove-background` 已登记在节点目录里（`pipeline.rs` 的 `builtin_nodes()`），
-# 声明了 `requiresEngines: [python, onnx-models]`，因此本清单能通过
-# `PluginManifest::validate()`；但它在 v0.1 的执行器里尚未实现
-# （`nodes.rs` 的 `run()` 会返回 not_implemented）。本示例用于固化清单形态。
+# ── 这个插件现在是**真的能抠图**（此前只是"固化清单形态"）─────────────
+# 它引用 `image.remove-background`，那个节点的执行器已经实现：
+# 走一条独立的 Python 环境跑 ONNX Runtime 推理（U²-Net / ISNet）。
+#
+# 第一次运行会有两步一次性准备，都会在任务日志里说明：
+#   1. 权重：到「设置 → 引擎管理 → 模型权重」里下 u2netp（4.4 MB）或 u2net（168 MB）；
+#   2. 运行时：自动建一个独立 venv 装 onnxruntime / numpy / pillow（约 30 MB）。
+# 之后每张图都是**本地推理**，不联网、不上传图片。
+#
+# 注意：它需要一个 3.9~3.13 的 Python（onnxruntime 还没有 3.14 的 wheel）。
+# 系统上只有 3.14 时，到「引擎管理 → Python 运行时」点「另外安装应用托管版本」——
+# 应用会装一个自己管理的 3.11，不会动系统上那一份。
 #
 # ── 关于「python / onnx-models 相关能力」─────────────────────────────────
 # 引擎依赖**不是** Capability，而是节点自己的 `requiresEngines`：
 # 缺失时宿主把该节点标记为不可用并提示安装，插件不需要为此申请任何权限。
-# 模型权重由宿主按需下载到 `<data_root>/models/`，插件自己不联网，
-# 所以这里**不申请** net 能力（申请了反而是多余的扩权）。
+# 也正因为推理发生在**宿主的节点里**（不是插件进程里），插件自己不联网、
+# 不碰 Python —— 所以这里**不申请** net / spawn 能力（申请了反而是多余的扩权）。
 apiVersion: toolforge/v1
 kind: Plugin
 
 metadata:
   id: com.toolforge.builtin.remove-bg
   name: 一键抠图
-  version: 0.1.0
-  description: ⚠️ 该能力尚未实现——AI 抠图去背景，输出透明背景 PNG，可选边缘羽化与背景色替换。依赖的执行器排在 v0.2。
+  version: 0.2.0
+  description: AI 抠图去背景（U²-Net / ISNet），输出透明背景 PNG，也可以换成纯色背景。本地推理、不联网。首次使用需要下载权重与 Python 依赖。
   author: ToolForge
   license: MIT
   icon: scissors
@@ -46,31 +53,53 @@ io:
       type: file
       required: false
   params:
-    # id 叫 `model`：与节点目录里该节点的参数 id 一致
+    # 参数 id 必须与节点目录里该节点的参数 id 逐字一致，
+    # 否则宿主读不到 → 静默用默认值（这是本项目踩过的坑之一）。
     - id: model
       label: 模型
       type: enum
-      description: 首次使用时会按需下载权重；BiRefNet 与 MODNet 的权重标注为不可商用。
-      default: { kind: str, value: u2net }
+      description: u2netp 只有 4.4 MB，建议先用它试效果；u2net / isnet-general 效果更好但约 170 MB。
+      # 默认给最轻的那个："先让它跑起来"比"一上来就要下 168 MB"重要得多
+      default: { kind: str, value: u2netp }
       options:
-        - { value: u2net, label: U²-Net（通用，176 MB） }
-        - { value: u2netp, label: U²-Net 轻量（快约 3 倍，5 MB） }
-        - { value: isnet-general, label: IS-Net General（复杂边缘更好，176 MB） }
-        - { value: birefnet-general, label: BiRefNet（发丝级，900 MB，权重不可商用） }
-        - { value: modnet-portrait, label: MODNet Portrait（人像专用，25 MB，权重不可商用） }
-      required: true
-      affectsOutput: true
-    - id: alphaMatting
-      label: 边缘羽化（发丝级）
-      type: bool
-      description: 开启后处理更慢，但头发等半透明边缘更自然。
-      default: { kind: bool, value: false }
+        - { value: u2netp, label: U²-Net 轻量（4.4 MB，最快） }
+        - { value: u2net, label: U²-Net（168 MB，效果均衡） }
+        - { value: isnet-general, label: IS-Net General（170 MB，复杂背景更稳） }
       required: false
-    - id: backgroundColor
-      label: 替换背景色
+      affectsOutput: true
+    - id: mode
+      label: 输出方式
+      type: enum
+      description: 「透明背景」输出带 alpha 的 PNG；「替换背景色」把主体贴到纯色底上。
+      default: { kind: str, value: alpha }
+      options:
+        - { value: alpha, label: 透明背景 PNG }
+        - { value: color, label: 替换背景色 }
+      required: false
+      affectsOutput: true
+    - id: background
+      label: 背景色
       type: color
-      description: 留空 = 输出透明背景 PNG。
-      default: { kind: str, value: "" }
+      description: 仅当「输出方式 = 替换背景色」时生效。
+      default: { kind: str, value: "#FFFFFF" }
+      required: false
+    - id: threshold
+      label: 蒙版阈值
+      type: int
+      description: 0 = 不卡阈值。调大能把残留的杂边清掉，但调太高会啃掉主体边缘。
+      default: { kind: int, value: 0 }
+      min: 0
+      max: 99
+      step: 1
+      required: false
+    - id: feather
+      label: 边缘羽化
+      type: int
+      description: 0 = 不羽化。模型在 320×320 上推理再放大回原尺寸，边缘会有轻微锯齿，羽化能抹平。
+      default: { kind: int, value: 0 }
+      min: 0
+      max: 50
+      step: 1
       required: false
 
 runtime:
@@ -78,7 +107,7 @@ runtime:
   pipeline:
     description: 单节点流水线：一次调用完成抠图。
     onError: fail
-    # 首次运行要下载模型 + 加载 ONNX 会话，给足 10 分钟。
+    # 首次运行可能要下依赖（onnxruntime 约 30 MB）+ 加载 ONNX 会话，给足 10 分钟。
     timeoutMs: 600000
     steps:
       - id: cutout
@@ -87,3 +116,8 @@ runtime:
         with:
           src: "${src}"
           dst: "${output.dst}"
+          model: "${params.model}"
+          mode: "${params.mode}"
+          background: "${params.background}"
+          threshold: "${params.threshold}"
+          feather: "${params.feather}"
