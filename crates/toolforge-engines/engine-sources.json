@@ -2,12 +2,12 @@
   {
     "id": "ffmpeg",
     "platform": "windows",
-    "url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
-    "sha256": null,
+    "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip",
+    "sha256": "db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec",
     "archive": "zip",
     "stripComponents": 1,
     "binSubdir": "bin",
-    "note": "gyan.dev 的 essentials 构建。注意该 URL 始终指向最新版，因此无法预置固定哈希；安装时必须由用户确认或由维护者改为版本固定的直链。该构建启用了 GPL 组件，闭源分发前请评估许可证。"
+    "note": "版本固定直链（8.1.2）。哈希取自 gyan.dev 随包发布的 ffmpeg-8.1.2-essentials_build.zip.sha256 —— 是上游自己的摘要，比自己下载计算更可信。注意 essentials 构建启用了 GPL 组件，闭源分发前请评估许可证。"
   },
   {
     "id": "ffmpeg",
@@ -17,7 +17,7 @@
     "archive": "tar.xz",
     "stripComponents": 1,
     "binSubdir": ".",
-    "note": "静态构建，无动态库依赖。URL 同样指向最新版。"
+    "note": "**哈希待回填**。johnvansickle 的该 URL 指向'最新版'，无法预置稳定哈希；改用版本固定直链（形如 ffmpeg-7.1-amd64-static.tar.xz）后应自行下载并回填 sha256。在此之前 Linux 上请走系统安装（apt/dnf 的 ffmpeg 包）。"
   },
   {
     "id": "ffmpeg",
@@ -27,86 +27,89 @@
     "archive": "zip",
     "stripComponents": 0,
     "binSubdir": ".",
-    "note": "evermeet.cx 的 macOS 构建。"
+    "note": "**哈希待回填**。evermeet.cx 的 getrelease 同样是滚动别名。macOS 上推荐直接用 `brew install ffmpeg`（系统安装模式）。"
   },
+
   {
-    "id": "pandoc",
+    "id": "libvips",
     "platform": "windows",
-    "url": "https://github.com/jgm/pandoc/releases/download/3.5/pandoc-3.5-windows-x86_64.zip",
-    "sha256": null,
+    "url": "https://github.com/libvips/build-win64-mxe/releases/download/v8.18.6/vips-dev-x64-web-8.18.6.zip",
+    "sha256": "10086f2ccc8e2a861831facabab75fa1b80b4bd03f0a8447623ec581002aa4b2",
     "archive": "zip",
     "stripComponents": 1,
-    "binSubdir": ".",
-    "note": "版本固定直链。升级时请同步更新 URL 并回填 sha256。"
+    "binSubdir": "bin",
+    "note": "源仓库是 **libvips/build-win64-mxe**（不是 libvips/libvips —— 后者的 release 里没有 Windows 资产，实测 404）。这里用 `-web` 变体而非 `-all`：web 版已包含 ToolForge 用得到的全部编解码器，体积只有一半。解压后必须保留 lib/ 与 share/，否则 vips 找不到依赖 DLL。"
   },
   {
-    "id": "pandoc",
-    "platform": "linux",
-    "url": "https://github.com/jgm/pandoc/releases/download/3.5/pandoc-3.5-linux-amd64.tar.gz",
+    "id": "libvips",
+    "platform": "macos",
+    "url": "https://github.com/libvips/libvips/releases/download/v8.18.6/vips-8.18.6-arm64-macos.tar.gz",
     "sha256": null,
     "archive": "tar.gz",
     "stripComponents": 1,
     "binSubdir": "bin",
-    "note": "版本固定直链。"
+    "note": "**未核对**（本机无法验证 macOS 资产名与哈希 —— 仓库里没有 macOS 产物）。macOS 上推荐 `brew install vips`。"
+  },
+
+  {
+    "id": "pandoc",
+    "platform": "windows",
+    "url": "https://github.com/jgm/pandoc/releases/download/3.11/pandoc-3.11-windows-x86_64.zip",
+    "sha256": "2ab72baf2399450e148ddf7a2a8689806c42e1bba71862b57e220fd9b8456d3d",
+    "archive": "zip",
+    "stripComponents": 1,
+    "binSubdir": ".",
+    "note": "版本固定直链（3.11，39.8 MB）。sha256 为实际下载后计算。升级时请同时替换版本号与哈希。"
+  },
+  {
+    "id": "pandoc",
+    "platform": "linux",
+    "url": "https://github.com/jgm/pandoc/releases/download/3.11/pandoc-3.11-linux-amd64.tar.gz",
+    "sha256": "37edb3bbcf722f921a009941bf5874e2e0c09263226c9b4a2d980788cb062ab6",
+    "archive": "tar.gz",
+    "stripComponents": 1,
+    "binSubdir": "bin",
+    "note": "版本固定直链（3.11，33.3 MB）。sha256 为实际下载后计算。"
   },
   {
     "id": "pandoc",
     "platform": "macos",
-    "url": "https://github.com/jgm/pandoc/releases/download/3.5/pandoc-3.5-arm64-macOS.pkg",
+    "url": "https://github.com/jgm/pandoc/releases/download/3.11/pandoc-3.11-arm64-macOS.pkg",
     "sha256": null,
     "archive": "raw",
     "stripComponents": 0,
     "binSubdir": ".",
-    "note": "macOS 官方只提供 pkg 安装包。建议改为 brew install pandoc（系统模式）。"
+    "note": "**不可用于自动安装**：macOS 官方只提供 .pkg 安装包，装它需要 root 且要写 /usr/local。macOS 上请用 `brew install pandoc`。该条目保留只是为了在 UI 上说明情况。"
   },
-  {
-    "id": "libvips",
-    "platform": "windows",
-    "url": "https://github.com/libvips/libvips/releases/download/v8.16.0/vips-dev-w64-web-8.16.0.zip",
-    "sha256": null,
-    "archive": "zip",
-    "stripComponents": 1,
-    "binSubdir": "bin",
-    "note": "vips-dev 预编译包（含全部依赖 DLL）。注意解压后目录里必须保留 lib/ 与 share/，否则 vips 找不到依赖。"
-  },
-  {
-    "id": "libvips",
-    "platform": "macos",
-    "url": "https://github.com/libvips/libvips/releases/download/v8.16.0/vips-8.16.0-arm64-macos.tar.gz",
-    "sha256": null,
-    "archive": "tar.gz",
-    "stripComponents": 1,
-    "binSubdir": "bin",
-    "note": "macOS 预编译包。"
-  },
+
   {
     "id": "python",
     "platform": "windows",
-    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250115/cpython-3.11.11+20250115-x86_64-pc-windows-msvc-install_only.tar.gz",
-    "sha256": null,
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.11.16%2B20260924-x86_64-pc-windows-msvc-install_only.tar.gz",
+    "sha256": "0dc3a404d4d6501f3b8f99d58354410a0b1699dd5c21070778a594db02070dd3",
     "archive": "tar.gz",
     "stripComponents": 1,
     "binSubdir": ".",
-    "note": "python-build-standalone 的独立运行时（install_only 变体），解压即用、不写注册表、不影响系统 Python。这是 L3 插件 pin 3.11 的关键 —— 不要用系统 Python。"
+    "note": "python-build-standalone 的 **install_only** 变体（3.11.16，46 MB 压缩 / 约 150 MB 解压）：解压即用、不写注册表、不影响系统 Python。这正是 L3 插件能 pin 3.11 的关键 —— 系统 Python 是 3.14，而 onnxruntime 没有 3.14 的 wheel。URL 里的 %2B 是 `+` 的转义，不要改成裸加号。"
   },
   {
     "id": "python",
     "platform": "linux",
-    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250115/cpython-3.11.11+20250115-x86_64-unknown-linux-gnu-install_only.tar.gz",
-    "sha256": null,
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.11.16%2B20260924-x86_64-unknown-linux-gnu-install_only.tar.gz",
+    "sha256": "49a52eb189878431a36efd137e7cd08f6429e59dc049b9cfb030bf706eb33fd4",
     "archive": "tar.gz",
     "stripComponents": 1,
     "binSubdir": "bin",
-    "note": "同上，Linux 版本。"
+    "note": "同上，Linux 变体。注意 binSubdir 是 `bin`（Windows 版的解释器在根目录）。"
   },
   {
     "id": "python",
     "platform": "macos",
-    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20250115/cpython-3.11.11+20250115-aarch64-apple-darwin-install_only.tar.gz",
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.11.16%2B20260924-aarch64-apple-darwin-install_only.tar.gz",
     "sha256": null,
     "archive": "tar.gz",
     "stripComponents": 1,
     "binSubdir": "bin",
-    "note": "同上，Apple Silicon 版本。Intel Mac 请把 aarch64 换成 x86_64。"
+    "note": "**未核对**（无 macOS 环境验证资产名与哈希）。Intel Mac 请把 aarch64 换成 x86_64。"
   }
 ]

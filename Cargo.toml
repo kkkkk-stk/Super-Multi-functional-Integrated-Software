@@ -33,7 +33,10 @@ tauri-plugin-opener = "2.5"
 
 # ---------- 类型桥（Rust -> TS 自动生成）----------
 # 注意：specta 2.x 目前仅有 RC 版本，tauri-specta 与 specta 必须严格同版。
-# 所有导出类型都收敛在 apps/desktop/src-tauri/src/bindings.rs，便于日后整体替换为 ts-rs。
+# 所有导出类型收敛在 apps/desktop/src-tauri/src/{ipc.rs, commands.rs}，
+# 由 lib.rs::specta_builder() 统一注册，产物是 **前端的**
+# apps/desktop/src/bindings.ts（不是 Rust 侧的 bindings.rs —— 那个文件不存在）。
+# 这样收敛是为了日后整体替换成 ts-rs 时改动面可控。
 specta = { version = "=2.0.0-rc.25", features = ["derive", "serde_json"] }
 specta-typescript = "0.0.12"
 tauri-specta = { version = "=2.0.0-rc.25", features = ["typescript"] }

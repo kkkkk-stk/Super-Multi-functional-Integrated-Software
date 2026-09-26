@@ -330,12 +330,24 @@ pnpm build          # tsc --noEmit && vite build
   - `image.rotate` 的任意角度分支**不是降级到 ImageMagick**，而是直接 `return Err(engine_missing("imagemagick"))`（`nodes.rs:588`）。
 - 也就是说：**「纯 Rust 打底 → libvips 加速 → ImageMagick 兜底」这条链路目前只有第一档存在**，后两档是声明而非实现。这必须写进验收标准，否则会被误认为已经可用。
 
-### 3. `engine-sources.json` 的 12 条下载源**全部没有 sha256**
+### 3. `engine-sources.json` 的下载源哈希 ✅ 已回填 6 条（Windows / Linux）
 
-- 实测：`engine-sources.json` 共 **12** 条（`ffmpeg`、`pandoc`、`libvips`、`7zip`、`python`；windows 5 / linux 3 / macos 4），其中 `sha256` **非空的为 0 条**。
-- 而 `EngineRegistry::install` 的设计是：`sha256` 为 `None` 时**直接拒绝下载**（`registry.rs` 顶部注释与实现一致，错误信息要求「维护者需要在 engine-sources.json 里补上 url 与 sha256」）。
-- **结论：校验机制（SHA-256 比对）已经写好且有测试，但在当前数据下任何引擎都无法安装。** 这不是 bug，是**数据未回填**，属于 v0.2 的前置工作。
-- 另注：`ffmpeg` 的 windows 条目备注写明「该 URL 始终指向最新版，因此无法预置固定哈希」，且「该构建启用了 GPL 组件，闭源分发前请评估许可证」——这与 v1.0 的 LGPL 合规目标直接冲突，需要更换构建源（见 v1.0）。
+- 原状：12 条来源的 `sha256` **全部为 `null`**，而 `EngineRegistry::install` 在缺哈希时**直接拒绝下载** —— 也就是说校验机制写好了，但**任何引擎都装不上**。
+- **现已回填 6 条**，且全部是**实际核对过**的（不是抄的）：
+
+  | 引擎 | 平台 | 版本 | 大小 | 哈希来源 |
+  |---|---|---|---|---|
+  | `ffmpeg` | windows | 8.1.2 essentials | 104.6 MB | gyan.dev 随包发布的 `.sha256` 旁挂文件 |
+  | `libvips` | windows | 8.18.6 (`build-win64-mxe`, x64-web) | 10.8 MB | 下载后自行计算 |
+  | `pandoc` | windows | 3.11 | 39.8 MB | 下载后自行计算 |
+  | `pandoc` | linux | 3.11 | 33.3 MB | 下载后自行计算 |
+  | `python` | windows | 3.11.16 (python-build-standalone) | 46.0 MB | 下载后自行计算 |
+  | `python` | linux | 3.11.16 (同上) | 46.6 MB | 下载后自行计算 |
+
+- **同时把所有可用 URL 改成版本固定直链**。原来 `ffmpeg` 用的是 `ffmpeg-release-essentials.zip`（滚动指向最新版）—— 那类 URL 上的哈希**必然失效**，表现为"昨天能装、今天全部失败"。`libvips` 的源仓库也从 `libvips/libvips` 改为 `libvips/build-win64-mxe`（前者的 release 里没有 Windows 资产，实测 404）。
+- **剩余未回填**：macOS 三条（无 macOS 环境核对）、`ffmpeg@linux`（上游 URL 是滚动别名）。这些条目 `sha256` 保持 `null`，`install` 会返回 `HashRequired` 而不是放行 —— 保守的默认值是刻意的。
+- 新增两条纪律测试：`every_declared_hash_is_a_wellformed_sha256`（长度/大小写/字符集）、`no_source_points_at_a_rolling_latest_alias`（禁止滚动别名配哈希）。
+- 另一条实测教训：回填后有个单元测试**开始真的下载 104 MB 的 FFmpeg**（它原本假设"所有哈希都是 null"所以 `install` 会立刻返回 `HashRequired`）。现已改为用临时来源文件构造缺哈希场景，与真实数据解耦 —— **测试不该有联网副作用**。
 
 ### 4. 许可证确认有数据、无强制
 

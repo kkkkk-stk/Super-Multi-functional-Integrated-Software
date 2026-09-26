@@ -65,7 +65,8 @@ EngineModel {
 
 另外有两点必须如实说明：
 
-- `crates/toolforge-engines/engine-sources.json` 是一个**独立于 `EngineModel` 的来源清单**（对应 `registry::EngineSourceSpec`）。它为 `ffmpeg` / `pandoc` / `libvips` / `python` 给出了候选下载 URL，但**其中每一条的 `sha256` 都是 `null`**；而 `registry.rs` 的文档注释明确规定「`sha256` 为 `None` 时 `EngineRegistry::install` 会**拒绝下载**」。也就是说这些 URL 目前只是候选，尚未成为可用的、经过校验的安装来源。
+- `crates/toolforge-engines/engine-sources.json` 是一个**独立于 `EngineModel` 的来源清单**（对应 `registry::EngineSourceSpec`）。
+  > ✅ **已回填 6 条**（Windows / Linux 的 `ffmpeg` / `libvips` / `pandoc` / `python`），每条都带**实际核对过的 SHA-256** 与**版本固定直链**；`registry.rs` 规定 `sha256` 为 `None` 时拒绝下载，所以 macOS 三条与 `ffmpeg@linux`（上游是滚动别名）目前仍**不可自动安装**，会返回 `HashRequired`。核对方式与实测版本表见 `docs/ROADMAP.md` §3。
   > **`7zip` 的条目已移除**（原先有，现已删除）：官方只提供安装器，或需要先有 7-Zip 才能解压的 `.7z`（先有鸡还是先有蛋），且那条版本固定直链 `7z2408-extra.7z` **实测 404**。因此 `7zip` 在 `engine_catalog()` 里已改为**仅系统安装**。本文档第 2、4 节的「体积」「安装方式」全部取自 `engine_catalog()`，不与 `engine-sources.json` 混用。
 - 本文档不给出任何版本号要求。`EngineDescriptor` 中只有 `license`、`licenseNote`、`approxSizeMb`、`platforms`、`installModes` 等字段，**没有最低版本字段**。`EngineState::Outdated`（版本过旧）只是一个运行时枚举值，其最低版本判定标准在代码中尚未定义，属于**待定**。
 
@@ -90,8 +91,8 @@ EngineModel {
 
 | 引擎 id | 名称 | 中文说明 | 许可证 | 许可证注意事项 | 体积 | 安装方式 | 提供的节点 | 平台支持 | 需要用户确认许可证 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `ffmpeg` | FFmpeg（核心引擎） | 音视频转码、剪辑、抽帧、提取音轨的万能工具。 | `LGPL-2.1+ / GPL-2.0+（取决于编译选项）` | 官方构建常启用 GPL 组件。若你的产品闭源分发，请选用 LGPL 构建或自行编译。 | 约 90 MB | 仅探测系统已安装；应用按需下载 | `video.transcode`<br>`video.trim`<br>`video.thumbnail`<br>`video.extract-audio`<br>`video.compress`<br>`audio.convert`<br>`audio.normalize` | Windows / macOS / Linux | 是 |
-| `libvips` | libvips | 低内存、流式的大图处理库。批量处理上千张图时比逐个解码快数倍。 | `LGPL-2.1` | 以动态库方式调用即可满足 LGPL 要求，无需开源你的代码。 | 约 35 MB | 仅探测系统已安装；应用按需下载 | `image.convert`<br>`image.resize`<br>`image.enhance`<br>`image.strip-metadata` | Windows / macOS / Linux | 否 |
+| `ffmpeg` | FFmpeg（核心引擎） | 音视频转码、剪辑、抽帧、提取音轨的万能工具。 | `LGPL-2.1+ / GPL-2.0+（取决于编译选项）` | 官方构建常启用 GPL 组件。若你的产品闭源分发，请选用 LGPL 构建或自行编译。 | 约 105 MB（8.1.2 essentials 实测 104.6 MB） | 仅探测系统已安装；应用按需下载 | `video.transcode`<br>`video.trim`<br>`video.thumbnail`<br>`video.extract-audio`<br>`video.compress`<br>`audio.convert`<br>`audio.normalize` | Windows / macOS / Linux | 是 |
+| `libvips` | libvips | 低内存、流式的大图处理库。批量处理上千张图时比逐个解码快数倍。 | `LGPL-2.1` | 以动态库方式调用即可满足 LGPL 要求，无需开源你的代码。 | 约 30 MB（8.18.6 x64-web 压缩包实测 10.8 MB） | 仅探测系统已安装；应用按需下载 | `image.convert`<br>`image.resize`<br>`image.enhance`<br>`image.strip-metadata` | Windows / macOS / Linux | 否 |
 | `imagemagick` | ImageMagick | 格式覆盖最全的图像处理工具集，作为 libvips 的兜底。 | `ImageMagick License（Apache-2.0 风格）` | 本体宽松，但若链接了 GPL 组件（如部分 delegate）会传染，分发前需确认构建配置。 | 约 60 MB | 仅探测系统已安装；应用按需下载 | `image.convert`<br>`image.resize`<br>`image.crop`<br>`image.rotate`<br>`image.strip-metadata` | Windows / macOS / Linux | 否 |
 | `pandoc` | Pandoc（核心引擎） | 文档格式转换的瑞士军刀：Markdown / HTML / DOCX / EPUB / LaTeX 互转。 | `GPL-2.0+` | 以独立进程调用不构成衍生作品，可随闭源应用分发；但不得静态链接进你的二进制。 | 约 40 MB | 仅探测系统已安装；应用按需下载 | `doc.convert`<br>`ebook.convert` | Windows / macOS / Linux | 是 |
 | `libreoffice` | LibreOffice (headless) | Office 文档转 PDF 的事实标准。冷启动 2~5 秒，ToolForge 会复用常驻进程。 | `MPL-2.0` | MPL 是文件级 copyleft，独立进程调用无传染风险。 | 约 420 MB | 仅探测系统已安装 | `doc.to-pdf` | Windows / macOS / Linux | 是 |
@@ -394,7 +395,8 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 ### 6.5 模型下载地址与 SHA-256 全部缺失
 
 - 见第 1.3 节：`engine_catalog()` 中 6 个模型的 `url` 与 `sha256` 全部为 `None`。
-- 另外 `crates/toolforge-engines/engine-sources.json` 中 5 个引擎的候选 URL 虽然存在，但**每条 `sha256` 均为 `null`**，而 `registry.rs` 规定 `sha256` 为 `None` 时拒绝下载。因此现阶段**没有任何一个引擎或模型具备可用的、带校验的自动安装来源**。
+- ~~另外 `engine-sources.json` 中 5 个引擎的候选 URL 虽然存在，但**每条 `sha256` 均为 `null`**，因此没有任何一个引擎具备可用的自动安装来源。~~
+  > ✅ **已修正**：`engine-sources.json` 已回填 **6 条**带真实核对哈希 + 版本固定直链的来源（`ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux`）。因此 Windows 与 Linux 上的这 4 个引擎**现在可以自动安装**。**模型权重**（`onnx-models`）仍全部为 `null` —— 而依赖它们的节点执行器也还没实现，v0.1 不需要。详见 `docs/ROADMAP.md` §3。
 - 处理方式：**待补齐**。这也是「引擎层规格说明」与「待实现清单」双重定位的核心一项。
 
 ### 6.6 `nodes.rs` 的模块文档表与实际实现不一致：`archive.*` 的「系统 tar」兜底并不存在
@@ -433,7 +435,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 | `crates/toolforge-engines/src/lib.rs` | 引擎层的职责划分与图像域三层降级设计的说明；`MANAGED_LAYOUT`、`version_args()` |
 | `crates/toolforge-engines/src/registry.rs` | 引擎探测 / 下载 / 校验的实现；`EngineSourceSpec`、`ModelSpec`、`EngineRegistry`（含「`sha256` 为 `None` 时拒绝下载」的规则） |
 | `crates/toolforge-engines/src/nodes.rs` | 节点执行实现（1464 行）：`run()` 分发已实现 25 个节点；模块文档自带一张降级表，但与实现存在出入，见第 6.6、6.7 节 |
-| `crates/toolforge-engines/engine-sources.json` | 候选下载来源清单（**所有 `sha256` 均为 `null`**，当前不可用于自动安装），见第 1.3 与 6.5 节 |
+| `crates/toolforge-engines/engine-sources.json` | 下载来源清单：**6 条已回填真实哈希 + 版本固定直链**（Windows/Linux 的 ffmpeg/libvips/pandoc/python），macOS 三条与 `ffmpeg@linux` 仍为 `null`（安装时返回 `HashRequired`）。见第 1.3 与 6.5 节 |
 | `crates/toolforge-process/` | 外部进程调用（执行、RPC、进程监管），是引擎被真正调用的下层 |
 | `docs/ROADMAP.md` | `nodes.rs` 的 `not_implemented()` 错误提示所指向的实现进度文档（本文档未引用其内容，也不与其重复记录进度） |
 | `Cargo.toml`（根） | workspace 成员与依赖声明，见第 1.2 与 6.8 节 |

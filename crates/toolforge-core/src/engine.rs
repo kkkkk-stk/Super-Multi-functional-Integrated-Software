@@ -231,7 +231,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             homepage: "https://ffmpeg.org/".into(),
             license: "LGPL-2.1+ / GPL-2.0+（取决于编译选项）".into(),
             license_note: "官方构建常启用 GPL 组件。若你的产品闭源分发，请选用 LGPL 构建或自行编译。".into(),
-            approx_size_mb: 90,
+            approx_size_mb: 105,
             core: true,
             provides: vec![
                 "video.transcode".into(),
@@ -254,7 +254,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             homepage: "https://www.libvips.org/".into(),
             license: "LGPL-2.1".into(),
             license_note: "以动态库方式调用即可满足 LGPL 要求，无需开源你的代码。".into(),
-            approx_size_mb: 35,
+            approx_size_mb: 30,
             core: false,
             provides: vec![
                 "image.convert".into(),

@@ -323,10 +323,17 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
 1. **`specta 2.0.0-rc.25` 是预发布版**。`specta` 的稳定版还停在 1.x，而 Tauri 2 需要 2.x。
    所有导出类型都收敛在 `apps/desktop/src-tauri/src/{ipc.rs, commands.rs}`，
    一旦 RC 破坏兼容，换成 `ts-rs` 的改动面被刻意限制在这两个文件里。
-2. **引擎下载源默认没有 SHA-256**。`engine-sources.json` 里所有 `sha256` 都是 `null`，
-   因为那些 URL 指向"最新版"、哈希会随版本变化。`EngineRegistry::install` 在这种情况下
-   **拒绝自动安装**，除非调用方显式传 `allow_unverified = true` 且用户在 UI 上二次确认。
-   维护者应改为版本固定直链并回填哈希。
+2. **引擎下载源已回填 6 条，但只覆盖 Windows 与 Linux**。
+   `engine-sources.json` 里 `ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、
+   `python@windows/linux` 六条已带**真实核对过的 SHA-256**（ffmpeg 取自 gyan.dev 随包发布的
+   `.sha256` 旁挂文件，其余为自己流式下载后计算），并且 URL 全部改成**版本固定直链**——
+   滚动别名（如 `ffmpeg-release-essentials.zip`）会在上游发新版时让哈希失效。
+   **macOS 的三条仍为 `null`**：没有 macOS 环境可核对，`install` 会返回 `HashRequired`
+   而不是放行。macOS 用户应走 Homebrew（系统安装模式）。
+   在哈希为 `null` 时，`EngineRegistry::install` **拒绝自动安装**，除非调用方显式传
+   `allow_unverified = true` 且用户在 UI 上二次确认。
+   > 单元测试 `no_source_points_at_a_rolling_latest_alias` 与
+   > `every_declared_hash_is_a_wellformed_sha256` 守着这两条纪律。
 3. **模型权重不随包分发**。U²-Net 是 Apache-2.0 可商用，MODNet / BiRefNet 的**权重**许可不同，
    首次使用时会下载并单独确认许可证。
 4. **`--stripComponents` / 解压依赖系统 `tar`**。Windows 10 1803+ 自带 bsdtar；

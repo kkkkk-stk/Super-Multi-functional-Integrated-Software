@@ -62,8 +62,30 @@ pub const ENGINE_BINARIES: &[(&str, &[&str])] = &[
 // 下载来源描述
 // ============================================================================
 
-/// 引擎的下载来源。**这是需要维护者按平台补全的数据**，
-/// 默认随包分发的 `engine-sources.json` 里哈希一律为 `null`。
+/// 引擎的下载来源。
+///
+/// # 维护 `engine-sources.json` 的三条纪律
+///
+/// 1. **`sha256` 只能是自己算出来或从上游旁挂文件读来的**，不要抄网上的。
+///    抄来的哈希无法验证；错了的后果是所有用户下载失败，更糟的是"校验通过了一份
+///    被替换的文件"。本仓库当前的做法：ffmpeg 取自 gyan.dev 随包发布的
+///    `.sha256` 旁挂文件（那是上游自己的摘要，比自己算更可信），其余是自己流式
+///    下载后计算的 SHA-256。
+/// 2. **URL 必须指向版本固定直链**，不能是 `/latest` 之类的滚动别名 ——
+///    上游一发新版哈希就失效，表现为"昨天还能装、今天全部失败"。
+///    `ffmpeg-release-essentials.zip` 就属于这类，已换成
+///    `packages/ffmpeg-8.1.2-essentials_build.zip`。
+/// 3. **未核对的条目不编造哈希**，`sha256` 留 `null` 并在 `note` 里说明原因。
+///    [`EngineRegistry::install`] 会对它们返回
+///    [`EngineInstallOutcome::HashRequired`] 而不是放行 —— 这是刻意的安全默认值。
+///
+/// 验证过的可用条目（2026-09 实测）：`ffmpeg`@windows、`libvips`@windows、
+/// `pandoc`@windows/linux、`python`@windows/linux。macOS 的三条都留了 `null`，
+/// 因为仓库里没有 macOS 环境可以核对；macOS 用户应走 Homebrew（系统安装模式）。
+///
+/// 注意：该文件反序列化成 `Vec<Self>`，**不能放注释用的对象**（缺必填字段会让
+/// 整个文件解析失败，而 [Self] 的加载是 `if let Ok(..)`，会静默退化成"零个来源"）。
+/// 单元测试 `builtin_sources_parse` 守着这一点。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineSourceSpec {
@@ -1011,6 +1033,57 @@ mod tests {
     }
 
     #[test]
+    fn every_declared_hash_is_a_wellformed_sha256() {
+        // 哈希写错一个字符 = 所有用户下载失败。这条测试不验证哈希"对不对"
+        // （那需要联网重算），但能挡住长度错误、大写、带 `sha256:` 前缀、
+        // 或者不小心粘贴了半截这类低级错误。
+        let list: Vec<EngineSourceSpec> = serde_json::from_str(BUILTIN_SOURCES)
+            .expect("engine-sources.json 必须是合法的 EngineSourceSpec 数组");
+        let mut verified = 0;
+        for s in &list {
+            let Some(raw) = &s.sha256 else { continue };
+            let h = s.expected_hash().expect("sha256 字段存在时应当能规范化");
+            assert_eq!(h.len(), 64, "{}@{} 的 sha256 长度不是 64：{h}", s.id, s.platform);
+            assert!(
+                h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{}@{} 的 sha256 含非法字符或大写：{h}",
+                s.id,
+                s.platform
+            );
+            assert!(raw.is_empty() == false);
+            verified += 1;
+        }
+        // 目前应当至少有 6 条已核对（ffmpeg/libvips Windows、pandoc 两平台、python 两平台）。
+        // 这个数字下降说明有人把哈希删了，需要解释原因。
+        assert!(
+            verified >= 6,
+            "已核对的下载源只剩 {verified} 条 —— 是不是误删了 sha256？"
+        );
+    }
+
+    #[test]
+    fn no_source_points_at_a_rolling_latest_alias() {
+        // 指向 'latest' 的 URL 会让哈希在上游发新版后立刻失效
+        let list: Vec<EngineSourceSpec> = serde_json::from_str(BUILTIN_SOURCES).unwrap();
+        for s in &list {
+            if s.sha256.is_none() {
+                continue; // 没有哈希的条目本来就不参与安装
+            }
+            let u = s.url.to_ascii_lowercase();
+            assert!(
+                !u.contains("release-essentials.zip")
+                    && !u.contains("/latest")
+                    && !u.contains("getrelease")
+                    && !u.contains("/releases/latest/download"),
+                "{}@{} 指向了滚动别名，哈希会失效：{}",
+                s.id,
+                s.platform,
+                s.url
+            );
+        }
+    }
+
+    #[test]
     fn every_download_mode_engine_has_a_source_entry_or_is_explicitly_absent() {
         // 允许缺失（会在安装时给出 NotConfigured），但不能有语法错误
         let list: Vec<EngineSourceSpec> = serde_json::from_str(BUILTIN_SOURCES).unwrap();
@@ -1054,21 +1127,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_without_hash_is_refused() {
+    async fn install_refuses_unhashed_source_without_explicit_consent() {
+        // ⚠️ 这个测试**绝不能触发真实下载**。
+        //
+        // 它最初写成"直接对 ffmpeg 调 install，期望拿到 HashRequired" —— 那在
+        // `engine-sources.json` 里所有 sha256 都是 null 时成立。后来我们回填了
+        // ffmpeg 的真实哈希，于是这个测试开始**默默下载 104 MB 的 FFmpeg**。
+        //
+        // 现在改成用临时来源文件把 libvips 的哈希置空，与真实数据解耦：
+        // 既不会联网，也不会因为数据更新而失效。
         let tmp = std::env::temp_dir().join("tf-engine-test-nohash");
-        let reg = EngineRegistry::new(AppPaths::new(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let paths = AppPaths::new(&tmp);
+        paths.ensure_all().unwrap();
+
+        let platform = EngineSourceSpec::platform_key();
+        let sources_file = tmp.join("sources.json");
+        std::fs::write(
+            &sources_file,
+            serde_json::json!([{
+                "id": "libvips",
+                "platform": platform,
+                "url": "https://example.invalid/vips.zip",
+                "sha256": serde_json::Value::Null,
+                "archive": "zip",
+                "stripComponents": 1
+            }])
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut reg = EngineRegistry::new(paths);
+        assert_eq!(reg.load_sources_file(&sources_file).unwrap(), 1);
+
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
         let q = toolforge_core::queue::JobQueue::new(1, tx);
-        let ctx = q.create(toolforge_core::job::JobKind::EngineInstall {
-            engine_id: "ffmpeg".into(),
-        }, "test", 0);
-        let out = reg.install("ffmpeg", &ctx, false).await.unwrap();
-        // 要么已可用（本机装了），要么要求哈希/未配置
-        match out {
+        let ctx = q.create(
+            toolforge_core::job::JobKind::EngineInstall {
+                engine_id: "libvips".into(),
+            },
+            "test",
+            0,
+        );
+
+        match reg.install("libvips", &ctx, false).await.unwrap() {
+            // 本机装了 libvips 的话会走这条 —— 那也是正确行为
             EngineInstallOutcome::AlreadyAvailable { .. } => {}
-            EngineInstallOutcome::HashRequired { .. } => {}
-            EngineInstallOutcome::NotConfigured { .. } => {}
-            other => panic!("意外的安装结果：{other:?}"),
+            EngineInstallOutcome::HashRequired { reason } => {
+                assert!(reason.contains("SHA-256"), "提示应当说清楚缺什么：{reason}");
+            }
+            other => panic!("缺哈希时必须拒绝安装，实际得到：{other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn system_only_engine_reports_not_configured_instead_of_downloading() {
+        // libreoffice 在目录里是 System-only：install 必须**明确拒绝**并给出
+        // 手动安装指引，而不是去找一个不存在的下载源、也不是静默成功。
+        let tmp = std::env::temp_dir().join("tf-engine-test-systemonly");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let paths = AppPaths::new(&tmp);
+        paths.ensure_all().unwrap();
+        let reg = EngineRegistry::new(paths);
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let q = toolforge_core::queue::JobQueue::new(1, tx);
+        let ctx = q.create(
+            toolforge_core::job::JobKind::EngineInstall {
+                engine_id: "libreoffice".into(),
+            },
+            "test",
+            0,
+        );
+
+        match reg.install("libreoffice", &ctx, false).await.unwrap() {
+            EngineInstallOutcome::AlreadyAvailable { .. } => {}
+            EngineInstallOutcome::NotConfigured { reason } => {
+                assert!(
+                    reason.contains("系统安装") || reason.contains("手动"),
+                    "应当给出可操作的手动安装指引：{reason}"
+                );
+            }
+            other => panic!("System-only 引擎不该走下载路径：{other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

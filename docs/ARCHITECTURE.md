@@ -31,13 +31,13 @@ Rust 工作区：
 | `crates/toolforge-plugins/` | ✅ | `audit.rs` `l1.rs` `store.rs` `runtimes.rs` `runtimes/wasm.rs` `runtimes/python.rs` |
 | `crates/toolforge-ai/` | ✅ | `lib.rs` `provider.rs` `review.rs` |
 | `apps/desktop/src-tauri/` | ✅ | `Cargo.toml` `build.rs` `tauri.conf.json` `capabilities/default.json` `src/{lib,main,commands,ipc,state}.rs` `src/bin/export_bindings.rs` |
-| `apps/desktop/src/` | ⛔ | **不存在**。React 前端、`package.json`、`dist/`、`bindings.ts` 全部缺失（详见 4.11） |
+| `apps/desktop/src/` | ✅ | React 18 + TS + Vite 5 前端（92 个文件）：`lib/ipc.ts`（唯一 IPC 出口）、`types/domain.ts`（别名层）、`stores/`、`hooks/`、`components/`、`features/`；`bindings.ts` 由 specta 生成并入库 |
 | `plugins/builtin/*/plugin.yaml` | ✅ | `batch-rename` `image-convert` `remove-bg` `video-to-gif` 四个 L1 示例 |
 | `plugins/wasm-example/` | ✅ | L2 示例（`Cargo.toml` + `plugin.yaml` + `src/lib.rs`） |
 | `plugins/python-example/plugin.yaml` | ✅ | L3 示例清单 |
-| `scripts/` | ✅ | `enginectl.mjs` `gen-icon.mjs` `env.ps1` |
-| `docs/` | 🚧 | 本次核对前只有 `ENGINE-MATRIX.md` `ROADMAP.md` `SECURITY.md`；**`PLUGIN-SDK.md` 缺失**（README 引用了它） |
-| `.github/workflows/` | ⛔ | **不存在**（README 的目录树画了它） |
+| `scripts/` | ✅ | `enginectl.mjs` `gen-icon.mjs` `ensure-dist.mjs` `env.ps1` |
+| `docs/` | ✅ | `ARCHITECTURE.md` `PLUGIN-SDK.md` `SECURITY.md` `ENGINE-MATRIX.md` `ROADMAP.md` 五篇齐备 |
+| `.github/workflows/` | ✅ | `ci.yml`：rust（三平台矩阵）/ web / bindings 漂移检查 / 许可证清单一致性 |
 | `engines/` | ✅ | 仅 `.downloads`（下载缓存目录），无引擎二进制 |
 
 版本锁定（`Cargo.toml` 的 `[workspace.dependencies]`）：tauri `2.11`、specta `=2.0.0-rc.25`、tauri-specta `=2.0.0-rc.25`、specta-typescript `0.0.12`、extism `1.30`、reqwest `0.12`、image `0.25`、tokio `1`。
@@ -64,8 +64,8 @@ Rust 工作区：
 
 ```mermaid
 flowchart TD
-    FE["apps/desktop/src<br/>React 前端<br/>⛔ 目录尚不存在"]
-    BIND["apps/desktop/src/bindings.ts<br/>specta 生成的 TS 类型<br/>⛔ 尚未生成"]
+    FE["apps/desktop/src<br/>React 18 + TS + Vite 5<br/>✅ 92 个文件"]
+    BIND["apps/desktop/src/bindings.ts<br/>specta 生成的 TS 类型<br/>✅ 已生成（29 命令）"]
 
     subgraph Shell["Tauri 外壳 · crate toolforge / lib toolforge_lib"]
         CMD["commands.rs<br/>28 个 tauri::command"]
@@ -151,8 +151,8 @@ flowchart TD
 
 **图注**
 
-- **`apps/desktop/src`（React 前端）不存在**，所以「前端 → invoke」和「`listen` → 前端」两条边是虚线。外壳侧（`commands.rs` / `spawn_event_bridge`）已经就位，缺的只是调用方。
-- **`bindings.ts` 不存在**。`lib.rs` 在 `#[cfg(debug_assertions)]` 下会尝试导出它，`src/bin/export_bindings.rs` 提供无 GUI 的导出入口，但当前工作区里没有生成产物。
+- **`apps/desktop/src`（React 前端）已落地**（92 个文件），「前端 → `invoke`」与「`listen` → 前端」两条边都已接通。唯一的纪律是：**只有 `lib/ipc.ts` 允许接触 `bindings` / `invoke`**，其它 91 个文件一律从它导入具名函数。
+- **`bindings.ts` 已生成并入库**（29 个命令，1621 行）。两个生成入口：调试构建时 `lib.rs` 自动导出；无 GUI 环境用 `cargo run -p toolforge --bin export-bindings`（即 `pnpm bindings`）。CI 有一个专门的 job 校验它没有漂移。
 - **L1 不是进程也不是沙箱**：它是 `toolforge-plugins::l1::run_pipeline` 在宿主进程内解释一段数据。图中把它与 L2/L3 并列，是为了对齐三级运行时的概念模型；实现上 L1 **没有**独立的运行时实体。
 - `NET` 节点代表 `toolforge-engines` 与 `toolforge-ai` 各自对 `reqwest` 的依赖。**领域层没有这条边**（`toolforge-core` 不依赖 `reqwest`）。
 - `ENGINES --> PROC` 表示 `nodes.rs` 通过 `toolforge-process::exec` 起子进程，而不是自己 `Command::new`。
@@ -163,12 +163,11 @@ flowchart TD
 
 ```text
  ┌───────────────────────────────────────────────────────────────────────────┐
- │  apps/desktop/src                       React + TS + Vite                 │
- │  ⛔ 目录不存在 —— 没有前端代码、没有 package.json、没有 dist/、没有         │
- │     bindings.ts。package.json 的 dev/build/typecheck 脚本全部指向它。      │
+ │  apps/desktop/src                       React 18 + TS + Vite 5            │
+ │  ✅ 92 个文件；唯一 IPC 出口 = lib/ipc.ts（29 个具名函数包住全部命令）      │
+ │  types/domain.ts 是 bindings.ts 的别名层，不重复定义任何结构               │
  └──────────────────────────────────┬────────────────────────────────────────┘
-                                    ┆ invoke / listen
-                                    ┆ （⛔ 无调用方；外壳侧已就绪）
+                                    ┆ invoke / listen（已接通）
  ┌──────────────────────────────────▼────────────────────────────────────────┐
  │  apps/desktop/src-tauri            Cargo package = toolforge               │
  │                                    lib name     = toolforge_lib            │
@@ -655,8 +654,8 @@ std::fs::create_dir_all(&workspace).ok();
 8. 🚧 **`jobs_retry` 命令不存在**。`JobQueue::retry` / `set_retry` 在领域层存在且有单测（`retry_requires_registered_closure`），但 `COMMAND_NAMES` 里没有 `jobs_retry`，且 `commands.rs::plugins_run` 从不调用 `set_retry`。所以「重试」这条路径目前从 UI 不可达。`JobKind::is_retryable()` 的注释解释了为什么 `AiGenerate` 与 `EngineInstall` **不该**可重试（"会产生副作用/重复扣费"）。
 9. 🚧 **`settings_patch` 改 `concurrency` 不影响已建的队列**（见步骤 5）。
 10. 🚧 **打包后内置插件可能加载不到**。`lib.rs::resolve_builtin_plugins` 先找 `app.path().resource_dir()/plugins/builtin`，找不到再回退到 `CARGO_MANIFEST_DIR/../../../plugins/builtin`（开发态路径）。而 `tauri.conf.json` 的 `bundle.resources` 是**空数组**，`bundle.externalBin` 也是空的。所以打包产物里是否包含 `plugins/builtin`，代码与配置里都没有给出保证。**待定**。
-11. 🚧 **引擎下载源全部没有哈希**。`crates/toolforge-engines/engine-sources.json` 里每一项的 `sha256` 都是 `null`；`registry.rs` 的字段注释写「为 `None` 时禁止自动安装」，`EngineRegistry::install` 在缺哈希时返回 `EngineInstallOutcome::HashRequired`（由 `commands.rs::engines_install` 映射成 `ErrorCode::IntegrityCheckFailed`），除非调用方显式传 `allow_unverified = true`。README 的「已知风险」第 2 条也承认了这点。→ 🚧 有意为之的保守行为，不是缺陷。
-12. 🚧 **模型权重下载未落地**。`engine.rs::EngineModel` 的 `url` 与 `sha256` 在 `engine_catalog()` 里**全部是 `None`**，`installed: false`。`EngineRegistry::install_model` 存在，但没有对应 IPC 命令（`COMMAND_NAMES` 里没有 `models_*`）。
+11. ✅ **引擎下载源已回填 6 条**（此前每一项的 `sha256` 都是 `null`，导致任何引擎都装不上）。现在 `ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux` 都带**实际核对过的哈希 + 版本固定直链**；macOS 三条与 `ffmpeg@linux` 仍为 `null`，`install` 对它们返回 `EngineInstallOutcome::HashRequired`（由 `commands.rs::engines_install` 映射成 `ErrorCode::IntegrityCheckFailed`）。`allow_unverified = true` 时才会走未校验路径。详见 README「已知风险」第 2 条与 `docs/ROADMAP.md` §3。
+12. 🚧 **模型权重下载未落地**。`engine.rs::EngineModel` 的 `url` 与 `sha256` 在 `engine_catalog()` 里**全部是 `None`**，`installed: false`。`EngineRegistry::install_model` 存在，但没有对应 IPC 命令（`COMMAND_NAMES` 里没有 `models_*`）。**v0.1 不需要它**：依赖模型的节点（`image.remove-background` / `ai.upscale`）执行器本身也还没实现。
 
 ---
 
