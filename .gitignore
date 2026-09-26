@@ -1,0 +1,63 @@
+# ---- 构建产物 ----
+build/
+dist/
+out/
+target/
+*.exe
+*.dll
+*.so
+*.dylib
+*.msi
+*.app
+
+# ---- 依赖目录 ----
+node_modules/
+vendor/
+packages/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- IDE / 编辑器 ----
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- 操作系统 ----
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ---- 日志与临时文件 ----
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+
+# ---- 密钥与本地配置（重要：绝不提交）----
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+secrets.*
+config.local.*
+
+# ---- 本地工具与缓存 ----
+.tools/
+.cache/
+*.cache
