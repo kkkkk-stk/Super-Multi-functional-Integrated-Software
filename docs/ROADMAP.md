@@ -33,7 +33,28 @@
 
 ## 当前状态速览
 
-> 快照时间：**2026-09-26 10:07**。下表为一次性观察结果，仓库可能已被继续改动。
+> ⚠️ **下面这几节是 2026-09-26 10:07 的原始快照，已经大面积过时** ——
+> 它说 `Cargo.lock` 不存在、前端"完全不存在"、`toolforge-core` 无法编译、
+> `bindings.rs` 缺失等等，**这些现在都不成立**。
+>
+> 之所以留着而不是删掉：它是"骨架刚搭完"那一刻的真实记录，
+> 后面的每一条修复都能在这里找到对照。**但要判断现在的状态，请用下面这份。**
+>
+> **当前（本文件末尾的「基线」一节有可复核的命令与输出）：**
+>
+> | 项 | 现在的值 |
+> | --- | --- |
+> | 编译 | `cargo check --workspace --all-targets` **0 error / 0 warning** |
+> | 测试 | `cargo test --workspace` **217 passed / 0 failed** |
+> | 前端 | `apps/desktop/src` 下有 93 个文件；`tsc --noEmit` 0 错误、`vite build` 通过 |
+> | `Cargo.lock` | **已存在并入库** |
+> | IPC 命令 | **32 个**（`COMMAND_NAMES` 与生成的 `bindings.ts` 逐条对齐，由 `export_bindings` 守卫） |
+> | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
+> | 内置示例插件 | **7 个** |
+> | 引擎下载源 | `engine-sources.json` 共 **12 条**（5 个引擎 × 各平台），其中 **7 条**的 SHA-256 是真实下载后核对过的；其余 5 条 `sha256: null`，`install` 会对它们返回 `HashRequired` 而**不放行** |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **69 项全通过** |
+>
+> 下面这段原始快照保留原样，**不要据此判断现状**：
 
 ### Cargo workspace
 

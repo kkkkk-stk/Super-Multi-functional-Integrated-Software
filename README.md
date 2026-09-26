@@ -3,7 +3,7 @@
 > 一个**插件驱动**的集成式多功能工具箱 —— 格式转换、抠图去背景、图像增强、批量重命名、可视化流水线编排，全部收在一个界面里。
 > 任何新功能都能以**插件**形式接入，不改主程序一行代码。
 
-[![Status](https://img.shields.io/badge/status-骨架已就绪-orange.svg)](#-项目状态)
+[![Status](https://img.shields.io/badge/status-32%2F32%20节点可用-green.svg)](#-功能规划)
 [![Rust](https://img.shields.io/badge/rust-1.82%2B-dea584.svg?logo=rust)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/tauri-2.11-24C8DB.svg?logo=tauri)](https://v2.tauri.app/)
 [![React](https://img.shields.io/badge/react-18.3-61DAFB.svg?logo=react)](https://react.dev/)
