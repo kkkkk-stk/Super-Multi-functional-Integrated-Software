@@ -210,10 +210,32 @@ pnpm typecheck        # 前端类型检查（tsc --noEmit）
 pnpm build            # 前端产物（tsc + vite build）
 pnpm check:rust       # cargo check --workspace --all-targets
 pnpm check:all        # 两者都跑
-pnpm bindings         # 重新生成 apps/desktop/src/bindings.ts
+pnpm bindings         # 重新生成 apps/desktop/src/bindings.ts（含 4 项守卫）
 pnpm engines:list     # 查看引擎目录
 pnpm engines:install  # 交互式安装引擎（本地开发用）
 ```
+
+### 真机验证（补上自动化测试覆盖不到的那一层）
+
+> 本项目在 `cargo check` / 194 个单元测试 / `tsc` / `vite build` **全绿**的情况下，
+> 真机跑一次仍然找出了 **3 个发布级缺陷**。共同点是"组件各自正确，连起来不对"。
+
+两个终端：
+
+```powershell
+# 终端 1：带 WebView2 调试端口启动
+pnpm dev:cdp                      # 或 .\scripts\devtools\dev-with-cdp.ps1
+
+# 终端 2：跑全部真机检查
+pnpm verify:app                   # 或 node scripts/devtools/run.mjs
+```
+
+也可以单独跑：`verify:inspect`（单页体检）、`verify:smoke`（9 个路由）、
+`verify:e2e`（真实转换任务）、`verify:security`（解码 / 多文件扇出 / 恶意插件安全测试）。
+
+详见 [`scripts/devtools/README.md`](scripts/devtools/README.md)。它**验不了**的两件事
+只能靠人：**从资源管理器真实拖拽文件**（走 Tauri 原生 drag-drop 事件，不是 DOM 事件），
+以及**主题切换的视觉效果**。
 
 > ⚠️ **`cargo check --release` 之前需要前端产物**。
 > `tauri::generate_context!` 会在编译期把 `frontendDist`（`apps/desktop/dist`）
@@ -275,6 +297,10 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
 │   └── ROADMAP.md               路线图与验收标准
 │
 ├── scripts/                     开发辅助脚本（非运行时依赖）
+│   ├── devtools/                ★ 真机验证（CDP 驱动真实 WebView）
+│   ├── enginectl.mjs            引擎目录 / 探测 / 按需下载
+│   ├── gen-icon.mjs             生成图标（仓库不放二进制素材）
+│   └── ensure-dist.mjs          保证 cargo check 需要的前端产物存在
 └── .github/workflows/           CI
 ```
 
