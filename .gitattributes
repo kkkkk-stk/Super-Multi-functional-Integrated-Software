@@ -1,0 +1,35 @@
+# 统一行尾，避免 Windows 上 `core.autocrlf=true` 把 LF 转成 CRLF。
+#
+# 为什么必须显式声明：
+#   * CI 里有一个「TS 绑定是否与 Rust 类型同步」的 job，它比对的是
+#     `git diff --exit-code apps/desktop/src/bindings.ts`。如果那份文件
+#     在 Windows 上被写成 CRLF、在 CI（Linux）上被写成 LF，diff 永远非空，
+#     job 会一直红 —— 而原因和真实漂移毫无关系。
+#   * `.editorconfig` 声明了 LF，但那只是编辑器的约定，管不到 git 的转换。
+
+* text=auto eol=lf
+
+# Windows 脚本用 CRLF，兼容老版本 PowerShell 的解析器
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 二进制：绝不做行尾转换或 diff
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.icns  binary
+*.wasm  binary
+*.onnx  binary
+*.zip   binary
+*.7z    binary
+*.exe   binary
+*.dll   binary
+*.pdb   binary
+
+# 锁文件在 diff 里没有阅读价值，但必须保留（CI 用 --locked / --frozen-lockfile）
+Cargo.lock    -diff linguist-generated
+pnpm-lock.yaml -diff linguist-generated
+apps/desktop/src/bindings.ts -diff linguist-generated

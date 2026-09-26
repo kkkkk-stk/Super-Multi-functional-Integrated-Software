@@ -1,0 +1,23 @@
+[package]
+name = "toolforge-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ToolForge AI 层：自然语言 → 插件清单/代码 的生成、静态校验与安全审核"
+
+[dependencies]
+toolforge-core = { workspace = true }
+toolforge-plugins = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+parking_lot = { workspace = true }
+specta = { workspace = true }

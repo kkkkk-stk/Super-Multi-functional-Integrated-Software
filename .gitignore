@@ -1,4 +1,4 @@
-# ---- 构建产物 ----
+# ================= 构建产物 =================
 build/
 dist/
 out/
@@ -9,11 +9,13 @@ target/
 *.dylib
 *.msi
 *.app
+# TypeScript 增量编译缓存（tsc --noEmit 也会生成）
+*.tsbuildinfo
+.vite/
 
-# ---- 依赖目录 ----
+# ================= 依赖目录 =================
 node_modules/
 vendor/
-packages/
 .venv/
 venv/
 env/
@@ -21,7 +23,27 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# ---- IDE / 编辑器 ----
+# ================= ToolForge 专属 =================
+# 按需下载的引擎二进制 / 模型权重，绝不入库
+/engines/
+/models/
+/apps/desktop/src-tauri/engines/
+/apps/desktop/src-tauri/models/
+
+# 插件构建产物（WASM / Python 打包）
+plugins/**/target/
+plugins/**/*.wasm
+plugins/**/dist/
+plugins/**/.venv/
+
+# 本地工具链隔离目录（沙箱 / CI 用）
+.tools/
+.cache/
+
+# 前端自动生成的 TS 绑定**要入库**（见 .gitignore 末尾说明），此处不忽略
+# apps/desktop/src/bindings.ts
+
+# ================= IDE / 编辑器 =================
 .vs/
 .vscode/
 .idea/
@@ -29,7 +51,7 @@ __pycache__/
 *.swo
 *~
 
-# ---- 操作系统 ----
+# ================= 操作系统 =================
 Thumbs.db
 ehthumbs.db
 Desktop.ini
@@ -38,7 +60,7 @@ $RECYCLE.BIN/
 .AppleDouble
 .LSOverride
 
-# ---- 日志与临时文件 ----
+# ================= 日志与临时文件 =================
 *.log
 logs/
 tmp/
@@ -46,7 +68,7 @@ temp/
 *.tmp
 *.bak
 
-# ---- 密钥与本地配置（重要：绝不提交）----
+# ================= 密钥与本地配置（重要：绝不提交）=================
 .env
 .env.*
 *.pem
@@ -57,7 +79,6 @@ temp/
 secrets.*
 config.local.*
 
-# ---- 本地工具与缓存 ----
-.tools/
-.cache/
-*.cache
+# Tauri 签名私钥（updater 用）
+*.tauri.key
+*.tauri.key.pub

@@ -1,0 +1,916 @@
+# ToolForge 安全模型与威胁说明
+
+> 本文档面向三类读者：**插件作者**（要知道自己的代码受什么约束）、**审阅者**（要判断这些约束是否真的存在）、**报告漏洞的人**（要知道什么算问题）。
+>
+> 它的写作原则是：**只写能从代码里指出位置的事实**。凡是"设计上应该有、但代码里还没接线"的东西，一律标注为「规格说明 / 待实现 / 待定」，而不是当成已实现的安全能力来宣称。
+>
+> 相关的相邻文档：运行时与引擎边界见 `docs/ENGINE-MATRIX.md`，阶段目标与验收标准见 `docs/ROADMAP.md`。
+
+---
+
+## 0. 本文档的事实基线（请先读这一节）
+
+### 0.1 核对方式
+
+本文所有关于代码的结论，都来自对仓库源码的**逐文件阅读与检索**（`read` / `grep`）。引用代码位置时只写「文件路径 + 函数名/类型名」，不写行号（行号会随编辑漂移；个别必须定位的地方写「约第 N 行」并注明可能漂移）。
+
+**本次核对没有运行 `cargo`。** 这是刻意的：本文档的产出约束是"不修改、不创建仓库内其它文件"，而编译会在 `target/` 下产生产物。由此带来一条必须坦白的限制：
+
+> 凡是"能不能编译通过""单元测试是否全绿"这类判断，本文档一律**不作为结论**，只记录"阅读代码后发现的、看起来会失败的部位"。
+
+### 0.2 与 `docs/ROADMAP.md` 的偏差（重要）
+
+`docs/ROADMAP.md` 的「当前状态速览」一节**已经过期**，不能作为现状依据。本次核对确认的实际状态与它不一致的地方至少有：
+
+| `ROADMAP.md` 的写法 | 本次核对到的事实 |
+| --- | --- |
+| 「Tauri 后端 `apps/desktop/src-tauri`：🚧 待实现（目录不存在）」 | 目录存在，且 `src/commands.rs`、`src/ipc.rs`、`src/state.rs`、`src/lib.rs`、`src/main.rs`、`src/bin/export_bindings.rs`、`capabilities/default.json` 均已存在 |
+| 「进程层 `crates/toolforge-process`：🚧 待实现」 | 存在，含 `exec.rs` / `rpc.rs` / `supervisor.rs` |
+| 「引擎层 / 插件宿主 / AI 层：🚧 待实现」 | 三个 crate 都存在源码（`toolforge-engines`、`toolforge-plugins`、`toolforge-ai`） |
+| 阻塞 1：`pipeline.rs` 双引号未转义导致无法编译 | **已修复**：该处（`video.compress` 的描述，约第 751 行）已改用「」中文引号 |
+| 阻塞 2：`pipeline.rs` 的 `Some(-16.0.into())` 触发 E0282 | **已修复**：现已写成 `Some((-16.0f64).into())` 并附了说明注释 |
+| 阻塞 3：`PermissionSet` 的 `#[serde(transparent)]` 与 `plugin.rs` 测试夹具不匹配 | **已消解，但方向与当初判断相反**：`#[serde(transparent)]` 被**移除**，schema 改为 `permissions: { capabilities: [...] }`，各夹具本来就是映射形式，因此 5 个失败用例现在通过。**后果是原先按裸数组写的示例插件全部失效**，`plugins/` 下 6 个 `plugin.yaml` 已改正并重新通过校验（见 §3.0） |
+| 阻塞 4：`paths.rs` 的 `sanitize_id` 实现与自身测试不符 | **仍然成立**（见 §4.5） |
+
+结论：**判断"现在能不能跑"必须以代码和 CI 输出为准**，本文档只描述代码里存在的安全机制与缺口。下面是委托方在 `crates/toolforge-core` 源码快照上用真实 `cargo test --lib` 得到的**最新**基线（此前"61 个测试中 54 通过"的记录已过期）：
+
+```text
+compiling 成功（阻塞 1、2 已修）
+test result: FAILED. 59 passed; 2 failed
+失败项：paths::tests::sanitize_blocks_traversal
+        paths::tests::plugin_data_stays_inside_plugin_dir
+```
+
+即当前唯一剩余的测试失败就是阻塞 4（`sanitize_id`），其余 59 项全绿。
+
+### 0.3 强度分级用语
+
+本文档对每一项安全能力都会给出下列标签之一，请按标签理解措辞：
+
+| 标签 | 含义 |
+| --- | --- |
+| **已实现** | 有明确的代码路径在运行时真的执行这个检查 |
+| **部分实现** | 检查存在，但只覆盖一部分情形，或只在某个运行时下生效 |
+| **仅声明未接线** | 类型/数据结构与单元测试都有，但生产代码里没有调用点 |
+| **规格说明** | 只是设计意图，代码尚未写 |
+| **已知缺陷** | 代码与它自己的文档或测试不一致，或存在可指出的绕过 |
+
+---
+
+## 1. 威胁模型
+
+### 1.1 核心断言
+
+> **AI 生成的插件 = 不受信任代码。从外部导入的插件同样不受信任。**
+
+这条断言的直接后果，是整个项目的安全模型**不敢建立"代码看起来没问题"之上**：
+
+- 不做"源码审查通过就放行"的假设。AI 生成的结果可能被提示词注入操纵（模型输出的 YAML/Python 是**外部输入**，与用户手打的字符串没有区别）；
+- 不因为插件"只是 YAML"就认为它无害（见 §1.4：L1 是数据，但它读写的仍是你磁盘上的文件）；
+- 不因为插件目录是用户自己放进来的就默认信任（用户往往是从别处下载的）。
+
+`crates/toolforge-plugins/src/lib.rs` 的模块文档把这条断言落成了流程：读清单 → 静态校验 → 权限差异检测 → 用户授权 → 哈希锁定 → 装载。**"用户授权"是唯一真正的放行门**，其余步骤都是为了让人能做出知情决定。
+
+### 1.2 资产（要保护什么）
+
+按重要性从高到低：
+
+1. **用户文件** —— 输入/输出目录、以及这些目录之外的任何可读文件（文档、照片、密钥文件如 `id_rsa`、`.env`）。
+2. **API Key 与凭据** —— 尤其是 AI 服务的 Key。它在宿主进程里以内存态保存：`AiProviderConfig::api_key` 带 `skip_serializing`（见 `crates/toolforge-ai/src/provider.rs`），不会随 `Settings` 序列化到前端。
+3. **用户额度** —— `Capability::Ai` 的 `describe()` 原文就是「调用 AI 服务（消耗你的额度）」。被刷额度不致命但真实存在。
+4. **宿主进程** —— 插件跑在宿主进程内（L2）或作为子进程（L3）。宿主进程被打崩 = 任务丢失、数据可能未落盘。
+5. **机器** —— 任意代码执行、持久化驻留（开机自启）、横向移动到用户其它凭据。
+
+### 1.3 攻击者画像
+
+| 攻击者 | 动机 | 典型手法 | 主要被哪一层挡住 |
+| --- | --- | --- | --- |
+| **恶意插件作者** | 窃取文件、装后门、刷额度 | 在 L3 代码里读 `~/.ssh`、拉取远程脚本、起 `curl` | 用户授权界面（必须看到 `fsRead`/`exec` 的含义）+ 路径收敛 + 审计 |
+| **被投毒的 AI 生成结果** | 同上的"副产物" | 提示词注入让模型输出"顺手多声明 `net`"或用 `eval` 隐藏逻辑 | `PluginManifest::validate()`（纯函数，写盘前就能拒）+ `review_draft()` 的可疑模式扫描 + 用户 diff 审阅 |
+| **被替换的插件文件** | 在你授权**之后**把代码换掉（授权的是 A，跑的是 B） | 安装后往插件目录塞 `backdoor.py`、改 `main.py` | `content_hash` + `PluginState::installed_hash`（装载前校验，不匹配即拒绝 + 记审计 + 自动禁用） |
+| **被篡改的前端** | 绕过 UI 直接下命令 | 改 renderer、伪造 `invoke` 参数，试图给插件授予清单外能力 | `PluginStore::set_granted()` 会丢弃清单未声明的能力并记审计；安装命令要求 `permissions_acknowledged` |
+
+注意最后一行背后的设计立场：**前端永远被当作不可信输入源**。所有判据都在 Rust 侧重算一遍，前端的勾选只是"用户意图的载体"，不是权限本身。
+
+### 1.4 信任边界：三级运行时的真实强度
+
+三级运行时不是"同一机制的三个档位"，而是三种**根本不同的信任边界**（`crates/toolforge-plugins/src/lib.rs` 的表述是"用一套机制表达会导致要么什么都不让做、要么什么都让做"）：
+
+| 运行时 | 载体 | 信任边界 | 强度标签 |
+| --- | --- | --- | --- |
+| **L1 `Pipeline`** | YAML 编排内置节点 | **是数据，不是代码**。但"数据"仍然能指定输入输出与节点参数，所以仍受路径收敛与能力裁决约束 | **已实现**（见 §2.3 的接线状态说明） |
+| **L2 `Wasm`** | Extism + Wasmtime，关闭 WASI | **与内核无关的强沙箱**：没有文件系统、没有网络、没有线程、没有 SIMD，只有确定性的整数/浮点运算 | **已实现** |
+| **L3 `Python`** | 独立进程 + JSON-RPC over stdio | **不是沙箱** | **部分实现**（诚实说明见下） |
+
+#### L2：为什么它敢叫沙箱
+
+`crates/toolforge-plugins/src/runtimes/wasm.rs` 的 `WasmPlugin::load()` 里，`PluginBuilder` 显式 `.with_wasi(false)` —— 注释写得很直白：「打开 WASI 就等于把宿主的文件描述符暴露给插件」。此外：
+
+- **资源上界用 wasmtime 的 fuel（燃料），不用墙钟超时**。理由同样写在模块文档里：WASM 关掉 WASI 后无法阻塞（没有 I/O、没有网络、没有 `sleep`），只能烧 CPU；既然只能烧 CPU，燃料耗尽就 trap，精确且可中断。反之"丢到另一个线程再 timeout"只是**假装**超时——超时后那个线程还在烧 CPU。
+- `timeout_ms` 在装载时经 `fuel_for_timeout()` 换算成燃料上限（经验值 1e8 燃料/秒，并有 1e7 的下限，避免 `timeoutMs: 1` 变成"什么都不许做"）。
+- 内存上限走 `Manifest::with_memory_max()`（`pages_for_memory()` 把 MB 换算成 64 KiB 页，并 clamp 到 16 页…65536 页，即 1 MiB…4 GiB）。
+- 调用入口还有一道 16 MiB 的载荷上限（沙箱之间要拷贝内存，塞大文件会 OOM）。
+- **v0.1 不注入任何自定义宿主函数**。清单里的 `allowHostFunctions` 会被校验（只允许 `log` / `kv`），其中 `kv` 是 v0.2 才接的内容；日志走 Extism PDK 内置的 `extism_log_*` 导入。理由写在文件里：宿主函数是**唯一**能从沙箱里伸出手来的口子，每加一个都要单独评估。
+
+因此 L2 的能力边界是**结构性的**，不是"检查得比较严"：清单里给 L2 插件声明 `fsRead` 是设计错误，校验器会给出 `WASM_WITH_PERMISSIONS` 警告。
+
+#### L3：请**不要**对用户说它是沙箱
+
+`crates/toolforge-plugins/src/runtimes.rs` 的模块文档「L3 · Python 进程的隔离程度（诚实说明）」一节，逐字要点如下（`crates/toolforge-plugins/src/runtimes/python.rs` 的 `PythonPlugin::launch()` 是它的实现）：
+
+宿主**做了**：
+
+- **清空继承的环境变量**（`SpawnSpec::clear_env = true`）——所以 `OPENAI_API_KEY` 之类读不到；
+- **锁定工作目录**在插件的私有目录（`spec.cwd`）；
+- **默认断网**：设置指向 `127.0.0.1:1` 的代理环境变量（`HTTP_PROXY` / `HTTPS_PROXY` / `http_proxy` / `https_proxy`，并把 `NO_PROXY` 清空），同时注入 `TOOLFORGE_NETWORK=denied` 让写得好的插件直接给出友好报错；
+- **超时**：默认 300 秒，超时返回 `TIMEOUT` 错误码，并且**超时的进程会被强杀**（`PythonPlugin::call()` 里判到 `ErrorCode::Timeout` 就 `kill()`），因为卡在 native 代码里的进程已经不可信；
+- **优雅关闭**：先 `shutdown` 再关 stdin，最后才 kill（`ChildSupervisor::shutdown()`）。
+
+**但是**（原文语气）：
+
+> 这不是内核级沙箱。一个蓄意的插件可以直接用 `socket` 绕过代理环境变量、可以读它进程能读的任何文件。真正的隔离需要 Windows Job Object + AppContainer、或 macOS `sandbox-exec`、或 Linux seccomp —— 这些在 v0.2 的路线图里（见 ROADMAP）。
+
+配套的两条结论也必须一起复制过去，不要只抄前半段：
+
+> **因此 L3 插件的安全依赖两件事**：
+> 1. 用户在授权前真的看了权限清单（所以 UI 必须把高危能力标红）；
+> 2. 审计日志能事后追溯。
+
+同一个立场在外壳层有对应的用户可见文案：`apps/desktop/src-tauri/src/commands.rs` 的 `plugins_install()` 要求 L3 插件必须带 `executable_code_acknowledged`，拒绝时的 `detail` 是「L3 插件以你的身份运行。宿主的隔离措施（清空环境变量、锁定工作目录、默认禁网）只能挡住非蓄意的越权，不能挡住恶意代码。」——这句话是准确的，请保持。
+
+#### 另外两个必须一起说的边界
+
+- **`PATH` 是被刻意保留的**。`crates/toolforge-process/src/supervisor.rs` 的 `ChildSupervisor::spawn()` 在 `env_clear()` 之后重新注入了 `PATH`，注释理由是「至少要给 PATH，否则 Windows 上子进程自己起程序会失败」。**这意味着 L3 插件可以用 `subprocess` 起 PATH 里的任何程序**。`Capability::Exec` 目前没有运行时强制（见 §3.4 与 §9）。
+- **不做原生动态库加载**。`ROADMAP.md` 的 Non-Goals 明确写了不做 `.dll` / `.so` / `.dylib` 加载，理由是"原生库一旦载入进程便拥有与应用同等的权限，无法做到逐条能力授权 + 运行时可裁决；这会直接废掉本项目安全模型的地基"。这条决定本身是一项**核心安全属性**，改动它等于换掉整个威胁模型。
+
+---
+
+## 2. 三层防护
+
+### 2.1 第一层：声明制
+
+**机制**：插件的 `plugin.yaml` 里用 `permissions` 列出它需要的**全部**能力；运行时出现未声明的调用 = 直接拒绝 + 记安全审计，**不做静默降级**。
+
+`crates/toolforge-core/src/permission.rs` 的模块文档把这条写成硬机制：
+
+> 代码里出现没声明的能力调用 = 直接拒绝 + 记安全审计，不是"尽力而为"。
+
+为什么强调"不做静默降级"：`CapabilityGuard::check()` 的文档注释给的理由是「静默降级（比如"读不到就当空文件"）会让攻击面隐形」——一次被吞掉的越权尝试不会出现在审计里，用户就永远不知道有人试过。
+
+**诚实的接线状态**：这条规则在代码里的**具体落点**是：
+
+- L1：`crates/toolforge-plugins/src/l1.rs` 的 `run_pipeline()`，在跑之前先判断流水线是否引用 `${src}`，若是而生效权限里没有**任意** `FsRead`，则 `record_violation()` + 返回 `ToolforgeError::violation()`。这是**已实现**的。
+- 装载门：`PluginStore::runnable()`（`crates/toolforge-plugins/src/store.rs`）要求"已启用 + 校验通过 + **没有待授权项**"，否则返回 `ErrorCode::PermissionDenied`。**已实现**。
+- 通用裁决器 `CapabilityGuard::check()`：**仅声明未接线**。它有针对 `ReadFile`/`WriteFile`/`Http`/`ReadEnv`/`Spawn` 五个请求类型的完整判断逻辑和单元测试，但全仓库生产代码里**没有任何调用点**（`CapabilityRequest` 只在 `permission.rs` 自己的测试里被构造）。相关缺口见 §9 第 1 项。
+
+### 2.2 第二层：最小授权
+
+**机制**：清单声明的能力 ≠ 已授权。用户逐条勾选，**运行时真正生效的集合 = 声明 ∩ 已授权**：
+
+```rust
+// crates/toolforge-core/src/permission.rs
+pub fn effective(declared: &PermissionSet, granted: &PermissionSet) -> PermissionSet
+```
+
+判定用 `Capability::fingerprint()`（`serde_json::to_string(self)` 得到的稳定指纹）做集合运算，`effective()` 最后会 `dedup()`。
+
+支撑这条的几个事实：
+
+- **安装 ≠ 可用**。`PluginStore::install()` 无论走哪条路径，最后都经 `finish_install()`，它把状态写成 `enabled: false` + `granted: PermissionSet::empty()`（注释：「这是安全模型的地基」）。`installed_hash` 与 `installed_at` 在这里落盘。
+- **没有"一键全部允许"**。`PluginStore::set_enabled()` 在启用前调用 `runnable_or_grant_all()`，只要还有未授权项就拒绝，`detail` 明确写着「这是刻意设计：我们不提供「一键全部允许」。」
+- **前端不能越权授权**。`PluginStore::set_granted()` 会逐条比对清单，把**清单未声明**的能力丢弃，并记一条 `AuditEventKind::CapabilityViolation`（detail 是 `{ "rejected": [...] }`）。注释说明了理由：「防止前端被篡改后给插件开出清单外的权限」。
+- **"存在待授权项"对外表现为一个布尔**：`PluginSummary::has_pending_permissions`，计算方式是 `effective.capabilities.len() != declared.capabilities.len()`（`crates/toolforge-core/src/plugin.rs` 的 `PluginSummary::from_manifest()`）。列表页用它排序（有待授权项的排前面）、顶部用它显示待处理数量。
+- **内置插件是唯一的例外**：`PluginStore::load_state()` 对内置插件给出 `enabled: true` 且**默认授予其声明的全部能力**，理由是"这些清单是我们自己写的、随包分发的"。用户插件默认既禁用也不授权。这条例外依赖"内置插件目录不可被替换"这个前提，见 §9 第 20 项。
+- **不允许运行期提权**（**已实现**）。L3 插件可以在运行中发 `host.request` 向宿主申请新能力，`crates/toolforge-plugins/src/runtimes/python.rs` 的 `handle_notification()` 对此的处理是：**一律拒绝**，只给用户一条警告——「插件在运行中请求了额外能力，已被拒绝。如确需该能力，请在插件详情页重新授权并重启插件。」代码注释把理由点明了：「能力必须在装载前由用户授权，运行期提权是"点击劫持"的经典入口」。同样的立场在 `apps/desktop/src-tauri/src/commands.rs` 的 `plugins_grant()` 里：授权变更后**立即卸载**该插件的已装载实例（因为 Python 进程的环境变量与能力标签都变了），保证"新的授权集合"与"正在跑的进程"不会不一致。
+
+### 2.3 第三层：运行时裁决 + 路径收敛
+
+**机制（设计）**：
+
+```
+CapabilityGuard::check(&CapabilityRequest) -> CapabilityVerdict { Allow | Deny { code, reason } }
+```
+
+- `Deny` 里的 `code` 固定是 `ErrorCode::PluginCapabilityViolation`（见 `error.rs` 中这个变体的注释：「插件使用了未声明的能力（**安全事件，会被审计记录**）」）；
+- 原文要求：**返回 Deny 就一定要向上冒泡成 `PluginCapabilityViolation`**，由调用方同时写审计日志。
+
+**路径收敛**：`PathResolver::resolve()` 是把插件逻辑路径翻译成真实路径的**唯一**入口。`permission.rs` 里对它的定性是：
+
+> **这是防止路径穿越的唯一入口**。任何绕过它直接 `Path::new(plugin_input)` 的代码都是漏洞。
+
+详见 §4。
+
+**接线状态（必须如实说明）**：如 §2.1 所述，`CapabilityGuard::check()` 目前没有生产调用点，所以"运行时逐请求裁决"这一层**尚未生效**。当前实际生效的是：
+
+1. `PluginStore::runnable()` 的装载门（权限不齐直接不让跑）；
+2. L1 的 `fsRead` 预检；
+3. `PathResolver`（**已实现**，所有内置节点解析路径都走 `crates/toolforge-engines/src/nodes.rs` 的 `resolve_path()`）；
+4. L3 的 `deny_network` 布尔开关与超时强杀。
+
+**路径收敛的适用范围（必须写清楚，否则会严重误判 L3 的安全性）**：
+
+`PathResolver` 管的是"**宿主自己**拿着插件给的（逻辑）路径去开文件"这条路——也就是 L1 内置节点（`nodes.rs::resolve_path()`）以及宿主侧的读写。它**管不到 L3 插件进程自己的 `open()`**：Python 插件是独立进程，文件读写由它自己发起，宿主既不代理也没有拦截（宿主→插件的方法只有 `initialize` / `run` / `shutdown` 三个，插件→宿主只有 `progress` / `log` / `host.request` 通知，**没有任何"宿主代插件读文件"的通道**）。
+
+另外，`PluginRunner::resolver_for()` 上写着"让 `PathResolver` 与插件目录对齐（**供 L3 使用**）"，但全仓库**没有任何调用点**。
+
+结论：**对 L3 而言，`fsRead{scope}` / `fsWrite{scope}` 目前是"约定"而不是"强制"**；L3 的实际边界就是 §1.4 所述的那几件事（清空环境变量、锁 cwd、代理断网、超时强杀）。凡是对外描述"插件的文件访问被限制在授权目录内"，都必须同时说明这个区别。§9 第 25 项。
+
+因此当前的安全姿势可以概括为：**"能不能跑"卡得比较严，"跑起来之后每一次具体操作"卡得不严**。§9 把它列为第 1 项缺口。
+
+---
+
+## 3. 每种 Capability 的攻击面
+
+### 3.0 清单里到底怎么写（先看这个，否则会踩坑）
+
+`permissions` 在清单里是**带 `capabilities` 字段的映射**，不是裸数组。
+`PermissionSet` 是一个普通结构体，`permission.rs` 里刻意**没有**加 `#[serde(transparent)]`：
+
+```rust
+// crates/toolforge-core/src/permission.rs
+/// ⚠️ 这里**刻意不加** `#[serde(transparent)]`：加了之后 YAML 会变成
+/// `permissions: [ ... ]` 这种裸数组，既不好读也没法在未来扩展字段。
+/// 现在的形状是 `permissions: { capabilities: [ ... ] }`，
+/// 所有示例插件与文档都按这个形状写。
+#[derive(..., Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionSet {
+    pub capabilities: Vec<Capability>,
+}
+```
+
+所以正确写法是：
+
+```yaml
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+```
+
+**不能**写成裸数组 `permissions: [ ... ]` —— 那会报
+`permissions: invalid type: sequence, expected struct PermissionSet`。
+不申请任何能力时写 `permissions: { capabilities: [] }`。
+
+> ⚠️ 本文档早期版本曾把这里写成"序列"，是**旧 schema**（那时 `PermissionSet` 带
+> `#[serde(transparent)]`，该属性已被移除）。`plugins/` 下 6 个示例插件与
+> `docs/PLUGIN-SDK.md` 均已按映射形式更正并逐一通过 `PluginManifest::validate()`。
+
+`Capability` 的 serde 形态是 `#[serde(tag = "kind", rename_all = "camelCase")]`（见 `permission.rs`），所以标签值是 `fsRead` / `fsWrite` / `net` / `exec` / `env` / `ai` / `gpu`；`PathScope` 同样是内部标签枚举，标签值是 `input` / `output` / `pluginData` / `workspace` / `explicit`。
+
+**注意**：随包示例插件（`plugins/`）目前只用到 `fsRead` 与 `fsWrite`，`wasm-example` 用的是空权限。下面各小节里的 `net` / `env` / `exec` / `ai` / `gpu` 写法是按上述 serde 属性推导的（结构一致），但**没有随包示例可作为"已被装载器接受"的证据**，见到实际报错时以代码为准。
+
+`capabilities` 列表之外还有两条通用约束：
+
+- 插件 id 必须是 3..=128 个字符，且只含小写字母、数字、`.`、`-`、`_`（`plugin.rs` 的 `is_valid_plugin_id()`，错误码 `ID_FORMAT`）；
+- 声明了 `Critical` 风险的能力会得到一条 `CRITICAL_CAPABILITY` 警告（**是警告不是错误**——`ValidationReport::ok` 只看 Error，所以它会进确认页但不会阻止安装）。
+
+### 3.1 `FsRead { scope }`
+
+```yaml
+permissions:
+  - kind: fsRead
+    scope: { kind: input }
+```
+
+**含义**：读取某个逻辑作用域内的文件。作用域由宿主分配，插件拿不到真实绝对路径（`PathScope::describe()` 的文案直接渲染在 UI 上）。
+
+`risk()`：**Low**。唯一例外是 `PathScope::Explicit(_)`，返回 **High**（但见 §3.8：这个分支目前不可达）。
+
+**攻击面**：
+
+- 读走输入目录里的**全部**文件——如果用户把整个文件夹拖进来，插件能看到这个文件夹里与其任务无关的文件；
+- 输入根目录是通过"所有输入文件的公共父目录"算出来的（`commands.rs` 的 `build_io()` → `common_prefix()`）。拖入单个文件时，**根目录就是该文件所在的整个目录**。这是路径收敛边界的一个真实放大效应：只想转一张图，插件却获得了该目录的读权限。
+- 通过符号链接逃出授权根目录（见 §4.4，**这是真实的绕过方向**）。
+
+**缓解**：`PathResolver::resolve()` 拒绝绝对路径 + 词法规范化 + `starts_with(root)`；`Input` 作用域在设计上是只读的（`PathScope::Input` 的注释写「宿主自动加入，只读」）。建议：**拖入单个文件而不是整个目录**，把待处理文件放在专用子目录里。
+
+> **L3 例外**：上面的收敛只对"宿主自己开文件"成立。Python 插件自己发起的 `open()` **不经** `PathResolver`（见 §2.3）。
+
+### 3.2 `FsWrite { scope }`
+
+```yaml
+permissions:
+  - kind: fsWrite
+    scope: { kind: output }
+```
+
+**含义**：向某个逻辑作用域写文件。
+
+`risk()`：**Medium**。但 `FsWrite { scope: PathScope::Explicit(_) }` 会被拉到 **Critical**（代码里 `Capability::FsWrite { .. } => RiskLevel::Medium` 这一支其实覆盖了所有 `FsWrite`；Critical 的效果来自 `PathScope::Explicit` 自身的设计意图与 `plugin.rs` 里专门为它准备的 `HOST_PATH_WRITE` 警告——注意这两处对 `Explicit` 的风险定级**并不一致**，`FsRead{Explicit}` 判 High、`FsWrite{..}` 判 Medium，而 `PathScope::Explicit` 的文档注释说"风险等级直接拉到 Critical"。这是一个代码内部不一致，已记入 §9）。
+
+**攻击面**：
+
+- 覆盖/删除输出目录里的既有文件（`fs.delete`、`fs.move` 节点都在内置节点表里）；
+- 写一个同名文件把用户原文件顶掉——**如果输出目录被用户设成与输入目录相同**，这一步就会毁掉原文件。建议：输出目录与输入目录分开，这是唯一可靠的缓解；
+- 用大文件把磁盘写满（`Bundle` 安装路径有体积上限，但**运行时写文件没有配额**）。
+
+**缓解**：`starts_with(root)` 收敛；"输出目录"这个概念本身就是缓解手段。**没有**磁盘配额、**没有**写入白名单文件名、**没有**对已存在文件的保护策略。
+
+> **L3 例外**：同上——插件进程自己的写入不经 `PathResolver`。所以"输出目录与输入目录分开"这条建议对 L3 是**唯一**有效的数据保护手段。
+
+### 3.3 `Net { hosts }`
+
+```yaml
+# 只允许特定主机
+permissions:
+  - kind: net
+    hosts: ["api.openai.com", "*.huggingface.co"]
+
+# 任意主机（高风险写法）
+permissions:
+  - kind: net
+    hosts: []
+```
+
+**含义**：出网。**`hosts` 为空列表表示"任意主机"**（`Capability::describe()` 会渲染成「访问网络（任意主机，无限制）」），`risk()` 返回 **High**；非空列表返回 **Medium**。
+
+**匹配规则**（`permission.rs` 的 `host_matches()`）：
+
+```rust
+if let Some(suffix) = pattern.strip_prefix("*.") {
+    host == suffix || host.ends_with(&format!(".{suffix}"))
+} else {
+    pattern == host
+}
+```
+
+即"精确相等，或 `*.` 前缀的后缀匹配"。两个必须知道的推论：
+
+1. **`*.huggingface.co` 会匹配裸 `huggingface.co`**（因为 `host == suffix` 这一支）。代码里 `host_allowlist_matching` 单元测试把这一点固定为**预期行为**。所以写 `*.example.com` 并不等于"仅子域"。
+2. 匹配前双方都会被 `trim().to_ascii_lowercase()`，所以大小写与首尾空格不敏感；但**不做** IDN/Punycode 归一化、**不看**端口（`Http { host }` 里如果带了 `example.com:8080`，`pattern == host` 会失配）。
+
+**攻击面**：
+
+- `hosts: []` 等于把网络完全交出去：数据外传、拉取二阶段载荷、打内网地址（SSRF 到 `127.0.0.1`、`169.254.169.254` 这类元数据地址）、DNS 隧道；
+- 白名单写得过宽（`*.example.com`、`*.github.io`、`*.s3.amazonaws.com`）等于把"用户可控内容托管平台"拉进来，攻击者可以在那里放载荷；
+- **绕过代理环境变量**：`deny_network` 的实现只是设了几个 `*_PROXY` 环境变量，任何直接使用 socket 的代码（`socket`、`aiohttp` 的某些路径、原生扩展）都不受影响。
+
+**缓解（当前真实有效的部分）**：
+
+- **默认断网**：`PythonRuntimeDef::allow_network` 默认 `false`，`SpawnSpec::deny_network` 默认 `true`（`supervisor.rs` 的 `spawn_spec_defaults_are_safe` 单元测试锁定这条不变量）；
+- **声明一致性检查**：`PluginManifest::validate()` 在 `python.allowNetwork == true` 但清单没声明 `net` 时报**错误** `PYTHON_NET_WITHOUT_PERMISSION`（零容忍，不是警告）；
+- 运行期也查一次：`PluginRunner::call()` 在"生效权限要求联网、但 `python.allowNetwork == false`"时报 `PluginInvalid`，注释是"两者必须一致。若确实需要联网，请在清单里同时打开"；
+- 递归缓解：`crates/toolforge-ai/src/review.rs` 的 `scan_code()` 会把 `socket` / `requests.` / `urllib` / `httpx` 标为"需要 net"的可疑模式，清单没声明就报 `UNDECLARED_*` 发现（`socket` 那条的说明文案就是"原始套接字（可绕过代理环境变量）"）。
+
+**当前**没有**的**：`hosts` 白名单**没有运行时强制**。`CapabilityGuard::check_host()` 会做这个判定，但 `check()` 没有调用点（§9 第 2 项）。所以现在 `hosts` 唯一的作用是"声明给用户看"——它决定用户在授权界面看到「访问网络（仅限：…）」还是「访问网络（任意主机，无限制）」。
+
+**建议**：白名单**写得越具体越好**——写完整主机名而不是 `*.` 通配；不要写平台型域名；确实需要联网时优先"宿主代取"而不是给插件开网。
+
+### 3.4 `Exec`
+
+```yaml
+permissions:
+  - kind: exec
+```
+
+**含义**：启动子进程。`describe()` 是「启动外部进程」。
+
+`risk()`：**Critical，`RiskLevel` 里的最高档**。代码注释把理由写得没有余地：
+
+> 能起子进程 = 基本等价于任意代码执行，这是最高危的一档
+
+**攻击面**：**这一项本身就是攻击面，不是"可能导致攻击面"**。能起子进程基本等于拿到用户权限：起 `curl`/`pwsh` 外传文件、起 `cmd /c` 做一切、读写插件自身权限之外的东西（因为子进程不再受 `PathResolver` 约束——路径收敛只管宿主自己打开文件的那条路）、建立持久化。`ValidationReport` 会为它加一条 `CRITICAL_CAPABILITY` 警告，但那只是**警告**。
+
+**当前的真实状态（务必如实转述）**：
+
+- `CapabilityGuard::check()` 对 `Spawn { program }` **只判断"有没有 Exec 能力"，不校验程序名**——这一点是刻意的分层设计（具体收窄交给引擎解析），但既然 `check()` 没有调用点（§9 第 1 项），**目前 L3 插件起子进程没有任何运行时拦截**；
+- `PATH` 在 `clear_env` 之后被刻意保留（§1.4），所以 `subprocess.run(["curl", ...])` 这类调用是可行的；
+- `crates/toolforge-ai/src/review.rs` 在报"未声明的 `subprocess`"时，用户可见的提示文案是「（提示：插件进程只能起它自己，起外部程序会被拒绝）」。**这句话与当前实现不符**，属于必须修正的文案缺陷（§9 第 3 项）。
+
+**缓解（现在能做的）**：`RiskLevel::Critical` 让它在确认页最显眼；`CRITICAL_CAPABILITY` 警告；AI 审阅把 `subprocess` / `os.system` / `os.popen` 当作需要 `exec` 的模式扫描。**用户侧的唯一有效缓解是：看到 `exec` 就不要装**，除非你愿意读一遍它的全部代码。
+
+### 3.5 `Env { names }`
+
+```yaml
+permissions:
+  - kind: env
+    names: ["HF_HOME"]
+```
+
+**含义**：读取**按名字白名单**指定的环境变量。设计意图（`Capability` 上的注释）：白名单"避免插件顺手把 API key 读走"。
+
+`risk()`：**Medium**。
+
+**攻击面与诚实边界**：
+
+- 白名单只在**宿主进程自己**做 `ReadEnv` 时有用——它防的是"插件顺手读走 `OPENAI_API_KEY`"这一类**非蓄意**行为；
+- **没有任何机制阻止插件读宿主进程之外的东西**。要读进程环境有无数条路：读 `/proc/self/environ`、读别的进程、读配置文件。所以 `Env` 这个名字容易给人错误的安全感；
+- **在 L3 里真正起作用的防线是 `clear_env`，不是这个白名单。** `PythonPlugin::launch()` 设 `spec.clear_env = true`，注释是「绝不继承父进程环境（可能含 API Key）」，之后只注入 `PATH` + `TOOLFORGE_PLUGIN_ID` + `TOOLFORGE_CAPABILITIES` + `PYTHONNOUSERSITE=1`（另加 `PYTHONUNBUFFERED` 等三个由 `ChildSupervisor::spawn()` 统一注入）。**清空的环境里根本没有值可读，所以"读不到 Key"是清空环境带来的，不是 `Env` 白名单带来的。**
+
+**当前状态**：`Env { names }` **没有任何运行时实现**。`CapabilityGuard::check()` 有 `ReadEnv` 分支，但它没被调用；也没有任何地方按 `names` 把宿主环境变量挑出来注入给插件进程。所以这个能力目前**只影响 UI 文案与风险等级**（§9 第 4 项）。
+
+### 3.6 `Ai`
+
+```yaml
+permissions:
+  - kind: ai
+```
+
+**含义**：调用大模型服务。`describe()` 是「调用 AI 服务（消耗你的额度）」。
+
+`risk()`：**Low**。
+
+**攻击面**：
+
+- **额度消耗**：被循环调用刷额度是最直接的损失（L3 插件的 `timeout_ms` 只限单次调用，`workers` 上限 8，但没有总调用配额）；
+- **数据外传**：把用户文件内容/路径拼进 prompt 发出去。这是 `Ai` 能力**最容易被低估**的一面——`Ai` 的风险等级是 Low，但它实际上意味着"可以把数据送出本机"（发给用户自己配置的 AI 服务商，仍然算外传）；
+- **提示词注入回流**：AI 的输出在 `ai_generate` 流程里被当成"草稿数据"处理（见 §6），但如果某个插件把 AI 输出当指令执行，就构成了注入链。
+
+**当前状态**：
+
+- 宿主侧的 AI 调用在命令层（`commands.rs` 的 `ai_test_connection` / `ai_generate` / `ai_review_draft`），走 `toolforge-ai` 的 `AiClient`；
+- **`Ai` 能力没有运行时裁决点**：`CapabilityRequest` 枚举里根本没有对应变体（只有 `ReadFile`/`WriteFile`/`Http`/`ReadEnv`/`Spawn`），也就是说连"插件请求调用 AI"这个事件类型都还不存在（§9 第 5 项）。
+
+**缓解**：UI 文案直说"消耗你的额度"；建议把 `Ai` 当成**中风险**对待（"能外传数据"），不要因为 `risk()` 返回 Low 就降低确认强度。
+
+### 3.7 `Gpu`
+
+```yaml
+permissions:
+  - kind: gpu
+```
+
+**含义**：使用 GPU。`describe()` 是「使用 GPU」。`risk()`：**Low**。
+
+**攻击面**：主要不是机密性而是**可用性**——占满显存、让系统卡顿、影响其它任务；在共享显存/集成显卡上尤其明显。GPU 驱动栈历史上也有提权漏洞，但那是驱动的问题，不是本项目的攻击面。
+
+**当前状态**：**没有任何运行时实现或裁决点**（与 `Ai` 同理，`CapabilityRequest` 里没有对应变体）。而且 `ROADMAP.md` 的 Non-Goals 明确写了"不做需要 GPU 常驻的推理服务"，所以这个能力在可预见的阶段里更像是一个**声明位**（§9 第 5 项）。
+
+### 3.8 已知缺陷：`PathScope::Explicit` 无法通过 `plugin.yaml` 表达
+
+这是本次核对中最重要的一个"设计与实现不符"，必须单独写清楚。
+
+**问题**：`PathScope` 是 `#[serde(tag = "kind")]` 的**内部标签**枚举，而 `Explicit` 是**带 `String` 的 newtype 变体**：
+
+```rust
+// crates/toolforge-core/src/permission.rs
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PathScope {
+    Input,
+    Output,
+    PluginData,
+    Workspace,
+    Explicit(String),   // ← 逃生舱口
+}
+```
+
+内部标签要求"剩下的字段"能被反序列化成变体的载荷类型。对 `Explicit(String)` 来说，剩下的内容是一个**映射**，而 `String` 只能从字符串反序列化——**这两件事无法调和**。因此：
+
+- `scope: { kind: explicit, value: "C:/x/**" }` → 解析失败（映射无法变成字符串）；
+- `scope: { kind: explicit }` → 同样失败；
+- 报错形如 `invalid type: map, expected a string`（委托方的实测结论；本文档作者通过阅读代码确认了它的**结构性原因**，但**未独立运行验证**，也未在 `cargo test` 下复现）。
+
+**核实过程的限制**：仓库里的 `.tools/scratch/` 下有上一次会话留下的探针文件（`a.yaml` 用的正是 `scope: { kind: explicit, value: "C:/x/**" }`，`d.yaml` 覆盖 `net`/`env`/`exec`/`ai`/`gpu`），`.tools/probe2/src/main.rs` 是一个最小 serde 探针程序——但它只对比了 `permissions` 的**映射形式**与**序列形式**，**没有覆盖 `explicit`**。所以仓库内没有 `Explicit` 的实测记录，本次也没有生成新的记录。
+
+**后果（这才是要写进文档的部分）**：
+
+因为 `Explicit` 无法从清单装载进来，`plugin.rs` 里为它准备的两段逻辑在"从清单装载"这条路径上**暂时不可达**：
+
+1. `PluginManifest::validate()` 里的 `HOST_PATH_WRITE` 警告（"插件申请直接写宿主机路径：{glob}"）；
+2. `Capability::risk()` 里 `FsRead { scope: Explicit(_) } => RiskLevel::High` 这一支。
+
+这不是"安全漏洞"（**攻击者也不能用它**），而是"一道准备好的闸门装不上"：逃生舱口实际上是**锁死**的，任何需要访问固定系统目录（如 `%APPDATA%\SomeVendor`）的合法插件目前都做不到。
+
+**建议的两种修法**（都还没实施，属于待定）：
+
+- **方案 A（改动小，语义清楚）**：把 `Explicit(String)` 改成 struct 变体，让标签与字段能共存：
+
+  ```rust
+  Explicit { glob: String },
+  ```
+
+  这样 `scope: { kind: explicit, glob: "C:/x/**" }` 就能解析。代价是 `PathScope::Explicit(pattern)` 的匹配点（`describe()`、`is_sandboxed()`、`root_for()`、`resolve_explicit()`、`risk()`）都要跟着改。
+- **方案 B（后来实际采用的方向）**：让 `PermissionSet` 不再 `#[serde(transparent)]`，改用显式字段 `permissions: { capabilities: [...] }`。**这一步已经落地**（见 §3.0），`Capability` / `PathScope` 的表示此后可以自由调整；代价是原先按裸数组写的示例与文档需要同步更正（`plugins/` 下 6 个 `plugin.yaml` 与 `docs/PLUGIN-SDK.md` 已完成更正并重新校验通过）。
+
+在选定方案之前，任何文档、示例、UI 都**不应该**向用户展示 `Explicit` 的写法——因为它写出来必然解析失败。
+
+---
+
+## 4. 路径穿越防护
+
+### 4.1 原理
+
+`crates/toolforge-core/src/permission.rs` 的 `PathResolver::resolve(scope, rel)` 依次做三件事：
+
+1. **拒绝绝对路径**：`Path::new(rel).is_absolute()` 为真 → `ErrorCode::PermissionDenied`，附 `detail`「请改用相对于输入/输出/工作目录的路径」。设计前提是"插件只能用逻辑作用域，不能自己指定宿主机位置"。
+2. **拼接 + 词法规范化**：`root.join(rel)` 之后走 `normalize_lexically()`，逐组件展开：`.` 丢弃；`..` **只在栈顶是一个真正的目录名（`Component::Normal`）时才回退**，否则继续累积 `..`。
+3. **边界判定**：`!normalized.starts_with(root)` → 拒绝，`detail` 里同时给出"授权根目录"与"实际解析"两条路径，便于用户判断是插件写错了还是有人在试探。
+
+`starts_with` 是**按路径组件**比较的，不是字符串前缀比较——所以授权根 `/srv/input` 不会误放行 `/srv/input-evil`。这一点值得记下来，它避免了一类经典的前缀匹配漏洞。
+
+若该作用域的根目录尚未由宿主分配，`resolve()` 返回 `ErrorCode::Internal`，并在文案里明确「这是宿主 bug，不是插件问题」（单元测试 `unassigned_scope_is_host_bug_not_plugin_fault` 锁定这条）。
+
+#### ⚠️ 曾经的致命实现缺陷：`pop()` 会把两个 `..` 互相抵消
+
+第 2 步最初写的是：
+
+```rust
+// ❌ 错误实现
+Component::ParentDir => { if !out.pop() { out.push("..") } }
+```
+
+当栈顶是**我们自己刚压进去的 `..`** 时，`PathBuf::pop()` 依然返回 `true`。
+于是 `../../evil` 被规范化成 `evil` —— 两个 `..` 互相抵消了，**路径穿越检查被静默拆掉**。
+
+影响面：
+
+* `PathResolver::resolve` 对**相对路径**的检查失效；
+* `toolforge-plugins::store::safe_relative_path`（AI 生成的 Bundle 落盘路径校验）**完全失效**。
+
+它此前没有暴露，是因为 `resolve()` 是把 `rel` 拼到绝对根目录**之后**才规范化的，
+根目录会先吸收掉 `..`；真正漏掉的是"比根目录层级更深的 `..`"和"纯相对路径"两条路径。
+
+现在由两个测试锁死：`dotdot_is_never_cancelled`（语义正确性）与
+`excessive_traversal_from_input_root_is_rejected`（比根更深的 `..` 必须被拒）。
+
+**教训**：路径规范化是安全边界，**不能靠直觉写**。任何"消除 `..`"的代码
+都必须回答一个问题——"如果消不掉，是保留它还是丢掉它？"
+正确行为永远是**保留**（然后让边界判定去拒绝），而"抵消"是灾难。
+
+### 4.2 为什么用词法规范化而不是 `canonicalize()`
+
+`normalize_lexically()` 的文档注释给出了第一条理由：
+
+> 这也是为什么不用 `canonicalize()`：输出目录里的文件在写入前根本不存在，
+> `canonicalize` 会直接失败。
+
+完整的三条理由是：
+
+1. **对不存在的路径也有效**。输出文件在写入前不存在，`canonicalize()` 会返回错误——而这个错误又不是"越权"，只是"文件还没建"，用它做安全判定会导致正常的第一次写入被拒；
+2. **不跟随符号链接**。`canonicalize()` 会解析 symlink，攻击者只要在授权根目录内放一个指向外部的链接，`canonicalize` 的结果就一定在根目录之外——真实的实现里这会变成"要么全部拒绝、要么被迫接受已解析的越界路径"；
+3. **结果确定、不访问文件系统**。纯字符串/组件运算，没有 I/O、没有竞态（TOCTOU 的时间窗被压缩到后续真正的 `open` 那一步），也因此可以被单元测试穷举。
+
+### 4.3 正例与反例
+
+`permission.rs` 的单元测试就是最权威的用例集：
+
+| 输入（`scope = Input`，根 = `/srv/input`） | 结果 |
+| --- | --- |
+| `a/b.png` | ✅ 放行 |
+| `a/../b/c.png` | ✅ 放行（绕了一圈但仍在根内，属于合法写法，`nested_traversal_that_stays_inside_is_allowed`） |
+| `../../../etc/passwd` | ⛔ `PermissionDenied`（`path_traversal_is_blocked`） |
+| `C:\Windows\System32` | ⛔ `PermissionDenied`（绝对路径，同上测试） |
+
+### 4.4 局限（必须诚实写出来）
+
+词法规范化**挡不住**下面这些东西，它们都是真实的绕过方向，只是当前都还没有对应的缓解代码：
+
+1. **符号链接**。若攻击者能在授权根目录内创建一个指向外部的 symlink（例如插件自己先写一个链接，或者用户此前留下的链接），那么 `root/evil` 在词法上是"根目录内的路径"，`starts_with` 会放行，而内核在 `open` 时会跟随链接走到外面。`normalize_lexically()` **不访问文件系统，因此永远看不到链接**；
+2. **Windows 8.3 短名**。`PROGRA~1` 之类的别名可能让"看起来在根内"的路径指向别处；
+3. **UNC 路径**（`\\server\share\...`）与设备路径（`\\.\PhysicalDrive0`）；
+4. **TOCTOU**：校验与真正的 `open` 之间存在时间窗，链接可在其间被替换。
+
+加固方向（**属路线图，尚未实现**）：改用 `openat` 语义（相对已打开的目录 fd 解析）、`O_NOFOLLOW`、逐级校验每一层组件、Windows 上用 `CreateFile` 的 `FILE_FLAG_OPEN_REPARSE_POINT` 并拒绝 reparse point。
+
+**一条"间接成立"的补充结论**：`resolve()` 只显式拒绝 `is_absolute()` 的路径，没有像 `store.rs` 的 `safe_relative_path()` 那样显式检查 Windows 盘符前缀（`C:foo`）与根目录。看起来仍会被拦住——因为 `PathBuf::join`/`push` 在遇到"有前缀无根"或"有根无前缀"的路径时会**替换**整段，结果落在 `root` 之外，于是被 `starts_with` 判否。但这条推理依赖标准库的替换语义，属于**阅读推导而非实测**，建议对齐 `safe_relative_path()` 补一条显式检查，降低对库语义的依赖。**待定**。
+
+### 4.5 `sanitize_id()`：目录名拼接的最后一道防线（含一处待修缺陷）
+
+`crates/toolforge-core/src/paths.rs` 的 `sanitize_id()` 用途是把任意 ID 清洗成安全的目录名，被 `plugin_dir()` / `engine_dir()` / `model_dir()` / `job_workspace()` 使用。它自己的注释说明了定位：
+
+> 虽然插件 ID 在校验阶段已经限制过字符集，但**目录名拼接是最后一道防线**：任何时候把外部输入拼进路径都必须再过一次，防止 `..` 或分隔符漏网。
+
+实现是：非 `[A-Za-z0-9.\-_]` 的字符一律替换成 `_`，然后 `trim_matches('.')` 去掉首尾的点，空串回落成 `"unnamed"`。
+
+**缺陷（与 `ROADMAP.md` 阻塞 4 一致，本次核对仍成立）**：实现**先替换、再去点**，所以：
+
+| 输入 | 实际返回 | 单元测试断言 | 结论 |
+| --- | --- | --- | --- |
+| `../../etc/passwd` | `_.._etc_passwd` | `etc_passwd` | ❌ 测试会失败 |
+| `..` | `unnamed` | `unnamed` | ✅ |
+| `""` | `unnamed` | `unnamed` | ✅ |
+| `a/b\c` | `a_b_c` | `a_b_c` | ✅ |
+
+（"实际返回"是按实现逐字符推导得到的，与 `ROADMAP.md` 记录的实测结果一致；本次**未运行测试**验证。）
+
+**严重性判断（不要夸大）**：`_.._etc_passwd` 里的 `..` 是**同一个路径组件的一部分**（它前后是 `_` 与 `e`，没有分隔符），所以它**不是**可穿越的路径。`sanitize_id` 把 `/` 与 `\` 都换成了 `_`，因此它**没有**给出目录穿越能力。所以这是**"实现与自己声明的意图/测试不一致"**的缺陷，而不是一个可立即利用的漏洞。同时 `paths.rs` 的 `plugin_data_stays_inside_plugin_dir` 测试断言 `!dir.to_string_lossy().contains("..")`，对 `../../evil` 得到的 `_.._evil` 同样会失败——这条断言比必要强度更严。
+
+修法（**待定**，取其一并与测试对齐）：让实现先消除 `..` 组件（例如按路径组件处理、丢弃 `.`/`..`，再对每段做字符替换），或者放宽测试断言到"结果仍是单个路径组件且不含分隔符"。**在改动它之前应先补边界用例**（`..`、`..\`、绝对路径、尾随点、Windows 保留名），因为它处在路径收敛的边界上。
+
+### 4.6 虚拟前缀
+
+内置节点的路径解析在 `crates/toolforge-engines/src/nodes.rs` 的 `resolve_path(ctx, scope_kind, p)`：它先把 `scope_kind` 映射成 `PathScope`（`input` → `Input`、`output` → `Output`、`data` → `PluginData`、其它一律 `Workspace`），**剥掉** `/input/`、`/output/`、`/work/`、`/data/` 这四个虚拟前缀，再把剩下的部分交给 `PathResolver::resolve()`。
+
+对应的"逻辑视图"由 `PathResolver::logical_view()` 定义：`Input → /input`、`Output → /output`、`PluginData → /data`、`Workspace → /work`。Python/WASM 插件看到的 `paths.input` 就是这些虚拟路径，插件**永远不知道真实盘符**——但注意 `PluginRunner::ensure_loaded()` 往 `plugin_paths` 里塞的 JSON 中，`data` 一项是**真实路径**（`self.paths.plugin_data(&id).display().to_string()`），而 `input`/`output`/`work` 是虚拟路径。这是同一份契约里的不一致，属**待定**项（§9 第 21 项）。
+
+**要点**：剥前缀只是"写法便利"，安全判定完全依赖随后的 `PathResolver`。剥完之后的字符串仍然会经过绝对路径拒绝与 `starts_with` 检查，所以 `/input/../../etc/passwd` 与直接写 `../../etc/passwd` 得到同样的结果（被拒）。
+
+---
+
+## 5. 前端永远拿不到裸 shell
+
+### 5.1 设计约束
+
+**约束本身**（这是必须成立的，无论当前实现进度如何）：
+
+1. 前端只能通过 **IPC 命令**间接触发任务，**不允许**直接执行任意命令；
+2. `tauri-plugin-shell` 的 capability 只应放行**白名单**的程序，不允许通配；
+3. `Capability::Exec` 只给"宿主内部、按引擎 id 解析出来的固定可执行文件"，**不把用户/插件给的字符串当程序名**；
+4. 前端不得暴露"可以传任意命令名"的 `invoke` 透传封装。
+
+### 5.2 当前实际配置（与约束的偏差）
+
+`apps/desktop/src-tauri/capabilities/default.json` 是当前唯一的能力配置。它**总体上收得很紧**（只放行 `core:*` 的窗口/事件最小集合 + `log` / `dialog` / `opener` / `store` / `fs` / `shell`），值得记下来的正面事实：
+
+- `tauri.conf.json` 里 `app.withGlobalTauri: false`，所以页面里**没有** `window.__TAURI__` 全局对象；
+- CSP 很严：`default-src 'self'`、`script-src 'self'`、`frame-src 'none'`、`object-src 'none'`、`base-uri 'self'`、`form-action 'none'`、`connect-src 'self' ipc: http://ipc.localhost`，另有 `freezePrototype: true`。这显著降低了"前端被注入脚本后去调 IPC"的风险等级；
+- `assetProtocol.scope` 与 `fs:scope` 都限定在用户目录（`$APPDATA` / `$DOWNLOAD` / `$PICTURE` / … / `$TEMP`），没有通配整个盘。
+
+**但有两处与 §5.1 的约束不一致，必须如实写出**：
+
+1. **shell 放行的不是 sidecar，而是 `explorer`，并且参数不受限**：
+
+   ```json
+   {
+     "identifier": "shell:allow-execute",
+     "allow": [
+       { "name": "toolforge-open-folder", "cmd": "explorer", "args": true }
+     ]
+   }
+   ```
+
+   - 白名单里**没有** `sidecar: true` 的引擎二进制条目（`bundle.externalBin` 目前也是空数组）；
+   - `"args": true` 表示**允许任意参数**，而"打开某个目录"只需要固定形态的少量参数。这个配置宽于需求。
+   - 我没有验证 `explorer` + 任意参数是否存在可用的执行链（不同的 Windows 版本行为不同），因此**不把它写成"可执行任意程序"**；它是一条应当收窄的配置项（§9 第 11 项）。
+
+2. **前端直接持有文件系统文本读写能力**：`fs:default` + `fs:allow-read-text-file` + `fs:allow-write-text-file` + `fs:allow-exists`，scope 覆盖 `$DOWNLOAD/**`、`$DESKTOP/**`、`$DOCUMENT/**`、`$TEMP/**` 等。也就是说**前端不经过 Rust 命令层也能读写这些目录里的文本文件**。这与"前端只能通过 IPC 命令间接触发任务"的表述不完全一致（§9 第 12 项）。
+
+顺便指出：`apps/desktop/src-tauri/src/lib.rs` 的注释里写着「特别是 shell —— 它只被允许执行白名单 sidecar，前端拿不到任意命令执行」，这句**与上面的实际配置不符**（配置里是 `explorer`，不是 sidecar）。注释与配置应当对齐。
+
+### 5.3 现状标注与落地验收条件
+
+**现状**：与"`src/` 目录还不存在、主程序未写"的旧描述不同，外壳代码**已经存在**：`src/commands.rs`（28 个命令）、`src/ipc.rs`、`src/state.rs`、`src/lib.rs`、`src/main.rs`、`src/bin/export_bindings.rs`。命令层本身的设计纪律是好的——`commands.rs` 的模块文档写着「命令只做编排」「耗时操作一律异步化」「前端拿不到裸 shell」「AI 的产出永远只是草稿」，且 `lib.rs` 用 `COMMAND_NAMES` 与 `collect_commands!` 做数量一致性自检（`debug_assert_eq!(COMMAND_NAMES.len(), 28)`）。
+
+因此本节的状态应标注为：**设计约束已写进代码与注释，能力配置已存在但需要收窄**；下面这些验收条件应在 v0.1/v0.2 阶段被实际检查。
+
+**落地时必须满足的验收条件**：
+
+1. `tauri.conf.json` 与 `capabilities/*.json` 里**不得**出现"允许任意命令"的权限配置（例如裸的 `shell:allow-execute` 无 `allow` 列表、`args: true` 用于非固定参数场景、或任何通配形式的命令名）；
+2. 需要执行引擎二进制时，使用 `sidecar: true` + **显式白名单**（每个引擎一条），并在 `bundle.externalBin` 里登记；
+3. 前端的 `invoke` 封装**不得**接受"命令名"作为参数透传（即不允许 `invoke(cmdName, args)` 这种形态），命令名必须是字面量；
+4. `fs` 能力逐条评估：前端确实需要直接读写文件的场景应收窄到最小目录，其余一律走 Rust 命令层；
+5. `AssetProtocol` 的 scope 与 `fs:scope` 保持一致且都指向用户目录，不得出现 `**` 根通配；
+6. 单测/CI 里加一条"配置断言"：解析 `capabilities/*.json`，若出现 `shell:allow-execute` 且 `args !== false`（或 allow 列表为空）则失败。
+
+### 5.4 两条与"具体收窄"有关的注意事项
+
+这两点是**刻意的分层设计**，不是疏漏；但它们意味着"单靠 `CapabilityGuard` 不足以兜住路径"，必须写下来：
+
+1. **`CapabilityGuard::check()` 对 `Spawn { program }` 只判断"有没有 Exec 能力"，不校验程序名**。设计意图是把"具体能起哪个程序"交给引擎解析（宿主按引擎 id 解析出固定可执行文件）——但前提是有一条真正走引擎解析的调用路径，而不是把用户/插件给的字符串直接当程序名。
+2. **`needs_fs()` 只判断"集合里存在任意一个 `FsRead` / `FsWrite`"，不比对具体 scope 值**。注释写明了后续补充：「真正落到具体路径时还要再过 `PathResolver`」。所以：
+
+```
+CapabilityGuard  ⇒  回答"有没有这类能力"
+PathResolver     ⇒  回答"这个具体路径行不行"
+```
+
+**只做前者不做后者，就等于放行整个文件系统。** 任何新增的文件访问代码路径都必须同时经过 `PathResolver`。
+
+---
+
+## 6. AI 插件生成的安全流程
+
+### 6.1 流水线（设计规格）
+
+```
+生成（自然语言 → 草稿）
+  → 静态校验（PluginManifest::validate()，纯函数）
+  → 安全审核（review_draft()：能力风险定级 + 可疑模式扫描 + 运行时选择合理性）
+  → 权限差异检测（PermissionSet::is_subset_of / diff_capabilities：扩权必须重新确认）
+  → 人工 diff 审阅（AiProvenance.reviewed_at）
+  → 落盘（PluginSource::Bundle，路径不允许 .. 与绝对路径）
+  → 哈希锁定（内容哈希；装载前校验，不匹配报 IntegrityCheckFailed）
+```
+
+逐步说明与**当前的接线状态**：
+
+**① 生成**：`commands.rs` 的 `ai_generate()` 组装 system prompt + user prompt 调 `AiClient::complete()`，然后用 `toolforge_ai::parse_model_output()` 解析成 `Vec<DraftFile>`。返回类型是 `AiGenerateResponse`，里面的 `AiDraft` 是一个**纯内存类型**——`crates/toolforge-ai/src/review.rs` 的注释专门解释了这一点：它**没有任何写盘能力**，要落盘必须显式转成 `PluginSource`，而那个转换发生在外壳层、在用户点了"安装"之后。这条类型设计是"即使模型被提示词注入攻陷，它也只能产出用户看得见的一份草稿"的实现手段。**已实现。**
+
+**② 静态校验**：`PluginManifest::validate()`（`crates/toolforge-core/src/plugin.rs`）是**纯函数**——文档原话：
+
+> 这个函数是**纯的**（不碰磁盘、不联网），因此可以被 AI 生成流程在写盘之前调用 —— 这是"先校验再落盘"的关键：AI 的产出必须过这一关才有机会被用户看到。
+
+它产出的校验码包括（`ValidationIssue::code`）：`API_VERSION_MISMATCH`、`KIND_INVALID`、`ID_EMPTY`、`ID_FORMAT`、`NAME_EMPTY`、`VERSION_INVALID`、`IO_DUPLICATE_ID`、`IO_EMPTY_ID`、`PARAM_DUPLICATE_ID`、`ENUM_WITHOUT_OPTIONS`、`PARAM_RANGE_INVERTED`、`PARAM_DEFAULT_TYPE`（警告）、`PYTHON_NET_WITHOUT_PERMISSION`（**错误**）、`CRITICAL_CAPABILITY`（警告）、`HOST_PATH_WRITE`（警告，见 §3.8）、`WASM_PATH_EMPTY`、`WASM_EXT`（警告）、`WASM_MEMORY_RANGE`、`WASM_TIMEOUT`、`WASM_HOST_FN_UNKNOWN`、`WASM_WITH_PERMISSIONS`（警告）、`PY_ENTRY_EMPTY`、`PY_ENTRY_EXT`（警告）、`PY_REQ_EMPTY`、`PY_REQ_UNSAFE`、`PY_WORKERS_RANGE`。其中 `PY_REQ_UNSAFE` 专门拦"URL / VCS / 本地路径"形式的依赖（`://`、`-` 开头、` @ `），理由是禁止从任意来源拉代码。另有流水线自身的校验码（由 `PipelineDef::validate_into()` 产出，例如 `STEP_UNKNOWN_NODE`）。**已实现。**
+
+**③ 安全审核**：`review_draft()` 在清单之上再做一层——不执行任何代码、不写盘。产物 `SecurityReview` 会原封不动显示在"安装"确认页上。它的定位写得很清楚：**审核通过 ≠ 可以安装**，真正的门是用户逐条勾选权限。`scan_code()` 的扫描表包括 `subprocess` / `os.system` / `os.popen`（需 Exec）、`eval(` / `exec(` / `__import__` / `globals()` / `getattr(`（**需要 Code，而 Code 永远判定为"未声明"**——因为动态代码执行没有任何清单能力能覆盖）、`socket` / `requests.` / `urllib` / `httpx`（需 Net）、`open(` / `pathlib` / `shutil` / `os.remove` / `os.rmdir`（需 Fs）。判定策略是"**宁可误报**"（误报的代价是用户多点一次确认，漏报的代价是后门）。另外它还会为 L1 运行时配了代码文件报 `CODE_WITH_L1_RUNTIME`（Critical）、为 WASM 运行时声明媒体输入报 `WASM_MEDIA_INPUT`（High）。**已实现。**
+
+**④ 权限差异检测**：`PermissionSet::is_subset_of()` 是判定核心：
+
+```rust
+pub fn is_subset_of(&self, other: &PermissionSet) -> bool
+```
+
+**判定规则**：`new.is_subset_of(&old) == false` 时（即新版本声明了旧版本没有的能力），**必须重新走授权流程**。落地形态有两处：
+
+- `store.rs` 的 `finish_install()` 用 `diff_capabilities()` 算出 `(added, removed)`，`added` 非空就记一条 `AuditEventKind::PrivilegeEscalation`，并把它放进 `InstallReport::added_capabilities`（前端确认页展示"新增能力"）；
+- 安装/升级后状态一律重置为 `enabled: false` + `granted: 空`（`finish_install()`），所以**扩权的旧插件也必须重新授权**——这比"只对新增项重新确认"更严格，也更安全。单元测试 `reinstall_detects_privilege_escalation` 锁定这条。
+
+**已实现。**
+
+**⑤ 人工 diff 审阅**：设计上由 `AiProvenance.reviewed_at`（ISO-8601 字符串）承载，`PluginSummary::reviewed` 由 `ai.reviewed_at.is_some()` 派生（手写插件没有 `ai` 字段时默认 `true`）。**注意**：这个字段目前**没有任何写入方**（全仓库只出现在定义与读取处），也就是说宿主还没有"记录人工审阅时间"的代码路径。当前真正发生的"人工审阅"是前端拿到草稿后由用户确认，再调 `plugins_install`（其 `detail` 里明确要求 L3 必须 `executable_code_acknowledged`）。所以这一环应标注为 **规格说明 + 部分实现（由 UI 流程承担，但未落成溯源字段）**。
+
+**⑥ 落盘**：AI 产物走 `PluginSource::Bundle`。`store.rs` 的模块文档指出这是**唯一一个"外部数据决定磁盘写入位置"的地方**，所以检查做得最全：
+
+1. `safe_relative_path()`：拒绝绝对路径、拒绝盘符前缀（`raw.as_bytes()[1] == b':'`）、拒绝规范化后仍含 `..`、拒绝首组件不是 `Normal`（空路径/根）、Windows 上还拒绝保留设备名（`CON`/`PRN`/`AUX`/`NUL`/`COM1..COM4`/`LPT1..LPT3`）；
+2. 体积上限：单文件 1 MB（`MAX_BUNDLE_FILE_BYTES`）、整包 8 MB（`MAX_BUNDLE_TOTAL_BYTES`），超限即中止并清理已建目录；
+3. 已存在的插件目录默认**不覆盖**，除非 `overwrite = true`（升级要显式确认）；
+4. 覆盖安装时先 `remove_dir_all` 再重建，注释理由是「避免旧版本残留文件造成"幽灵代码"」。
+5. L2/L3 必须自带入口产物（`runtime.requires_artifact()`），否则 `PluginInvalid`。
+
+`PluginSource` 的三个变体在实现上也体现了同样的思路：`Directory { path }`、`Manifest { yaml }`、`Bundle { yaml, files }`。**已实现。**
+
+**⑦ 哈希锁定**：这里需要更正一处容易混淆的说法。设计文档里写的是 `AiProvenance.source_hash`（`sha256:...`，"装载前校验，防止装载后被替换"），但**这个字段同样没有任何写入方**。真正生效的完整性锁是 `PluginState::installed_hash`：
+
+- 安装时 `content_hash(dir)` 写入 `state.installed_hash`（`content_hash` 在 `crates/toolforge-plugins/src/audit.rs`）；
+- 装载前 `PluginRunner::ensure_loaded()` 重新计算并比对，不一致就 `record_integrity()` 记审计并返回 `ErrorCode::IntegrityCheckFailed`（"插件 `{id}` 的内容在装载前已被改动，拒绝执行"）；
+- 运行插件前的 `PluginStore::quarantine_if_changed()` 更进一步：不一致时记审计、**自动禁用**、通过 `AppEvent::security("critical", ...)` 推事件提示"如果这不是你自己改的，请卸载后重新安装"，最后返回 `IntegrityCheckFailed`。
+
+`content_hash` 的规则值得记下：只对**代码与清单**哈希，跳过 `.data/`、`.venv/`、`__pycache__/`、`node_modules/`、`.git` 目录以及 `.pyc`/`.pyo`/`.log`/`.tmp`；**路径参与哈希**（所以"把 `a.py` 改名成 `b.py`"也会被检出）；按相对路径排序以保证与文件系统枚举顺序无关。`.toolforge-state.json` 本身也不参与哈希（否则授权一次哈希就变了）。**已实现。**
+
+### 6.2 "宿主不会因为 `reviewedAt` 有值就自动放行"
+
+`plugin.rs` 的 `AiProvenance` 文档注释原文（已核实）：
+
+> 记录"这个插件是 AI 生成的"，以及人工审核的状态。
+>
+> 宿主**不会**因为 `reviewedAt` 有值就自动放行 —— 放行的唯一依据是用户授予的 [`PermissionSet`]。这里只是审计线索。
+
+这条是**整个 AI 流程的安全地基**：审阅时间戳、模型名、prompt 都只是**审计线索**，不是权限。任何"审核过了就免确认"的改动都会推翻它。
+
+### 6.3 当前落地状态总表
+
+| 环节 | 状态 |
+| --- | --- |
+| 生成（`crates/toolforge-ai` 的 `provider.rs` / `lib.rs`、外壳的 `ai_generate`） | **已实现**（`crates/toolforge-ai` **已存在**，与早先"还不存在"的说法不同） |
+| 静态校验 `PluginManifest::validate()` | **已实现**（纯函数，写盘前可调用） |
+| 安全审核 `review_draft()` | **已实现** |
+| 权限差异检测 `is_subset_of` / `diff_capabilities` | **已实现** |
+| 人工审阅落成 `AiProvenance.reviewed_at` | **未实现**（字段无写入方，审阅实际由 UI 流程承担） |
+| 落盘 `PluginSource::Bundle` + 路径校验 + 体积上限 | **已实现** |
+| 哈希锁定 `AiProvenance.source_hash` | **未实现**；等价能力由 `PluginState.installed_hash` + `content_hash()` 承担（**已实现**） |
+| 审计 `AiDraftAccepted` / `AiDraftRejected` 事件 | **未实现**（枚举里有这两个变体，但没有任何写入方；`ai_generate` 也不写审计） |
+
+---
+
+## 7. 审计日志
+
+### 7.1 为什么必须有，以及写在哪
+
+`crates/toolforge-plugins/src/audit.rs` 的模块文档把动机说得很准：
+
+> 因为最危险的情况不是"插件被拒绝"，而是"插件**做了**某件用户没意识到的事"。
+
+没有审计日志，用户在事后无法回答三个问题：我什么时候授权了这个插件读我的整个 D 盘？这个插件的哪个版本开始多要了 `exec` 权限？昨天有没有插件尝试越权、被拦住了吗？
+
+**位置**：`AppPaths::audit()` → `<data_root>/audit`（`crates/toolforge-core/src/paths.rs`）。文件名是 `audit-YYYY-MM-DD.ndjson`（`AuditLog::current_file()`，日期用 UTC，由 `chrono_day()` / `civil_from_days()` 手算，不引 chrono）。`AppPaths::describe()` 会把"审计日志"这一条展示给前端，`commands.rs` 的 `plugins_list()` 也会把 `audit_dir` 一起返回。
+
+**格式**：NDJSON（每行一个 JSON 对象）。理由：「追加写不会破坏已有内容」，且可以直接用 `Select-String` / `jq` 过滤。
+
+**落点约定**：`error.rs` 里 `ErrorCode::PluginCapabilityViolation` 的注释是「插件使用了未声明的能力（**安全事件，会被审计记录**）」，`ToolforgeError::violation()` 的注释是「插件越权。这是**安全事件**：调用方必须同时写审计日志。」`permission.rs` 的 `CapabilityGuard::check()` 注释同样要求"返回 Deny 就一定要向上冒泡成 `PluginCapabilityViolation`，由调用方同时写审计日志"。**这条约定目前依赖调用方自觉**——因为 `check()` 没有调用点，也就没有地方在强制它（§9 第 1 项）。
+
+### 7.2 `AuditEventKind` 全部变体与记录内容
+
+事件结构（`AuditEvent`）：`at`（ISO-8601，由 `job::now_iso()` 产生）、`kind`、`subject`（相关插件/引擎/请求标识，可选）、`summary`（人类可读摘要）、`detail`（结构化补充信息，可选）。`.detail` / `.subject` 都是构建器方法。
+
+| 变体 | 注释里的语义 | 是否有写入方 | 记录了哪些字段 |
+| --- | --- | --- | --- |
+| `Installed` | 插件被安装 | ✅ | `store.rs::finish_install`：summary 含名称/版本/文件数/哈希，detail 含 `files[]`、`hash`、`runtime`、`aiGenerated`；`runtimes.rs::ensure_loaded`：装载 L2/L3 时记 summary，L2 的 detail 含 `wasmBytes`/`memoryLimitMb`/`hostFunctions`，L3 的 detail 含 `entry`/`requirements`/`network` |
+| `Uninstalled` | 插件被卸载 | ✅ | `store.rs::uninstall`：只有 subject |
+| `PermissionGranted` | 用户授予了能力 | ✅ | `store.rs::set_granted`：summary 含数量，detail 为 `{ "granted": [能力中文描述] }`（只记**新增**的能力） |
+| `PermissionRevoked` | 用户收回了能力 | ❌ **无写入方** | —（`set_granted` 只算 `added`，撤销不记审计） |
+| `PrivilegeEscalation` | **检测到权限扩张** | ✅ | `audit.rs::record_escalation` ← `store.rs::finish_install`：summary 含"从 x 升级到 y 时新增了 N 项能力声明"，detail 为 `{ "added": [...] }` |
+| `CapabilityViolation` | **运行时越权被拦截**（最重要的安全信号） | ✅（两处） | `audit.rs::record_violation`：summary「插件尝试使用未声明的能力：{what}」，detail 为 `{ "request": what }`（**只有一句人类可读描述**）；`l1.rs::run_pipeline`：「流水线读取输入文件，但未声明 fsRead 能力」；`store.rs::set_granted`：「请求授予 N 项清单未声明的能力，已丢弃」，detail 为 `{ "rejected": [...] }` |
+| `ValidationFailed` | 清单校验失败 | ❌ **无写入方** | — |
+| `IntegrityFailure` | 哈希不匹配 | ✅ | `audit.rs::record_integrity` ← `runtimes.rs::ensure_loaded` 与 `store.rs::quarantine_if_changed`：summary「内容哈希与记录不符，已拒绝装载」，detail 为 `{ "expected", "actual" }` |
+| `AiDraftAccepted` | AI 生成的插件通过审核并落盘 | ❌ **无写入方** | — |
+| `AiDraftRejected` | AI 生成的插件被拒绝 | ❌ **无写入方** | — |
+
+注意 `AuditEventKind` 的枚举注释规定：「**只增不改**：改名会让历史日志失去可读性。」
+
+### 7.3 建议补全项
+
+按"最有用 → 次有用"排序（都还没实现）：
+
+1. **越权请求的结构化字段**。现在 `record_violation()` 只记一句 `{ "request": "读取 /etc/passwd" }` 这样的描述，无法做聚合分析。建议补：原始请求路径（**规范化之前**的那份，这才看得出攻击意图）、被拒绝的主机名、`Exec` 的程序名与参数、`Env` 的变量名、请求发生的插件版本与哈希；
+2. **权限撤销事件**。`PermissionRevoked` 已在枚举里，但没有任何写入方——`set_granted` 应当像记 `granted` 一样记 `revoked`；
+3. **校验失败事件**（`ValidationFailed`）。目前 `plugins_validate` 返回报告但**不写审计**，导致"AI 生成被拦下"这件事在审计里看不到。应在校验失败时写入错误码清单；
+4. **AI 生成请求与结果的摘要**。`AiDraftAccepted` / `AiDraftRejected` 用例应当记录：prompt 摘要、模型名、provider、`review_draft()` 的 `risk_level` 与 findings 的 code 列表、最终是否安装。**注意只记摘要，不要记完整 prompt 与文件内容**（可能含用户隐私，也会让审计文件膨胀）；
+5. **AI 调用本身**（模型名、耗时、token 估算），用于解释"我的额度去哪了"；
+6. **权限授予/撤销的操作上下文**：至少记插件版本与生效权限快照，便于回答"当时到底授权了什么"；
+7. **宿主侧的安全决策**：`quarantine_if_changed` 已经推了 `AppEvent::security("critical", ...)`，但它只记了 `IntegrityFailure` 一条；建议把"自动禁用"这个动作也写成独立事件（谁在什么时候禁用了什么）。
+
+### 7.4 审计日志的性质与约束
+
+- **只追加**。`AuditLog::try_record()` 用 `OpenOptions::new().create(true).append(true)`，只 `writeln!` 一行，从不重写文件；`tail()` / `files()` 只读。`files()` 按文件名排序后 `reverse()`，给出"按日期倒序"的文件列表；
+- **写入失败不能影响业务**。`record()` 吞掉错误并记一条 `tracing::error!`（注释：「磁盘满不该导致插件装不上」），并有单元测试 `audit_write_failure_does_not_panic` 锁定"指向不可创建的路径也不 panic"。**注意这个取舍的代价**：磁盘满/权限错误时审计会**静默缺失**，只有应用日志里有痕迹。如果将来要做"关键安全事件必须落盘"，需要为 `CapabilityViolation` / `IntegrityFailure` 这类事件单开一条**不允许静默失败**的路径；
+- **不记录 API Key 明文**。审计事件的 `detail` 全部由调用方显式构造，本次核对过的所有写入点都不含凭据；`AiProviderConfig::api_key` 带 `skip_serializing`（永不序列化到前端），Key 只以内存态存在于 `AppState`。**这条是"当前写入点如此"，不是"结构上不可能"**——`detail` 是自由的 `serde_json::Value`，任何人塞进去就会被记下来，所以**审阅新增的审计写入点时必须专门看一眼有没有塞敏感值**；
+- **可在插件详情页回放给用户看**。`commands.rs` 的 `plugins_audit(limit)` 返回 `AuditSnapshot { events, files, dir }`，`limit` 被 clamp 到 `1..=2000`；`AuditLog::tail(limit)` 读当天的文件、按行解析、`rev()` 取最后 N 条后再 `reverse()`（即按时间正序返回），解析失败的行被 `filter_map` 丢掉（所以**一行坏了不会影响其它行**）。"安全"页面应当据此按时间顺序还原"生成 → 审阅 → 授权 → 执行"全过程（`ROADMAP.md` 的 v0.5 验收标准第 10 条就是这条）；
+- **审计文件是明文 NDJSON**，用户可以直接用文本编辑器打开。这意味着**审计日志本身不是机密材料**，不要往里写敏感值；它也意味着用户可以**删改**它（没有签名/防篡改链）。防篡改（哈希链、只追加文件属性、外部投递）属于**待定**事项。
+
+---
+
+## 8. 如何报告安全问题
+
+### 8.1 请不要在公开 issue 里贴 PoC
+
+公开的 PoC 会让所有还在旧版本上的用户立刻暴露。请按下面的顺序做：
+
+1. **先通过仓库 Issues 请求一个私下渠道**。提交一条**不含任何技术细节**的 issue，说明"我发现了一个安全问题，希望私下沟通"，并留下一个你可以接收回复的方式（例如"请在我的 GitHub 主页上找我公开的联系方式"）。
+   - 仓库：`https://github.com/kkkkk-stk/Super-Multi-functional-Integrated-Software`（见 `README.md`）
+   - Issues：`https://github.com/kkkkk-stk/Super-Multi-functional-Integrated-Software/issues`（`README.md` 的「联系方式」一节给出的就是 GitHub 主页与 Issues）
+2. **仓库目前未设立专门的安全邮箱。** `README.md` 的「联系方式」一节只有 GitHub 主页与 Issues 入口，没有安全邮箱、也没有安全政策文件。所以**不要**往一个猜测的地址发邮件；请通过 Issues 请求私下渠道，维护者会给出下一步的联系方式。
+
+### 8.2 报告里应当包含什么
+
+越具体越好，清单如下：
+
+1. **版本**：应用版本（「关于」页，来自 `app_info` 命令的 `version`）与 `pluginApiVersion`（当前是 `toolforge/v1`）；如果是自己构建的，给 commit 号；
+2. **平台**：操作系统与版本（Windows 10/11 具体版本、macOS 版本与芯片、Linux 发行版与内核）、应用是安装包还是开发态；
+3. **插件标识**：插件 id（`metadata.id`）、插件版本、**内容哈希**（`sha256:...`）。
+   - 哈希可以在**安装确认页**上看到（`InstallReport::content_hash`），也可以在审计日志里找 `Installed` 事件的 `detail.hash`；
+   - 注意 `PluginDetail` 目前**不包含** `installed_hash` 字段，所以详情页上拿不到它——请从上面两处取；
+4. **涉及的能力**：这个插件**已经授权**了哪些能力（这决定了问题严重程度：一个只有 `fsRead{input}` 的插件能做的事，和一个拿着 `exec` 的插件完全不同）；
+5. **复现步骤**：最小可复现的材料（`plugin.yaml` 全文 + 必要的最小代码文件），以及"我期望发生什么 / 实际发生了什么"。仓库根目录下的 `README.md` 是你的参照，但**请把 PoC 的细节留在私下渠道**；
+6. **影响范围**：能读/写/外传什么、是否需要用户交互（例如"必须用户点安装并授权"还是"装载即触发"）、是否需要特定引擎或 Python 环境；
+7. **是否已公开**：你是否已在别处披露过、有没有时间线约束；
+8. **可选但很有帮助**：审计日志里相关几行（`<data_root>/audit/audit-YYYY-MM-DD.ndjson`），以及错误码。
+
+### 8.3 什么算"安全问题"（本项目的判定口径）
+
+- **算**：绕过 `PathResolver` 的路径穿越；未授权却成功的文件/网络/进程操作；`content_hash` 校验被绕过；前端能执行任意命令或绕过授权给插件开权限；安装包（`Bundle`）里的路径逃出插件目录；审计里能伪造/删除越权记录；AI 生成流程能让草稿在用户确认前落盘。
+- **也算**（虽然是"设计已知"）：上面 §1.4 与 §9 列出的**程度不足**——例如"L3 插件能读进程可读的任何文件""符号链接能逃出授权根目录"。这类问题我们已知，但如果你有**具体的利用链**或**更简单的复现**，请仍然报告，它会影响加固的优先级。
+- **可能不算**：纯粹因为"用户自己授权了 `exec`/`net` 然后插件滥用了它"。这类需要靠 §7 的审计与用户判断兜住。但如果你认为"授权界面没有把后果说清楚"，那算**可用性/知情同意缺陷**，也请报。
+
+---
+
+## 9. 已知缺口清单
+
+下表的"计划"一列对应 `docs/ROADMAP.md` 的阶段名（v0.1 / v0.2 / v0.5 / v1.0）。**该文档的阶段划分仍可作为参考，但它的「当前状态速览」已过期**（见 §0.2），所以"计划"只表示"这件事应在哪个阶段被处理"，不代表该阶段的其它描述是准确的。
+
+| # | 问题 | 影响 | 当前缓解 | 计划 |
+| --- | --- | --- | --- | --- |
+| 1 | `CapabilityGuard::check()` **没有生产调用点**（`CapabilityRequest` 只在自身单测中构造）；`NodeCtx` 持有 `guard` 字段但内置节点不使用它 | "运行时逐请求裁决 + 拒绝即冒泡成 `PluginCapabilityViolation` + 写审计"这一层整体未生效 | `PluginStore::runnable()` 装载门 + L1 的 `fsRead` 预检 + `PathResolver` | v0.2（"运行时裁决：未授权能力在任何运行时下都不可用"） |
+| 2 | `Net { hosts }` 白名单**无运行时强制**（`check_host()` 未被调用） | `hosts` 只影响 UI 文案；真正的控制只有"能否联网"的布尔开关，且可用 socket 绕过代理变量 | `deny_network` 默认开、`PYTHON_NET_WITHOUT_PERMISSION` 错误、`scan_code()` 的模式扫描 | v0.2 |
+| 3 | `Exec` **无运行时强制**；且 `supervisor.rs` 在 `env_clear()` 后**刻意保留 `PATH`**，L3 插件可起 PATH 内程序 | 拿到 `Exec`（或干脆不声明）的 L3 插件等价于任意代码执行；越权无法被拦 | 仅风险定级 `Critical` + `CRITICAL_CAPABILITY` 警告 + 审阅扫描。**另需修正 `review.rs` 中"起外部程序会被拒绝"这句与实际不符的用户可见文案** | v0.2 |
+| 4 | `Env { names }` **无任何实现**（无注入通道；`ReadEnv` 分支未被调用） | 该能力只影响 UI 与风险等级；"白名单防 API Key"在 L3 里实际由 `clear_env` 承担 | L3 `clear_env = true`（真防线）；L1/L2 无环境读取路径 | v0.2（或明确降级为"仅声明"并在 UI 说明） |
+| 5 | `Ai` / `Gpu` **无裁决点，也无对应请求类型**（`CapabilityRequest` 只有 5 个变体） | 两项能力目前只有风险等级与文案；`Ai` 的"额度消耗 + 数据外传"没有被任何机制约束 | `Ai` 走宿主侧 `AiClient`（插件不能直接拿到 Key）；风险文案 | v0.5 |
+| 6 | `PathScope::Explicit` **无法通过 `plugin.yaml` 表达**（内部标签 + `String` newtype 变体无法调和） | `HOST_PATH_WRITE` 警告与 `FsRead{Explicit}` 的 High 分支**暂不可达**；需要访问固定系统目录的合法插件也写不出来 | 无（逃生舱口实际锁死） | 待定（需先定 §3.8 的方案 A / B） |
+| 7 | 词法规范化**挡不住符号链接**、Windows 8.3 短名、UNC/设备路径、TOCTOU | 若攻击者能在授权根内放置链接，可读到根目录之外 | 绝对路径拒绝 + `starts_with(root)` 组件级比较 | v0.2 起（`openat`/`O_NOFOLLOW`/逐级校验） |
+| 8 | `PathResolver::resolve()` **不显式拒绝盘符前缀/根目录**（依赖 `join`/`push` 的替换语义） | 看起来仍被 `starts_with` 拦住，但结论是阅读推导、非实测，依赖标准库语义 | 同上。建议对齐 `store.rs::safe_relative_path()` 补显式检查 | 待定 |
+| 9 | `sanitize_id()` 实现与自身单测不符（`../../etc/passwd` → `_.._etc_passwd`，断言期望 `etc_passwd`）；`plugin_data_stays_inside_plugin_dir` 的 `!contains("..")` 断言同样会失败 | 不是可穿越漏洞（`/`、`\` 已被替换，结果仍是单个组件），但"最后一道防线"的行为与声明不一致；测试不可通过 | 无（行为本身未造成穿越） | v0.1（`ROADMAP.md` 阻塞 4；改前先补边界用例） |
+| 10 | ~~`plugin.rs`、`store.rs`、`toolforge-ai/src/review.rs` 的清单夹具与 `PermissionSet` 的 serde 表示不符~~ **已消解** | 这些夹具使用的是映射形式 `permissions: { capabilities: [...] }`，而 `PermissionSet` 的 `#[serde(transparent)]` 已被**移除**、schema 统一到映射形式，因此不再有解析失败。相反，原先按裸数组写的 6 个示例 `plugin.yaml` 一度全部失效，已改正并重新校验通过 | 无 | 已关闭 |
+| 11 | `crates/toolforge-process/src/supervisor.rs` 的 `ChildSupervisor::spawn()` 在返回结构体时写了 `notifications: notify_rx`，而局部变量名是 `notifications`（`notify_rx` 在文件里不存在） | 该 crate **看起来无法编译**，进而 L3 的进程隔离（`clear_env` / `deny_network` / 超时强杀）都还没被真正跑起来。**本次仅通过阅读发现，未运行 `cargo` 验证** | 无 | v0.1（属编译阻塞，性质同 `ROADMAP.md` 的阻塞 1/2） |
+| 12 | `capabilities/default.json` 里 `shell:allow-execute` 放行的是 **`explorer` + `args: true`**，且**没有** `sidecar: true` 的引擎白名单条目 | `args: true` 宽于"打开目录"的需求；且与代码注释中"只放行白名单 sidecar"的说法不符（可利用性未验证） | CSP 很严（`script-src 'self'` 等）+ `withGlobalTauri: false` | v0.1/v0.2（见 §5.3 验收条件） |
+| 13 | 前端直接持有 `fs:allow-read-text-file` / `fs:allow-write-text-file` / `fs:allow-exists` 及一组用户目录 scope | 前端可不经 Rust 命令层读写这些目录的文本文件，与"前端只通过 IPC 间接触发任务"的表述不一致 | scope 限定在用户目录（无根通配）+ 严格 CSP | v0.1/v0.2（逐条评估收窄） |
+| 14 | `AiProvenance.reviewed_at` 与 `AiProvenance.source_hash` **无任何写入方** | "AI 审阅时间戳"与"AI 产物哈希锁定"两个设计承诺未落地（等价完整性由 `installed_hash` 承担） | `PluginState.installed_hash` + `content_hash()` + `quarantine_if_changed` 自动禁用 | v0.5 |
+| 15 | `AuditEventKind` 中 `ValidationFailed` / `PermissionRevoked` / `AiDraftAccepted` / `AiDraftRejected` **无写入方**；`ai_generate` 本身不写审计 | 校验失败、权限撤销、AI 生成与拒绝这些事件在审计里看不到，事后无法还原完整链路 | 部分动作有应用日志（`tracing`） | v0.5（"审计日志完整"） |
+| 16 | 越权事件 `detail` 只有一句人类可读描述（`{ "request": what }`），缺结构化字段 | 无法聚合分析"哪个插件在反复试探什么"，也看不到规范化之前的原始路径 | 无 | v0.5（见 §7.3） |
+| 17 | 审计写入失败被**静默吞掉**（只记 `tracing::error`） | 磁盘满/权限错误时关键安全事件可能不落盘，用户无感 | 应用日志里有痕迹 | 待定（为关键事件单开不可静默失败的路径） |
+| 18 | ~~`PathResolver::resolve()` 的文档注释仍写「之所以先 `canonicalize` 再比较」~~ | —— | ✅ **已修复**：注释已改为「之所以先做词法规范化再比较」，与实现一致 | 关闭 |
+| 19 | L1 只预检 `fsRead`，**不预检 `fsWrite`**（`run_pipeline` 里只查了 `"src"`） | 未授权写文件要靠后续 `PathResolver` 或节点自身兜住，预检层有缺口 | `PathResolver` + 输出路径由宿主算好（`build_io`） | v0.2（随第 1 项一起补） |
+| 20 | 内置插件默认 `enabled: true` 且**自动授予声明的全部能力** | 前提是"内置目录不可被替换"。打包后它来自 `resource_dir()/plugins/builtin`；开发态直接指向仓库的 `plugins/builtin`。若该目录可被写入，等同"自动全量授权" | 路径解析有多级回退（`resolve_builtin_plugins`），但无完整性校验（内置插件没有 `installed_hash`） | v1.0（"插件来源可信"）/ 待定 |
+| 21 | ~~传给插件的路径同时存在两套语义~~ | —— | ✅ **已修复**：`initialize` 现在只传 `pluginDir` / `dataDir`（跨任务稳定的插件私有目录），本次任务的 `input` / `output` / `work` 只在每次 `run` 的载荷里给，**全部是真实路径**。契约内不一致消除；同时把"虚拟路径"的说法从注释里删掉，因为它与 L3 是普通进程这一事实不符 | 关闭 |
+| 22 | L3 **没有内核级隔离**（无 Windows Job Object + AppContainer / macOS `sandbox-exec` / Linux seccomp） | 见 §1.4：蓄意插件可绕过代理断网、可读进程可读的任何文件 | `clear_env` + 锁 cwd + 代理变量断网 + 超时强杀 + 优雅关闭；**并在 UI 上如实告知用户** | v0.2（`ROADMAP.md` 的路线图项） |
+| 23 | `plugin_data` / `PluginData` 作用域的写入**没有配额**；运行时写文件也没有总量限制 | 授权 `FsWrite` 的插件可以把磁盘写满（安装路径的 1 MB / 8 MB 上限只约束 `Bundle` 安装，不约束运行期） | 无 | 待定 |
+| 24 | 内置节点里的 `fs.delete` / `fs.move` 在 `FsWrite` 授权下即可用，**没有"只允许写新文件、不允许覆盖/删除既有文件"的约束** | 输出目录若与输入目录相同（或输出目录里有用户的其它文件），可能造成数据丢失 | 输出目录由用户指定；`PathResolver` 限制在目录内 | 待定（建议加"覆盖既有文件需二次确认"） |
+| 25 | **L3 的文件访问完全不经宿主中介**：`PathResolver` 不在 L3 的文件读写路径上，且 `PluginRunner::resolver_for()`（自称"供 L3 使用"）没有任何调用点 | 对 L3 而言 `fsRead{scope}` / `fsWrite{scope}` 只是**约定**，不是强制；"文件访问被限制在授权目录内"这句话只对 L1/宿主侧成立 | 只有 §1.4 的三件事（清空环境变量、锁 cwd、代理断网）+ 用户在授权前的判断 | v0.2（"路径收敛落地"这一条应明确 L3 怎么办：要么加内核级隔离，要么把 L3 的权限语义如实改写） |
+| 26 | ~~`nodes.rs::libreoffice_to_pdf` 在 `dst` 没有父目录时回退到 `std::env::temp_dir()`~~ | —— | ✅ **已修复**：改为**直接报错**而不是回退到宿主机临时目录。宁可让调用方看到"输出路径没有父目录"，也不要在授权范围之外偷偷写文件 | 关闭 |
+
+### 附：本次核对中**没有**发现问题的部分（也值得记下来）
+
+为了避免只有坏消息造成误判，以下几处的实现与文档一致且质量较高：
+
+- `PluginStore::set_granted()` 对"清单未声明能力"的**丢弃 + 审计**；
+- `finish_install()` 的"安装后一律禁用 + 零授权"，以及"升级后同样重置"；
+- `content_hash()` 的规则（跳过运行期目录、路径参与哈希、排序保证确定性）；
+- `safe_relative_path()` 的校验完整性（绝对路径、盘符、`..`、Windows 保留名）；
+- `WasmPlugin` 的 WASI 关闭 + fuel 上限 + 内存上限 + 载荷上限；
+- `PythonRuntimeDef::allow_network` 与 `SpawnSpec::deny_network` 的**默认安全值**（有单测锁定）；
+- `review.rs` 的"`eval`/`exec` 无任何能力可覆盖"这条判定（`CapabilityNeed::Code => false`）；
+- `AiProvenance` 的"`reviewedAt` 有值不等于放行"这条注释；
+- 外壳的 CSP、`withGlobalTauri: false`、`COMMAND_NAMES` 一致性自检。
+
+---
+
+## 附：本文档引用的代码位置索引
+
+| 主题 | 位置 |
+| --- | --- |
+| 能力模型、裁决器、路径收敛 | `crates/toolforge-core/src/permission.rs`（`PathScope` / `Capability` / `RiskLevel` / `PermissionSet` / `CapabilityRequest` / `CapabilityVerdict` / `CapabilityGuard` / `host_matches` / `PathResolver` / `normalize_lexically`） |
+| 清单 schema 与校验码 | `crates/toolforge-core/src/plugin.rs`（`PluginManifest::validate` / `validate_runtime` / `is_valid_plugin_id` / `AiProvenance` / `PluginSource` / `BundleFile` / `PluginSummary::from_manifest` / `ValidationReport`） |
+| 错误码全集 | `crates/toolforge-core/src/error.rs`（`ErrorCode`：尤见 `PermissionDenied` / `PluginCapabilityViolation` / `IntegrityCheckFailed` / `AiRejected`；`ToolforgeError::violation`） |
+| 目录布局与 `sanitize_id` | `crates/toolforge-core/src/paths.rs`（`AppPaths::audit` / `plugin_dir` / `plugin_data` / `sanitize_id`） |
+| 运行时边界（L2/L3 诚实说明） | `crates/toolforge-plugins/src/runtimes.rs`（模块文档、`PluginRunner::ensure_loaded` / `call` / `resolver_for`） |
+| L2 沙箱 | `crates/toolforge-plugins/src/runtimes/wasm.rs`（`WasmPlugin::load` / `pages_for_memory` / `fuel_for_timeout`） |
+| L3 进程隔离 | `crates/toolforge-plugins/src/runtimes/python.rs`（`PythonPlugin::launch` / `handle_notification` / `prepare_venv`） |
+| L1 执行与权限预检 | `crates/toolforge-plugins/src/l1.rs`（`run_pipeline` / `pipeline_uses_fs`） |
+| 审计 | `crates/toolforge-plugins/src/audit.rs`（`AuditEventKind` / `AuditEvent` / `AuditLog` / `content_hash` / `record_violation` / `record_escalation` / `record_integrity`） |
+| 插件仓库与安装 | `crates/toolforge-plugins/src/store.rs`（`PluginStore::install` / `finish_install` / `set_granted` / `set_enabled` / `runnable` / `verify_integrity` / `quarantine_if_changed` / `safe_relative_path` / `diff_capabilities`） |
+| 子进程监管 | `crates/toolforge-process/src/supervisor.rs`（`SpawnSpec` / `ChildSupervisor::spawn` / `initialize` / `call` / `shutdown` / `kill` / `decorate`）、`crates/toolforge-process/src/lib.rs`（`hide_console` / `detach_process_group` / 安全边界说明） |
+| 内置节点与虚拟前缀 | `crates/toolforge-engines/src/nodes.rs`（`resolve_path`） |
+| AI 生成与审核 | `crates/toolforge-ai/src/review.rs`（`AiDraft` / `SecurityReview` / `review_draft` / `scan_code`）、`crates/toolforge-ai/src/provider.rs`（`AiProviderConfig` 的 `api_key`） |
+| 外壳与 IPC | `apps/desktop/src-tauri/src/commands.rs`（`plugins_install` / `plugins_grant` / `plugins_run` / `ai_generate` / `build_io` / `resolve_output_dir`）、`apps/desktop/src-tauri/src/lib.rs`（`COMMAND_NAMES` / `specta_builder` / 插件注册）、`apps/desktop/src-tauri/capabilities/default.json`、`apps/desktop/src-tauri/tauri.conf.json` |
+| 阶段目标 | `docs/ROADMAP.md`、`docs/ENGINE-MATRIX.md` |

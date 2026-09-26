@@ -1,0 +1,422 @@
+//! 前端与后端之间的**契约类型**。
+//!
+//! ## 为什么单独一个模块
+//!
+//! 这些类型只存在于 IPC 边界上：它们不参与领域逻辑，但**必须**被 specta 导出成
+//! TypeScript。把它们集中在一个文件里，是为了让"前端能看到什么"这件事一目了然 ——
+//! 想加一个字段，改动点永远在这里，而不是散落在各个命令里。
+//!
+//! ## 一条约定
+//!
+//! 命令返回 `Result<T, ToolforgeError>`，而 `tauri-specta` 使用默认的
+//! [`tauri_specta::ErrorHandlingMode::Result`]，所以前端拿到的是：
+//!
+//! ```ts
+//! type Result<T, E> = { status: "ok"; data: T } | { status: "error"; error: E }
+//! ```
+//!
+//! 前端 `lib/ipc.ts` 里的 `unwrap()` 负责把它折成 Promise 的 resolve/reject。
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use specta::Type;
+
+use toolforge_core::engine::{EngineDescriptor, EngineStatus};
+use toolforge_core::job::{Job, JobFilter, JobStatus};
+use toolforge_core::permission::{Capability, PermissionSet};
+use toolforge_core::plugin::{ParamValue, PluginSource, PluginSummary, ValidationReport};
+use toolforge_ai::review::SecurityReview;
+use toolforge_ai::AiDraft;
+
+// ============================================================================
+// 应用 / 设置
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PathEntry {
+    pub label: String,
+    pub path: String,
+}
+
+/// 应用目录布局（设置页「打开目录」按钮用）
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AppPathsDto {
+    pub entries: Vec<PathEntry>,
+}
+
+/// 用户设置。全部字段都有默认值 —— 首次启动时不需要用户填任何东西。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    /// 任务队列并发度
+    #[serde(default = "default_concurrency")]
+    pub concurrency: u32,
+    /// 主题：`system` / `light` / `dark`
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    /// 强调色（CSS 变量注入）
+    #[serde(default = "default_accent")]
+    pub accent: String,
+    /// 是否启用背景氛围动效（低配机器可关）
+    #[serde(default = "default_true")]
+    pub ambient_effects: bool,
+    /// 默认输出目录；空表示"与源文件同目录"
+    #[serde(default)]
+    pub default_output_dir: String,
+    /// 批量处理时是否保留源文件
+    #[serde(default = "default_true")]
+    pub keep_original: bool,
+    /// AI 配置（不含 Key —— Key 单独走钥匙串）
+    #[serde(default)]
+    pub ai: AiSettings,
+    /// 启动时自动重新探测引擎
+    #[serde(default = "default_true")]
+    pub probe_engines_on_startup: bool,
+}
+
+fn default_concurrency() -> u32 {
+    // 按 CPU 核数取一半，至少 2、至多 8：批量处理时"占满所有核"反而更慢
+    // （磁盘 IO 与内存带宽会成为瓶颈）
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4);
+    (n / 2).clamp(2, 8)
+}
+fn default_theme() -> String {
+    "system".into()
+}
+fn default_accent() -> String {
+    "cyan".into()
+}
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            concurrency: default_concurrency(),
+            theme: default_theme(),
+            accent: default_accent(),
+            ambient_effects: true,
+            default_output_dir: String::new(),
+            keep_original: true,
+            ai: AiSettings::default(),
+            probe_engines_on_startup: true,
+        }
+    }
+}
+
+/// AI 设置。**API Key 不在这里** —— 它存在内存与 OS 钥匙串里，
+/// 绝不落到这个会序列化给前端的结构体上。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSettings {
+    pub provider: toolforge_ai::AiProviderKind,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    /// 只读：是否已经配置过 Key
+    #[serde(default)]
+    pub has_key: bool,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+}
+
+fn default_temperature() -> f32 {
+    0.2
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            provider: toolforge_ai::AiProviderKind::OpenAi,
+            base_url: String::new(),
+            model: String::new(),
+            has_key: false,
+            temperature: 0.2,
+        }
+    }
+}
+
+/// 局部更新设置（`None` 表示不改这个字段）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambient_effects: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_output_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_original: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<AiSettings>,
+    /// 写 `Some` 时会更新内存中的 Key；写 `Some("")` 则清除
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_engines_on_startup: Option<bool>,
+}
+
+// ============================================================================
+// 任务
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JobsSnapshot {
+    pub jobs: Vec<Job>,
+    pub active_count: u32,
+    pub running: Vec<String>,
+}
+
+// ============================================================================
+// 引擎
+// ============================================================================
+
+/// 引擎目录项 = 静态描述 + 运行时状态。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineEntry {
+    pub descriptor: EngineDescriptor,
+    pub status: EngineStatus,
+    /// 依赖这个引擎的内置节点名列表（UI 上显示"装了它能解锁什么"）
+    pub used_by_nodes: Vec<String>,
+}
+
+/// 引擎安装请求。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineInstallRequest {
+    pub engine_id: String,
+    /// 用户是否已经确认了许可证条款
+    #[serde(default)]
+    pub license_accepted: bool,
+    /// 是否允许安装没有 SHA-256 的来源（需要在 UI 上做二次确认）
+    #[serde(default)]
+    pub allow_unverified: bool,
+}
+
+// ============================================================================
+// 插件
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginsSnapshot {
+    pub plugins: Vec<PluginSummary>,
+    /// 有未授权项的插件数（侧边栏红点）
+    pub pending_permission_count: u32,
+    /// 审计目录（安全页展示）
+    pub audit_dir: String,
+}
+
+/// 校验一份插件来源（不落盘）。用于"导入前先看看"。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidatePluginRequest {
+    pub source: PluginSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidatePluginResponse {
+    pub validation: ValidationReport,
+    /// 申请的能力（中文描述 + 风险等级）
+    pub capabilities: Vec<Capability>,
+    /// 声明需要的引擎
+    pub required_engines: Vec<String>,
+    /// 缺失的引擎
+    pub missing_engines: Vec<String>,
+}
+
+/// 安装插件的请求。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallPluginRequest {
+    pub source: PluginSource,
+    /// 是否覆盖已存在的同名插件
+    #[serde(default)]
+    pub overwrite: bool,
+    /// 用户是否已确认权限清单（L1/L2 必填；L3 需要额外确认可执行代码）
+    #[serde(default)]
+    pub permissions_acknowledged: bool,
+    /// 仅 L3：用户是否确认"这是可执行代码"
+    #[serde(default)]
+    pub executable_code_acknowledged: bool,
+}
+
+/// 插件运行请求。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RunPluginRequest {
+    pub plugin_id: String,
+    /// 输入端口的实际文件路径（由原生文件对话框或拖拽得到）
+    pub inputs: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub params: HashMap<String, ParamValue>,
+    /// 输出目录；空则用设置里的默认值
+    #[serde(default)]
+    pub output_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RunPluginResponse {
+    /// 立即返回任务 id，实际执行在队列里进行（前端订阅事件跟进度）
+    pub job_id: String,
+    pub plugin_name: String,
+    /// 预计处理的文件总数
+    pub total_items: u32,
+}
+
+/// 授权请求
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GrantPermissionsRequest {
+    pub plugin_id: String,
+    pub granted: PermissionSet,
+}
+
+/// 内置节点目录（流程编辑器的节点面板）
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeCatalogResponse {
+    pub nodes: Vec<toolforge_core::pipeline::NodeDescriptor>,
+    /// 当前各节点的可用性（引擎缺失时置 false）
+    pub availability: HashMap<String, bool>,
+    /// 缺失引擎 -> 需要它的节点
+    pub missing_engines: HashMap<String, Vec<String>>,
+}
+
+// ============================================================================
+// AI
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AiGenerateRequest {
+    pub description: String,
+    /// 是否允许生成 Python 代码插件（默认 false）
+    #[serde(default)]
+    pub allow_python: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_hint: Option<String>,
+}
+
+/// 生成结果 = 草稿 + 审核报告。**不含任何"已安装"语义。**
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AiGenerateResponse {
+    pub draft: AiDraft,
+    pub review: SecurityReview,
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AiTestConnectionResponse {
+    pub ok: bool,
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+// ============================================================================
+// 审计
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditSnapshot {
+    pub events: Vec<toolforge_plugins::AuditEvent>,
+    pub files: Vec<String>,
+    pub dir: String,
+}
+
+// ============================================================================
+// 系统状态
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemStatus {
+    pub info: toolforge_core::AppInfo,
+    pub paths: AppPathsDto,
+    /// 已可用引擎数 / 总数
+    pub engines_ready: u32,
+    pub engines_total: u32,
+    /// 已装载的插件数
+    pub plugins_total: u32,
+    pub plugins_enabled: u32,
+    pub active_jobs: u32,
+    /// 数据库/目录是否可写
+    pub storage_writable: bool,
+    /// 当前平台
+    pub platform: String,
+    /// 命令总数（开发信息）
+    pub command_count: u32,
+}
+
+/// 任务状态统计（仪表盘用）
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JobStats {
+    pub by_status: HashMap<String, u32>,
+    pub total: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+}
+
+impl JobStats {
+    pub fn from_jobs(jobs: &[Job]) -> Self {
+        let mut by_status: HashMap<String, u32> = HashMap::new();
+        let mut succeeded = 0;
+        let mut failed = 0;
+        for j in jobs {
+            *by_status
+                .entry(
+                    match j.status {
+                        JobStatus::Queued => "queued",
+                        JobStatus::Running => "running",
+                        JobStatus::Succeeded => "succeeded",
+                        JobStatus::Failed => "failed",
+                        JobStatus::Cancelled => "cancelled",
+                    }
+                    .to_string(),
+                )
+                .or_insert(0) += 1;
+            if j.status == JobStatus::Succeeded {
+                succeeded += 1;
+            }
+            if j.status == JobStatus::Failed {
+                failed += 1;
+            }
+        }
+        Self {
+            by_status,
+            total: jobs.len() as u32,
+            succeeded,
+            failed,
+        }
+    }
+}
+
+/// 统一的 `jobs_list` 请求（specta 对 `Option<JobFilter>` 的处理不如显式结构体清晰）
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JobsListRequest {
+    #[serde(default)]
+    pub filter: JobFilter,
+}

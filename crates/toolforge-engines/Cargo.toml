@@ -1,0 +1,51 @@
+[package]
+name = "toolforge-engines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ToolForge 能力引擎层：探测 / 按需下载 / 降级调用 / 内置节点实现"
+
+[dependencies]
+toolforge-core = { workspace = true }
+toolforge-process = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+which = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+walkdir = { workspace = true }
+image = { workspace = true, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "bmp",
+    "tiff",
+    "gif",
+    "ico",
+    "pnm",
+    "qoi",
+    "tga",
+    "dds",
+    "hdr",
+    "ff",
+] }
+
+# 引擎 / 模型按需下载
+reqwest = { workspace = true }
+
+[features]
+default = []
+# AVIF 需要 rav1e 编码器，编译要几分钟，默认关闭
+avif = ["image/avif"]
+# 大图解码（EXR 等），体积换能力
+heavy-formats = ["image/exr"]

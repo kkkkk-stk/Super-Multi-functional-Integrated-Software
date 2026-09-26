@@ -1,0 +1,27 @@
+[package]
+name = "toolforge-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ToolForge 领域模型：任务、引擎、插件清单、权限与事件总线"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+semver = { workspace = true }
+globset = "0.4"
+specta = { workspace = true }
+
+[features]
+default = []

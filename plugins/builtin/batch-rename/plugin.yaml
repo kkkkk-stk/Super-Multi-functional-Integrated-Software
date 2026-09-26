@@ -1,0 +1,118 @@
+# ToolForge L1 插件（声明式编排，零代码）
+#
+# ── 实现状态提醒（务必先读）───────────────────────────────────────────────
+# `flow.foreach` 已经登记在节点目录里（见 `pipeline.rs` 的 `builtin_nodes()`），
+# 因此本清单能通过 `PluginManifest::validate()`；但 `toolforge-engines/src/nodes.rs`
+# 的 `run()` 目前**还没有实现它**，会返回
+# 「内置节点 `flow.foreach` 尚未在 v0.1 中实现」。
+# 也就是说：现在每个任务只处理 `${src}` 指向的那一个文件；
+# 真正的批量循环（按 `concurrency` 并行、逐项迭代）是 v0.2 的执行器能力。
+# 本示例保留该步骤，是为了把批量重命名的**目标形态**先固化下来。
+#
+# ── 关于 `with` ──────────────────────────────────────────────────────────
+# `with` 只传路径/结构性参数（`src` / `dst` / `path` / `name` / `value`）；
+# 节点的可调参数由执行器按 id 从插件 `io.params` 读取，写进 `with` 无效。
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.builtin.batch-rename
+  name: 批量重命名
+  version: 0.1.0
+  description: 按规则重命名一批文件：正则查找替换 + 序号/前后缀，然后落到输出目录。
+  author: ToolForge
+  license: MIT
+  icon: text-cursor-input
+  category: system
+  tags: [批量, 重命名, 正则]
+
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+
+io:
+  inputs:
+    - id: files
+      label: 待重命名文件
+      type: files
+      multiple: true
+      required: true
+  outputs:
+    - id: dst
+      label: 输出目录
+      type: directory
+      required: false
+  params:
+    - id: find
+      label: 正则表达式
+      type: text
+      description: 在文件名（不含扩展名）上匹配。留空表示不做替换。
+      default: { kind: str, value: "" }
+      placeholder: "IMG_(\\d+)"
+      required: false
+    - id: replace
+      label: 替换为
+      type: text
+      description: 支持 $1 / $2 这类捕获组反向引用。
+      default: { kind: str, value: "" }
+      placeholder: "photo-$1"
+      required: false
+    - id: ignoreCase
+      label: 忽略大小写
+      type: bool
+      default: { kind: bool, value: false }
+      required: false
+    - id: prefix
+      label: 前缀
+      type: text
+      default: { kind: str, value: "" }
+      required: false
+    - id: suffix
+      label: 后缀（插在扩展名之前）
+      type: text
+      default: { kind: str, value: "" }
+      required: false
+    - id: startIndex
+      label: 起始序号（0 = 不追加序号）
+      type: int
+      default: { kind: int, value: 0 }
+      min: 0
+      max: 1000000
+      step: 1
+      required: false
+    # id 叫 `concurrency`：`flow.foreach` 节点的执行器读的就是这个键
+    - id: concurrency
+      label: 并发度
+      type: int
+      description: 透传给 flow.foreach；磁盘是瓶颈时调小更稳。
+      default: { kind: int, value: 4 }
+      min: 1
+      max: 64
+      step: 1
+      required: false
+
+runtime:
+  kind: pipeline
+  pipeline:
+    description: 批量循环标记 + 逐项移动。
+    onError: continue
+    steps:
+      - id: loop
+        uses: flow.foreach
+        label: 批量循环
+        with:
+          # `${input.files}` 是**逗号连接**的全部输入路径；
+          # 需要单值时用 `${src}`（第一个输入文件）。
+          items: "${input.files}"
+      - id: rename
+        uses: fs.move
+        label: 重命名并移动
+        with:
+          src: "${src}"
+          dst: "${output.dst}"
+        # 单个文件命名冲突时不中止整批：Continue 会把失败原因写进
+        # `${steps.rename.error}` 供后续步骤引用（见 `l1.rs`）
+        onError: continue

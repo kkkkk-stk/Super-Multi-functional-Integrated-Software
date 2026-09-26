@@ -1,0 +1,94 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/desktop/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+authors = ["kkkkk-stk"]
+homepage = "https://github.com/kkkkk-stk/Super-Multi-functional-Integrated-Software"
+repository = "https://github.com/kkkkk-stk/Super-Multi-functional-Integrated-Software"
+description = "ToolForge — 插件驱动的集成式多功能工具箱"
+
+[workspace.dependencies]
+# ---------- 内部 crate ----------
+toolforge-core = { path = "crates/toolforge-core" }
+toolforge-process = { path = "crates/toolforge-process" }
+toolforge-engines = { path = "crates/toolforge-engines" }
+toolforge-plugins = { path = "crates/toolforge-plugins" }
+toolforge-ai = { path = "crates/toolforge-ai" }
+
+# ---------- Tauri 外壳 ----------
+tauri = { version = "2.11", features = ["specta"] }
+tauri-build = "2.6"
+tauri-plugin-fs = "2.5"
+tauri-plugin-dialog = "2.7"
+tauri-plugin-shell = "2.3"
+tauri-plugin-store = "2.4"
+tauri-plugin-updater = "2.12"
+tauri-plugin-log = "2.9"
+tauri-plugin-opener = "2.5"
+
+# ---------- 类型桥（Rust -> TS 自动生成）----------
+# 注意：specta 2.x 目前仅有 RC 版本，tauri-specta 与 specta 必须严格同版。
+# 所有导出类型都收敛在 apps/desktop/src-tauri/src/bindings.rs，便于日后整体替换为 ts-rs。
+specta = { version = "=2.0.0-rc.25", features = ["derive", "serde_json"] }
+specta-typescript = "0.0.12"
+tauri-specta = { version = "=2.0.0-rc.25", features = ["typescript"] }
+
+# ---------- 基础库 ----------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "sync",
+    "time",
+    "io-util",
+    "fs",
+] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+dashmap = "6"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"
+which = "8"
+sha2 = "0.10"
+hex = "0.4"
+dirs = "6"
+semver = "1"
+
+# ---------- 引擎层 ----------
+# 使用默认 native-tls（Windows 走 schannel / 系统证书库），
+# 这样企业代理或本机 TLS 中间人证书也能正常下载引擎。
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# 默认只带无专利风险、编译快的编解码器；
+# AVIF（rav1e，编译数分钟）与 EXR 通过 toolforge-engines 的 cargo feature 按需开启。
+image = { version = "0.25", default-features = false }
+
+# ---------- 插件运行时 ----------
+extism = "1.30"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[profile.dev]
+# 开发期给依赖一些优化，避免引擎/图像处理慢到不可用
+opt-level = 0
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 2

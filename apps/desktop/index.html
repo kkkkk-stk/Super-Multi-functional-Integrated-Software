@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN" class="dark" data-accent="cyan">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>ToolForge</title>
+  </head>
+  <body>
+    <!--
+      CSP 是 `script-src 'self'`（见 src-tauri/tauri.conf.json），所以这里不能放内联脚本
+      来提前套用主题。首屏防闪烁改由 index.css 里 `html.dark` 的默认值 +
+      main.tsx 在 render 之前同步调用 applyPersistedTheme() 完成。
+    -->
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

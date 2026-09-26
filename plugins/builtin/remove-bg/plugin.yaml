@@ -1,0 +1,89 @@
+# ToolForge L1 插件（声明式编排，零代码）
+#
+# ── 实现状态提醒 ─────────────────────────────────────────────────────────
+# `image.remove-background` 已登记在节点目录里（`pipeline.rs` 的 `builtin_nodes()`），
+# 声明了 `requiresEngines: [python, onnx-models]`，因此本清单能通过
+# `PluginManifest::validate()`；但它在 v0.1 的执行器里尚未实现
+# （`nodes.rs` 的 `run()` 会返回 not_implemented）。本示例用于固化清单形态。
+#
+# ── 关于「python / onnx-models 相关能力」─────────────────────────────────
+# 引擎依赖**不是** Capability，而是节点自己的 `requiresEngines`：
+# 缺失时宿主把该节点标记为不可用并提示安装，插件不需要为此申请任何权限。
+# 模型权重由宿主按需下载到 `<data_root>/models/`，插件自己不联网，
+# 所以这里**不申请** net 能力（申请了反而是多余的扩权）。
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.builtin.remove-bg
+  name: 一键抠图
+  version: 0.1.0
+  description: AI 抠图去背景，输出透明背景 PNG，可选边缘羽化与背景色替换。
+  author: ToolForge
+  license: MIT
+  icon: scissors
+  category: ai
+  tags: [抠图, AI, 透明背景, ONNX]
+
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+
+io:
+  inputs:
+    - id: src
+      label: 原图
+      type: file
+      accept: ["image/*"]
+      multiple: false
+      required: true
+  outputs:
+    - id: dst
+      label: 透明背景 PNG
+      type: file
+      required: false
+  params:
+    # id 叫 `model`：与节点目录里该节点的参数 id 一致
+    - id: model
+      label: 模型
+      type: enum
+      description: 首次使用时会按需下载权重；BiRefNet 与 MODNet 的权重标注为不可商用。
+      default: { kind: str, value: u2net }
+      options:
+        - { value: u2net, label: U²-Net（通用，176 MB） }
+        - { value: u2netp, label: U²-Net 轻量（快约 3 倍，5 MB） }
+        - { value: isnet-general, label: IS-Net General（复杂边缘更好，176 MB） }
+        - { value: birefnet-general, label: BiRefNet（发丝级，900 MB，权重不可商用） }
+        - { value: modnet-portrait, label: MODNet Portrait（人像专用，25 MB，权重不可商用） }
+      required: true
+      affectsOutput: true
+    - id: alphaMatting
+      label: 边缘羽化（发丝级）
+      type: bool
+      description: 开启后处理更慢，但头发等半透明边缘更自然。
+      default: { kind: bool, value: false }
+      required: false
+    - id: backgroundColor
+      label: 替换背景色
+      type: color
+      description: 留空 = 输出透明背景 PNG。
+      default: { kind: str, value: "" }
+      required: false
+
+runtime:
+  kind: pipeline
+  pipeline:
+    description: 单节点流水线：一次调用完成抠图。
+    onError: fail
+    # 首次运行要下载模型 + 加载 ONNX 会话，给足 10 分钟。
+    timeoutMs: 600000
+    steps:
+      - id: cutout
+        uses: image.remove-background
+        label: 抠图去背景
+        with:
+          src: "${src}"
+          dst: "${output.dst}"

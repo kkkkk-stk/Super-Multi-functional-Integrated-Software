@@ -1,0 +1,60 @@
+# ToolForge L2 插件（Extism WASM 沙箱，**只能做纯计算**）
+#
+# 能力边界（务必先读）：WASM 沙箱里没有文件系统、没有网络、没有 SIMD / 线程，
+# 所以本层只适合文本变换、哈希、编码解码、规则计算这类**纯计算**任务。
+# 想解码/缩放图片？请用 L1（内置 image.* 节点）或 L3（Python）。
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.example.text-toolkit
+  name: 文本工具箱（WASM 示例）
+  version: 0.1.0
+  description: 纯计算示例插件：文本统计与 slugify。演示 Extism PDK 的最小可用骨架。
+  author: ToolForge
+  license: MIT
+  icon: type
+  category: text
+  tags: [示例, WASM, 文本, 纯计算]
+
+# L2 是纯计算沙箱，**声明任何 fs/net 能力都是设计错误**
+# （校验器会给出 WASM_WITH_PERMISSIONS 警告）。所以这里是空集合。
+# 形状必须是 `permissions: { capabilities: [...] }`；写成裸数组会解析失败。
+permissions:
+  capabilities: []
+
+io:
+  inputs:
+    - id: text
+      label: 输入文本
+      type: text
+      required: true
+  outputs:
+    - id: result
+      label: 处理结果
+      type: json
+      required: false
+      description: JSON 字符串，字段随所选功能变化。
+  params:
+    - id: mode
+      label: 功能
+      type: enum
+      default: { kind: str, value: stats }
+      options:
+        - { value: stats, label: 文本统计（字符/词/行） }
+        - { value: slugify, label: 生成 URL slug }
+      required: true
+      affectsOutput: true
+
+runtime:
+  kind: wasm
+  wasm:
+    # 相对插件目录的产物路径；用 `cargo build --target wasm32-wasip1 --release`
+    # 后把 target/wasm32-wasip1/release/*.wasm 复制过来（见同目录 README 注释）
+    path: plugin.wasm
+    entry: run
+    memoryLimitMb: 64
+    timeoutMs: 5000
+    # 宿主函数白名单只允许 log 与 kv；本示例只申请 log。
+    # 注意：申请 kv 也不要放敏感信息 —— 它是插件私有存储，卸载插件时会被清理。
+    allowHostFunctions: ["log"]

@@ -1,0 +1,34 @@
+[package]
+name = "toolforge-plugins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ToolForge 三级插件运行时：L1 声明式流水线 / L2 Extism WASM / L3 Python JSON-RPC"
+
+[dependencies]
+toolforge-core = { workspace = true }
+toolforge-process = { workspace = true }
+toolforge-engines = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+walkdir = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+semver = { workspace = true }
+specta = { workspace = true }
+
+extism = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

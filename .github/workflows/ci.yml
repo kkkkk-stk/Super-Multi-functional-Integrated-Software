@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 编译期把警告当错误？不要 —— 先用 -D warnings 只卡 clippy，
+  # 普通编译保留警告，避免上游依赖的 deprecation 直接卡死构建。
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ==========================================================================
+  # Rust 侧：编译 + 单测 + clippy
+  # ==========================================================================
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: 安装 Linux 系统依赖
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            build-essential curl wget file libxdo-dev libayatana-appindicator3-dev
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # workspace 里的 tauri 依赖树很大，缓存命中能省几分钟
+          workspaces: ". -> target"
+
+      # frontendDist（apps/desktop/dist）是构建产物、不入库。
+      # 实测 debug 下 `cargo check` 不需要它（走 devUrl），但：
+      #   ① 这里要跑 `cargo clippy --all-targets`，release 语义下会需要；
+      #   ② 顺手验证前端在这个平台上也能构建 —— 比单独一个 job 更早暴露问题。
+      - name: 准备前端产物
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          node scripts/gen-icon.mjs
+          pnpm build
+
+      - name: cargo check（全 workspace + 全部 target）
+        run: cargo check --workspace --all-targets --locked
+
+      - name: cargo test
+        # 领域层与各子系统的单测 + 示例清单的端到端校验。
+        # app crate 的测试需要 WebView，这里不跑（由 web / bindings 两个 job 覆盖）。
+        run: >
+          cargo test
+          -p toolforge-core
+          -p toolforge-process
+          -p toolforge-engines
+          -p toolforge-plugins
+          -p toolforge-ai
+          --locked
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        continue-on-error: true # v0.1 阶段 clippy 先做提示，不卡合并
+
+  # ==========================================================================
+  # 前端侧：类型检查 + 构建
+  # 单独一个 job，这样前端挂了不会掩盖 Rust 的问题（反之亦然）
+  # ==========================================================================
+  web:
+    name: Web (tsc + vite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成图标
+        # 仓库里不放二进制素材，图标由脚本即时生成
+        run: node scripts/gen-icon.mjs
+
+      - name: 类型检查
+        run: pnpm typecheck
+
+      - name: 构建前端
+        run: pnpm build
+
+  # ==========================================================================
+  # 绑定同步检查：Rust 类型改了但没重新生成 bindings.ts 时，这个 job 会红。
+  # 这是防止"前端类型悄悄过期"的唯一可靠手段。
+  # ==========================================================================
+  bindings:
+    name: TS 绑定与 Rust 类型是否同步
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: 安装 Linux 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev build-essential curl wget file libxdo-dev libayatana-appindicator3-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 准备前端产物占位
+        # tauri 的 generate_context! 在编译期需要 frontendDist 存在
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: 重新导出绑定
+        run: cargo run -p toolforge --bin export-bindings
+
+      - name: 校验绑定没有漂移
+        run: |
+          if ! git diff --exit-code apps/desktop/src/bindings.ts; then
+            echo "::error::apps/desktop/src/bindings.ts 与 Rust 类型不同步。"
+            echo "::error::请在本地运行 \`pnpm bindings\` 并提交结果。"
+            exit 1
+          fi
+
+  # ==========================================================================
+  # 许可证合规：引擎与模型权重的许可证清单必须与代码里的目录保持一致
+  # ==========================================================================
+  licenses:
+    name: 引擎许可证清单一致性
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 校验 ENGINE-MATRIX.md 覆盖了 engine_catalog() 里的每个引擎
+        run: |
+          missing=0
+          for id in $(grep -oP 'id: "\K[a-z0-9-]+' crates/toolforge-core/src/engine.rs | sort -u); do
+            if ! grep -q "\`$id\`" docs/ENGINE-MATRIX.md; then
+              echo "::error::docs/ENGINE-MATRIX.md 缺少引擎 \`$id\` 的许可证说明"
+              missing=1
+            fi
+          done
+          exit $missing

@@ -1,0 +1,118 @@
+# ToolForge L1 插件（声明式编排，零代码）
+#
+# 本插件演示**多步流水线**与 `${steps.<步骤id>.<键>}` 引用：
+#   抽取画面（video.thumbnail）→ 读尺寸（image.probe）→ 记录变量（flow.set-var）→ 转 GIF（image.convert）
+#
+# ── 为什么中间产物要用第二个输出端口 ──────────────────────────────────────
+# `video.thumbnail` 的产出只登记在 `NodeOutput::outputs`（文件路径）里，
+# **不会**写进可供 `${steps.x.y}` 引用的值表（见 `nodes.rs`：`NodeOutput::file(...)`
+# 不带 `values`）。所以两步之间传路径的正确做法是：给插件声明第二个输出端口
+# `frame`，由宿主动分配它的目标路径，后续步骤直接引用 `${output.frame}`。
+#
+# 哪些节点会产出可引用的值（`nodes.rs` 实测）：
+#   image.probe  → width / height / color / megapixels
+#   image.resize → width / height
+#   image.crop   → width / height
+#   fs.copy / fs.move / fs.mkdir / image.convert / archive.unpack → path
+#   flow.set-var → value
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.builtin.video-to-gif
+  name: 视频转 GIF
+  version: 0.1.0
+  description: 抽取视频指定时间点的画面并转成 GIF，适合做表情包与文档配图。
+  author: ToolForge
+  license: MIT
+  icon: film
+  category: video
+  tags: [视频, GIF, 抽帧, ffmpeg]
+
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+
+io:
+  inputs:
+    - id: src
+      label: 源视频
+      type: file
+      accept: ["video/*"]
+      multiple: false
+      required: true
+  outputs:
+    - id: frame
+      label: 中间抽帧（PNG）
+      type: file
+      required: false
+      description: 中间产物；若不需要保留可让宿主只取 dst。
+    - id: dst
+      label: 输出 GIF
+      type: file
+      required: false
+  params:
+    # id 叫 `at`：video.thumbnail 的执行器读的就是它
+    - id: at
+      label: 抽帧时间点
+      type: text
+      description: 支持 00:00:03 或 3.5 两种写法。
+      default: { kind: str, value: "00:00:01" }
+      placeholder: "00:00:01"
+      required: false
+    # id 叫 `width`：video.thumbnail 读它作为抽帧宽度
+    - id: width
+      label: 抽帧宽度（px）
+      type: int
+      default: { kind: int, value: 480 }
+      min: 16
+      max: 1920
+      step: 1
+      required: false
+      affectsOutput: true
+    # id 叫 `quality`：image.convert 读它作为编码质量
+    - id: quality
+      label: GIF 质量
+      type: int
+      default: { kind: int, value: 80 }
+      min: 1
+      max: 100
+      step: 1
+      required: false
+
+runtime:
+  kind: pipeline
+  pipeline:
+    description: 抽帧 → 探测尺寸 → 转 GIF。
+    onError: fail
+    # 抽帧 + 编码在慢机器上可能超过 1 分钟，这里给 5 分钟上限；0 表示不限。
+    timeoutMs: 300000
+    steps:
+      - id: frame
+        uses: video.thumbnail
+        label: 抽取画面
+        with:
+          src: "${src}"
+          dst: "${output.frame}"
+      - id: probe
+        uses: image.probe
+        label: 读取抽帧尺寸
+        with:
+          src: "${output.frame}"
+      - id: remember
+        uses: flow.set-var
+        label: 记录尺寸
+        # `${steps.probe.width}` 引用**前序**步骤产出的值；引用后续步骤会被
+        # 校验器以 TEMPLATE_FORWARD_REF 拒绝（见 `pipeline.rs`）。
+        with:
+          name: frameSize
+          value: "${steps.probe.width}x${steps.probe.height}"
+      - id: toGif
+        uses: image.convert
+        label: 转成 GIF
+        with:
+          src: "${output.frame}"
+          dst: "${output.dst}"

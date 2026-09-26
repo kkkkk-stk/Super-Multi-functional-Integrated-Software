@@ -1,0 +1,79 @@
+# ToolForge L3 插件（Python 独立进程 + JSON-RPC over stdio）
+#
+# 协议与生命周期细节见 docs/PLUGIN-SDK.md 的「L3 Python 插件开发指南」。
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.example.palette
+  name: 图片主色调提取（Python 示例）
+  version: 0.1.0
+  description: 用 Pillow 统计图片主色调，输出色值 JSON 与一张色卡图。演示 L3 的完整 JSON-RPC stdio 循环与进度上报。
+  author: ToolForge
+  license: MIT
+  icon: palette
+  category: image
+  tags: [示例, Python, 配色, Pillow]
+
+# 只申请输入读、输出写。两处都不是显式宿主机路径（Explicit），因此风险等级为
+# Low / Medium，用户授权时不会看到红色警示。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+
+io:
+  inputs:
+    - id: src
+      label: 图片
+      type: file
+      accept: ["image/*"]
+      multiple: false
+      required: true
+  outputs:
+    - id: palette
+      label: 主色调（JSON）
+      type: json
+      required: false
+      description: 形如 [{"hex":"#1a2b3c","ratio":0.42}, ...] 的 JSON 字符串。
+    - id: swatch
+      label: 色卡图
+      type: file
+      required: false
+  params:
+    - id: count
+      label: 颜色数量
+      type: int
+      default: { kind: int, value: 5 }
+      min: 1
+      max: 16
+      step: 1
+      required: false
+      affectsOutput: true
+    - id: ignoreNearWhite
+      label: 忽略接近白色的像素
+      type: bool
+      description: 白底商品图/扫描件建议开启，否则主色调会被背景吃掉。
+      default: { kind: bool, value: true }
+      required: false
+
+runtime:
+  kind: python
+  python:
+    entry: main.py
+    # 宿主按这个版本挑选独立的 sidecar 运行时（与系统 Python 隔离）
+    pythonVersion: "3.11"
+    # 首次运行时由宿主在插件私有的 .venv 里安装。
+    # 禁止 URL / VCS / 本地路径（`pkg @ https://...`、`-e .` 之类），
+    # 否则校验器会以 PY_REQ_UNSAFE 直接拒绝装载。
+    requirements:
+      - "Pillow==10.4.0"
+    # 单次调用 5 分钟；冷启动要装依赖 / 载入解释器，别给太小的值
+    timeoutMs: 300000
+    # 常驻 1 个进程。这个插件没有重模型，多开进程只会浪费内存。
+    workers: 1
+    # 不出网。为 true 时 permissions 里必须有 net 能力，否则报
+    # PYTHON_NET_WITHOUT_PERMISSION。
+    allowNetwork: false

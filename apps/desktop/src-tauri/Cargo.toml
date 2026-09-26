@@ -1,0 +1,62 @@
+[package]
+name = "toolforge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ToolForge 桌面应用外壳"
+default-run = "toolforge"
+
+[lib]
+name = "toolforge_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "toolforge"
+path = "src/main.rs"
+
+[[bin]]
+name = "export-bindings"
+path = "src/bin/export_bindings.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+toolforge-core = { workspace = true }
+toolforge-process = { workspace = true }
+toolforge-engines = { workspace = true }
+toolforge-plugins = { workspace = true }
+toolforge-ai = { workspace = true }
+
+# `protocol-asset` 是 tauri.conf.json 里 app.security.assetProtocol.enable 所必需的：
+# 前端要用 `convertFileSrc()` 把本地图片路径渲染成可用的 URL（预览缩略图）。
+tauri = { workspace = true, features = ["protocol-asset"] }
+tauri-plugin-fs = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+tauri-plugin-shell = { workspace = true }
+tauri-plugin-store = { workspace = true }
+tauri-plugin-log = { workspace = true }
+tauri-plugin-opener = { workspace = true }
+# updater 需要签名私钥才能工作，默认关闭；发布时用 `--features updater` 打开
+tauri-plugin-updater = { workspace = true, optional = true }
+
+specta = { workspace = true }
+specta-typescript = { workspace = true }
+tauri-specta = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+dirs = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+default = []
+updater = ["dep:tauri-plugin-updater"]

@@ -1,0 +1,32 @@
+# ToolForge L2 示例插件（Extism WASM）
+#
+# 单独成一个 workspace，避免被仓库根的 Cargo workspace 误纳入
+# （根 Cargo.toml 的 members 是 crates/* 与 apps/desktop/src-tauri）。
+[workspace]
+
+[package]
+name = "toolforge-plugin-text-toolkit"
+version = "0.1.0"
+edition = "2021"
+description = "ToolForge L2 示例插件：文本统计与 slugify（纯计算）"
+license = "MIT"
+publish = false
+
+[lib]
+# Extism 插件必须是 cdylib，产物是 .wasm
+crate-type = ["cdylib"]
+
+[dependencies]
+# Extism 插件端 SDK。宿主端用的是 extism 1.30（见根 Cargo.toml）。
+extism-pdk = "1.4"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# WASM 体积直接决定插件装载速度，这里按体积优先优化
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

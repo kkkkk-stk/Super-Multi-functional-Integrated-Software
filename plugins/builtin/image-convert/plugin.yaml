@@ -1,0 +1,102 @@
+# ToolForge L1 插件（声明式编排，零代码）
+#
+# ── 关于 `with` 的约定（重要，别写错）───────────────────────────────────────
+# `with` 只负责传**路径 / 结构性参数**：`src` / `dst` / `path` / `name` / `value`。
+# 节点的可调参数（format / quality / width / height / filter / mode / …）由执行器
+# 从**插件自己的 `io.params` 里按同名的 id 直接读取**（见
+# `crates/toolforge-engines/src/nodes.rs` 里的 `ctx.param_str("format", "webp")` 等调用）。
+# 所以参数 id 必须与节点读取的键名逐字相同，写进 `with` 反而没有任何效果。
+#
+# ── 关于 `${...}` 变量 ─────────────────────────────────────────────────────
+# `${src}`   = 本次任务的第一个输入文件（`input.<portId>` 是逗号连接的全部路径）
+# `${output.<portId>}` = 宿主已分配好的输出目标路径
+# 建议始终写 `${output.dst}` 而不是简写 `${dst}`：`${dst}` 取的是输出端口里**任意**
+# 一个（HashMap 顺序不确定），输出端口多于一个时行为不稳定。
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.builtin.image-convert
+  name: 图片格式转换
+  version: 0.1.0
+  description: 在 PNG / JPEG / WebP / BMP / TIFF / GIF 之间互转。纯 Rust 解码器，无需外部引擎即可工作。
+  author: ToolForge
+  license: MIT
+  icon: image
+  category: image
+  tags: [图片, 格式转换, 压缩]
+
+# 声明 ≠ 授权：用户还要在「插件详情 → 权限」里逐条勾选。
+# 形状是 `permissions: { capabilities: [ ... ] }` —— `PermissionSet` 是带
+# `capabilities` 字段的结构体（刻意**没有** `#[serde(transparent)]`，这样 YAML
+# 可读性好、将来还能加字段）。写成裸数组 `permissions: [ ... ]` 会解析失败：
+# `permissions: invalid type: sequence, expected struct PermissionSet`。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+
+io:
+  inputs:
+    - id: src
+      label: 源图片
+      type: file
+      accept: ["image/*"]
+      multiple: true
+      required: true
+      # ⚠️ 诚实说明（2026-09 核对的实现现状）：
+      # 端口本身接受多张，但 L1 执行器会把 `${src}` 绑定到**第一个**输入路径
+      # （`toolforge-plugins/src/l1.rs`：`req.inputs.values().find_map(|v| v.first())`），
+      # 而 `apps/desktop/src-tauri/src/commands.rs::plugins_run` 只调用一次
+      # `run_pipeline`、不做逐文件扇出。所以「拖入 12 张」目前只会处理第 1 张，
+      # 但任务标题里的 `total_items` 会显示 12（宿主侧的不一致，见 docs/ROADMAP.md）。
+      # 逐文件扇出属待实现能力；在它落地前，请一次只拖入一张。
+      description: 当前实现只处理拖入的第一张图（逐文件扇出尚未落地）。
+  outputs:
+    - id: dst
+      label: 输出图片
+      type: file
+      required: false
+      description: 扩展名由「目标格式」决定。
+  params:
+    # id 必须叫 `format`：image.convert 节点的执行器读的就是这个键
+    - id: format
+      label: 目标格式
+      type: enum
+      description: 纯 Rust 后端的 WebP 编码只有无损模式；AVIF 需要安装 libvips 或 ImageMagick。
+      default: { kind: str, value: webp }
+      options:
+        - { value: png, label: PNG（无损，支持透明） }
+        - { value: jpeg, label: JPEG（有损，体积小） }
+        - { value: webp, label: WebP }
+        - { value: bmp, label: BMP }
+        - { value: tiff, label: TIFF }
+        - { value: gif, label: GIF }
+        - { value: avif, label: AVIF（需 libvips / ImageMagick） }
+      required: true
+      affectsOutput: true
+    # id 必须叫 `quality`
+    - id: quality
+      label: 质量
+      type: int
+      description: 仅对有损格式（jpeg）生效；纯 Rust 后端的 WebP / PNG 会忽略它。
+      default: { kind: int, value: 90 }
+      min: 1
+      max: 100
+      step: 1
+      required: false
+
+runtime:
+  kind: pipeline
+  pipeline:
+    description: 单节点流水线：一次调用完成格式转换。
+    onError: fail
+    steps:
+      - id: convert
+        uses: image.convert
+        label: 转换格式
+        with:
+          src: "${src}"
+          dst: "${output.dst}"
