@@ -656,7 +656,8 @@ function SecuritySection() {
         <p className="text-[11px] text-muted-foreground">
           审计格式是 NDJSON（每行一个 JSON），可以直接用 <span className="font-mono">Select-String</span> /{" "}
           <span className="font-mono">jq</span> 过滤。重点看这几类：
-          <span className="font-mono">capabilityViolation</span>（越权被拦）、
+          <span className="font-mono">pathEscapeBlocked</span>（试图访问授权范围外的路径）、
+          <span className="font-mono">capabilityViolation</span>（用了没声明的能力）、
           <span className="font-mono">privilegeEscalation</span>（升级后多要权限）、
           <span className="font-mono">integrityFailure</span>（哈希不符）。
         </p>
@@ -665,12 +666,18 @@ function SecuritySection() {
           <SkeletonCard lines={4} />
         ) : !audit.data || audit.data.events.length === 0 ? (
           <p className="rounded-lg border border-dashed border-border/70 p-6 text-center text-xs text-muted-foreground">
-            今天还没有审计事件。安装/授权/卸载插件、越权拦截都会写在这里。
+            今天还没有审计事件。安装/授权/卸载插件、越权与路径逃逸拦截都会写在这里。
           </p>
         ) : (
           <ul className="space-y-1.5">
             {[...audit.data.events].reverse().map((event, idx) => {
+              // 会标红的都是**安全事件**，不是普通操作记录。
+              //
+              // `pathEscapeBlocked` 是这里面最值得看的一类：它意味着某个插件
+              // 试图访问授权目录之外的路径（例如 `C:\Windows\System32\...`）。
+              // 这条曾经完全没有被记录 —— 见 `toolforge-plugins/src/l1.rs` 的注释。
               const alarming =
+                event.kind === "pathEscapeBlocked" ||
                 event.kind === "capabilityViolation" ||
                 event.kind === "integrityFailure" ||
                 event.kind === "privilegeEscalation";

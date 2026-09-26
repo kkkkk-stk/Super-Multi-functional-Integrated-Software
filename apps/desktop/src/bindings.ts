@@ -359,8 +359,21 @@ export type AuditEventKind =
 "permissionRevoked" | 
 /**  **检测到权限扩张**（新版本声明了旧版本没有的能力） */
 "privilegeEscalation" | 
-/**  **运行时越权被拦截** —— 最重要的安全信号 */
+/**  **运行时越权被拦截** —— 用了没声明/没授权的能力 */
 "capabilityViolation" | 
+/**
+ *  **路径逃逸被拦截** —— 插件试图访问授权根之外的路径。
+ * 
+ *  与 [`AuditEventKind::CapabilityViolation`] 分开记，因为它们的**排查含义不同**：
+ *  前者是"插件声明漏了/用户没授权"，后者是"有人在试探沙箱边界"。
+ *  事后取证时这两件事的严重程度不一样，混在一起就分不出来了。
+ * 
+ *  这条是被一次真机测试逼出来的：我装了一个步骤里写死
+ *  `C:\Windows\System32\drivers\etc\hosts` 的恶意插件并运行，任务被正确拒绝，
+ *  **但审计日志里什么都没有** —— 因为拦截来自 `PathResolver`（`PermissionDenied`），
+ *  而当时的审计钩子只认能力裁决的 `PluginCapabilityViolation`。
+ */
+"pathEscapeBlocked" | 
 /**  清单校验失败 */
 "validationFailed" | 
 /**  哈希不匹配（装载时或下载时） */

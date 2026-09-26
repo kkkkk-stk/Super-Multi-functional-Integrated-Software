@@ -324,16 +324,45 @@ pub async fn run_pipeline(
 
                 // **安全事件必须先落审计，再决定怎么处理。**
                 //
-                // `PluginCapabilityViolation` 由 `nodes.rs::resolve_path` 的能力裁决
-                // 抛出（插件试图做清单没声明的访问）。这一类事件不能因为
-                // 本步骤配了 `onError: skip` 就从记录里消失 —— 那正好是攻击者
-                // 最希望发生的事。所以审计发生在策略判断**之前**。
-                if err.code == ErrorCode::PluginCapabilityViolation {
-                    crate::audit::record_violation(
+                // 两类都要记，而且它们的排查含义不同：
+                //   * `PluginCapabilityViolation` —— 能力裁决拦下的（用了没声明的能力），
+                //     来自 `nodes.rs::resolve_path` 的第一层；
+                //   * `PermissionDenied` —— 路径收敛拦下的（试图走出授权根），
+                //     来自第二层 `PathResolver`。
+                //
+                // ⚠️ 第二类曾经**完全没被记录**：审计钩子只认第一类，于是
+                // "插件试图读 C:\Windows\System32\drivers\etc\hosts" 这种最典型的
+                // 沙箱试探在日志里查无此事 —— 任务失败了，但没人知道为什么失败，
+                // 也没人知道有人在试。这是真机测试暴露的。
+                //
+                // 放在策略判断**之前**是刻意的：本步骤若配了 `onError: skip`，
+                // 越权记录绝不能跟着消失 —— 那正是攻击者最希望发生的事。
+                match err.code {
+                    ErrorCode::PluginCapabilityViolation => crate::audit::record_violation(
                         &record_dir_audit(record),
                         record.id(),
                         &format!("步骤 `{}`：{}", step.id, err.message),
-                    );
+                    ),
+                    ErrorCode::PermissionDenied => {
+                        let log = record_dir_audit(record);
+                        log.record(
+                            crate::audit::AuditEvent::new(
+                                crate::audit::AuditEventKind::PathEscapeBlocked,
+                                format!(
+                                    "步骤 `{}` 试图访问授权范围之外的路径，已拦截",
+                                    step.id
+                                ),
+                            )
+                            .subject(record.id())
+                            .detail(serde_json::json!({
+                                "step": step.id,
+                                "node": step.uses,
+                                "message": err.message,
+                                "detail": err.detail,
+                            })),
+                        );
+                    }
+                    _ => {}
                 }
 
                 match policy {

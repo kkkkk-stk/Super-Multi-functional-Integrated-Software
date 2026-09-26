@@ -799,13 +799,16 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | `Installed` | 插件被安装 | ✅ | `store.rs::finish_install`：summary 含名称/版本/文件数/哈希，detail 含 `files[]`、`hash`、`runtime`、`aiGenerated`；`runtimes.rs::ensure_loaded`：装载 L2/L3 时记 summary，L2 的 detail 含 `wasmBytes`/`memoryLimitMb`/`hostFunctions`，L3 的 detail 含 `entry`/`requirements`/`network` |
 | `Uninstalled` | 插件被卸载 | ✅ | `store.rs::uninstall`：只有 subject |
 | `PermissionGranted` | 用户授予了能力 | ✅ | `store.rs::set_granted`：summary 含数量，detail 为 `{ "granted": [能力中文描述] }`（只记**新增**的能力） |
-| `PermissionRevoked` | 用户收回了能力 | ❌ **无写入方** | —（`set_granted` 只算 `added`，撤销不记审计） |
+| `PermissionRevoked` | 用户收回了能力 | ✅ | `store.rs::set_granted`：summary 含数量，detail 为 `{ "revoked": [...] }`。**曾经只记增加不记收回** —— 那样就回答不了"我什么时候把某个插件的网络权限关掉的" |
 | `PrivilegeEscalation` | **检测到权限扩张** | ✅ | `audit.rs::record_escalation` ← `store.rs::finish_install`：summary 含"从 x 升级到 y 时新增了 N 项能力声明"，detail 为 `{ "added": [...] }` |
-| `CapabilityViolation` | **运行时越权被拦截**（最重要的安全信号） | ✅（两处） | `audit.rs::record_violation`：summary「插件尝试使用未声明的能力：{what}」，detail 为 `{ "request": what }`（**只有一句人类可读描述**）；`l1.rs::run_pipeline`：「流水线读取输入文件，但未声明 fsRead 能力」；`store.rs::set_granted`：「请求授予 N 项清单未声明的能力，已丢弃」，detail 为 `{ "rejected": [...] }` |
-| `ValidationFailed` | 清单校验失败 | ❌ **无写入方** | — |
+| `PathEscapeBlocked` | **路径逃逸被拦截** —— 插件试图访问授权根之外的路径 | ✅ | `l1.rs::run_pipeline`：summary「步骤 \`X\` 试图访问授权范围之外的路径，已拦截」，detail 为 `{ "step", "node", "message", "detail" }`（`detail` 里含**授权根**与**实际解析到的路径**，取证足够）。**这条曾经完全没被记录** —— 审计钩子只认能力裁决的 `CapabilityViolation`，而路径拦截来自 `PathResolver` 的 `PermissionDenied`。真机测试里那个读 `C:\Windows\System32\drivers\etc\hosts` 的恶意插件任务失败了，日志里却查无此事 |
+| `CapabilityViolation` | **运行时越权被拦截** | ✅（三处） | `audit.rs::record_violation`：summary「插件尝试使用未声明的能力：{what}」；`l1.rs::run_pipeline`：能力裁决拦下时记「步骤 \`X\`：{message}」；`store.rs::set_granted`：「请求授予 N 项清单未声明的能力，已丢弃」，detail 为 `{ "rejected": [...] }` |
+| `ValidationFailed` | 清单校验失败 | ❌ **无写入方** | 校验发生在 `PluginManifest::validate()`，它返回报告而不是写审计；调用方（`plugins_validate` / `install`）目前只把报告回给前端 |
 | `IntegrityFailure` | 哈希不匹配 | ✅ | `audit.rs::record_integrity` ← `runtimes.rs::ensure_loaded` 与 `store.rs::quarantine_if_changed`：summary「内容哈希与记录不符，已拒绝装载」，detail 为 `{ "expected", "actual" }` |
-| `AiDraftAccepted` | AI 生成的插件通过审核并落盘 | ❌ **无写入方** | — |
-| `AiDraftRejected` | AI 生成的插件被拒绝 | ❌ **无写入方** | — |
+| `AiDraftAccepted` | AI 生成的插件被安装 | ✅ | `store.rs::finish_install`：当 `manifest.ai.generated == true` 时记 summary 与 `{ "model", "runtime", "hash" }`。只记 `Installed` 的话，AI 生成的与手写的混在一起分不出来 |
+| `AiDraftRejected` | AI 生成的插件未通过安全审核 | ✅ | `commands.rs::ai_generate`：审核不通过时记 summary 与 `{ "model", "provider", "promptChars", "findings" }`。它回答"这个模型是不是经常试图生成越权的插件" |
+
+> **安全事件的记录位置是有讲究的**：`l1.rs::run_pipeline` 里，越权与路径逃逸的审计发生在**应用 `onError` 策略之前**。本步骤若配了 `onError: skip`，记录绝不能跟着消失 —— 那正是攻击者最希望发生的事。
 
 注意 `AuditEventKind` 的枚举注释规定：「**只增不改**：改名会让历史日志失去可读性。」
 
