@@ -883,6 +883,103 @@ c.section('【12】图片降级链的**中间档**（ImageMagick）是否真的�
   }
 }
 
+// ============================================================================
+// 【13】兜底档：两个引擎都藏起来，纯 Rust 必须接得住（且能跑）
+// ============================================================================
+c.section('【13】图片降级链的**兜底档**（纯 Rust）是否真的能兜住');
+{
+  // 这一档是"零依赖、始终可用"的那条 —— 也正因如此，**装了引擎的机器上
+  // 永远走不到它**：libvips 在就永远走 libvips。于是它是三档里最该被验、
+  // 却最容易被漏掉的一档（文档此前只敢写"三档里有两档有证据"）。
+  //
+  // 把两个引擎目录都临时改名，就能逼出真实的兜底行为；测完在 finally 里还原。
+  const engines = await client.invoke('engines_catalog');
+  const usable = (id) => {
+    const e = engines.find((x) => x.descriptor.id === id);
+    return e && (e.status.state === 'detected' || e.status.state === 'installed');
+  };
+  const managedOnly = (id) => {
+    const e = engines.find((x) => x.descriptor.id === id);
+    // 只有"应用托管"的那份才藏得掉；系统装的（在 PATH 里）改名没用
+    return usable(id) && e.status.source === 'managed';
+  };
+
+  const hideable = ['libvips', 'imagemagick'].filter(managedOnly);
+  if (hideable.length === 0) {
+    c.note('跳过：没有任何"应用托管"的图片引擎可以临时藏起来');
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    const ENG = join(DATA_DIR, 'engines');
+    const moved = [];
+    const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-tier-rust');
+    const src = join(REPO_ROOT, '.tools', 'smoke', 'in-tier-rust.png');
+
+    try {
+      for (const id of hideable) {
+        const from = join(ENG, id);
+        const to = join(ENG, `${id}__hidden_by_verify`);
+        renameSync(from, to);
+        moved.push([from, to]);
+      }
+      await client.invoke('engines_probe_all');
+      for (const id of hideable) {
+        const st = await client.invoke('engines_probe', { engineId: id });
+        c.check(st.state !== 'installed' && st.state !== 'detected', `${id} 已不可用`, st.state);
+      }
+
+      rmSync(outDir, { recursive: true, force: true });
+      mkdirSync(outDir, { recursive: true });
+      writeFileSync(src, makePng(320, 200, 2));
+      const sub = await client.invoke('plugins_run', {
+        req: {
+          pluginId: 'com.toolforge.builtin.image-convert',
+          inputs: { src: [src] },
+          params: { format: { kind: 'str', value: 'webp' }, quality: { kind: 'int', value: 80 } },
+          outputDir: outDir,
+        },
+      });
+      const job = await client.waitJob(sub.jobId, 200, 500);
+      const line =
+        (job.logs ?? []).map((l) => String(l.message)).find((m) => m.includes('后端 =')) ?? '';
+      c.note(line);
+      c.check(job.status === 'succeeded', '两个引擎都没有时，转换依然成功（兜底真的兜住了）', job.status);
+      c.check(line.includes('rust'), '★ 实际后端是纯 Rust', line);
+
+      const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+      if (produced.length === 1) {
+        const info = webpInfo(readFileSync(join(outDir, produced[0])));
+        // 纯 Rust 后端只有无损 WebP —— 这既是它的能力边界，也是"确实是它做的"的指纹
+        c.check(
+          info?.codec === 'VP8L',
+          '★ 产出是无损 VP8L（纯 Rust 后端的指纹，同时也说明它给不了有损）',
+          String(info?.codec)
+        );
+      }
+      const warned = (job.logs ?? []).some((l) => String(l.message).includes('只有无损模式'));
+      c.check(warned, '如实提示了"只有无损模式"', String(warned));
+    } catch (e) {
+      c.check(false, '兜底档测试抛错', String(e.message).split('\n')[0]);
+    } finally {
+      for (const [from, to] of moved) {
+        try {
+          renameSync(to, from);
+        } catch (e) {
+          c.check(false, `还原 ${from} 失败 —— 请手动把 ${to} 改回去`, String(e.message));
+        }
+      }
+      await client.invoke('engines_probe_all');
+      for (const id of hideable) {
+        const back = await client.invoke('engines_probe', { engineId: id });
+        c.check(
+          back.state === 'installed' || back.state === 'detected',
+          `${id} 已还原`,
+          back.state
+        );
+      }
+    }
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 
