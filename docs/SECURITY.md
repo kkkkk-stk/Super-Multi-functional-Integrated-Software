@@ -161,7 +161,17 @@ test result: FAILED. 59 passed; 2 failed
 
 - L1：`crates/toolforge-plugins/src/l1.rs` 的 `run_pipeline()`，在跑之前先判断流水线是否引用 `${src}`，若是而生效权限里没有**任意** `FsRead`，则 `record_violation()` + 返回 `ToolforgeError::violation()`。这是**已实现**的。
 - 装载门：`PluginStore::runnable()`（`crates/toolforge-plugins/src/store.rs`）要求"已启用 + 校验通过 + **没有待授权项**"，否则返回 `ErrorCode::PermissionDenied`。**已实现**。
-- 通用裁决器 `CapabilityGuard::check()`：**仅声明未接线**。它有针对 `ReadFile`/`WriteFile`/`Http`/`ReadEnv`/`Spawn` 五个请求类型的完整判断逻辑和单元测试，但全仓库生产代码里**没有任何调用点**（`CapabilityRequest` 只在 `permission.rs` 自己的测试里被构造）。相关缺口见 §9 第 1 项。
+- 通用裁决器 `CapabilityGuard::check()`：**已接线**（`fsRead` / `fsWrite` 部分）。`nodes.rs::resolve_path()` 对每一次文件访问先调它；拒绝时返回 `PluginCapabilityViolation`，由 `l1.rs` 在**应用 `onError` 策略之前**写入审计。`ReadEnv` / `Spawn` / `Http` 三个分支仍无调用点，见 §9 第 2–4 项。
+
+  > ⚠️ **这条曾经是本项目最严重的一处"文档说谎"**：`check()` 有完整逻辑和单测，
+  > 但生产代码里**一个调用点都没有** —— `CapabilityGuard` 在 `l1.rs` 被构造、
+  > 塞进 `NodeCtx.guard`，然后就再也没人碰过它。也就是说 README 与本文档里
+  > 宣称的"运行时逐请求裁决"当时**根本不生效**，真正拦住越权的只有
+  > `PathResolver`（它管路径，不管"你有没有这个能力"）。
+  >
+  > 它是由一次外部代码审计发现的，不是测试发现的 —— 因为当时的测试只验证了
+  > `check()` **自己**的行为，没有验证它**被调用**。现在有四条回归测试
+  > （`fs_write_is_rejected_without_the_capability` 等）钉住接线本身。
 
 ### 2.2 第二层：最小授权
 
@@ -200,12 +210,15 @@ CapabilityGuard::check(&CapabilityRequest) -> CapabilityVerdict { Allow | Deny {
 
 详见 §4。
 
-**接线状态（必须如实说明）**：如 §2.1 所述，`CapabilityGuard::check()` 目前没有生产调用点，所以"运行时逐请求裁决"这一层**尚未生效**。当前实际生效的是：
+**接线状态**：`CapabilityGuard::check()` 已接在 `nodes.rs::resolve_path()` 上（见 §2.1），所以"运行时逐请求裁决"对**文件访问**是生效的。当前实际生效的完整链条是：
 
 1. `PluginStore::runnable()` 的装载门（权限不齐直接不让跑）；
-2. L1 的 `fsRead` 预检；
-3. `PathResolver`（**已实现**，所有内置节点解析路径都走 `crates/toolforge-engines/src/nodes.rs` 的 `resolve_path()`）；
-4. L3 的 `deny_network` 布尔开关与超时强杀。
+2. **`CapabilityGuard::check()`**（每次文件访问都过 —— 回答"有没有这类能力"）；
+3. **`PathResolver`**（回答"这个具体文件能不能碰"，见 §4）；
+4. L1 的 `fsRead` 预检（流水线引用 `${src}` 却没声明 fsRead 时提前拒绝并记审计）；
+5. L3 的 `deny_network` 布尔开关与超时强杀。
+
+**仍未覆盖**：`ReadEnv` / `Spawn` / `Http` 三类请求没有运行时调用点 —— 宿主目前不代插件发 HTTP、不代插件读环境变量，而 L3 起子进程由它自己发起（见 §9 第 2–4 项）。
 
 **路径收敛的适用范围（必须写清楚，否则会严重误判 L3 的安全性）**：
 
@@ -619,22 +632,21 @@ Component::ParentDir => { if !out.pop() { out.push("..") } }
 - CSP 很严：`default-src 'self'`、`script-src 'self'`、`frame-src 'none'`、`object-src 'none'`、`base-uri 'self'`、`form-action 'none'`、`connect-src 'self' ipc: http://ipc.localhost`，另有 `freezePrototype: true`。这显著降低了"前端被注入脚本后去调 IPC"的风险等级；
 - `assetProtocol.scope` 与 `fs:scope` 都限定在用户目录（`$APPDATA` / `$DOWNLOAD` / `$PICTURE` / … / `$TEMP`），没有通配整个盘。
 
-**但有两处与 §5.1 的约束不一致，必须如实写出**：
+**关于 shell 的三条约束，当前状态是全部满足的**：
 
-1. **shell 放行的不是 sidecar，而是 `explorer`，并且参数不受限**：
-
-   ```json
-   {
-     "identifier": "shell:allow-execute",
-     "allow": [
-       { "name": "toolforge-open-folder", "cmd": "explorer", "args": true }
-     ]
-   }
-   ```
-
-   - 白名单里**没有** `sidecar: true` 的引擎二进制条目（`bundle.externalBin` 目前也是空数组）；
-   - `"args": true` 表示**允许任意参数**，而"打开某个目录"只需要固定形态的少量参数。这个配置宽于需求。
-   - 我没有验证 `explorer` + 任意参数是否存在可用的执行链（不同的 Windows 版本行为不同），因此**不把它写成"可执行任意程序"**；它是一条应当收窄的配置项（§9 第 11 项）。
+1. ~~shell 放行的是 `explorer` + `args: true`~~ → ✅ **已移除**。`capabilities/default.json`
+   里现在**没有任何 `shell:allow-execute` 条目**，连 `shell:allow-open` 都没有。
+   需要"在文件管理器里显示文件"时用 `opener` 插件的 `revealItemInDir()`。
+   这样做的理由很直接：`shell:allow-execute` 的 scope 项形如 `{ name, cmd, args }`，
+   而 `args: true` 意味着**任意参数** —— 对一个能启动 `explorer.exe` 的入口来说，
+   `explorer <某个.exe>` 就是一条完整的任意程序执行路径。前端（以及将来可能注入的
+   插件 UI）拿到它，整个权限模型都成了摆设。移除比"收窄参数"更干净：
+   我们根本不需要这个能力。
+2. **白名单里没有 `sidecar: true` 的引擎二进制条目**（`bundle.externalBin` 目前也是空数组）
+   —— 这是**当前状态的如实描述**，不是缺陷：所有引擎调用都走 Rust 命令层经
+   `toolforge-process` 起进程，前端不参与。
+3. `lib.rs` 里那句「只被允许执行白名单 sidecar」的注释**曾经与配置不符**（配置里是
+   `explorer`），现已改写成与配置一致的说明。
 
 2. **前端直接持有文件系统文本读写能力**：`fs:default` + `fs:allow-read-text-file` + `fs:allow-write-text-file` + `fs:allow-exists`，scope 覆盖 `$DOWNLOAD/**`、`$DESKTOP/**`、`$DOCUMENT/**`、`$TEMP/**` 等。也就是说**前端不经过 Rust 命令层也能读写这些目录里的文本文件**。这与"前端只能通过 IPC 命令间接触发任务"的表述不完全一致（§9 第 12 项）。
 
@@ -852,8 +864,8 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 
 | # | 问题 | 影响 | 当前缓解 | 计划 |
 | --- | --- | --- | --- | --- |
-| 1 | `CapabilityGuard::check()` **没有生产调用点**（`CapabilityRequest` 只在自身单测中构造）；`NodeCtx` 持有 `guard` 字段但内置节点不使用它 | "运行时逐请求裁决 + 拒绝即冒泡成 `PluginCapabilityViolation` + 写审计"这一层整体未生效 | `PluginStore::runnable()` 装载门 + L1 的 `fsRead` 预检 + `PathResolver` | v0.2（"运行时裁决：未授权能力在任何运行时下都不可用"） |
-| 2 | `Net { hosts }` 白名单**无运行时强制**（`check_host()` 未被调用） | `hosts` 只影响 UI 文案；真正的控制只有"能否联网"的布尔开关，且可用 socket 绕过代理变量 | `deny_network` 默认开、`PYTHON_NET_WITHOUT_PERMISSION` 错误、`scan_code()` 的模式扫描 | v0.2 |
+| 1 | ~~`CapabilityGuard::check()` 没有生产调用点~~ | —— | ✅ **已修复**：`nodes.rs::resolve_path()` 现在对**每一次**文件访问先调 `check()`（input 走 `ReadFile`、其余走 `WriteFile`），拒绝时返回 `PluginCapabilityViolation`，并由 `l1.rs` 在**应用 `onError` 策略之前**写入审计（否则 `onError: skip` 会让越权记录凭空消失）。四条回归测试钉住：`fs_write_is_rejected_without_the_capability`、`fs_read_is_rejected_without_the_capability`、`fs_write_passes_once_the_capability_is_granted`、`path_traversal_is_still_blocked_after_the_capability_check`。**注意 `ReadEnv` / `Spawn` / `Http` 三个分支仍无调用点**，见第 2、3、4 项 | 关闭（fsRead/fsWrite 部分） |
+| 2 | `Net { hosts }` 白名单**无运行时强制**（`check_host()` 未被调用） | `hosts` 只影响 UI 文案；真正的控制只有"能否联网"的布尔开关，且可用 socket 绕过代理变量 | `deny_network` 默认开、`PYTHON_NET_WITHOUT_PERMISSION` 错误、`scan_code()` 的模式扫描 | v0.2（宿主目前不代插件发请求，所以这条暂时没有可利用面） |
 | 3 | `Exec` **无运行时强制**；且 `supervisor.rs` 在 `env_clear()` 后**刻意保留 `PATH`**，L3 插件可起 PATH 内程序 | 拿到 `Exec`（或干脆不声明）的 L3 插件等价于任意代码执行；越权无法被拦 | 仅风险定级 `Critical` + `CRITICAL_CAPABILITY` 警告 + 审阅扫描。**另需修正 `review.rs` 中"起外部程序会被拒绝"这句与实际不符的用户可见文案** | v0.2 |
 | 4 | `Env { names }` **无任何实现**（无注入通道；`ReadEnv` 分支未被调用） | 该能力只影响 UI 与风险等级；"白名单防 API Key"在 L3 里实际由 `clear_env` 承担 | L3 `clear_env = true`（真防线）；L1/L2 无环境读取路径 | v0.2（或明确降级为"仅声明"并在 UI 说明） |
 | 5 | `Ai` / `Gpu` **无裁决点，也无对应请求类型**（`CapabilityRequest` 只有 5 个变体） | 两项能力目前只有风险等级与文案；`Ai` 的"额度消耗 + 数据外传"没有被任何机制约束 | `Ai` 走宿主侧 `AiClient`（插件不能直接拿到 Key）；风险文案 | v0.5 |
@@ -863,7 +875,7 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | 9 | `sanitize_id()` 实现与自身单测不符（`../../etc/passwd` → `_.._etc_passwd`，断言期望 `etc_passwd`）；`plugin_data_stays_inside_plugin_dir` 的 `!contains("..")` 断言同样会失败 | 不是可穿越漏洞（`/`、`\` 已被替换，结果仍是单个组件），但"最后一道防线"的行为与声明不一致；测试不可通过 | 无（行为本身未造成穿越） | v0.1（`ROADMAP.md` 阻塞 4；改前先补边界用例） |
 | 10 | ~~`plugin.rs`、`store.rs`、`toolforge-ai/src/review.rs` 的清单夹具与 `PermissionSet` 的 serde 表示不符~~ **已消解** | 这些夹具使用的是映射形式 `permissions: { capabilities: [...] }`，而 `PermissionSet` 的 `#[serde(transparent)]` 已被**移除**、schema 统一到映射形式，因此不再有解析失败。相反，原先按裸数组写的 6 个示例 `plugin.yaml` 一度全部失效，已改正并重新校验通过 | 无 | 已关闭 |
 | 11 | `crates/toolforge-process/src/supervisor.rs` 的 `ChildSupervisor::spawn()` 在返回结构体时写了 `notifications: notify_rx`，而局部变量名是 `notifications`（`notify_rx` 在文件里不存在） | 该 crate **看起来无法编译**，进而 L3 的进程隔离（`clear_env` / `deny_network` / 超时强杀）都还没被真正跑起来。**本次仅通过阅读发现，未运行 `cargo` 验证** | 无 | v0.1（属编译阻塞，性质同 `ROADMAP.md` 的阻塞 1/2） |
-| 12 | `capabilities/default.json` 里 `shell:allow-execute` 放行的是 **`explorer` + `args: true`**，且**没有** `sidecar: true` 的引擎白名单条目 | `args: true` 宽于"打开目录"的需求；且与代码注释中"只放行白名单 sidecar"的说法不符（可利用性未验证） | CSP 很严（`script-src 'self'` 等）+ `withGlobalTauri: false` | v0.1/v0.2（见 §5.3 验收条件） |
+| 12 | ~~`capabilities/default.json` 里 `shell:allow-execute` 放行的是 `explorer` + `args: true`~~ | —— | ✅ **已修复**：`shell:allow-execute` 与 `shell:allow-open` 已**整体移除**。"在文件管理器里显示输出文件"改走 `opener` 插件的 `revealItemInDir()` —— 目的明确的 API，不是通用命令执行。shell 插件仍被注册（对齐技术选型与未来的 sidecar 分发），但**零权限**。`lib.rs` 里那句与配置不符的注释也已改正 | 关闭 |
 | 13 | 前端直接持有 `fs:allow-read-text-file` / `fs:allow-write-text-file` / `fs:allow-exists` 及一组用户目录 scope | 前端可不经 Rust 命令层读写这些目录的文本文件，与"前端只通过 IPC 间接触发任务"的表述不一致 | scope 限定在用户目录（无根通配）+ 严格 CSP | v0.1/v0.2（逐条评估收窄） |
 | 14 | `AiProvenance.reviewed_at` 与 `AiProvenance.source_hash` **无任何写入方** | "AI 审阅时间戳"与"AI 产物哈希锁定"两个设计承诺未落地（等价完整性由 `installed_hash` 承担） | `PluginState.installed_hash` + `content_hash()` + `quarantine_if_changed` 自动禁用 | v0.5 |
 | 15 | `AuditEventKind` 中 `ValidationFailed` / `PermissionRevoked` / `AiDraftAccepted` / `AiDraftRejected` **无写入方**；`ai_generate` 本身不写审计 | 校验失败、权限撤销、AI 生成与拒绝这些事件在审计里看不到，事后无法还原完整链路 | 部分动作有应用日志（`tracing`） | v0.5（"审计日志完整"） |

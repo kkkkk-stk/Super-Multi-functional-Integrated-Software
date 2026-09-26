@@ -18,8 +18,9 @@
 
     "log:default",
     "dialog:default",
-    "opener:default",
     "store:default",
+
+    "opener:default",
 
     "fs:default",
     "fs:allow-read-text-file",
@@ -37,18 +38,6 @@
         { "path": "$DOCUMENT/**" },
         { "path": "$DESKTOP/**" },
         { "path": "$TEMP/**" }
-      ]
-    },
-
-    "shell:allow-open",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [
-        {
-          "name": "toolforge-open-folder",
-          "cmd": "explorer",
-          "args": true
-        }
       ]
     }
   ]

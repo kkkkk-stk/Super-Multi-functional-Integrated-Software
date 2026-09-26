@@ -222,15 +222,53 @@ fn arg_bool(args: &BTreeMap<String, String>, key: &str, default: bool) -> bool {
     }
 }
 
-/// 把逻辑路径（`/output/x.png` 或相对路径）解析成真实路径，走权限与穿越检查。
+/// 把逻辑路径（`/output/x.png` 或相对路径）解析成真实路径。
+///
+/// ## 这是两层防护的交汇点，两层都必须过
+///
+/// 1. **能力裁决**（[`CapabilityGuard::check`]）：插件有没有声明并获授权做这类
+///    访问（"能读文件吗"）。
+/// 2. **路径收敛**（[`PathResolver::resolve`]）：这次具体访问是否落在授权目录内、
+///    有没有穿越（"这个文件能碰吗"）。
+///
+/// ⚠️ 第 1 层曾经**从未被调用** —— `CapabilityGuard` 在 `l1.rs` 里被构造、
+/// 塞进 `NodeCtx.guard`，然后就再也没人碰过它；所有 `check()` 调用点都在
+/// `permission.rs` 自己的单测里。也就是说 README 与 SECURITY.md 里宣称的
+/// "运行时逐请求裁决"当时是**布线完成但没接线**，真正生效的只有第 2 层。
+///
+/// 现在每一次文件访问都必须先过 `check()`。越权会返回
+/// [`ErrorCode::PluginCapabilityViolation`]，并由 `l1.rs` 记进审计日志 ——
+/// **能力模型的价值就在于"代码里出现没声明的能力调用会被抓住"，而抓住它的
+/// 正是这一行**。
 fn resolve_path(ctx: &NodeCtx, scope_kind: &str, p: &str) -> ToolforgeResult<PathBuf> {
-    use toolforge_core::permission::PathScope;
+    use toolforge_core::permission::{CapabilityRequest, CapabilityVerdict, PathScope};
+
     let scope = match scope_kind {
         "input" => PathScope::Input,
         "output" => PathScope::Output,
         "data" => PathScope::PluginData,
         _ => PathScope::Workspace,
     };
+
+    // ---- 第 1 层：能力裁决 ----
+    // 读输入端口算读、其余（输出/工作区/插件数据）算写。
+    // 这个映射与节点目录里 `io` 的语义一致：input 是只读来源，
+    // output/work/data 是可写目标。
+    let request = if matches!(scope, PathScope::Input) {
+        CapabilityRequest::ReadFile {
+            path: p.to_string(),
+        }
+    } else {
+        CapabilityRequest::WriteFile {
+            path: p.to_string(),
+        }
+    };
+
+    if let CapabilityVerdict::Deny { code, reason } = ctx.guard.check(&request) {
+        return Err(ToolforgeError::new(code, reason).with_subject(ctx.guard.plugin_id()));
+    }
+
+    // ---- 第 2 层：路径收敛 ----
     // 允许 '/input/xxx' 这种带虚拟前缀的写法：剥掉前缀后按相对路径处理
     let rel = p
         .strip_prefix("/input/")
@@ -1607,6 +1645,12 @@ mod tests {
     // ========================================================================
 
     fn test_ctx() -> (NodeCtx, Arc<toolforge_core::queue::JobQueue>, String) {
+        test_ctx_with_caps(toolforge_core::permission::PermissionSet::empty())
+    }
+
+    fn test_ctx_with_caps(
+        caps: toolforge_core::permission::PermissionSet,
+    ) -> (NodeCtx, Arc<toolforge_core::queue::JobQueue>, String) {
         let (tx, _rx) = tokio::sync::broadcast::channel(64);
         let queue = Arc::new(toolforge_core::queue::JobQueue::new(1, tx));
         let job = queue.create(toolforge_core::job::JobKind::Probe, "测试", 0);
@@ -1617,11 +1661,11 @@ mod tests {
         let ctx = NodeCtx {
             job,
             engines,
-            resolver: PathResolver::new().with_input(&dir).with_output(&dir),
-            guard: CapabilityGuard::new(
-                "test.plugin",
-                toolforge_core::permission::PermissionSet::empty(),
-            ),
+            resolver: PathResolver::new()
+                .with_input(&dir)
+                .with_output(&dir)
+                .with_workspace(&dir),
+            guard: CapabilityGuard::new("test.plugin", caps),
             params: HashMap::new(),
             vars: HashMap::new(),
             arg_scope: BTreeMap::new(),
@@ -1752,6 +1796,89 @@ mod tests {
         assert_eq!(
             param_to_string(&P::List(vec!["a".into(), "b".into()])),
             "a,b"
+        );
+    }
+
+    // ========================================================================
+    // 运行时能力裁决必须真的接在文件访问路径上
+    //
+    // ⚠️ 回归测试。`CapabilityGuard` 曾经在 `l1.rs` 里被构造、塞进 `NodeCtx`，
+    // 然后**再也没有被调用过** —— 所有 `check()` 调用点都在 `permission.rs`
+    // 自己的单测里。也就是说 "运行时逐请求裁决" 当时是"布线完成但没接线"，
+    // README 与 SECURITY.md 的说法是**假的**。
+    // 这一组测试确保那条线接上了，并且断开会立刻失败。
+    // ========================================================================
+
+    #[tokio::test]
+    async fn fs_write_is_rejected_without_the_capability() {
+        // 空权限集 → 任何写操作都必须被拒
+        let (mut ctx, _q, _id) = test_ctx();
+        let err = run(&mut ctx, "fs.mkdir", &args_of(&[("path", "sub")]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::PluginCapabilityViolation,
+            "未授权时写入必须被能力裁决拦下：{err}"
+        );
+        assert_eq!(err.subject.as_deref(), Some("test.plugin"));
+    }
+
+    #[tokio::test]
+    async fn fs_read_is_rejected_without_the_capability() {
+        let (mut ctx, _q, _id) = test_ctx();
+        // fs.copy 先读 src：未授权 fsRead 时应当在**第一步**就被拒，
+        // 而不是"先读到一半再失败"
+        let err = run(
+            &mut ctx,
+            "fs.copy",
+            &args_of(&[("src", "a.txt"), ("dst", "b.txt")]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PluginCapabilityViolation);
+    }
+
+    #[tokio::test]
+    async fn fs_write_passes_once_the_capability_is_granted() {
+        use toolforge_core::permission::{Capability, PathScope, PermissionSet};
+        let caps = PermissionSet::from_iter_caps([Capability::FsWrite {
+            scope: PathScope::Output,
+        }]);
+        let (mut ctx, _q, _id) = test_ctx_with_caps(caps);
+
+        let out = run(&mut ctx, "fs.mkdir", &args_of(&[("path", "tf-guard-test")]))
+            .await
+            .expect("授权后写入应当通过");
+        assert!(out.values.contains_key("path"));
+
+        // 清理
+        if let Some(p) = out.values.get("path") {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+
+    #[tokio::test]
+    async fn path_traversal_is_still_blocked_after_the_capability_check() {
+        // 两层防护是**与**关系：通过了能力裁决，还要过路径收敛。
+        // 这条测试防止有人为了"让插件跑起来"把第二层拆掉。
+        use toolforge_core::permission::{Capability, PathScope, PermissionSet};
+        let caps = PermissionSet::from_iter_caps([Capability::FsWrite {
+            scope: PathScope::Output,
+        }]);
+        let (mut ctx, _q, _id) = test_ctx_with_caps(caps);
+
+        let err = run(
+            &mut ctx,
+            "fs.mkdir",
+            &args_of(&[("path", "../../../tf-escaped")]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::PermissionDenied,
+            "有权写 ≠ 可以写到授权目录之外：{err}"
         );
     }
 }

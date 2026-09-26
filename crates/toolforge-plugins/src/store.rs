@@ -494,6 +494,32 @@ impl PluginStore {
             );
         }
 
+        // 收回能力同样要记。审计日志如果只记"给了什么"，就回答不了
+        // "我什么时候把某个插件的网络权限关掉的" —— 而那正是排查
+        // "它为什么突然不能联网了"时第一个要问的问题。
+        let removed: Vec<String> = before
+            .capabilities
+            .iter()
+            .filter(|b| {
+                !state
+                    .granted
+                    .capabilities
+                    .iter()
+                    .any(|c| c.fingerprint() == b.fingerprint())
+            })
+            .map(|c| c.describe())
+            .collect();
+        if !removed.is_empty() {
+            self.audit.record(
+                AuditEvent::new(
+                    AuditEventKind::PermissionRevoked,
+                    format!("用户收回 {} 项能力", removed.len()),
+                )
+                .subject(id)
+                .detail(serde_json::json!({ "revoked": removed })),
+            );
+        }
+
         self.save_state(&dir, &state)?;
         if let Some(mut r) = self.records.get_mut(id) {
             r.state = state;
@@ -704,6 +730,28 @@ impl PluginStore {
                 "aiGenerated": manifest.ai.as_ref().map(|a| a.generated).unwrap_or(false),
             })),
         );
+
+        // AI 生成的插件被安装 = 用户明确接受了这次生成结果。
+        // 记一条独立事件，这样"AI 到底产出了多少东西并被我装上了"是可查的 ——
+        // 只看 `Installed` 事件的话，AI 生成的与手写的混在一起分不出来。
+        let ai_generated = manifest.ai.as_ref().map(|a| a.generated).unwrap_or(false);
+        if ai_generated {
+            self.audit.record(
+                AuditEvent::new(
+                    AuditEventKind::AiDraftAccepted,
+                    format!(
+                        "安装 AI 生成的插件 {} v{}（用户已确认权限清单）",
+                        manifest.metadata.name, manifest.metadata.version
+                    ),
+                )
+                .subject(&id)
+                .detail(serde_json::json!({
+                    "model": manifest.ai.as_ref().and_then(|a| a.model.clone()),
+                    "runtime": format!("{:?}", manifest.runtime.kind()),
+                    "hash": hash,
+                })),
+            );
+        }
 
         let _ = self.tx.send(AppEvent::PluginChanged {
             plugin_id: id.clone(),

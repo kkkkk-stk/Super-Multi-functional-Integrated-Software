@@ -250,8 +250,19 @@ pub fn run() {
     let mut tauri_builder = tauri::Builder::default();
 
     // ---- 官方插件 ----
-    // 注意：这些插件的能力由 `capabilities/default.json` 严格限制。
-    // 特别是 shell —— 它只被允许执行白名单 sidecar，前端拿不到任意命令执行。
+    //
+    // ⚠️ **`shell` 插件被注册，但没有授予任何 execute 权限。**
+    // `capabilities/default.json` 里已彻底移除 `shell:allow-execute`（以及
+    // `shell:allow-open`）。理由：`shell:allow-execute` 的 scope 项是
+    // `{ name, cmd, args }`，而 `args: true` 意味着**任意参数** ——
+    // 对一个能启动 `explorer.exe` 的入口来说，`explorer <某个.exe>` 就是
+    // 一条完整的任意程序执行路径。前端（以及将来可能注入的插件 UI）拿到它，
+    // 上面所有的权限模型都成了摆设。
+    //
+    // "在文件管理器里显示输出文件"这个需求由 `tauri-plugin-opener` 的
+    // `revealItemInDir()` 满足 —— 它是**目的明确**的 API，不是通用命令执行。
+    // 保留 shell 插件的注册只是为了对齐技术选型（以及未来的 sidecar 分发），
+    // 但**零权限**意味着前端调不动它。
     tauri_builder = tauri_builder
         .plugin(tauri_plugin_log::Builder::new()
             .level(if cfg!(debug_assertions) {

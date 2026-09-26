@@ -322,6 +322,20 @@ pub async fn run_pipeline(
                     ToolforgeError::internal(format!("步骤 `{}` 未产出也未报错", step.id))
                 });
 
+                // **安全事件必须先落审计，再决定怎么处理。**
+                //
+                // `PluginCapabilityViolation` 由 `nodes.rs::resolve_path` 的能力裁决
+                // 抛出（插件试图做清单没声明的访问）。这一类事件不能因为
+                // 本步骤配了 `onError: skip` 就从记录里消失 —— 那正好是攻击者
+                // 最希望发生的事。所以审计发生在策略判断**之前**。
+                if err.code == ErrorCode::PluginCapabilityViolation {
+                    crate::audit::record_violation(
+                        &record_dir_audit(record),
+                        record.id(),
+                        &format!("步骤 `{}`：{}", step.id, err.message),
+                    );
+                }
+
                 match policy {
                     OnErrorPolicy::Skip | OnErrorPolicy::Continue => {
                         // 明确记录跳过原因，绝不静默

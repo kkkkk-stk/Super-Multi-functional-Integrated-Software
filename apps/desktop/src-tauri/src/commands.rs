@@ -7,9 +7,14 @@
 //! 2. **耗时操作一律异步化**：命令立即返回一个 `jobId`，实际执行在任务队列里，
 //!    进度通过事件回流。**没有任何一个命令会阻塞到任务跑完** —— 否则
 //!    WebView 会假死。
-//! 3. **前端拿不到裸 shell**：`tauri-plugin-shell` 的 capability 只放行白名单
-//!    sidecar，所有引擎调用都经过 [`toolforge_engines`] 与 [`toolforge_process`]。
+//! 3. **前端拿不到裸 shell**：`capabilities/default.json` 里**没有授予
+//!    `shell:allow-execute`**（连 `shell:allow-open` 也没有）。"在文件管理器里
+//!    显示文件"走 `opener` 插件的 `revealItemInDir()` —— 那是目的明确的 API。
+//!    所有引擎调用都经过 [`toolforge_engines`] 与 [`toolforge_process`]，
+//!    绝不由前端拼命令行。
 //! 4. **AI 的产出永远只是草稿**：见 `ai_generate` 的文档。
+//! 5. **安全事件要落审计**：`PluginCapabilityViolation` 与 AI 草稿被拒都会写
+//!    审计日志（NDJSON），见 `plugins_audit` 命令。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -852,6 +857,33 @@ pub async fn ai_generate(
 
     // 审核时把 allow_python 的意图也考虑进去
     let review = toolforge_ai::review::review_draft(&draft);
+
+    // AI 草稿被拒是**安全事件**，必须落审计。
+    // 它回答的问题是："这个模型是不是经常试图生成越权的插件？"
+    // 如果不记，用户只会看到一句"审核未通过"，而没有任何可追溯的痕迹。
+    if !review.recommended {
+        let codes: Vec<String> = review
+            .findings
+            .iter()
+            .filter(|f| f.severity >= toolforge_core::permission::RiskLevel::High)
+            .map(|f| f.code.clone())
+            .collect();
+        state.plugins.audit().record(
+            toolforge_plugins::AuditEvent::new(
+                toolforge_plugins::audit::AuditEventKind::AiDraftRejected,
+                format!(
+                    "AI 草稿未通过安全审核（{} 项高危发现）",
+                    codes.len()
+                ),
+            )
+            .detail(serde_json::json!({
+                "model": client.config().model,
+                "provider": client.config().kind.describe(),
+                "promptChars": gen_req.description.chars().count(),
+                "findings": codes,
+            })),
+        );
+    }
 
     Ok(AiGenerateResponse {
         draft,
