@@ -263,6 +263,8 @@ flowchart TD
 - **图像域的三层降级现在是实现，不再只是 `lib.rs` 里的一张图**：`pick_image_backend()` 按 `libvips → imagemagick → 纯 Rust` 挑后端（`is_available` 读带缓存的状态，不会每个文件都去 spawn 一次 `vips --version`），并把结果**报出去** —— 节点输出里多一个 `backend` 值（`"libvips"` / `"imagemagick"` / `"rust"`），任务日志里多一条 debug 行。**走这条链的是 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个节点；`image.enhance` 与 `image.strip-metadata` 仍是纯 Rust 实现，不问引擎**（详见 `docs/ENGINE-MATRIX.md` 第 5.1、6.2 节）。理由写在代码注释里：后端选择一旦不可观测，"到底走没走 libvips"就只能靠猜，而这个项目已经被"文档说有、实际没有"坑过好几次。
 - **抠图是第四条路，不在这张图里**：`image.remove-background` 已经实现（`image_remove_background`），但它跑的是 **ONNX 推理**，不经过 `pick_image_backend()`，`libvips` / ImageMagick 装得再全也不会让它快一点。推理**不在 Rust 里做**，而是交给 `python` 引擎的子进程执行 —— 理由见决策 9。
 - **模型下载的两条加固**（详见 4.11 第 12 条）：`install_model` 会先对**已存在的本地文件**算哈希，匹配就跳过下载（`u2net` 是 168 MB）；`download()` 对 5xx / 429 / 连接错误**重试一次**（第二次换 `http1_only` 客户端）。
+- **引擎下载的卡死检测（本轮新增）**：`stream_to_file()` 用 `tokio::time::timeout(STALL_TIMEOUT, stream.next())` 包住每一次读取，**60 秒内一个字节都没到**就判定卡死、删掉半截文件、报一条说得清的错误（已收到多少 / URL / 常见原因 / 可以怎么做），而不是让进度条停在 0% 一直等到客户端 30 分钟总超时。触发点是一个真机现象：安装 FFmpeg 时进度条停在 **0%** 十几分钟没有任何动静（`www.gyan.dev` 不可达，`curl` 直测同样连不上）。60 秒是刻意的宽容值 —— 慢速网络也会持续有小块到达，真正卡死是"完全静默"。
+  > ⚠️ **这一条没有经过真机运行验证**：本机 `toolforge.exe` 被一个无关进程持有文件句柄，cargo 写不回链接产物（`link.exe` 1104），二进制重建不了。只跑到了 `cargo check --workspace --all-targets`（0 error / 0 warning）与单元测试。改动很小，但**"能编译"不等于"验过"**。
 - **依赖了谁**：`toolforge-core`、`toolforge-process` + `reqwest`（下载）、`image`（含 `png` `jpeg` `webp` `bmp` `tiff` `gif` `ico` `pnm` `qoi` `tga` `dds` `hdr` `ff` feature）、`which` `sha2` `hex` `walkdir` `dashmap` `parking_lot` `futures-util` 等。Cargo feature：`avif = ["image/avif"]`、`heavy-formats = ["image/exr"]`，**两者默认关闭**。
 - **被谁依赖**：`toolforge-plugins`、`apps/desktop/src-tauri`。
 
@@ -572,7 +574,8 @@ std::fs::create_dir_all(&workspace).ok();
   1. **远程服务型引擎**（`install_modes == [Remote]`，即 `ai-provider`）→ 直接 `Detected` + `EngineSource::Remote`，`path: None`（"远程服务，无需本地安装"）。
   2. **① 托管目录** → `managed_binary(engine_id)`：先按 `lib.rs::MANAGED_LAYOUT` 的相对路径找（`<data>/engines/<id>/<rel>`，Windows 自动补 `.exe`），再按 `ENGINE_BINARIES` 的文件名在托管目录里 `walkdir` 递归 **`max_depth(3)`** 找。命中则 `EngineState::Installed` + `EngineSource::Managed`。
   3. **② PATH + ③ 平台常见路径** → `system_binary(engine_id)`：先 `which::which(name)` 遍历 `ENGINE_BINARIES` 的候选名，再遍历 `platform_candidates(engine_id)`。命中则 `EngineState::Detected` + `EngineSource::System`。
-  4. 都失败 → `EngineStatus::missing(&desc.id)`，`message` 由 `install_hint(&desc)` 生成。
+  4. 都失败 → `EngineStatus::missing(&desc.id)`，`message` 由 `install_hint(&desc, registry.has_download_source(&desc.id))` 生成。
+     > ⚠️ **第二个参数是后补的，补的理由值得记**：它原来只看 `install_modes`，于是**只要引擎声明了 `Download` 就说「可在「引擎管理」里一键下载安装」**。而"声明了下载模式"与"当前平台真的配了下载源"是两件事 —— `imagemagick` 声明 `[System, Download]`，当时 `engine-sources.json` 里**没有**它的条目，用户点那个按钮只会得到"当前平台没有配置下载源"。现在有来源才允许出现"一键下载"字样，没来源就明确说"当前平台没有配置下载源，请手动安装：<官网>"。两条不变量测试守着它：`download_mode_engines_have_a_source_for_this_platform` 与 `install_hint_only_promises_a_download_when_a_source_exists`。**提示语的唯一职责是别把用户指错方向。**
   - `lib.rs` 给了「托管优先」的理由：「因为用户从官网下的绿色版 FFmpeg 通常不在 PATH 里。」
 
 - **`nodes.rs` 的翻译职责**：`crates/toolforge-engines/src/nodes.rs::run(ctx, node, args)` 是一个大 `match`，把节点名分派到具体实现：
@@ -685,7 +688,9 @@ std::fs::create_dir_all(&workspace).ok();
 8. ✅ **`jobs_retry` 已存在**。命令已注册；`plugins_run` 会注册重放闭包，任务中心的「重试」按钮因此可用。`AiGenerate` 与 `EngineInstall` 仍然**不**可重试（有副作用/成本）。
 9. ✅ **`settings_patch` 改并发度已作用到队列**。新增 `JobQueue::set_concurrency()` 并在命令层调用。**降低并发是渐近生效的**（`Semaphore::forget_permits` 只能收回空闲许可），这一点写在该方法的文档注释里。
 10. ✅ **打包后内置插件会被分发**。`tauri.conf.json` 的 `bundle.resources` 已改为 `{ "../../../plugins/builtin": "plugins/builtin" }`，与 `resolve_builtin_plugins()` 打包态查找的 `resource_dir()/plugins/builtin` 对齐。
-11. ✅ **引擎下载源已回填 6 条**（此前每一项的 `sha256` 都是 `null`，导致任何引擎都装不上）。现在 `ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux` 都带**实际核对过的哈希 + 版本固定直链**；macOS 三条与 `ffmpeg@linux` 仍为 `null`，`install` 对它们返回 `EngineInstallOutcome::HashRequired`（由 `commands.rs::engines_install` 映射成 `ErrorCode::IntegrityCheckFailed`）。`allow_unverified = true` 时才会走未校验路径。详见 README「已知风险」第 2 条与 `docs/ROADMAP.md` §3。
+11. ✅ **引擎下载源已回填 7 条**（此前每一项的 `sha256` 都是 `null`，导致任何引擎都装不上）。现在 `ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux`，以及本轮新增的 **`imagemagick@windows`**（7.1.2-31 便携版 `.7z`，11,739,115 字节，`stripComponents: 0`）都带**实际核对过的哈希 + 版本固定直链**；macOS 四条与 `ffmpeg@linux` 仍为 `null`，`install` 对它们返回 `EngineInstallOutcome::HashRequired`（由 `commands.rs::engines_install` 映射成 `ErrorCode::IntegrityCheckFailed`）。`allow_unverified = true` 时才会走未校验路径。详见 README「已知风险」第 2 条与 `docs/ROADMAP.md` §3。
+    - **`imagemagick` 此前是"声明了下载却没有来源"**，这也是上面「探测失败 → 提示语」那一条缺陷的起因：界面显示「一键下载」，点下去必然失败。补来源时验证了三件原本不确定的事（**直接执行**，不是推断）：官方 Windows 便携包只有 `.7z`；**Windows 自带的 `tar`（bsdtar / libarchive）能读 7z**（`tar -xf` 退出码 0、`magick.exe -version` 正常输出），所以装它**不依赖先装 7-Zip**；包内**没有顶层目录**，所以 `stripComponents` 必须是 0。⚠️ **应用内的完整安装链路未复验**（同一个 `toolforge.exe` 句柄问题）。
+    - ⚠️ **FFmpeg 的安装在本机没有完成过**：本次会话里 `www.gyan.dev` 不可达（`curl` 直测 `Failed to connect ... after 21107 ms`），依赖它的 `video.*` / `audio.*` 节点在那台机器上不可用。这是**环境事实，不是代码缺陷**；`ffmpeg@windows` 的哈希取自上游随包发布的 `.sha256`，能证明来源写对了，但替代不了一次真实安装。
     - **而且这条路径现在真的跑通过**：通过应用安装过一次 **libvips 8.18.6**（下载 → SHA-256 校验 → 解压 → 探测为 `installed`，落在 `<data_dir>/engines/libvips/bin/vips.exe`，约 29.67 MB）。跑通它顺带暴露了两个 `toolforge-process` 的缺陷（裸命令名不查 PATH、`quiet` 丢光输出），见 3.2。
 12. ✅ **模型权重下载已落地**。以前 `EngineRegistry.models` 是一张**永远空的 map**（只有 `register_model` 能填，而没有任何调用点），于是 UI 列出模型、每次点下载都答「未在注册表里登记」。现在 `EngineRegistry::new` 直接从 `toolforge_core::engine::engine_catalog()` 建这张表（**注册表 map 这个"第二真相来源"已被删掉**），并新增三条 IPC：`models_list` / `models_install` / `models_remove`。目录里现在是 **8 个**权重（抠图 5 + 超分 3），其中 **5 个**可直接下载。
     - `EngineModel` 增加了 `file_name`：GitHub 的资产名与模型 id **不一致**（`isnet-general` 的资产是 `isnet-general-use.onnx`），文件落在 `<data_dir>/models/<model_id>/<file_name>`。

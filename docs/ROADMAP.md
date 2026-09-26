@@ -403,7 +403,7 @@ pnpm build          # tsc --noEmit && vite build
 
 ```text
 【静态】
-cargo test --workspace                  →  214 passed / 0 failed
+cargo test --workspace                  →  217 passed / 0 failed
 cargo run -p toolforge --bin export-bindings
   → 生成 32 个命令的绑定 + 4 项守卫（其中「命令清单逐条核对」已取代被删除的魔数断言）
 
@@ -437,7 +437,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
                                              跑完已还原用户的 AI 设置
 ```
 
-**这份基线里仍然为空的**：`image.enhance` / `image.strip-metadata` 未接外部后端（仍是纯 Rust 实现）；ImageMagick 档位没有实测记录；macOS 没有环境基线；**三档输出的结果一致性没有测试**；"两个可选引擎都缺失"这类组合环境没有专门基线。
+**这份基线里仍然为空的**：`image.enhance` / `image.strip-metadata` 未接外部后端（仍是纯 Rust 实现，而且已不再声明引擎依赖）；**「仅 ImageMagick」这一档仍然没有实测记录**（本轮补齐了它的 Windows 下载源，但应用内的安装链路未复验，见 §3 与开放项 8）；macOS 没有环境基线；**三档输出的结果一致性没有测试**；"两个可选引擎都缺失"这类组合环境没有专门基线。
 
 > ⚠️ **关于【8】号检查的诚实说明**：它需要先有模型权重与 Python 运行时，而那些都要下载。**前置条件不满足时它是"跳过"，不是"通过"** —— 脚本会明确打一条 skip（`c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）')`），不会把"没测"算成"测过了"。
 
@@ -542,7 +542,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 >
 > 这两件事是同一类漂移（`provides` ↔ 节点声明，共 5 处），所以除了逐处修，还加了一条**双向守卫测试** `provides_matches_node_declarations`，并做了反证确认它真的会红。详见 `docs/ENGINE-MATRIX.md` 第 6.2 节。
 >
-> 另外：**ImageMagick 档位只有代码路径、没有实测记录**（本机没有装 ImageMagick，也没有一个"只有 ImageMagick 可用"的环境基线）。
+> 另外：**ImageMagick 档位只有代码路径、没有实测记录**（本机没有装 ImageMagick，也没有一个"只有 ImageMagick 可用"的环境基线）。本轮给它补上了 **Windows 下载源**并做了直接执行验证（见 §3），但那只是让它**可装**，不等于"测过这一档"。
 >
 > 以下原文保留作为历史。
 
@@ -553,22 +553,27 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   - `image.rotate` 的任意角度分支**不是降级到 ImageMagick**，而是直接 `return Err(engine_missing("imagemagick"))`（`nodes.rs:588`）。
 - 也就是说（**写这条时的结论**）：「纯 Rust 打底 → libvips 加速 → ImageMagick 兜底」这条链路**当时只有第一档存在**，后两档是声明而非实现。当时的处理意见是"这必须写进验收标准，否则会被误认为已经可用" —— 后来的做法不是写进验收标准，而是**直接把后两档实现出来**（见上面的状态更新）。
 
-### 3. `engine-sources.json` 的下载源哈希 ✅ 已回填 6 条（Windows / Linux）
+### 3. `engine-sources.json` 的下载源哈希 ✅ 已回填 7 条（Windows / Linux）
 
 - 原状：12 条来源的 `sha256` **全部为 `null`**，而 `EngineRegistry::install` 在缺哈希时**直接拒绝下载** —— 也就是说校验机制写好了，但**任何引擎都装不上**。
-- **现已回填 6 条**，且全部是**实际核对过**的（不是抄的）：
+- **现已回填 7 条**，且全部是**实际核对过**的（不是抄的）：
 
   | 引擎 | 平台 | 版本 | 大小 | 哈希来源 |
   |---|---|---|---|---|
   | `ffmpeg` | windows | 8.1.2 essentials | 104.6 MB | gyan.dev 随包发布的 `.sha256` 旁挂文件 |
   | `libvips` | windows | 8.18.6 (`build-win64-mxe`, x64-web) | 10.8 MB | 下载后自行计算 |
+  | `imagemagick` | windows | 7.1.2-31 portable Q16 x64（`.7z`） | 11.7 MB | 下载后自行计算（**上游没有发布校验和**，release 里只有 SBOM 与 in-toto 证明，都不含产物摘要 —— 换版本必须重算） |
   | `pandoc` | windows | 3.11 | 39.8 MB | 下载后自行计算 |
   | `pandoc` | linux | 3.11 | 33.3 MB | 下载后自行计算 |
   | `python` | windows | 3.11.16 (python-build-standalone) | 46.0 MB | 下载后自行计算 |
   | `python` | linux | 3.11.16 (同上) | 46.6 MB | 下载后自行计算 |
 
+- **`imagemagick@windows` 是本轮新增的**（此前 `imagemagick` 声明了 `Download` 却没有来源，界面于是显示一个点下去必然失败的「一键下载」按钮 —— 那条提示语也一并修了）。三件事是**直接执行**验证的，不是推断：官方 Windows 便携包**只有 `.7z`**；**Windows 自带的 `tar`（bsdtar / libarchive）能读 7z**（`tar -xf` 退出码 0、`magick.exe -version` 打印 `ImageMagick 7.1.2-31 Q16 x64`），所以装它**不需要先装 7-Zip**；包内**没有顶层目录**（23 个条目直接在根），所以 `stripComponents` 是 **0** 而不是习惯上的 1。Linux / macOS **故意不写来源**（走 `apt` / `brew`）。
+  > ⚠️ **应用内的完整安装链路尚未复验**：`toolforge.exe` 被一个无关的第三方进程持有文件句柄，cargo 写不回链接产物（`link.exe` 1104），二进制重建不了、跑不了。上面四点才是原本的风险所在，它们已由直接执行验证。
+- ⚠️ **一条环境事实，不是代码缺陷**：本次会话里**本机连不上 `www.gyan.dev`**（`curl` 直测 `Failed to connect ... after 21107 ms`），所以 **FFmpeg 的安装在本机没有完成过**，依赖它的 `video.*` / `audio.*` 节点在那台机器上不可用。`ffmpeg@windows` 这条来源的哈希取自上游**随包发布的 `.sha256` 文件**（比自己下载后计算更可信），但那只能证明"来源写对了"，**不能替代一次真实安装**。
+
 - **同时把所有可用 URL 改成版本固定直链**。原来 `ffmpeg` 用的是 `ffmpeg-release-essentials.zip`（滚动指向最新版）—— 那类 URL 上的哈希**必然失效**，表现为"昨天能装、今天全部失败"。`libvips` 的源仓库也从 `libvips/libvips` 改为 `libvips/build-win64-mxe`（前者的 release 里没有 Windows 资产，实测 404）。
-- **剩余未回填**：macOS 三条（无 macOS 环境核对）、`ffmpeg@linux`（上游 URL 是滚动别名）。这些条目 `sha256` 保持 `null`，`install` 会返回 `HashRequired` 而不是放行 —— 保守的默认值是刻意的。
+- **剩余未回填**：macOS 四条（ffmpeg / libvips / pandoc / python，无 macOS 环境核对）、`ffmpeg@linux`（上游 URL 是滚动别名）。这些条目 `sha256` 保持 `null`，`install` 会返回 `HashRequired` 而不是放行 —— 保守的默认值是刻意的。
 - 新增两条纪律测试：`every_declared_hash_is_a_wellformed_sha256`（长度/大小写/字符集）、`no_source_points_at_a_rolling_latest_alias`（禁止滚动别名配哈希）。
 - 另一条实测教训：回填后有个单元测试**开始真的下载 104 MB 的 FFmpeg**（它原本假设"所有哈希都是 null"所以 `install` 会立刻返回 `HashRequired`）。现已改为用临时来源文件构造缺哈希场景，与真实数据解耦 —— **测试不该有联网副作用**。
 
@@ -613,10 +618,10 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 5 | ~~**`doc.ocr` 的参数枚举与执行器对不上**~~ **已修** | 枚举原为 `auto` / `tesseract` / `paddleocr`，执行器认 `auto` / `tesseract` / `ai`。填 `ai` 有效但不在下拉里；填 `paddleocr` 能选中却走到"两者都不满足"的分支。**已把枚举改成 `ai` 并把 PaddleOCR 文案删掉** | 这是一类值得记的漂移：**参数名对了但取值对不上**，比参数名写错更难发现 —— 界面照常显示、执行器照常运行，只有结果不符合预期 |
 | 6 | ~~**`doc.ocr` 的可用性判定严于实现**~~ **已修** | 原来 `requiresEngines` 是 `["python"]`，缺 Python 时整个节点被标灰；但 tesseract 那条路根本不碰 Python。**已改为 `requiresEngines: []` + `optionalEngines: ["tesseract", "ai-provider"]`** | 正是"能用却显示不可用"（这个项目在 `onnx-models` 上踩过反方向的坑） |
 | 7 | ~~**`doc.ocr` 的 AI 路径没有声明 `ai-provider`**~~ **已修** | 现在 `doc.ocr` 的 `optionalEngines` 含 `ai-provider`，`ai-provider.provides` 也含 `doc.ocr`，两个方向都对齐 | 同第 6 条，一并由 `provides_matches_node_declarations` 这条双向测试守住 |
-| 8 | **ImageMagick 档位与 macOS 没有环境基线** | "只有 ImageMagick 可用"这一档从未被单独测过（本机没装 ImageMagick）；macOS 三条下载源也仍是 `null`（没有环境核对哈希） | 不是"没实现"—— 代码路径在，缺的是验证记录 |
+| 8 | **ImageMagick 档位与 macOS 没有环境基线** | "只有 ImageMagick 可用"这一档从未被单独测过（本机没装 ImageMagick）。本轮补齐了它的 **Windows 下载源**，并**直接执行**验证了原本有风险的四点（哈希、`tar` 能解 7z、`magick.exe` 可运行、包内无顶层目录 —— 见 §3），但**应用内的安装链路未复验**，所以这一档现在是"可装"，仍不是"测过"。macOS 四条下载源（ffmpeg / libvips / pandoc / python）也仍是 `null`（没有环境核对哈希） | 不是"没实现"—— 代码路径在，缺的是验证记录 |
 | 9 | **验证脚本的覆盖面仍然是"我们可控的那部分"** | `ai.describe` 用假端点验证请求形状（这是对的，真模型不可复现、要花钱），但它**验不了**"模型答得好不好"；同理【11】验的是倍数与尺寸，不是超分画质 | 这是**刻意的边界**，不是疏漏。写清楚是为了避免有人把"69 项全通过"读成"AI 能力已经验收" |
 
-> **一句话总结这一轮**：节点的账已经平了（32/32，`UNIMPLEMENTED_NODES` 为空），但上面这 9 条里**有 6 条是"声明与实现/UI 之间的小漂移"** —— 这类问题不会让构建变红，只会让用户在看到真实行为时感到意外。它们比"缺一个功能"更难发现，所以专门列在这里而不是埋进正文。
+> **一句话总结这一轮**：节点的账已经平了（32/32，`UNIMPLEMENTED_NODES` 为空）。上面这 9 条里，第 2、5、6、7 条都属于**"声明与实现 / UI 之间的小漂移"**，现已全部修掉（5/6/7 是同一类：`doc.ocr` 的声明；2 是 `provides` ↔ 节点声明那 5 处），并且由双向测试守着 —— 这类问题不会让构建变红，只会让用户在看到真实行为时感到意外，比"缺一个功能"更难发现，所以专门列在这里而不是埋进正文。剩下的三类是：**真的还没做**（1 的固定尺寸补边、3 的 PDF 栅格化）、**知情时机**（4）、**还没有验证记录**（8 的 ImageMagick / macOS 档位、9 的验证覆盖面边界）。
 
 ---
 
@@ -693,7 +698,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 ### 验收标准
 
 1. `cargo test --workspace` 全绿，且 `cargo test -p toolforge-core` 恰好 **61 个测试通过、0 失败**。
-   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **214 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
+   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **217 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
 2. `cargo clippy --workspace -- -D warnings` 与 `cargo fmt --check` 无输出（零告警、零格式差异）。
 3. `cargo check --workspace --all-targets` 成功（即 `pnpm check:rust` 通过），且 `Cargo.lock` 已生成并入库。
 4. `pnpm check:all` 退出码为 0。
@@ -726,8 +731,8 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 - [ ] ⛔ 回填**全部 12 条**下载源的 `sha256`，否则 `install` 会按设计拒绝下载（不一致 3）
 - [ ] 🚧 许可证闸门：把 `requires_license_ack` 接进 `install` 路径，未确认不得安装；确认结果落盘（不一致 4）
 - [ ] 🚧 引擎接入：ffmpeg / pandoc / libreoffice / 7zip 已在 `nodes.rs` 中真实接线，需在真实环境逐个跑通
-  > 进度：**libvips 已跑通**（一键安装成功 + 四个图像节点真实调用，见上面两条与「阻塞 14」）；ffmpeg / pandoc / libreoffice / 7zip 这四个"必需引擎"档位的逐个真机跑通仍未完成。ImageMagick **既没有装过、也没有实测记录**。
-- [ ] 🚧 **真实接通图片加速链路（libvips 已达成，ImageMagick 与两个节点仍缺）**：`libvips` 已由 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 真实调用并可在日志/节点输出里观测（`verify-platform.mjs`【6】在真机上验证）；仍缺的是 —— `image.enhance` / `image.strip-metadata` 尚未接外部后端、`ImageMagick` 档位没有实测记录、**三档结果一致性没有测试**（见不一致 2 的更新）。
+  > 进度：**libvips 已跑通**（一键安装成功 + 四个图像节点真实调用，见上面两条与「阻塞 14」）；ffmpeg / pandoc / libreoffice / 7zip 这四个"必需引擎"档位的逐个真机跑通仍未完成。ImageMagick **没有装过、也没有实测记录**（本轮只补齐了它的 Windows 下载源，并对"能不能装"做了直接执行验证，见 §3）。另外 FFmpeg 在本机因 `www.gyan.dev` 不可达而**未能完成安装** —— 那是环境问题，不是代码缺陷（见 §3）。
+- [ ] 🚧 **真实接通图片加速链路（libvips 已达成，ImageMagick 与两个节点仍缺）**：`libvips` 已由 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 真实调用并可在日志/节点输出里观测（`verify-platform.mjs`【6】在真机上验证）；仍缺的是 —— `image.enhance` / `image.strip-metadata` 不接外部后端（这是性能议题，声明侧已经不再谎称"装了会更快"）、**`ImageMagick` 档位没有实测记录**（下载源已补齐、安装未复验）、**三档结果一致性没有测试**（见不一致 2 的更新）。
 - [ ] 🚧 `scripts/enginectl.mjs`：`list` / `install` / `verify` / `clean` 子命令
 - [ ] 🚧 离线 / 镜像源可配置（企业内网可用）
 
@@ -826,7 +831,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   - **配套示例插件** `plugins/builtin/ai-describe`（v0.1.0）：`ai.describe` → `text.replace`（把空白与标点归一成 `_`）→ `name.build` → `fs.move`，即"按图片内容重命名"。它顶部的注释如实写明**图片会上传给 AI 服务商**，并建议要完全离线就用 `image.remove-background`。插件本身**不申请 `net` 能力** —— 联网发生在宿主的节点里，不在插件进程里。
   - 真机验收落在 `verify-platform.mjs` 的**【10】号检查**：起一个**假 OpenAI 兼容端点**（`scripts/devtools/mock-openai.mjs`），把应用的 AI 设置临时指过去（provider 用 `ollama` —— 本地提供方，**不需要 API Key**），然后断言我们**自己可控**的那部分：恰好 1 次请求、恰好 1 张图、内联 data URL、MIME `image/jpeg`、体积合理（实测约 6.9 KB）、带系统提示词、用户提示词原样送达、`stream: false`，最后验证描述真的流到了下游文件名。**跑完会还原用户的 AI 设置。** 假端点**永远不会看到真实用户图片**（见 `docs/SECURITY.md`）。
 - [x] ✅ **OCR（`doc.ocr`）与电子书转换（`ebook.convert`）—— 均已实现**
-  - **`doc.ocr`**：有 tesseract 就用它（离线、免费、快，中文质量一般）；没有就用**多模态模型**（更强、要联网计费），日志里会写明切换了。**PDF 输入被明确拒绝** —— 要先按页栅格化成图片，这条链路没做。⚠️ 参数枚举（`auto` / `tesseract` / `paddleocr`）与执行器（认 `auto` / `tesseract` / `ai`）**有一处对不上**，见下方开放项。
+  - **`doc.ocr`**：有 tesseract 就用它（离线、免费、快，中文质量一般）；没有就用**多模态模型**（更强、要联网计费），日志里会写明切换了。**PDF 输入被明确拒绝** —— 要先按页栅格化成图片，这条链路没做。✅ **参数枚举与执行器已经逐字对齐**（现在是 `auto` / `tesseract` / `ai`），`requiresEngines` 也已清空、`optionalEngines` 改为 `["tesseract", "ai-provider"]` —— 三处漂移的修法见下方开放项 5 / 6 / 7。
   - **`ebook.convert`**：`calibre` 优先（**MOBI / AZW3 / LIT / PDF 只有它能写**），缺了退到 `pandoc`（EPUB / DOCX / FB2 / HTML / Markdown / RTF / ODT / TXT）。**关键点是"在调用前把关"**：pandoc 对认不出的输出扩展名**不报错**，只打一句 warning、写一个 HTML 出来、**保留原扩展名、退出码 0**；认不出输入格式时会把文件当纯文本读。所以执行器按两张能力表（`PANDOC_EBOOK_IN` / `PANDOC_EBOOK_OUT`）先检查，不通过就拒绝并要求装 Calibre。**"成功"的坏文件比失败更糟 —— 退出码在这里不可信。**
   - 真机实测：epub→docx 是真正的 `PK` magic ZIP；epub→md 中文文本完整保留；epub→mobi 且无 Calibre 时**干净拒绝、磁盘零残留**。验收落在 `verify-platform.mjs` 的**【9】号检查**。
   - 这两个引擎（tesseract / calibre）**只支持系统安装、没有配下载源**，所以 UI 只能引导用户去官网。
@@ -963,7 +968,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 检查点 | 命令/动作 | 期望 |
 | --- | --- | --- |
 | 领域层健康 | `cargo test -p toolforge-core` | 61 通过 / 0 失败（**写本文档时的目标值**；当前全仓合计见下一行，不再逐 crate 维护） |
-| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 214 passed / 0 failed** |
+| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 217 passed / 0 failed** |
 | 全目标检查 | `cargo check --workspace --all-targets` | 退出码 0 |
 | 静态质量 | `cargo clippy --workspace -- -D warnings`、`cargo fmt --check` | 无输出 |
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | 退出码 0（需前端工程先落地） |
@@ -971,7 +976,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 类型桥 | `pnpm bindings` 连续两次 | 第二次后 `git status` 干净（该命令同时跑 4 项守卫，含 `COMMAND_NAMES` 与注册命令的逐条核对） |
 | 真机验收 | `node scripts/devtools/verify-platform.mjs` | **69 项检查全通过**（【1】–【11】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】；【8】【9】【11】在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"） |
 | 最小闭环 | `pnpm tauri:dev` → 图片转换任务 | 任务完成、输出存在 |
-| 引擎 | `pnpm engines:list` / `engines:install` | 能探测、能安装并通过 SHA-256 校验；**libvips 已实测装成功**（哈希回填的 6 条仍限 Windows / Linux） |
+| 引擎 | `pnpm engines:list` / `engines:install` | 能探测、能安装并通过 SHA-256 校验；**libvips 已实测装成功**（哈希回填的 **7 条**仍限 Windows / Linux；`imagemagick@windows` 的来源已补齐、应用内安装未复验；FFmpeg 因本机 `www.gyan.dev` 不可达而未装成，见 §3） |
 | 图标 | `pnpm icons` | 成功（需先补 `assets/icon-source.png`） |
 
 ## 附 B：本文件的核对方法说明

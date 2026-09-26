@@ -14,6 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Separator } from "@/components/ui/separator";
 import {
+  capabilityEnforcementNote,
   capabilityFingerprint,
   capabilityRisk,
   capabilityWarning,
@@ -138,6 +139,7 @@ export function PermissionGate({
         <AnimatePresence initial={false}>
           {ordered.map((cap) => {
             const risk = capabilityRisk(cap);
+            const enforcementNote = capabilityEnforcementNote(cap);
             const key = capabilityFingerprint(cap);
             const checked = selected.has(key);
             const wasGranted = granted?.has(key) ?? false;
@@ -185,6 +187,20 @@ export function PermissionGate({
                     <p className="mt-0.5 font-mono text-[10px] text-muted-foreground/80">
                       {key}
                     </p>
+
+                    {/* 授权界面的义务：说清"这一项宿主到底管不管"。
+                        打勾给人的暗示是"宿主会按这个勾拦住"，而 exec / env / ai / gpu
+                        目前根本没有运行时调用点（详见 SECURITY.md §9）——
+                        不说的话，用户会以为自己刚刚做了一次有意义的安全决策。 */}
+                    {enforcementNote && (
+                      <p className="mt-1 flex items-start gap-1.5 text-[11px] text-risk-medium">
+                        <Info className="mt-0.5 h-3 w-3 shrink-0" />
+                        <span>
+                          <span className="font-medium">宿主尚未在运行时强制这一项。</span>
+                          {enforcementNote}
+                        </span>
+                      </p>
+                    )}
 
                     {warning && (
                       <p

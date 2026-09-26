@@ -35,7 +35,7 @@
 结论：**判断"现在能不能跑"必须以代码和 CI 输出为准**，本文档只描述代码里存在的安全机制与缺口。下面是**当前**可复核的基线（本文档最早写作时的那份"编译失败 / 59 passed, 2 failed"记录**已完全过期**，它的两个失败项正是上面已修掉的阻塞 1–4）：
 
 ```text
-cargo test --workspace                  →  214 passed / 0 failed
+cargo test --workspace                  →  217 passed / 0 failed
 scripts/devtools/verify-platform.mjs    →  69 项检查全通过（【1】–【11】）
 ```
 

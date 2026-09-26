@@ -62,7 +62,8 @@ libvips（快、省内存） ──缺失──▶ ImageMagick（格式最全）
 >
 > **走这条链的**：`image.convert`、`image.resize`、`image.crop`、`image.rotate`。
 > **还没走的**：`image.enhance` 与 `image.strip-metadata`（仍是纯 Rust 实现，不问引擎）——
-> 尽管 `libvips.provides` 声明了它们。详见
+> 它们**已经不再声明引擎依赖**（两个节点的 `optionalEngines` 已清空、`libvips.provides` 里那两条也撤掉了），
+> 所以界面不会再出现"装了 libvips 会更快"这种没有实现支撑的说法。详见
 > [docs/ENGINE-MATRIX.md](docs/ENGINE-MATRIX.md) 第 5.1、6.2 节与
 > [docs/ROADMAP.md](docs/ROADMAP.md) 的「不一致 2」。
 >
@@ -267,7 +268,7 @@ pnpm engines:install  # 交互式安装引擎（本地开发用）
 
 ### 真机验证（补上自动化测试覆盖不到的那一层）
 
-> 本项目在 `cargo check` / **214 个 Rust 测试** / `tsc` / `vite build` **全绿**的情况下，
+> 本项目在 `cargo check` / **217 个 Rust 测试** / `tsc` / `vite build` **全绿**的情况下，
 > 真机跑一次仍然找出了 **3 个发布级缺陷**。共同点是"组件各自正确，连起来不对"。
 > 同一类问题后来还出现过一次：验证脚本自己挑了一个**错误的模型**去超分，
 > 尺寸断言**全部通过**而输出是垃圾（复盘见 [docs/ENGINE-MATRIX.md](docs/ENGINE-MATRIX.md) 第 3.2 节）。
@@ -418,17 +419,25 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
 1. **`specta 2.0.0-rc.25` 是预发布版**。`specta` 的稳定版还停在 1.x，而 Tauri 2 需要 2.x。
    所有导出类型都收敛在 `apps/desktop/src-tauri/src/{ipc.rs, commands.rs}`，
    一旦 RC 破坏兼容，换成 `ts-rs` 的改动面被刻意限制在这两个文件里。
-2. **引擎下载源已回填 6 条，但只覆盖 Windows 与 Linux**。
+2. **引擎下载源已回填 7 条，但只覆盖 Windows 与 Linux**。
    `engine-sources.json` 里 `ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、
-   `python@windows/linux` 六条已带**真实核对过的 SHA-256**（ffmpeg 取自 gyan.dev 随包发布的
-   `.sha256` 旁挂文件，其余为自己流式下载后计算），并且 URL 全部改成**版本固定直链**——
-   滚动别名（如 `ffmpeg-release-essentials.zip`）会在上游发新版时让哈希失效。
-   **macOS 的三条仍为 `null`**：没有 macOS 环境可核对，`install` 会返回 `HashRequired`
+   `python@windows/linux`，以及本轮新增的 **`imagemagick@windows`**（7.1.2-31 便携版，官方只提供 `.7z`；
+   实测 **Windows 自带的 `tar` 能读 7z**，所以装它不需要先装 7-Zip）共七条已带**真实核对过的 SHA-256**
+   （ffmpeg 取自 gyan.dev 随包发布的 `.sha256` 旁挂文件，其余为自己流式下载后计算），
+   并且 URL 全部改成**版本固定直链** —— 滚动别名（如 `ffmpeg-release-essentials.zip`）会在上游发新版时让哈希失效。
+   **macOS 的四条仍为 `null`**：没有 macOS 环境可核对，`install` 会返回 `HashRequired`
    而不是放行。macOS 用户应走 Homebrew（系统安装模式）。
    在哈希为 `null` 时，`EngineRegistry::install` **拒绝自动安装**，除非调用方显式传
    `allow_unverified = true` 且用户在 UI 上二次确认。
    > 单元测试 `no_source_points_at_a_rolling_latest_alias` 与
-   > `every_declared_hash_is_a_wellformed_sha256` 守着这两条纪律。
+   > `every_declared_hash_is_a_wellformed_sha256` 守着这两条纪律；
+   > `download_mode_engines_have_a_source_for_this_platform` 守着"声明了下载就必须真有来源"
+   > —— `imagemagick` 违反过它，后果是界面显示一个点下去必然失败的「一键下载」按钮。
+   > ⚠️ **FFmpeg 的安装在本机没有完成过**：本次会话里 `www.gyan.dev` 不可达（`curl` 直测也是连不上），
+   > 依赖它的 `video.*` / `audio.*` 节点在那台机器上不可用。这是**环境事实，不是代码缺陷**；
+   > 哈希取自上游旁挂的 `.sha256` 文件只能证明来源写对了，替代不了一次真实安装。
+   > 另外 `imagemagick@windows` 的**应用内安装链路未复验**（`toolforge.exe` 被无关进程持有句柄，
+   > 重建不了二进制），已验证的是哈希、`tar` 解 7z、`magick.exe` 可运行、包内无顶层目录这四点（直接执行得出的）。
 3. **模型权重不随包分发**。U²-Net 是 Apache-2.0 可商用，MODNet / BiRefNet 的**权重**许可不同，
    首次使用时会下载并单独确认许可证。
    目录里共 **8 个权重**（抠图 5 + 超分 3），其中 **5 个**带下载源：

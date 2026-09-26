@@ -483,9 +483,9 @@ permissions:
 | `image.convert` | 图片格式转换 | — | libvips、imagemagick | `format`、`quality` | PNG/JPEG/WebP/BMP/TIFF/GIF 互转。**输出 `backend`**（`libvips` / `imagemagick` / `rust`）。装了 libvips 时 WebP/JPEG 才按 `quality` 走**有损**编码；纯 Rust 后端的 WebP **只有无损** |
 | `image.resize` | 图片缩放 | — | libvips、imagemagick | `width`、`height`、`filter` | Lanczos3 重采样；只给一边时另一边按比例推导（**两边都不给会报错**）。**输出 `backend`** |
 | `image.crop` | 裁剪 / 缩略图 | — | libvips、imagemagick | `mode`、`width`、`height`、`x`、`y` | `mode` 取 `center`/`custom`/`smart`（`smart` 目前与 `center` 相同）。**输出 `backend`** |
-| `image.rotate` | 旋转 / 翻转 | — | imagemagick | `angle`、`flipH`、`flipV`、`autoOrient` | 非 90° 倍数需要**会重采样的后端**：libvips（`similarity --angle`）或 ImageMagick（`-rotate`）；**两者都没有时报 `ENGINE_MISSING`**（detail 让你去装 libvips 或 ImageMagick），**不会静默把角度取整**。**输出 `backend`** |
-| `image.enhance` | 图像增强 | — | libvips | `brightness`、`contrast`、`saturation`、`sharpen` | 纯 Rust 走内置卷积。⚠️ **该节点不参与三层降级，也不会输出 `backend`** —— 声明里的 `libvips` 目前没有被调用 |
-| `image.strip-metadata` | 清除元数据 | — | libvips、imagemagick | — | 重新编码即不保留 EXIF/IPTC/XMP。⚠️ **当前是纯 Rust 实现，不调用 libvips / ImageMagick，也没有 `backend` 输出** |
+| `image.rotate` | 旋转 / 翻转 | — | libvips、imagemagick | `angle`、`flipH`、`flipV`、`autoOrient` | 非 90° 倍数需要**会重采样的后端**：libvips（`similarity --angle`）或 ImageMagick（`-rotate`），libvips 优先；**两者都没有时报 `ENGINE_MISSING`**（detail 让你去装 libvips 或 ImageMagick），**不会静默把角度取整**。**输出 `backend`** |
+| `image.enhance` | 图像增强 | — | — | `brightness`、`contrast`、`saturation`、`sharpen` | 纯 Rust 走内置卷积。**该节点不参与三层降级、没有 `backend` 输出，`optionalEngines` 也已清空** —— 此前它声明了 `libvips`，而实现里一个引擎都不调，界面因此会宣称一个并不存在的加速（已修，见 [ENGINE-MATRIX.md](ENGINE-MATRIX.md) 6.2） |
+| `image.strip-metadata` | 清除元数据 | — | — | — | 重新编码即不保留 EXIF/IPTC/XMP。**纯 Rust 实现，不调用 libvips / ImageMagick，也没有 `backend` 输出**；`optionalEngines` 同样已清空（理由同上） |
 | `image.remove-background` | 抠图去背景 | python、onnx-models | — | `model`、`mode`、`background`、`threshold`、`feather` | AI 抠图。**已实现**（此前是"登记了但执行器没写"）。走一条**独立的 ONNX 推理链**，不属于上面的 libvips / ImageMagick / 纯 Rust 三层降级（见下）。`model` 默认 `u2netp`（4.4 MB），可选 `u2net` / `isnet-general`；`mode` 取 `alpha`（透明背景 PNG）或 `color`（换纯色底，用 `background`）。**首次运行有两步一次性准备**：用户自己去「模型权重」下权重，应用再建一个独立 venv 装 `onnxruntime` / `numpy` / `pillow`（约 30 MB，**这一步要联网**）。之后推理全在本地，**不联网、不上传图片** |
 
 **图像格式的真实支持情况**：纯 Rust 后端的 `parse_format` 支持
@@ -503,8 +503,9 @@ permissions:
 > **`image.enhance` 与 `image.strip-metadata` 不走**（纯 Rust 实现，没有 `backend` 输出）。
 > 后端选择是**可观测**的这一设计是有意的 —— 代码注释写得很直白：不看日志就只能靠猜，
 > 而这个项目已经被"文档说有、实际没有"坑过好几次。
-> 详细的降级矩阵与两处仍未对齐的 `provides` 声明见
-> [ENGINE-MATRIX.md](ENGINE-MATRIX.md) 第 5.1、6.2 节。
+> 详细的降级矩阵见 [ENGINE-MATRIX.md](ENGINE-MATRIX.md) 第 5.1 节；
+> 声明侧 5 处 `provides` ↔ 节点声明的漂移（就是上面那两个节点的 `libvips` 声明）
+> 已经全部修掉，并由一条双向测试 `provides_matches_node_declarations` 守着，见同文档 6.2 节。
 >
 > **别把 libvips 的收益说成"文件一定更小"**：它带来的是**按质量换体积的能力**
 > （WebP/JPEG 有损编码），这对照片很重要，但在一张**合成渐变**图上，无损反而可能更小
@@ -541,7 +542,7 @@ permissions:
 |---|---|---|---|---|---|
 | `doc.convert` | 文档格式转换 | pandoc | — | `to`、`standalone`、`toc`、`extraArgs` | Markdown/HTML/DOCX/EPUB/LaTeX 互转 |
 | `doc.to-pdf` | 转 PDF（Office） | libreoffice | — | `format` | Word/Excel/PPT → PDF |
-| `doc.ocr` | OCR 文字识别 | python | tesseract | `engine`、`lang` | **已实现**。有 tesseract 就走它（离线、免费、快）；没有就用**多模态模型**（更强但要联网计费）。`engine` 默认 `auto`；`lang` 默认 `chi_sim+eng`。**PDF 输入会被明确拒绝**（要按页栅格化，那条链路没做）。输出可引用 `text` 与 `backend`（`tesseract` 或 `ai-vision`）。见下方说明 |
+| `doc.ocr` | OCR 文字识别 | — | tesseract、ai-provider | `engine`、`lang` | **已实现**。有 tesseract 就走它（离线、免费、快）；没有就用**多模态模型**（更强但要联网计费）。`engine` 取 `auto` / `tesseract` / `ai`（默认 `auto`）；`lang` 默认 `chi_sim+eng`。**PDF 输入会被明确拒绝**（要按页栅格化，那条链路没做），输入端口也不再声明 `.pdf`。输出可引用 `text` 与 `backend`（`tesseract` 或 `ai-vision`）。**两个引擎都是可选的**：`requiresEngines` 为空，所以只装 Tesseract 的机器照样能用（此前写的是必需 `python`，会让这种机器被无谓标灰） |
 | `archive.pack` | 打包压缩 | 7zip | — | `format`、`level`、`password` | zip / 7z / tar / tar.gz / tar.xz |
 | `archive.unpack` | 解压 | 7zip | — | `password`、`keepStructure` | 内置 Zip Slip 防护 |
 | `ebook.convert` | 电子书转换 | — | calibre、pandoc | `format`、`title`、`author` | **已实现**。`calibre` 优先（MOBI/AZW3/LIT/PDF 只有它能写），缺了退到 `pandoc`（EPUB/DOCX/FB2/HTML/Markdown/RTF/ODT/TXT）。**超出 pandoc 能力表的格式会在调用前被拒绝**（理由见下）。输出可引用 `backend`（`calibre` / `pandoc`） |
@@ -564,10 +565,15 @@ permissions:
 > 还会让错误看起来像图片的问题）。`ai.describe` 在服务端回 400 时会额外提示
 > 「很可能是这个模型不支持图片输入」，并让你去换视觉模型。
 >
-> ⚠️ **`doc.ocr` 的参数枚举与实现有一处对不上**：节点目录里 `engine` 的选项是
-> `auto` / `tesseract` / `paddleocr`，而执行器认的是 `auto` / `tesseract` / **`ai`**（`paddleocr`
-> 既没实现、也不在错误提示里）。所以现在**别写 `paddleocr`**；要强制走 AI 就写 `ai`。
-> 节点描述里那句「装了 PaddleOCR 时质量更高」目前只是文案，没有对应实现。
+> ✅ **`doc.ocr` 的参数枚举与实现已经逐字对齐**：`engine` 的选项是
+> `auto` / `tesseract` / `ai`，与执行器读的分支一字不差。
+> （历史：这里曾写着 `paddleocr` —— 执行器**没有**那条分支，选中它只会静默走到
+> `auto` 的行为；节点描述里「装了 PaddleOCR 时质量更高」也只是一句没有实现的文案。
+> 二者现已一并删掉。**参数名对了但取值对不上，比参数名写错更难发现**：
+> 界面照常显示、执行器照常运行，只有结果不符合预期。）
+> 另外 `doc.ocr` 的 `requiresEngines` 已清空（原来是 `["python"]`）、
+> `optionalEngines` 改成 `["tesseract", "ai-provider"]` —— Tesseract 那条路根本不碰 Python，
+> 而没装 Tesseract 时它靠的是配好的 AI 服务；两个方向都必须声明对。
 
 > ⚠️ 这里原来还有一行 `flow.foreach`（批量循环）。**这个节点已经被整个删除**，
 > 不是"留着不实现" —— 所以清单里写 `uses: flow.foreach` 现在会直接**校验不过**
