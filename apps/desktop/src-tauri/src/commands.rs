@@ -767,6 +767,10 @@ pub async fn pipeline_nodes(state: State<'_, Arc<AppState>>) -> ToolforgeResult<
         nodes,
         availability,
         missing_engines,
+        unimplemented: toolforge_core::pipeline::UNIMPLEMENTED_NODES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     })
 }
 

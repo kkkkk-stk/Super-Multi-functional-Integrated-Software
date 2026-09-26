@@ -643,20 +643,37 @@ std::fs::create_dir_all(&workspace).ok();
    - `plugins/l1.rs` 的模块文档第 6 条声称它「由**批量驱动层**（`apps/desktop` 的命令层）展开，执行器只把它当直通」——但 `commands.rs::plugins_run` 里**没有任何 foreach 展开逻辑**，它只调一次 `run_pipeline`。
    - 结论：这条注释描述的是**尚未存在的代码**。
 5. 🚧 **多文件输入不会逐项执行**。`plugins/builtin/image-convert/plugin.yaml` 把 `src` 端口标成 `multiple: true`，注释写「可一次拖入多张，宿主按并发度逐个执行本流水线」；但 `l1.rs` 里 `${src}` 绑定的是 `req.inputs.values().find_map(|v| v.first())`，即**第一个文件**，`input.<port>` 则是逗号连接的整串。`commands.rs::plugins_run` 也只 `run_pipeline` 一次。所以拖入 12 张 PNG 时，**当前实现只会处理第 1 张**（`total_items` 会显示 12，但实际只跑一次）。这属于 capability gap，不是 bug 报告，但必须知道。
-6. 🚧 **6 个节点已登记但未实现**。`builtin_nodes()` 共登记 **31** 个节点，`nodes::run` 的 `match` 覆盖 **25** 个，剩下 **6** 个一律返回 `not_implemented`：
+6. 🚧 **6 个节点已登记但未实现**。清单在 `toolforge_core::pipeline::UNIMPLEMENTED_NODES`，`nodes::run` 的 `match` 覆盖其余 25 个；命中的一律返回 `not_implemented`：
 
    `image.remove-background`、`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`、`flow.foreach`
 
-   注意这里的连锁效应：`image.remove-background` / `ai.upscale` / `doc.ocr` / `ai.describe` / `ebook.convert` 这 5 个恰好是 `python` / `onnx-models` / `ai-provider` / `calibre` / `tesseract` 引擎在 `engine_catalog()` 里 `provides` 的能力。`plugins/builtin/remove-bg/plugin.yaml` 这类内置插件因此**可装载、可授权、可入队，但执行时必然失败**（返回 "尚未在 v0.1 中实现"）——该清单自己的文件头注释也把这件事写清楚了：「`image.remove-background` 已登记在节点目录里……因此本清单能通过 `PluginManifest::validate()`；但它在 v0.1 的执行器里尚未实现（`nodes.rs` 的 `run()` 会返回 not_implemented）。本示例用于固化清单形态。」
-
-   README 的「功能规划」里也承认了这一点（「节点已登记，执行器待实现」），但节点目录本身**没有**暴露"未实现"这个状态——`pipeline_nodes` 命令返回的 `availability` 只根据 `requires_engines` 是否可用计算，未实现的节点在装了 python 之后会显示为"可用"。
-7. 🚧 **`JobFilter::kinds` 字段被声明但从未被使用**。`core/job.rs::JobFilter::matches` 只检查 `statuses` 与 `search`，**没有**读取 `kinds`。所以按任务类别过滤目前是空操作。
-8. 🚧 **`jobs_retry` 命令不存在**。`JobQueue::retry` / `set_retry` 在领域层存在且有单测（`retry_requires_registered_closure`），但 `COMMAND_NAMES` 里没有 `jobs_retry`，且 `commands.rs::plugins_run` 从不调用 `set_retry`。所以「重试」这条路径目前从 UI 不可达。`JobKind::is_retryable()` 的注释解释了为什么 `AiGenerate` 与 `EngineInstall` **不该**可重试（"会产生副作用/重复扣费"）。
-9. 🚧 **`settings_patch` 改 `concurrency` 不影响已建的队列**（见步骤 5）。
-10. 🚧 **打包后内置插件可能加载不到**。`lib.rs::resolve_builtin_plugins` 先找 `app.path().resource_dir()/plugins/builtin`，找不到再回退到 `CARGO_MANIFEST_DIR/../../../plugins/builtin`（开发态路径）。而 `tauri.conf.json` 的 `bundle.resources` 是**空数组**，`bundle.externalBin` 也是空的。所以打包产物里是否包含 `plugins/builtin`，代码与配置里都没有给出保证。**待定**。
+   ✅ **这份名单现在有唯一真相来源**：`UNIMPLEMENTED_NODES`（`pipeline.rs`）同时被三处消费 —— `nodes::run` 的兜底分支、IPC 的 `NodeCatalogResponse.unimplemented`、以及前端的节点面板/画布/Inspector（前端**不再硬编**）。以前它在**四个地方**各存一份（Rust 执行器、SDK 文档、示例清单注释、前端的 `node-support.ts`），每实现一个节点要手工同步四处。
+   两条测试守着它与真实分发表的一致性：`unimplemented_list_matches_actual_dispatch`（遍历节点目录，断言"名单里的确实走 not_implemented、名单外的不走"）与 `is_implemented_is_the_complement_of_the_list`。
+   另有一条示例层面的规则测试：`examples_do_not_silently_use_unimplemented_nodes` —— 示例要么别用未实现节点，要么必须在 `metadata.description` 里写明（`remove-bg` 走后者）。
+7. ✅ **`JobFilter::kinds` 已生效**。`matches()` 现在读它（按 `JobKind::label()` 匹配），并有单测 `filter_by_kind_label`。
+8. ✅ **`jobs_retry` 已存在**。命令已注册；`plugins_run` 会注册重放闭包，任务中心的「重试」按钮因此可用。`AiGenerate` 与 `EngineInstall` 仍然**不**可重试（有副作用/成本）。
+9. ✅ **`settings_patch` 改并发度已作用到队列**。新增 `JobQueue::set_concurrency()` 并在命令层调用。**降低并发是渐近生效的**（`Semaphore::forget_permits` 只能收回空闲许可），这一点写在该方法的文档注释里。
+10. ✅ **打包后内置插件会被分发**。`tauri.conf.json` 的 `bundle.resources` 已改为 `{ "../../../plugins/builtin": "plugins/builtin" }`，与 `resolve_builtin_plugins()` 打包态查找的 `resource_dir()/plugins/builtin` 对齐。
 11. ✅ **引擎下载源已回填 6 条**（此前每一项的 `sha256` 都是 `null`，导致任何引擎都装不上）。现在 `ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux` 都带**实际核对过的哈希 + 版本固定直链**；macOS 三条与 `ffmpeg@linux` 仍为 `null`，`install` 对它们返回 `EngineInstallOutcome::HashRequired`（由 `commands.rs::engines_install` 映射成 `ErrorCode::IntegrityCheckFailed`）。`allow_unverified = true` 时才会走未校验路径。详见 README「已知风险」第 2 条与 `docs/ROADMAP.md` §3。
 12. 🚧 **模型权重下载未落地**。`engine.rs::EngineModel` 的 `url` 与 `sha256` 在 `engine_catalog()` 里**全部是 `None`**，`installed: false`。`EngineRegistry::install_model` 存在，但没有对应 IPC 命令（`COMMAND_NAMES` 里没有 `models_*`）。**v0.1 不需要它**：依赖模型的节点（`image.remove-background` / `ai.upscale`）执行器本身也还没实现。
+13. ⚠️ **生产 CSP 与 Vite 开发模式的冲突（已解决，但容易被人"清理"掉）**。
 
+    `app.security.csp` 里的 `script-src 'self'` 会拦掉 `@vitejs/plugin-react`
+    内联注入的 Fast Refresh preamble，**导致 Tauri 窗口里 `pnpm tauri:dev` 白屏**
+    （控制台报 "can't detect preamble"）。
+
+    前端在 `apps/desktop/vite.config.ts` 里加了 `reactRefreshPreambleShim` 插件，
+    把那段内联脚本改写成同源外链模块（`<script src="/@toolforge/react-refresh-preamble.js">`），
+    并把 HMR 固定在**同源同端口**（另开 1421 会被 `connect-src 'self'` 拦掉）。
+
+    **不要因为"dev 白屏"就去放宽生产 CSP**（例如加 `'unsafe-inline'`）——
+    那会把一个开发期便利变成长期的生产安全债。要改就改那个 shim。
+
+    > 注：Tauri 的配置文件不允许未知字段（`tauri-build` 会拒绝），所以这条约束
+    > **没法写成 `tauri.conf.json` 里的注释** —— 只能写在这里。有人在配置里加
+    > `_note` 之类的键会让整个 app crate 编译失败。
+
+    
 ---
 
 ## 5. 三级插件运行时对比表

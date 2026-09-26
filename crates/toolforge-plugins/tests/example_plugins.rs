@@ -104,7 +104,7 @@ fn every_example_manifest_parses_and_validates() {
 }
 
 #[test]
-fn example_manifests_reference_real_nodes_only() {
+fn examples_reference_real_nodes_only() {
     let known: std::collections::HashSet<String> =
         builtin_nodes().into_iter().map(|n| n.name).collect();
 
@@ -124,6 +124,90 @@ fn example_manifests_reference_real_nodes_only() {
                 );
             }
         }
+    }
+}
+
+/// 示例**不得静默引用未实现的节点**。
+///
+/// ## 这条测试是被一个真实缺陷逼出来的
+///
+/// `plugins/builtin/batch-rename/plugin.yaml` 曾经在流水线里写着
+/// `uses: flow.foreach` —— 而那个节点没有执行器。它能通过 `validate()`
+/// （节点确实登记在目录里），所以**所有结构校验都放行了**；
+/// 用户装上之后一跑就报「尚未在 v0.1 中实现」。
+///
+/// 这正是"示例是用户的第一份参考"这件事的反面：一个装得上、跑不了的示例
+/// 比没有示例更糟。所以规则收紧为二选一：
+///
+/// * 不在流水线里用未实现的节点（推荐）；**或**
+/// * 确实要用（为了固化目标形态）→ 必须在 `metadata.description` 里
+///   明写"尚未实现"，让 UI 上那一行就带着警告。
+///
+/// `remove-bg` 走的是第二条路 —— 它的执行器排在 v0.2，但清单形态值得先固化。
+#[test]
+fn examples_do_not_silently_use_unimplemented_nodes() {
+    let unimplemented = toolforge_core::pipeline::UNIMPLEMENTED_NODES;
+
+    for path in collect_manifests() {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let Ok(manifest) = PluginManifest::from_yaml(&text) else {
+            continue;
+        };
+        let toolforge_core::plugin::PluginRuntime::Pipeline { pipeline } = &manifest.runtime else {
+            continue;
+        };
+
+        for step in &pipeline.steps {
+            if !unimplemented.contains(&step.uses.as_str()) {
+                continue;
+            }
+            let desc = manifest.metadata.description.clone().unwrap_or_default();
+            assert!(
+                desc.contains("尚未实现"),
+                "{} 的步骤 `{}` 引用了未实现的节点 `{}`，\n\
+                 但 metadata.description 里没有写明。\n\
+                 用户看到的是「安装成功、运行即报未实现」，请在 description 里加上 \
+                 「⚠️ 该能力尚未实现」；或者干脆别用这个节点（批量语义已由命令层扇出解决）。\n\
+                 当前 description：{desc}",
+                path.display(),
+                step.id,
+                step.uses
+            );
+        }
+    }
+}
+
+/// 示例**不得引用未实现的节点**（另一个方向）：如果某个示例的整条流水线
+/// 都建立在未实现节点上，那它就不是"示例"，是"占位符"。
+/// 允许最多一个未实现节点（`remove-bg` 那一类），超过就说明示例失去了参考价值。
+#[test]
+fn no_example_is_mostly_unimplemented() {
+    let unimplemented = toolforge_core::pipeline::UNIMPLEMENTED_NODES;
+
+    for path in collect_manifests() {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let Ok(manifest) = PluginManifest::from_yaml(&text) else {
+            continue;
+        };
+        let toolforge_core::plugin::PluginRuntime::Pipeline { pipeline } = &manifest.runtime else {
+            continue;
+        };
+        if pipeline.steps.is_empty() {
+            continue;
+        }
+        let bad = pipeline
+            .steps
+            .iter()
+            .filter(|s| unimplemented.contains(&s.uses.as_str()))
+            .count();
+        assert!(
+            bad <= 1,
+            "{} 的 {} 个步骤里有 {} 个用到了未实现的节点 —— \
+             这样的示例跑不起来，参考价值是负的",
+            path.display(),
+            pipeline.steps.len(),
+            bad
+        );
     }
 }
 

@@ -513,6 +513,41 @@ fn engine(name: &str) -> String {
     name.to_string()
 }
 
+/// 已登记但**尚未实现执行器**的节点。
+///
+/// # 这是唯一真相来源
+///
+/// 它同时被三处消费，**不要在别处再抄一份名单**：
+///
+/// * [`builtin_nodes`]（本模块）—— 前端节点面板据此显示"未实现"警告；
+/// * `toolforge_engines::nodes::not_implemented`（执行器的兜底分支）；
+/// * `apps/desktop` 的节点面板与画布（通过 IPC 的
+///   `NodeCatalogResponse.unimplemented` 拿到，**不硬编**）。
+///
+/// 为什么要把这件事单独拎出来：这份名单曾在**四个地方**各存了一份
+/// （Rust 执行器、SDK 文档、示例清单注释、前端的 `node-support.ts`）。
+/// 每实现一个节点就要手工同步四处，漏掉任何一处都会让用户看到
+/// 与实际行为相反的提示 —— 本项目已经因此踩过坑。
+///
+/// **新增节点时的正确顺序**：先实现执行器 → 再把它从这里删掉 →
+/// 前端与文档会自动跟上。
+pub const UNIMPLEMENTED_NODES: &[&str] = &[
+    // 需要 ONNX 运行时；模型分发链路（models_* IPC）也还没落地
+    "image.remove-background",
+    "ai.upscale",
+    "ai.describe",
+    "doc.ocr",
+    "ebook.convert",
+    // 批量语义现在由命令层逐文件扇出解决（见 commands.rs::expand_batches），
+    // 这个节点保留只是给流程编辑器留一个显式循环标记的位置
+    "flow.foreach",
+];
+
+/// 某个节点的执行器是否已实现
+pub fn is_implemented(node: &str) -> bool {
+    !UNIMPLEMENTED_NODES.contains(&node)
+}
+
 /// 内置节点目录。**这里就是"主程序能力"的完整边界** ——
 /// 想加新能力，先在这里加一个节点（或加一个引擎），而不是在每个功能页里写 if。
 pub fn builtin_nodes() -> Vec<NodeDescriptor> {
@@ -1060,6 +1095,33 @@ mod tests {
                     assert!(!p.options.is_empty(), "{} 的 {} 是 enum 但没 options", n.name, p.id);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn unimplemented_list_only_contains_registered_nodes() {
+        // 名单里写错一个名字（比如节点被改名/删掉了）会让"未实现"提示
+        // 落在空气上，同时真正没实现的节点被当成可用 —— 两种都是误导。
+        let known: std::collections::HashSet<String> =
+            builtin_nodes().into_iter().map(|n| n.name).collect();
+        for name in UNIMPLEMENTED_NODES {
+            assert!(
+                known.contains(*name),
+                "UNIMPLEMENTED_NODES 里的 `{name}` 不在节点目录中 —— 名字写错了或节点已删除"
+            );
+        }
+    }
+
+    #[test]
+    fn is_implemented_is_the_complement_of_the_list() {
+        for node in builtin_nodes() {
+            let expected = !UNIMPLEMENTED_NODES.contains(&node.name.as_str());
+            assert_eq!(
+                is_implemented(&node.name),
+                expected,
+                "`{}` 的实现状态与名单不一致",
+                node.name
+            );
         }
     }
 

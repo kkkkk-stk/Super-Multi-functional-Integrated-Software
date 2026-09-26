@@ -338,7 +338,18 @@ pub async fn run(
 ///
 /// 刻意**不返回假的成功**：插件作者与用户都必须立刻知道这个能力还没做，
 /// 否则会出现"流水线显示跑通了但没产出文件"这种最难排查的问题。
+///
+/// ⚠️ 判定走 [`toolforge_core::pipeline::UNIMPLEMENTED_NODES`]（唯一真相来源），
+/// 而不是在这里另抄一份名单。有一条测试
+/// （`unimplemented_list_matches_actual_dispatch`）会遍历节点目录，
+/// 断言"名单里的节点确实走这个分支、名单外的不走"—— 所以实现完一个节点后
+/// 忘了从名单里删掉它，测试会立刻红。
 fn not_implemented(node: &str) -> ToolforgeError {
+    debug_assert!(
+        !toolforge_core::pipeline::is_implemented(node),
+        "`{node}` 已从 UNIMPLEMENTED_NODES 里移除，但分发表里仍没有它的实现 —— \
+         要么补上实现，要么把它加回名单"
+    );
     ToolforgeError::new(
         ErrorCode::Internal,
         format!("内置节点 `{node}` 尚未在 v0.1 中实现"),
@@ -1634,6 +1645,40 @@ mod tests {
         std::fs::write(tmp.join("a.txt"), b"hi").unwrap();
         assert!(scan_for_escapes(&tmp).is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn unimplemented_list_matches_actual_dispatch() {
+        // 这条测试把「唯一真相来源」这句话变成可验证的事实。
+        //
+        // 它守住的失误形态：实现完某个节点后**忘了从 UNIMPLEMENTED_NODES 里删掉**
+        // ——那样前端会永久显示"该能力尚未实现"，而它其实能跑；
+        // 反过来，把实现删了却忘了加回名单，用户会看到"未实现"以外的怪错误。
+        let (mut ctx, _q, _id) = test_ctx();
+
+        for node in toolforge_core::pipeline::builtin_nodes() {
+            // 用空参数调用：已实现的节点会因为缺参数返回 PluginInvalid/EngineMissing 等，
+            // 未实现的必定返回 Internal + "尚未在 v0.1 中实现"。
+            let err = match run(&mut ctx, &node.name, &BTreeMap::new()).await {
+                Ok(_) => None, // 无参数也能跑通的节点（flow.log 有必填 message，不会走到这）
+                Err(e) => Some(e),
+            };
+
+            let hit_not_implemented = err
+                .as_ref()
+                .map(|e| e.message.contains("尚未在 v0.1 中实现"))
+                .unwrap_or(false);
+
+            assert_eq!(
+                hit_not_implemented,
+                !toolforge_core::pipeline::is_implemented(&node.name),
+                "节点 `{}` 的实际行为与 UNIMPLEMENTED_NODES 不符（实际报未实现={hit_not_implemented}，\
+                 名单说已实现={}）。err={:?}",
+                node.name,
+                toolforge_core::pipeline::is_implemented(&node.name),
+                err.map(|e| e.message)
+            );
+        }
     }
 
     // ========================================================================

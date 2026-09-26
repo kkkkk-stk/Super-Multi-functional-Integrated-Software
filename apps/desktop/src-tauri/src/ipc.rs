@@ -297,6 +297,17 @@ pub struct NodeCatalogResponse {
     pub availability: HashMap<String, bool>,
     /// 缺失引擎 -> 需要它的节点
     pub missing_engines: HashMap<String, Vec<String>>,
+    /// **尚未实现执行器**的节点名。
+    ///
+    /// ⚠️ 前端**不要**再硬编这份名单 —— 它来自
+    /// `toolforge_core::pipeline::UNIMPLEMENTED_NODES`（唯一真相来源），
+    /// 由 `unimplemented_list_matches_actual_dispatch` 与
+    /// `is_implemented_is_the_complement_of_the_list` 两条测试守着。
+    ///
+    /// 这份名单曾经在四个地方各存了一份（Rust 执行器、SDK 文档、示例清单注释、
+    /// 前端的 `node-support.ts`），每实现一个节点就要手工同步四处。
+    /// 漏掉任何一处，用户就会看到与实际行为相反的提示。
+    pub unimplemented: Vec<String>,
 }
 
 // ============================================================================

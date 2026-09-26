@@ -11,6 +11,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect } from "react";
 
 import { pipelineNodes } from "@/lib/ipc";
+import { setUnimplementedNodes } from "@/lib/node-support";
 import { queryKeys } from "@/lib/query-client";
 import { useCanvasStore } from "@/stores/canvas-store";
 import type { NodeCategory, NodeDescriptor, NodeCatalogResponse } from "@/types/domain";
@@ -31,6 +32,9 @@ export function useSyncCanvasWithCatalog(): NodeCatalogResponse | undefined {
   useEffect(() => {
     if (!data) return;
     syncWithCatalog(data.nodes, data.availability, data.missingEngines);
+    // 「哪些节点还没实现」也来自后端（唯一真相来源），装进模块级缓存供
+    // 各处同步读取 —— 前端不再硬编这份名单，见 lib/node-support.ts。
+    setUnimplementedNodes(data.unimplemented);
   }, [data, syncWithCatalog]);
 
   return data;
