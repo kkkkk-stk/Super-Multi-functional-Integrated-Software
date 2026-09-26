@@ -282,11 +282,20 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             license_note: "以动态库方式调用即可满足 LGPL 要求，无需开源你的代码。".into(),
             approx_size_mb: 30,
             core: false,
+            // ⚠️ 这张表必须与"节点自己声明的 `optional_engines`"**完全一致**，
+            // 有一条测试（`provides_matches_node_declarations`）在盯它。
+            //
+            // 它原来写着 `image.enhance` 与 `image.strip-metadata` —— 而那两个节点
+            // **只有纯 Rust 实现**，装了 libvips 不会有任何变化；同时漏了
+            // `image.crop` 与 `image.rotate`，而它们**真的**会调 libvips。
+            // 这属于最坏的一类不一致：界面照着 `provides` 显示"装了它解锁这些"，
+            // 于是用户为了两个用不上的功能去下一个 30 MB 的库，
+            // 而真正受益的两个功能反倒没被标出来。
             provides: vec![
                 "image.convert".into(),
                 "image.resize".into(),
-                "image.enhance".into(),
-                "image.strip-metadata".into(),
+                "image.crop".into(),
+                "image.rotate".into(),
             ],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::System, EngineInstallMode::Download],
@@ -307,7 +316,6 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                 "image.resize".into(),
                 "image.crop".into(),
                 "image.rotate".into(),
-                "image.strip-metadata".into(),
             ],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::System, EngineInstallMode::Download],
@@ -392,7 +400,6 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             provides: vec![
                 "image.remove-background".into(),
                 "ai.upscale".into(),
-                "doc.ocr".into(),
             ],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::Download],
@@ -564,7 +571,9 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             license_note: "API Key 默认只存在内存里（重启要重填）。打开「记住 API Key」后会以**明文**另存到数据目录下的 ai-key.txt —— 系统钥匙串尚未接入。它不会随插件或日志外泄。".into(),
             approx_size_mb: 0,
             core: false,
-            provides: vec!["ai.describe".into()],
+            // `doc.ocr` 也要算进来：没装 Tesseract 时它会用多模态模型兜底，
+            // 那条路径同样要用户配好 AI 服务。
+            provides: vec!["ai.describe".into(), "doc.ocr".into()],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::Remote],
             requires_license_ack: false,
@@ -759,6 +768,76 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(before, names.len(), "模型 file_name 有重复：{names:?}");
+    }
+
+    /// `EngineDescriptor::provides` 与节点自己声明的引擎依赖必须**互相吻合**。
+    ///
+    /// ## 为什么这条测试必须存在
+    ///
+    /// 界面照着 `provides` 显示「装了它解锁这些节点」。它和节点侧的
+    /// `requires_engines` / `optional_engines` 是**两份数据、说的是同一件事** ——
+    /// 而两份数据必然漂移。实测漂移过 5 处：
+    ///
+    /// * `libvips.provides` 写着 `image.enhance` / `image.strip-metadata`，
+    ///   而这两个节点**只有纯 Rust 实现** → 用户为了用不上的功能去下 30 MB；
+    /// * 同一张表漏了 `image.crop` / `image.rotate`，而它们**真的**会调 libvips
+    ///   → 真正受益的功能反倒没被标出来；
+    /// * `imagemagick.provides` 多写了 `image.strip-metadata`；
+    /// * `python.provides` 把 `doc.ocr` 算作"需要 Python"，而它的 Tesseract
+    ///   路径根本不需要 → 会让只装了 Tesseract 的机器被无谓地标灰；
+    /// * `ai-provider.provides` 漏了 `doc.ocr`，而它的 AI 兜底正需要 AI 服务。
+    ///
+    /// 判据是**双向**的，两边都必须成立：
+    /// * 节点把 E 列进 requires/optional ⟹ E 的 provides 里必须有这个节点；
+    /// * E 的 provides 里有某个节点 ⟹ 那个节点的 requires/optional 里必须有 E。
+    ///
+    /// 方向都是"界面承诺"与"实际依赖"必须一致 —— 任一方向不成立，
+    /// 用户看到的解锁关系就是假的。
+    #[test]
+    fn provides_matches_node_declarations() {
+        let nodes = crate::pipeline::builtin_nodes();
+        let engines = engine_catalog();
+
+        for e in &engines {
+            for node_name in &e.provides {
+                let node = nodes.iter().find(|n| &n.name == node_name);
+                let Some(node) = node else {
+                    panic!(
+                        "引擎 `{}` 的 provides 里写着不存在的节点 `{node_name}`",
+                        e.id
+                    );
+                };
+                assert!(
+                    node.requires_engines.contains(&e.id) || node.optional_engines.contains(&e.id),
+                    "引擎 `{}` 声称解锁节点 `{node_name}`，但那个节点的 \
+                     requiresEngines / optionalEngines 里都没有它 —— \
+                     界面会显示一个并不存在的解锁关系",
+                    e.id
+                );
+            }
+        }
+
+        for node in &nodes {
+            for engine_id in node
+                .requires_engines
+                .iter()
+                .chain(node.optional_engines.iter())
+            {
+                let Some(e) = engines.iter().find(|e| &e.id == engine_id) else {
+                    panic!(
+                        "节点 `{}` 依赖了目录里不存在的引擎 `{engine_id}`",
+                        node.name
+                    );
+                };
+                assert!(
+                    e.provides.contains(&node.name),
+                    "节点 `{}` 声明依赖引擎 `{}`，但那个引擎的 provides 里没有它 —— \
+                     界面会把「装了它解锁什么」显示漏",
+                    node.name,
+                    e.id
+                );
+            }
+        }
     }
 
     #[test]

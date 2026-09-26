@@ -536,9 +536,11 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 > - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错；整个脚本 **69 项检查全通过**。
 > - **收益要说准**：libvips 档位带来的是**按质量换体积的能力**（WebP/JPEG 有损编码），纯 Rust 后端的 WebP 只能无损。**但"有损一定更小"是错的**，实测 320×200 合成渐变图：无损 508 字节 vs 有损 1808 字节（所以【6】只断言"确实走了有损编码"，不断言体积）。
 >
-> **本条还剩两件事没做**（因此标"部分关闭"而不是"已关闭"）：
-> 1. `image.enhance` 与 `image.strip-metadata` **仍然只有纯 Rust 实现**，`pick_image_backend()` 没有被它们调用 —— 而 `libvips.provides` 里声明了这两个能力。要么接上，要么把声明撤掉。
-> 2. `image.crop` 的反向问题：实现里**已经**用 libvips 做裁剪，但 `libvips.provides` 里**没有** `image.crop`。应补进声明，让声明追上实现。
+> **本条原来还剩两件事，现在都做完了**：
+> 1. `image.enhance` 与 `image.strip-metadata` 仍然只有纯 Rust 实现 —— 这**不是缺陷**（它们本就该是纯 Rust），但它俩的 `optionalEngines` 与两个引擎的 `provides` 里都还声明着"装了引擎能用"，那是假的。**已撤掉声明**，并在描述里写明"只有纯 Rust 实现"。
+> 2. `image.crop` 的反向问题：实现里已经在用 libvips 裁剪，但 `libvips.provides` 里没有它。**已补进声明**（顺带补了 `image.rotate`、撤了引擎侧多余的 `image.strip-metadata` / `doc.ocr`）。
+>
+> 这两件事是同一类漂移（`provides` ↔ 节点声明，共 5 处），所以除了逐处修，还加了一条**双向守卫测试** `provides_matches_node_declarations`，并做了反证确认它真的会红。详见 `docs/ENGINE-MATRIX.md` 第 6.2 节。
 >
 > 另外：**ImageMagick 档位只有代码路径、没有实测记录**（本机没有装 ImageMagick，也没有一个"只有 ImageMagick 可用"的环境基线）。
 >
@@ -605,12 +607,12 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | # | 开放项 | 现状与影响 | 这不是什么 |
 | --- | --- | --- | --- |
 | 1 | **`realesrgan-x4plus` 的固定输入尺寸支持** | 它的 ONNX 导出输入尺寸固定（64×64 或 128×128），要跑通必须先补上「补齐到固定尺寸 → 推理 → 裁回去」，否则边缘块会留下**网格状接缝**。所以它**故意没有下载源**，也不出现在 `ai.upscale` 的 `model` 枚举里 | 不是"哈希没核对"—— 另外两个没有下载源的抠图模型（`birefnet-general` / `modnet-portrait`）才是这个原因。要做的顺序：补逻辑 → 重跑接缝检查 → 真实下载后填哈希 |
-| 2 | **`image.enhance` / `image.strip-metadata` 仍然只有纯 Rust 一条路** | 它们**不问引擎**、不调用 `pick_image_backend()`、不产出 `backend`，所以装了 libvips 也不会更快。而 `libvips.provides` 里**声明了**这两个能力 —— **声明比实现更乐观**（`docs/ENGINE-MATRIX.md` 第 6.2 节） | 不是降级链的问题：降级链只覆盖 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个节点，这一点从上一轮起就没变 |
+| 2 | **`image.enhance` / `image.strip-metadata` 仍然只有纯 Rust 一条路** | 它们**不问引擎**、不调用 `pick_image_backend()`、不产出 `backend`，所以装了 libvips 也不会更快。两者本身是**刻意**的（内置卷积与"解码再编码"都能干这个活），有问题的只是它们曾经声明了引擎依赖 —— **那部分已经撤掉**，界面不再宣称"装了引擎会更快" | 不是降级链的问题：降级链只覆盖 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个节点。要不要给这两个节点接外部后端，是**独立的性能议题**，不是缺陷 |
 | 3 | **`doc.ocr` 的 PDF 栅格化** | PDF 输入现在被**明确拒绝**（要按页转图片，需要 pdfium / poppler）。报错文案清楚，但功能确实没有 | 不是"忘了处理"—— 拒绝是刻意的：产出一堆乱码比报错糟得多 |
 | 4 | **`ebook.convert` 在两个可选引擎都没有时的 UI 提示** | 运行期会返回明确的 `EngineMissing`（detail 列出 Calibre 与 Pandoc 的覆盖范围与体积），但**节点可用性判定仍只看 `requiresEngines`**，所以这种机器上它依旧显示"可用" | 不是安全问题，是**知情时机的落差**：用户点下去才知道要装东西 |
-| 5 | **`doc.ocr` 的参数枚举与执行器对不上** | 枚举是 `auto` / `tesseract` / `paddleocr`，执行器认 `auto` / `tesseract` / `ai`。填 `ai` 有效但不在下拉里；填 `paddleocr` 能选中却会走到"两者都不满足"的报错分支。节点描述里的 PaddleOCR 目前只是**文案** | 不是"功能缺失"—— 是**声明与实现的一处漂移**，改起来只需二选一（要么实现 PaddleOCR，要么把枚举改成 `ai` 并把描述改掉） |
-| 6 | **`doc.ocr` 的可用性判定严于实现** | `requiresEngines` 是 `["python"]`，缺 Python 时整个节点被标灰；但执行器的 **tesseract 那条路根本不碰 Python** | 又是一处"能用却显示不可用"的可能（这个项目在 `onnx-models` 上已经踩过反方向的坑） |
-| 7 | **`doc.ocr` 的 AI 路径没有声明 `ai-provider`** | `doc_ocr` 在没有 tesseract 时会 `require_ai`，但 `doc.ocr` 的 `optionalEngines` 只有 `["tesseract"]`，`ai-provider.provides` 里也只有 `ai.describe`。所以"没装 tesseract 又没配 AI"时，UI 不会提示缺引擎，只有运行才报错 | 同上：运行期错误是清楚的，缺的是**提前告知** |
+| 5 | ~~**`doc.ocr` 的参数枚举与执行器对不上**~~ **已修** | 枚举原为 `auto` / `tesseract` / `paddleocr`，执行器认 `auto` / `tesseract` / `ai`。填 `ai` 有效但不在下拉里；填 `paddleocr` 能选中却走到"两者都不满足"的分支。**已把枚举改成 `ai` 并把 PaddleOCR 文案删掉** | 这是一类值得记的漂移：**参数名对了但取值对不上**，比参数名写错更难发现 —— 界面照常显示、执行器照常运行，只有结果不符合预期 |
+| 6 | ~~**`doc.ocr` 的可用性判定严于实现**~~ **已修** | 原来 `requiresEngines` 是 `["python"]`，缺 Python 时整个节点被标灰；但 tesseract 那条路根本不碰 Python。**已改为 `requiresEngines: []` + `optionalEngines: ["tesseract", "ai-provider"]`** | 正是"能用却显示不可用"（这个项目在 `onnx-models` 上踩过反方向的坑） |
+| 7 | ~~**`doc.ocr` 的 AI 路径没有声明 `ai-provider`**~~ **已修** | 现在 `doc.ocr` 的 `optionalEngines` 含 `ai-provider`，`ai-provider.provides` 也含 `doc.ocr`，两个方向都对齐 | 同第 6 条，一并由 `provides_matches_node_declarations` 这条双向测试守住 |
 | 8 | **ImageMagick 档位与 macOS 没有环境基线** | "只有 ImageMagick 可用"这一档从未被单独测过（本机没装 ImageMagick）；macOS 三条下载源也仍是 `null`（没有环境核对哈希） | 不是"没实现"—— 代码路径在，缺的是验证记录 |
 | 9 | **验证脚本的覆盖面仍然是"我们可控的那部分"** | `ai.describe` 用假端点验证请求形状（这是对的，真模型不可复现、要花钱），但它**验不了**"模型答得好不好"；同理【11】验的是倍数与尺寸，不是超分画质 | 这是**刻意的边界**，不是疏漏。写清楚是为了避免有人把"69 项全通过"读成"AI 能力已经验收" |
 
@@ -656,8 +658,9 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 - [x] ✅ 骨架完成：`EngineRegistry` 探测（`probe` / `probe_all` / `system_binary` / `resolve`）、按需下载（`download_to` / `install`）、SHA-256 比对、模型注册（`install_model`）
 - [ ] 🚧 纯 Rust 图片转换端到端可用：`image.probe` / `image.convert` / `image.resize` / `image.crop` / `image.rotate`（90° 整数倍）/ `image.enhance` / `image.strip-metadata` 至少各有一条测试
 - [ ] 🚧 引擎探测结果可从前端触发并展示（`engines:list` 或 IPC 命令二选一，先能看见就行）
-- [x] ✅ **处理不一致 2（部分完成）**：`image.convert` / `image.resize` / `image.crop` / `image.rotate` **已经真的调用** libvips / ImageMagick（`pick_image_backend()`，输出里报 `backend`），不再是"声明了但从不使用"。
-  - 仍待办：`image.enhance` 与 `image.strip-metadata` 只有纯 Rust 路径，而 `libvips.provides` 声明了它们；`image.crop` 则应补进 `libvips.provides`（实现已经在用 libvips 裁）。见「不一致 2」的更新。
+- [x] ✅ **处理不一致 2（已完成）**：`image.convert` / `image.resize` / `image.crop` / `image.rotate` **已经真的调用** libvips / ImageMagick（`pick_image_backend()`，输出里报 `backend`），不再是"声明了但从不使用"。
+  - 声明侧的 5 处漂移也全部修好：撤掉 `libvips.provides` 里的 `image.enhance` / `image.strip-metadata`、撤掉 `imagemagick.provides` 里的 `image.strip-metadata`、补上两个引擎都缺的 `image.crop` / `image.rotate`、撤掉 `python.provides` 里不该有的 `doc.ocr`、补上 `ai-provider.provides` 该有的 `doc.ocr`。
+  - 新增双向守卫测试 `provides_matches_node_declarations` 并做过反证。见 `docs/ENGINE-MATRIX.md` 第 6.2 节。
 
 **插件（仅内置示例）**
 

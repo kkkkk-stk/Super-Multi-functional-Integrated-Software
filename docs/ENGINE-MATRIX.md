@@ -156,7 +156,7 @@ EngineModel {
 - **主页**：https://www.libvips.org/
 - **提供的节点（4 个）**：`image.convert`、`image.resize`、`image.enhance`、`image.strip-metadata`。注意其中 `image.enhance` 只由 libvips 一家声明提供。
 - **缺失时会发生什么**：这 4 个节点不会失效，因为它们的 `requiresEngines` 都是空数组，libvips 只是 `optionalEngines` 中的首选。缺失后自动降级：先退到 ImageMagick，两者都缺失时退到纯 Rust 的 `image` crate。代价是批量/大图场景更慢、更吃内存（libvips 的价值正是在于低内存、流式处理）。
-  > ✅ **这条降级链现在是真的 —— 但只覆盖 4 个节点**：`nodes.rs::pick_image_backend()` 真的按 `libvips → imagemagick → 纯 Rust` 的顺序挑后端，并把用的是哪个报在节点输出的 `backend` 里（详见 5.1）。走这条链的是 **`image.convert` / `image.resize` / `image.crop` / `image.rotate`**；而 **`image.enhance` 与 `image.strip-metadata` 仍然是纯 Rust 实现、一行都不问引擎** —— 所以"libvips 提供 `image.enhance` / `image.strip-metadata`"这两条 `provides` 声明目前比实现更乐观（见 6.2）。
+  > ✅ **这条降级链现在是真的 —— 但只覆盖 4 个节点**：`nodes.rs::pick_image_backend()` 真的按 `libvips → imagemagick → 纯 Rust` 的顺序挑后端，并把用的是哪个报在节点输出的 `backend` 里（详见 5.1）。走这条链的是 **`image.convert` / `image.resize` / `image.crop` / `image.rotate`**；而 **`image.enhance` 与 `image.strip-metadata` 仍然是纯 Rust 实现、一行都不问引擎** —— 对应的 `provides` 声明已经撤掉（见 6.2），所以现在声明与实现是一致的。
 - **已实测的一键安装**：libvips 8.18.6 通过应用安装成功，可执行文件落在托管布局的 `…/engines/libvips/bin/vips.exe`，磁盘占用约 29.67 MB（数据点与顺带修掉的两个 `toolforge-process` 缺陷见 1.3）。
 - **许可证与分发注意点**：`LGPL-2.1`。以动态库方式调用即可满足 LGPL 要求，无需开源你自己的代码——这也是它被选为图像域首选引擎的原因。`requiresLicenseAck: false`。
 
@@ -274,7 +274,7 @@ EngineModel {
 - **主页**：https://platform.openai.com/docs/api-reference
 - **提供的节点（1 个）**：`ai.describe`。
 - **缺失时会发生什么**：`ai.describe` **不可用**，无降级路径（`requiresEngines: ["ai-provider"]`）。由于它是 `Remote` 模式的引擎，不存在「安装包」意义上的缺失，缺失等价于「未配置可用的服务商 / API Key」。
-  > ⚠️ **`doc.ocr` 的 AI 兜底路径也要靠这个引擎，但它没被声明**：`doc_ocr` 在没装 tesseract 时会调 `require_ai(ctx, "doc.ocr")`，也就是要求配好 AI 服务商；可是 `doc.ocr` 的 `optionalEngines` 只有 `["tesseract"]`，`ai-provider.provides` 里也只有 `ai.describe`。结果是：**没装 tesseract 又没配 AI 时，`doc.ocr` 在 UI 上不会被标成"缺引擎"**，只有运行到那一步才会报错（错误文案本身是清楚的，会把两个选项都列出来）。这是一处**声明与实现不一致**，如实记在这里，没有改。
+  > ✅ **这处声明不一致已经修掉了**：`doc_ocr` 在没装 tesseract 时会调 `require_ai(ctx, "doc.ocr")`，也就是说它同样依赖配好的 AI 服务商；而现在 `doc.ocr` 的 `optionalEngines` 是 `["tesseract", "ai-provider"]`，`ai-provider.provides` 是 `["ai.describe", "doc.ocr"]`——两个方向都对上了。为此新增了一条**双向**守卫测试 `provides_matches_node_declarations`（见 6.2）。
 - **许可证与分发注意点**：`依服务商条款`——许可证不取决于 ToolForge，而取决于用户接的是哪家服务。注意事项字段现在写的是「API Key 默认只存在内存里（重启要重填）。打开「记住 API Key」后会以**明文**另存到数据目录下的 `ai-key.txt` —— 系统钥匙串尚未接入。它不会随插件或日志外泄。」
   > ✅ **这句文案已经改对了**：它此前写的是「API Key 只存在本机加密存储中」，而仓库里**从来没有**加密存储、也没有 OS 钥匙串 —— 那是一句与实现不符的话。现在它如实描述了"默认只在内存、可选明文落盘"这个**能力降级**（细节见 `docs/SECURITY.md` 的凭据落盘一节）。`requiresLicenseAck: false`。
 
@@ -374,9 +374,9 @@ EngineModel {
 | `image.probe` | 无（纯 Rust 解码，读取图片信息） | 无 | 不适用——永远可用 | 无 |
 | `image.convert` | 图片格式转换（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底（**✅ 实测走通**，节点输出含 `backend`） | 批量/大图更慢、更吃内存；失去 libvips 的流式低内存优势；退回纯 Rust 时可用格式覆盖变窄，**且 WebP 只能无损编码**（丢掉"按质量换体积"的能力） |
 | `image.resize` | 图片缩放（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底（**✅ 实测走通**，节点输出含 `backend`） | 同上：更慢、更吃内存，缩放算法与格式覆盖可能变少 |
-| `image.crop` | 裁剪 / 缩略图（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底（**✅ 实测走通**，节点输出含 `backend`；但 `libvips.provides` 没声明这个能力，见第 6.2 节） | 同上：更慢、更吃内存 |
-| `image.rotate` | 旋转 / 翻转（可选：`imagemagick`） | `imagemagick`（可选，非必需） | `libvips`（实现里也能接手，见下）→ `imagemagick` → 两者都缺失 → 纯 Rust `image` crate **只支持 90° 整数倍**，非直角直接报 `EngineMissing`（**✅ 实测走通**，节点输出含 `backend`） | 更慢、更吃内存；**只剩纯 Rust 时任意角度旋转能力丧失**（不是静默取整，而是明确报错要用户装引擎） |
-| `image.enhance` | 图像增强（可选：`libvips`） | `libvips`（可选，非必需） | 🚧 **没有降级链，只有纯 Rust 一条路**：该节点的实现既不问后端、也不调用 libvips（见下） | 与"降级"无关：无论装了什么引擎，`image.enhance` 都走内置卷积 |
+| `image.crop` | 裁剪 / 缩略图（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips` 缺失 → ImageMagick → 两者都缺失 → 纯 Rust `image` crate 打底（**✅ 实测走通**，节点输出含 `backend`；`libvips.provides` 已补上这个能力） | 同上：更慢、更吃内存 |
+| `image.rotate` | 旋转 / 翻转（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | `libvips`（`rot d90` 或 `similarity --angle`）→ `imagemagick`（`-rotate`）→ 两者都缺失 → 纯 Rust `image` crate **只支持 90° 整数倍**，非直角直接报 `EngineMissing`（**✅ 实测走通**，节点输出含 `backend`） | 更慢、更吃内存；**只剩纯 Rust 时任意角度旋转能力丧失**（不是静默取整，而是明确报错要用户装引擎） |
+| `image.enhance` | 图像增强（**无引擎依赖**） | — | 🚧 **没有降级链，只有纯 Rust 一条路**：该节点的实现既不问后端、也不调用 libvips | 与"降级"无关：无论装了什么引擎，`image.enhance` 都走内置卷积 |
 | `image.strip-metadata` | 清除元数据（可选：`libvips`、`imagemagick`） | `libvips`（可选，非必需） | 🚧 **同上一行：只有纯 Rust 实现**（重新编码即不保留 EXIF/IPTC/XMP），`pick_image_backend()` 没有被它调用 | 与"降级"无关：装不装引擎，行为都一样；对部分容器格式的元数据块清理可能不完整 |
 | `ebook.convert` | 电子书格式转换（可选：`calibre`、`pandoc`） | `calibre`（可选，非必需） | `calibre` 缺失 → `pandoc`（**只覆盖 EPUB / DOCX / FB2 / HTML / Markdown / RTF / ODT / TXT，且认不出的输入输出格式会被执行器在调用前拦下**）；`pandoc` 也缺失 → 没有任何可用后端 | **MOBI / AZW3 / LIT / PDF 输出能力完全丧失**；只剩 pandoc 覆盖的那些格式。两个后端都缺失时，节点虽不被判为不可用，但执行器会返回明确的 `EngineMissing`（detail 里列出 Calibre 与 Pandoc 各自的覆盖范围与体积），**不会静默产出空文件**（见 3.5） |
 | `flow.branch` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
@@ -399,7 +399,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 > - 理由（代码注释原文的意思）：后端选择一旦不可观测，"到底走没走 libvips"就只能靠猜 —— 而这个项目已经被"文档说有、实际没有"坑过好几次。
 >
 > **走这条链的是 4 个节点**：`image.convert`、`image.resize`、`image.crop`、`image.rotate`。
-> **不走这条链的是 2 个节点**：`image.enhance` 与 `image.strip-metadata` —— 它们**仍然是纯 Rust 实现**，既不调用 `pick_image_backend()`，也不产生 `backend` 输出。所以 `libvips.provides` 里的 `image.enhance` / `image.strip-metadata`、以及 `imagemagick.provides` 里的 `image.strip-metadata`，这些声明目前**仍然只是声明**（见 6.2）。
+> **不走这条链的是 2 个节点**：`image.enhance` 与 `image.strip-metadata` —— 它们**仍然是纯 Rust 实现**，既不调用 `pick_image_backend()`，也不产生 `backend` 输出。这两个节点的 `optionalEngines` 与两个引擎的 `provides` 里都已经**不再声明**它们，所以界面不会再说"装了引擎能解锁它们"（见 6.2）。
 >
 > **`image.rotate` 的任意角度（非 90° 倍数）在新实现下的行为**：libvips 可用时走 `vips similarity --angle N`；ImageMagick 可用时走 `-rotate N`；**只有纯 Rust 可用时返回明确的 `EngineMissing`**，detail 让用户去「设置 → 引擎管理」装 libvips 或 ImageMagick。它**不会**静默把角度取整 —— 取整会让用户以为"转了 45°"，实际拿到一张没转的图。`verify-platform.mjs` 的【7】号检查盯着这一点。
 >
@@ -470,14 +470,41 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 - ✅ **现在两边对齐了，而且是双向的**：枚举收敛成 `realesr-general-x4v3`（默认）+ `realesrgan-anime6b`，这两个在 `engine_catalog()` 里都有**完整条目**（含真实下载后算出的 SHA-256）；反过来，目录里三个超分权重中**唯一没有下载源**的 `realesrgan-x4plus` 刻意不出现在枚举里 —— 列出一个永远下不到的模型，等于让用户选到一个必然失败的选项。`pipeline.rs` 里对这个枚举留了一行注释说明这条纪律：「枚举必须与 `engine_catalog()` 里 `onnx-models` 的模型表一致」。
 - **仍然存在的缺口（换了个方向）**：现有测试 `every_node_engine_reference_exists_in_catalog` 只校验节点引用的**引擎 id** 是否存在，**不校验参数枚举里的模型 id 是否有对应权重条目**，所以这条纪律目前靠代码注释与人工核对维持，没有测试拦住。`ai.upscale` 的执行器会在模型未被登记时返回 `NotFound` 并把可用的超分模型列出来，属于运行期兜底。
 
-### 6.2 `provides` 声明与实现之间的两处对不上（`image.crop` / `image.enhance` + `image.strip-metadata`）
+### 6.2 `provides` 与节点声明的一致性 ✅ 已修好，并且现在有测试守着
 
-- **方向一：引用方有、声明方没有。** `image.crop` 的 `optionalEngines` 是 `["libvips", "imagemagick"]`，但 `libvips` 的 `provides` 只有 `image.convert`、`image.resize`、`image.enhance`、`image.strip-metadata`——**没有 `image.crop`**；`image.crop` 只在 `imagemagick` 的 `provides` 里。
-  > ✅ **实现已经查清**：`nodes.rs::image_crop` 确实调用 `pick_image_backend()`，**libvips 可用时就用 libvips 做裁剪**。也就是说"libvips 能不能承担 `image.crop`"这个问题，答案是**能，而且已经在做**（这一点也由 `verify-platform.mjs`【6】间接覆盖：它验证的是"实际后端与引擎状态一致"）。
-  > 处理方式：**待补齐** —— 应该把 `image.crop` 补进 `libvips.provides`，让声明追上实现。
-- **方向二：声明方有、实现里没有。** `libvips.provides` 里还有 `image.enhance` 与 `image.strip-metadata`，但这两个节点的实现**完全没有调用 `pick_image_backend()`**（也就没有 `backend` 输出），是纯 Rust 内部实现。
-  > 处理方式：**待补齐** —— 要么在实现里真的接上 libvips，要么把这两个能力从 `libvips.provides` 里撤掉。**在二选一完成之前，"libvips 提供图像增强/清除元数据"这句话只是声明**，使用者不该据此以为装了 libvips 这两步会提速。
-- 补充：现有测试 `every_provided_capability_maps_to_a_real_node` 只校验「`provides` 里的能力都有对应节点」这个方向，**不校验反方向，也不校验"实现里到底调没调"**，所以这两处不一致都不会被测试拦住。
+`provides`（引擎侧："装了它解锁哪些节点"）与节点的 `requiresEngines` /
+`optionalEngines`（节点侧："我需要哪些引擎"）是**两份数据、说的是同一件事**。
+两份数据必然漂移，实测漂移过 **5 处**：
+
+| 位置 | 原来错在哪 |
+|---|---|
+| `libvips.provides` | 多写了 `image.enhance` / `image.strip-metadata`（**纯 Rust 实现，装了不会有任何变化**）→ 用户为用不上的功能去下 30 MB |
+| `libvips.provides` | 漏了 `image.crop` / `image.rotate`（**它们真的会调 libvips**）→ 真正受益的功能反倒没被标出来 |
+| `imagemagick.provides` | 多写了 `image.strip-metadata` |
+| `python.provides` | 多写了 `doc.ocr`（它的 Tesseract 路径**不需要 Python**）→ 只装了 Tesseract 的机器被无谓标灰 |
+| `ai-provider.provides` | 漏了 `doc.ocr`（它的 AI 兜底正需要 AI 服务） |
+
+> ✅ **全部已修**：`libvips` / `imagemagick` 的 `provides` 现在都正好是
+> `image.convert` / `image.resize` / `image.crop` / `image.rotate`；
+> `python.provides` 是 `image.remove-background` / `ai.upscale`；
+> `ai-provider.provides` 是 `ai.describe` / `doc.ocr`。
+
+**守住它的是一条双向测试** `provides_matches_node_declarations`
+（`crates/toolforge-core/src/engine.rs`）：
+
+* 节点把 E 列进 requires/optional ⟹ E 的 `provides` 里必须有这个节点；
+* E 的 `provides` 里有某个节点 ⟹ 那个节点的 requires/optional 里必须有 E。
+
+两个方向都是"界面承诺"与"实际依赖"必须一致 —— 任一方向不成立，
+用户看到的解锁关系就是假的。原有的 `every_provided_capability_maps_to_a_real_node`
+只校验"`provides` 里的名字是不是真节点"，管不到这两处漂移，所以新测试是必需的。
+
+> **这条测试做过反证**：把 `image.enhance` 加回 `libvips.provides` 后它立刻变红，
+> 报「引擎 `libvips` 声称解锁节点 `image.enhance`，但那个节点的
+> requiresEngines / optionalEngines 里都没有它」。
+> （反证时踩了一个小坑值得一提：第一次改文件用 `\r\n` 拼接替换，而本仓库的
+> `.gitattributes` 是 `* text=auto eol=lf`，文件里是 **LF** —— 替换静默没生效，
+> 测试自然"通过"。差点据此得出"守卫有效"的结论。**反证本身也要验证它真的改到了文件。**）
 
 ### 6.3 `ebook.convert` 在「两个可选引擎都缺失」时的行为 ✅ 已定义
 
