@@ -667,6 +667,128 @@ c.section('【10】AI 图像描述（ai.describe）的请求形状与下游接�
   }
 }
 
+// ============================================================================
+// 【11】AI 超分（ai.upscale）：尺寸是不是真的乘了倍数
+// ============================================================================
+c.section('【11】AI 超分（ai.upscale）是否真的按倍数放大');
+{
+  const models = await client.invoke('models_list');
+  const upModel = (models ?? []).find(
+    (m) => m.installed && m.usedByNodes.includes('ai.upscale')
+  );
+  const runtimeReady = existsSync(join(DATA_DIR, 'cache', 'onnx-runtime', 'Scripts', 'python.exe'));
+
+  if (!upModel || !runtimeReady) {
+    c.note(
+      `跳过：${!upModel ? '没有已下载的超分权重（到「模型权重」下 realesr-general-x4v3，4.9 MB）' : ''}` +
+        `${!runtimeReady ? ' ONNX 运行时尚未初始化' : ''}`
+    );
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-upscale-verify');
+    rmSync(outDir, { recursive: true, force: true });
+    mkdirSync(outDir, { recursive: true });
+    const src = join(REPO_ROOT, '.tools', 'smoke', 'in-upscale-verify.png');
+    // 用**有明确结构**的图：渐变图上超分的效果差异看不出来，
+    // 而尺寸断言才是这条检查的重点。
+    writeFileSync(src, makeSubjectPng(300, 200, [60, 40, 240, 160]));
+
+    const sub = await client.invoke('plugins_run', {
+      req: {
+        pluginId: 'com.toolforge.builtin.image-upscale',
+        inputs: { src: [src] },
+        params: {
+          model: { kind: 'str', value: upModel.id },
+          scale: { kind: 'int', value: 4 },
+        },
+        outputDir: outDir,
+      },
+    });
+    const job = await client.waitJob(sub.jobId, 600, 1000);
+    if (job.error) c.note(`${job.error.code}：${job.error.message}`);
+    c.check(job.status === 'succeeded', `超分成功（模型 ${upModel.id}）`, job.status);
+
+    const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+    if (produced.length === 1) {
+      const png = pngInfo(readFileSync(join(outDir, produced[0])));
+      c.note(JSON.stringify(png));
+      // ★ 核心断言：尺寸必须**精确**乘倍数。差一点就说明分块拼接算错了。
+      c.check(png?.width === 1200, '宽度 = 300 × 4', String(png?.width));
+      c.check(png?.height === 800, '高度 = 200 × 4', String(png?.height));
+      c.check(png?.colorType === 2, '输出是 RGB PNG', String(png?.colorType));
+
+      // 分块没接好会在拼缝处留下黑洞/条纹，日志里的 uncoveredRatio 就是为此准备的
+      const log = (job.logs ?? []).map((l) => String(l.message));
+      const warn = log.find((l) => l.includes('没被任何分块覆盖'));
+      c.check(!warn, '没有"像素未被分块覆盖"的警告（拼接无洞）', warn ?? '');
+      const detail = log.find((l) => l.includes('块；输出'));
+      if (detail) c.note(detail);
+      // 用**请求的那个**模型跑的 —— 别把"某个模型跑成功了"当成"指定的模型跑成功了"
+      c.check(
+        Boolean(detail && detail.includes(upModel.id)),
+        `实际用的是请求的模型（${upModel.id}）`,
+        detail ?? ''
+      );
+    } else {
+      c.check(false, '产出 1 个文件', produced.join(', '));
+    }
+
+    // ★ 反向断言：拿一个**非超分**权重（抠图模型）去超分，必须被拒绝。
+    //
+    // 这条是被一个真事故逼出来的：验证脚本曾经按"谁服务于 ai.upscale"挑模型，
+    // 而当时的归属是**按引擎推的**（`onnx-models` 同时承载抠图与超分），
+    // 于是挑中了 u2netp —— 一个分割模型。它的输出是单通道蒙版，
+    // 脚本把它当图片、算出"倍数 1"、再 resize 到目标尺寸，
+    // 结果**尺寸断言全过**，整条检查全绿而结果是垃圾。
+    const segModel = (models ?? []).find(
+      (m) => m.installed && m.usedByNodes.includes('image.remove-background')
+    );
+    if (segModel) {
+      const badDir = join(REPO_ROOT, '.tools', 'smoke', 'out-upscale-bad');
+      rmSync(badDir, { recursive: true, force: true });
+      mkdirSync(badDir, { recursive: true });
+      let rejected = false;
+      let msg = '';
+      try {
+        const badSub = await client.invoke('plugins_run', {
+          req: {
+            pluginId: 'com.toolforge.builtin.image-upscale',
+            inputs: { src: [src] },
+            params: { model: { kind: 'str', value: segModel.id }, scale: { kind: 'int', value: 4 } },
+            outputDir: badDir,
+          },
+        });
+        const badJob = await client.waitJob(badSub.jobId, 200, 500);
+        rejected = badJob.status === 'failed';
+        msg = String(badJob.error?.detail ?? badJob.error?.message ?? '');
+      } catch (e) {
+        rejected = true;
+        msg = String(e.message);
+      }
+      c.check(
+        rejected,
+        `拿抠图权重 ${segModel.id} 去超分会被明确拒绝（而不是产出一张垃圾还报成功）`,
+        msg.split('\n')[0].slice(0, 100)
+      );
+      const leftovers = existsSync(badDir) ? readdirSync(badDir) : [];
+      c.check(leftovers.length === 0, '磁盘上没有留下垃圾产出', leftovers.join(', '));
+    }
+
+    // 模型的归属必须**按权重**写清楚，而不是靠"所属引擎被谁用"去推 ——
+    // 否则抠图权重会声称自己服务于 ai.upscale（上面那条反向断言正是在防这个）。
+    const misattributed = (models ?? []).filter(
+      (m) =>
+        m.usedByNodes.includes('ai.upscale') &&
+        m.usedByNodes.includes('image.remove-background')
+    );
+    c.check(
+      misattributed.length === 0,
+      '没有权重同时声称服务于抠图和超分（归属是按权重而不是按引擎算的）',
+      misattributed.map((m) => m.id).join(', ')
+    );
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

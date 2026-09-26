@@ -380,16 +380,13 @@ pub async fn models_list(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Vec
                 .and_then(|p| std::fs::metadata(p).ok())
                 .map(|meta| meta.len() as f64 / (1024.0 * 1024.0));
 
-            let used_by_nodes: Vec<String> = nodes
-                .iter()
-                .filter(|n| {
-                    // 模型与节点的关联写在两处：目录里的 `provides` 只到引擎粒度，
-                    // 节点粒度靠 `requires_engines` / `optional_engines`。
-                    // 这里按"该模型所属引擎被谁用"来算，是最不容易漂移的口径。
-                    n.requires_engines.contains(&desc.id) || n.optional_engines.contains(&desc.id)
-                })
-                .map(|n| n.name.clone())
-                .collect();
+            // 归属**只认权重自己写的 `used_by`**，不再从"所属引擎被谁用"去推。
+            //
+            // 那个推断只对"一个引擎一组权重"成立，而 `onnx-models` 同时承载
+            // 抠图与超分两组权重 —— 推出来的结果是"抠图权重也服务于 ai.upscale"，
+            // 这直接导致一个验证脚本挑错了模型、拿分割模型去超分，
+            // 还因为尺寸断言恰好成立而"全绿"。权重与节点的对应推不出来，只能写。
+            let used_by_nodes: Vec<String> = m.used_by.clone();
 
             out.push(ModelEntry {
                 id: m.id.clone(),

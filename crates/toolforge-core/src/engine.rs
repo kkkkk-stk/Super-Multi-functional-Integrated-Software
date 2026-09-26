@@ -150,6 +150,17 @@ pub struct EngineModel {
     /// 该模型是否已下载（运行时填充）
     #[serde(default)]
     pub installed: bool,
+    /// 这个**权重**具体服务于哪些节点。
+    ///
+    /// 为什么不能靠"它所属引擎被谁用"来推：`onnx-models` 这一个引擎同时承载
+    /// 抠图和超分两组权重，于是在引擎粒度上算出来的结论是
+    /// "u2netp 被 `image.remove-background` 和 `ai.upscale` 共用" ——
+    /// 那是**假的**。它造成的实际后果不是"界面上多显示一行"，而是：
+    /// 一个验证脚本按"谁服务于 ai.upscale"去挑模型，挑中了 u2netp，
+    /// 于是拿一个**分割模型**去超分，输出了垃圾 —— 而尺寸断言照样通过，
+    /// 整条检查"全绿"。权重与节点的对应只能在权重这一层写清楚，推不出来。
+    #[serde(default)]
+    pub used_by: Vec<String>,
 }
 
 /// 引擎的**运行时**状态。
@@ -414,6 +425,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     sha256: Some("309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8".into()),
                     file_name: Some("u2netp.onnx".into()),
                     installed: false,
+                    used_by: vec!["image.remove-background".into()],
                 },
                 EngineModel {
                     id: "u2net".into(),
@@ -426,6 +438,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     sha256: Some("8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491".into()),
                     file_name: Some("u2net.onnx".into()),
                     installed: false,
+                    used_by: vec!["image.remove-background".into()],
                 },
                 EngineModel {
                     id: "isnet-general".into(),
@@ -439,6 +452,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     sha256: Some("60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a".into()),
                     file_name: Some("isnet-general-use.onnx".into()),
                     installed: false,
+                    used_by: vec!["image.remove-background".into()],
                 },
                 EngineModel {
                     id: "birefnet-general".into(),
@@ -453,6 +467,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     sha256: None,
                     file_name: None,
                     installed: false,
+                    used_by: vec!["image.remove-background".into()],
                 },
                 EngineModel {
                     id: "modnet-portrait".into(),
@@ -465,18 +480,63 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     sha256: None,
                     file_name: None,
                     installed: false,
+                    used_by: vec!["image.remove-background".into()],
+                },
+                EngineModel {
+                    id: "realesr-general-x4v3".into(),
+                    name: "Real-ESRGAN general x4v3".into(),
+                    purpose: "通用 4 倍超分（轻量）。**输入尺寸动态**，不需要切块补边，4.9 MB、单块约 26 ms —— 默认选它。".into(),
+                    approx_size_mb: 5,
+                    license: "BSD-3-Clause".into(),
+                    commercial_use: true,
+                    url: Some("https://huggingface.co/Heliosoph/realesrgan-onnx/resolve/main/realesr-general-x4v3.onnx".into()),
+                    sha256: Some("09b757accd747d7e423c1d352b3e8f23e77cc5742d04bae958d4eb8082b76fa4".into()),
+                    file_name: Some("realesr-general-x4v3.onnx".into()),
+                    installed: false,
+                    used_by: vec!["ai.upscale".into()],
+                },
+                EngineModel {
+                    id: "realesrgan-anime6b".into(),
+                    name: "Real-ESRGAN anime 6B".into(),
+                    purpose: "动漫 / 插画 4 倍超分。6 个残差块（完整版是 23 个），约 3 倍快、体积只有 1/4。输入尺寸同样动态。".into(),
+                    approx_size_mb: 18,
+                    license: "BSD-3-Clause".into(),
+                    commercial_use: true,
+                    url: Some("https://huggingface.co/RekluzLabs/realesrgan_anime6b.onnx/resolve/main/realesrgan_anime6b.onnx".into()),
+                    sha256: Some("45bd54934aeabe8df744c8fdacb9e8846c9b55cb4e60c499db77405d1625a667".into()),
+                    // 用**下划线**（`realesrgan_anime6b`），与远端资产名逐字一致。
+                    // 落盘名刻意跟远端保持一致 —— 两边拼法一旦不同，
+                    // "URL 必须以文件名结尾"这条不变量就没法守，而它正是用来
+                    // 抓"少拼资产名"这类错误的。
+                    file_name: Some("realesrgan_anime6b.onnx".into()),
+                    installed: false,
+                    used_by: vec!["ai.upscale".into()],
                 },
                 EngineModel {
                     id: "realesrgan-x4plus".into(),
                     name: "Real-ESRGAN x4plus".into(),
-                    purpose: "通用图像超分辨率放大".into(),
+                    purpose: "完整版通用超分，质量最好的一档".into(),
                     approx_size_mb: 67,
                     license: "BSD-3-Clause".into(),
                     commercial_use: true,
+                    // ⚠️ 这一条**故意**没有配下载源，原因和别的不同，值得写清楚：
+                    //
+                    // 找到的 x4plus ONNX 导出都是**固定输入尺寸**（64×64 或 128×128），
+                    // 也就是说想用它必须把整张图切成小块、逐块推理再拼回去。
+                    // 切块逻辑 `py/upscale.py` 里已经有了，但固定尺寸还要额外的
+                    // "补齐到 64×64 再裁掉"这一步，而补边的质量直接影响边缘块的结果 ——
+                    // 与其先上一个会留下网格状接缝的版本，不如先把两个**动态尺寸**
+                    // 的模型（上面那两条）做扎实：它们对任意尺寸都能直接推理。
+                    //
+                    // 要做 x4plus：补上补齐 + 裁切，重新跑一遍接缝检查，再把哈希填进来。
+                    // 哈希必须来自真实下载（见 `verified_sources_are_pinned`）。
                     url: None,
                     sha256: None,
                     file_name: None,
                     installed: false,
+                    // 它**是**给超分用的，只是还没配下载源 ——
+                    // 归属要照实写，"暂时下不了"和"没人用它"是两件事。
+                    used_by: vec!["ai.upscale".into()],
                 },
             ],
         },
@@ -598,9 +658,17 @@ mod tests {
         for m in &onnx.models {
             match (&m.url, &m.sha256) {
                 (Some(url), Some(hash)) => {
+                    // 权重来自两个托管方：rembg 的 GitHub release（抠图）与
+                    // Hugging Face（超分）。所以不能只认某一个域名 ——
+                    // 但"必须 https"和"必须指向具体文件"是通用的底线。
                     assert!(
-                        url.starts_with(REMBG_RELEASE),
-                        "模型 {} 的地址不在固定的 release 下：{url}",
+                        url.starts_with("https://"),
+                        "模型 {} 的地址不是 https：{url}",
+                        m.id
+                    );
+                    assert!(
+                        !url.contains("raw.githubusercontent.com"),
+                        "模型 {} 用了在这台机器上**被屏蔽**的域名（raw.githubusercontent.com）：{url}",
                         m.id
                     );
                     assert_eq!(hash.len(), 64, "模型 {} 的哈希长度不对", m.id);
@@ -657,6 +725,29 @@ mod tests {
             .filter(|m| m.url.is_some() && m.sha256.is_some())
             .count();
         assert!(ready >= 2, "可下载的抠图模型太少（{ready} 个）");
+
+        // 每个权重都必须**自己声明**服务于哪些节点。
+        //
+        // 这条不是为了好看：`models_list` 直接把它发给界面，而验证脚本也靠它
+        // 挑模型。以前这里的归属是"从所属引擎推"——那个推断对 `onnx-models`
+        // （同时承载抠图与超分）是错的，于是抠图权重声称自己也服务于 `ai.upscale`，
+        // 脚本据此拿分割模型去超分，**尺寸断言照样通过**，整条检查全绿而结果是垃圾。
+        for m in &onnx.models {
+            assert!(
+                !m.used_by.is_empty(),
+                "权重 {} 没有声明 `used_by` —— 归属推不出来，必须逐个写明",
+                m.id
+            );
+            for node in &m.used_by {
+                assert!(
+                    crate::pipeline::builtin_nodes()
+                        .iter()
+                        .any(|n| &n.name == node),
+                    "权重 {} 声称服务于不存在的节点 `{node}`",
+                    m.id
+                );
+            }
+        }
 
         // 文件名不能重复：两个模型写进同一个文件会互相覆盖
         let mut names: Vec<&str> = onnx

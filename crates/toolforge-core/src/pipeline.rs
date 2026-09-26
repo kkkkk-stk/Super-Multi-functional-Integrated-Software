@@ -534,10 +534,15 @@ fn engine(name: &str) -> String {
 /// **新增节点时的正确顺序**：先实现执行器 → 再把它从这里删掉 →
 /// 前端与文档会自动跟上。
 pub const UNIMPLEMENTED_NODES: &[&str] = &[
-    // Real-ESRGAN 权重连下载源都还没核对，见 engine.rs 的
-    // `verified_sources_are_pinned`（它要求 url / sha256 / file_name 三件套齐全）。
-    // 抠图那条链路（模型下载 + Python 推理）已经通了，超分可以照抄它。
-    "ai.upscale",
+    // 空的 —— 32 个内置节点全都有执行器了。
+    //
+    // 这个常量**保留**着，因为它同时是前端"标灰未实现节点"的数据来源
+    // （通过 `NodeCatalogResponse.unimplemented`）。把它删掉会让前端那句
+    // "该能力尚未实现"的提示失去依据；留着空数组，语义正好是"现在没有"。
+    //
+    // 谁下次加节点时忘了实现执行器：把节点名加到这里，
+    // `nodes::run` 的兜底分支、节点面板的灰显、以及 `unimplemented_list_matches_actual_dispatch`
+    // 那条测试会一起跟上 —— 这是刻意设计的"一处声明、多处生效"。
 ];
 
 // `flow.foreach` 曾经在这里，现在**整个节点都删掉了**。留个记录，免得有人再把它加回来：
@@ -962,7 +967,10 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "ai.upscale".into(),
         label: "AI 超分辨率".into(),
-        description: "Real-ESRGAN / SwinIR 放大图片，比传统插值保留更多细节。需要下载模型。".into(),
+        description: "用 Real-ESRGAN 放大图片，比传统插值保留更多细节。\
+                      **模型原生是 4 倍**；选 2/3 倍时会先用 4 倍推理再缩回去\
+                      （细节是模型真算出来的，比原图直接插值好得多）。\
+                      分块推理，所以大图也跑得动。需要下载权重（最小的只有 4.9 MB）。".into(),
         category: NodeCategory::Ai,
         requires_engines: vec![engine("python"), engine("onnx-models")],
         optional_engines: vec![],
@@ -971,9 +979,15 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         params: vec![
             // 枚举必须与 `engine_catalog()` 里 `onnx-models` 的模型表一致 ——
             // 列出目录里没有的模型 = 用户选到一个永远下不到的模型。
-            // 更多超分模型（x2plus / SwinIR / HAT）随 v0.2 的执行器一起接入。
-            enum_param("model", "模型", "realesrgan-x4plus", &["realesrgan-x4plus"]),
-            range_param("scale", "放大倍数", ParamType::Int, 2.0, 2.0, 4.0),
+            enum_param(
+                "model",
+                "模型",
+                "realesr-general-x4v3",
+                &["realesr-general-x4v3", "realesrgan-anime6b"],
+            ),
+            range_param("scale", "放大倍数", ParamType::Int, 4.0, 2.0, 4.0),
+            range_param("tile", "分块边长（px）", ParamType::Int, 256.0, 32.0, 2048.0),
+            range_param("overlap", "分块重叠（px）", ParamType::Int, 16.0, 0.0, 128.0),
         ],
     });
     n.push(NodeDescriptor {

@@ -341,8 +341,9 @@ pub async fn run(
         // ---------- 电子书（Calibre 优先，缺失时按能力表降级到 Pandoc）----------
         "ebook.convert" => ebook_convert(ctx, args).await,
 
-        // ---------- AI（需要多模态模型）----------
+        // ---------- AI（需要多模态模型 / ONNX 权重）----------
         "ai.describe" => ai_describe(ctx, args).await,
+        "ai.upscale" => ai_upscale(ctx, args).await,
         "doc.ocr" => doc_ocr(ctx, args).await,
 
         // ---------- 文档（Pandoc / LibreOffice）----------
@@ -376,19 +377,35 @@ pub async fn run(
 /// 断言"名单里的节点确实走这个分支、名单外的不走"—— 所以实现完一个节点后
 /// 忘了从名单里删掉它，测试会立刻红。
 fn not_implemented(node: &str) -> ToolforgeError {
-    debug_assert!(
-        !toolforge_core::pipeline::is_implemented(node),
-        "`{node}` 已从 UNIMPLEMENTED_NODES 里移除，但分发表里仍没有它的实现 —— \
-         要么补上实现，要么把它加回名单"
-    );
+    // 这里**不该有断言**：
+    //
+    // 曾有一条 `debug_assert!(!is_implemented(node))`，用来抓"实现了却忘了从名单里
+    // 删掉"。但那件事已由 `unimplemented_list_matches_actual_dispatch` 完整覆盖
+    // （跑真实分发、双向校验），而断言带来两个真问题：
+    //   1. `run()` 的兜底分支对"拼错的节点名"与"已登记但未实现的节点"是同一条出口，
+    //      断言让前者从"干净的报错"变成了**崩溃**；
+    //   2. `UNIMPLEMENTED_NODES` 现在是空的，任何节点名都会撞上它。
+    //
+    // 名字在不在目录里，决定了用户该往哪个方向查 ——
+    // "没实现"和"名字写错了"是两种完全不同的处境，别混成一句话。
+    let known = toolforge_core::pipeline::builtin_nodes()
+        .iter()
+        .any(|n| n.name == node);
     ToolforgeError::new(
         ErrorCode::Internal,
         format!("内置节点 `{node}` 尚未在 v0.1 中实现"),
     )
-    .with_detail(
+    .with_detail(if known {
         "该节点已在节点目录中登记（因此流程编辑器可以拖出来），但执行器还没有实现。\
-         实现进度见 docs/ROADMAP.md。若你期望它现在就能用，请提 issue。",
-    )
+         实现进度见 docs/ROADMAP.md。若你期望它现在就能用，请提 issue。"
+            .to_string()
+    } else {
+        format!(
+            "节点目录里**没有**叫 `{node}` 的节点。多半是清单里写错了名字，\
+             或者这份清单是给更新版本的 ToolForge 写的。\n\
+             可以在「流程编辑器 → 节点面板」里查当前版本支持的全部节点名。"
+        )
+    })
     .with_subject(node)
 }
 
@@ -1470,6 +1487,145 @@ async fn image_enhance(
     Ok(NodeOutput::file(dst.display().to_string()))
 }
 
+/// `ai.upscale`：Real-ESRGAN 超分辨率放大。
+///
+/// 与抠图共用同一条 ONNX + Python 链路（同一个独立 venv、同一套模型管理），
+/// 差别只在推理脚本与参数。**切块逻辑在脚本里**（`py/upscale.py`）：
+/// 4 倍放大的输出是 16 倍像素，整图推理的内存需求会直接劝退用户。
+///
+/// ## 关于两个"看起来多余"的设计
+///
+/// * **`scale=2|3` 是先 4× 再缩回去**：模型原生只有 4×。用一个 4× 模型 + Lanczos
+///   缩小，质量明显好于"原图直接双线性放 2 倍"—— 细节是模型真的算出来的。
+///   脚本会把 `modelScale` 与 `targetScale` 都报出来，别让用户以为模型支持 2×。
+/// * **`tile` 默认 256**：太小会让重叠边占比升高（推理量变大），太大则内存吃紧。
+///   256 配 16 像素重叠，在"接缝看不出来"和"跑得动 4K 图"之间是个稳妥的折中。
+async fn ai_upscale(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> ToolforgeResult<NodeOutput> {
+    let src = resolve_path(ctx, "input", arg(args, "src")?)?;
+    let dst = resolve_path(ctx, "output", arg(args, "dst")?)?;
+
+    let model_id = ctx.param_str("model", "realesr-general-x4v3");
+    let scale = ctx.param_i64("scale", 4).clamp(2, 4);
+    let tile = ctx.param_i64("tile", 256).clamp(32, 2048);
+    let overlap = ctx.param_i64("overlap", 16).clamp(0, 128);
+
+    let model_path = ctx.engines.model_path(&model_id).ok_or_else(|| {
+        ToolforgeError::not_found(format!("模型 {model_id} 不在引擎目录里登记"))
+            .with_detail("可用的超分模型：realesr-general-x4v3（4.9 MB）、realesrgan-anime6b（18 MB）。")
+    })?;
+    if !model_path.is_file() {
+        return Err(ToolforgeError::not_found(format!(
+            "超分模型 {model_id} 还没下载"
+        ))
+        .with_detail(
+            "请到「设置 → 引擎管理 → 模型权重」里点「下载」。\n\
+             realesr-general-x4v3 只有 4.9 MB，单块约 26 ms，建议先用它。"
+                .to_string(),
+        ));
+    }
+
+    ctx.job.progress_now(toolforge_core::job::JobProgress::indeterminate(format!(
+        "放大 {}",
+        file_label(&src)
+    )));
+
+    let python = ensure_onnx_runtime(ctx).await?;
+    let script = materialize_py_script(ctx, "upscale.py", UPSCALE_SCRIPT)?;
+
+    let job = ctx.job.clone();
+    let result = toolforge_process::exec_streaming(
+        ExecOptions::new(python)
+            .args([
+                script.display().to_string(),
+                "--model".into(),
+                model_path.display().to_string(),
+                "--input".into(),
+                src.display().to_string(),
+                "--output".into(),
+                dst.display().to_string(),
+                "--scale".into(),
+                scale.to_string(),
+                "--tile".into(),
+                tile.to_string(),
+                "--overlap".into(),
+                overlap.to_string(),
+            ])
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .cancel(ctx.job.cancel.clone())
+            .timeout(Duration::from_secs(3600))
+            .quiet(true),
+        move |kind, line| {
+            if kind == StreamKind::Stderr && !line.trim().is_empty() {
+                job.log(toolforge_core::job::LogLevel::Debug, line.to_string());
+            }
+        },
+    )
+    .await
+    .map_err(|e| {
+        ToolforgeError::engine_failed("python", format!("启动超分脚本失败：{}", e.message))
+    })?;
+
+    if !result.success() {
+        let detail = if result.stderr.trim().is_empty() {
+            result.stdout.clone()
+        } else {
+            result.stderr.clone()
+        };
+        return Err(ToolforgeError::engine_failed("python", "超分脚本执行失败")
+            .with_detail(detail.trim().to_string()));
+    }
+
+    let report: serde_json::Value = result
+        .stdout
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .ok_or_else(|| {
+            ToolforgeError::internal("超分脚本没有返回可解析的结果").with_detail(format!(
+                "stdout：{}\nstderr：{}",
+                result.stdout.trim(),
+                result.stderr.trim()
+            ))
+        })?;
+
+    if !dst.is_file() {
+        return Err(ToolforgeError::engine_failed(
+            "python",
+            format!("超分结束但没有生成 {}", dst.display()),
+        ));
+    }
+
+    let out_w = report.get("outWidth").and_then(|v| v.as_u64()).unwrap_or(0);
+    let out_h = report.get("outHeight").and_then(|v| v.as_u64()).unwrap_or(0);
+    let tiles = report.get("tiles").and_then(|v| v.as_u64()).unwrap_or(0);
+    let uncovered = report
+        .get("uncoveredRatio")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    // 有像素没被任何一块覆盖 = 拼出来的图会有黑洞。这属于**我们自己的 bug**，
+    // 不该悄悄交付给用户。
+    if uncovered > 0.0001 {
+        ctx.job.warn(format!(
+            "拼接后有 {:.3}% 的像素没被任何分块覆盖到 —— 这是分块逻辑的缺陷，请把这个文件报给我们。",
+            uncovered * 100.0
+        ));
+    }
+
+    ctx.job.log(
+        toolforge_core::job::LogLevel::Debug,
+        format!("ai.upscale：模型 {model_id}；{tiles} 块；输出 {out_w}x{out_h}"),
+    );
+
+    Ok(NodeOutput::file(dst.display().to_string())
+        .with_value("path", dst.display().to_string())
+        .with_value("model", model_id)
+        .with_value("backend", "onnx-python")
+        .with_value("width", out_w.to_string())
+        .with_value("height", out_h.to_string()))
+}
+
 /// `image.remove-background`：U²-Net / ISNet 抠图。
 ///
 /// ## 为什么是"Python 子进程"而不是 Rust
@@ -1655,19 +1811,27 @@ async fn image_remove_background(
 /// 只有几 KB，编进去最省事，也**不可能出现"文件没被打进包"**这种故障。
 const REMBG_SCRIPT: &str = include_str!("../py/rembg.py");
 
+/// 超分脚本的正文（同上：编进二进制，运行时写到缓存目录）
+const UPSCALE_SCRIPT: &str = include_str!("../py/upscale.py");
+
 /// 把脚本写到缓存目录，返回路径。
 ///
-/// 每次都重写（内容变了就自动生效），并用 `.toolforge` 之外的名字，
-/// 免得被插件的文件扫描当成用户数据。
-fn materialize_rembg_script(ctx: &NodeCtx) -> ToolforgeResult<PathBuf> {
+/// 每次都重写（内容变了就自动生效）。多个脚本共用一个目录 ——
+/// 它们都是"宿主自带的 Python 小工具"，放在一起便于排查。
+fn materialize_py_script(ctx: &NodeCtx, name: &str, body: &str) -> ToolforgeResult<PathBuf> {
     let dir = ctx.engines.paths().cache().join("onnx-runtime");
     std::fs::create_dir_all(&dir).map_err(|e| {
         ToolforgeError::io(format!("创建 {} 失败：{e}", dir.display()))
     })?;
-    let path = dir.join("rembg.py");
-    std::fs::write(&path, REMBG_SCRIPT)
+    let path = dir.join(name);
+    std::fs::write(&path, body)
         .map_err(|e| ToolforgeError::io(format!("写入 {} 失败：{e}", path.display())))?;
     Ok(path)
+}
+
+/// 兼容旧调用点：抠图脚本的落地路径
+fn materialize_rembg_script(ctx: &NodeCtx) -> ToolforgeResult<PathBuf> {
+    materialize_py_script(ctx, "rembg.py", REMBG_SCRIPT)
 }
 
 /// 依赖安装完成的标记文件名。
@@ -3012,18 +3176,41 @@ mod tests {
 
     #[test]
     fn not_implemented_error_names_the_node() {
-        // 用一个**当前确实未实现**的节点。这里原来写的是
-        // `image.remove-background` —— 它现在实现了，于是测试红了。
-        // 这是好事：说明"未实现名单"确实跟着代码在动。
-        let e = not_implemented("ai.upscale");
-        assert!(e.message.contains("ai.upscale"));
-        assert!(e.detail.unwrap().contains("ROADMAP"));
+        // 这条测试**刻意用一个不存在的节点名**，而不是从名单里挑一个。
+        //
+        // 它原本写的是 `image.remove-background`，后来跟着实现进度改成 `doc.ocr`、
+        // 又改成 `ai.upscale` —— 每实现一个节点就要改一次。现在名单空了，
+        // 但 `not_implemented` 这条**代码路径**仍然存在（分发表的兜底分支），
+        // 所以它仍然需要被钉住。
+        let e = not_implemented("example.not-a-real-node");
+        assert!(e.message.contains("example.not-a-real-node"));
+        // 名字不在目录里时，提示要指向"名字写错了"，而不是把用户往
+        // "这个功能还没做"上引 —— 那是两种完全不同的处境。
+        let detail = e.detail.unwrap();
+        assert!(
+            detail.contains("写错") || detail.contains("没有"),
+            "未知节点名的提示应当指向名字问题：{detail}"
+        );
+
+        // 反过来：目录里**有**但没实现时，提示要指向 ROADMAP。
+        // 现在名单是空的，所以只能构造一个"假装在目录里"的名字 ——
+        // 拿一个真实节点名来走这条路径即可（它虽然不是"未实现"，
+        // 但错误构造逻辑关心的是"名字在不在目录里"）。
+        let real = toolforge_core::pipeline::builtin_nodes()
+            .first()
+            .map(|n| n.name.clone())
+            .expect("节点目录不该为空");
+        let e2 = not_implemented(&real);
+        assert!(
+            e2.detail.unwrap().contains("ROADMAP"),
+            "目录里存在的节点走未实现分支时，应当指向实现进度"
+        );
     }
 
     #[test]
     fn unimplemented_nodes_are_reported_not_silently_succeed() {
         // 这是刻意设计的：宁可报"未实现"，也不要产出空文件让用户以为成功了
-        let e = not_implemented("ai.upscale");
+        let e = not_implemented("example.not-a-real-node");
         assert_eq!(e.code, ErrorCode::Internal);
     }
 

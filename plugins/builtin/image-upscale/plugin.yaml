@@ -1,0 +1,111 @@
+# ToolForge L1 插件（声明式编排，零代码）
+#
+# ── 一条流水线，一个节点 ─────────────────────────────────────────────────
+# `ai.upscale` 走的是与抠图同一套 ONNX + Python 链路（同一个独立 venv、
+# 同一套模型管理），所以"首次使用要准备什么"也完全一样：
+#
+#   1. 权重：到「设置 → 引擎管理 → 模型权重」下 realesr-general-x4v3（4.9 MB）；
+#   2. 运行时：自动建 venv 装 onnxruntime（约 30 MB，仅首次）。
+# 之后每张图都是**本地推理**，不联网、不上传图片。
+#
+# ── 两个必须说清楚的点 ───────────────────────────────────────────────────
+# * **模型原生是 4 倍**。选 2/3 倍时是"先 4 倍推理、再用 Lanczos 缩回去"——
+#   这比"原图直接插值放大 2 倍"质量好得多（细节是模型真算出来的），
+#   但别把它当成"模型支持 2 倍"。
+# * **分块推理**。4 倍放大的输出是 16 倍像素，一张 4000×3000 的照片整图推理
+#   光张量就要 2 GB。所以节点按 256 像素分块、块间留 16 像素重叠，
+#   只取每块的中心贴回结果 —— 重叠就是为了让接缝看不出来。
+#   嫌接缝的可以调大 `overlap`，代价是推理量上升。
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.builtin.image-upscale
+  name: 图片超分放大
+  version: 0.1.0
+  description: 用 Real-ESRGAN 把图片放大 2~4 倍，比传统插值保留更多细节。本地推理、不联网。首次使用需要下载权重（最小的只有 4.9 MB）与 Python 依赖。
+  author: ToolForge
+  license: MIT
+  icon: maximize
+  category: image
+  tags: [超分, 放大, Real-ESRGAN, ONNX, AI]
+
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+
+io:
+  inputs:
+    - id: src
+      label: 图片
+      type: file
+      accept: ["image/*"]
+      multiple: true
+      required: true
+      description: 可一次拖入多张，宿主按并发度逐张处理。
+  outputs:
+    - id: dst
+      label: 放大后的图片
+      type: file
+      required: false
+  params:
+    # 参数 id 与 `ai.upscale` 节点读取的键名逐字一致
+    - id: model
+      label: 模型
+      type: enum
+      default: { kind: str, value: realesr-general-x4v3 }
+      options:
+        - { value: realesr-general-x4v3, label: 通用 4×（4.9 MB，最快） }
+        - { value: realesrgan-anime6b, label: 动漫/插画 4×（18 MB） }
+      required: false
+      affectsOutput: true
+    - id: scale
+      label: 放大倍数
+      type: int
+      description: 模型原生 4 倍；选 2 或 3 会先 4 倍推理再缩回去，质量仍明显好于直接插值。
+      default: { kind: int, value: 4 }
+      min: 2
+      max: 4
+      step: 1
+      required: false
+      affectsOutput: true
+    - id: tile
+      label: 分块边长（px）
+      type: int
+      description: 调小省内存、调大减少块数。256 是"接缝看不出来"与"跑得动大图"之间的折中。
+      default: { kind: int, value: 256 }
+      min: 32
+      max: 2048
+      step: 32
+      required: false
+    - id: overlap
+      label: 分块重叠（px）
+      type: int
+      description: 重叠是为了让块与块的接缝看不出来。0 会更快，但复杂纹理上可能出现网格状痕迹。
+      default: { kind: int, value: 16 }
+      min: 0
+      max: 128
+      step: 4
+      required: false
+
+runtime:
+  kind: pipeline
+  pipeline:
+    description: 单节点流水线：一次调用完成超分。
+    onError: fail
+    # 首次要装依赖 + 加载会话；大图的 4 倍输出也要时间
+    timeoutMs: 3600000
+    steps:
+      - id: upscale
+        uses: ai.upscale
+        label: 超分放大
+        with:
+          src: "${src}"
+          dst: "${output.dst}"
+          model: "${params.model}"
+          scale: "${params.scale}"
+          tile: "${params.tile}"
+          overlap: "${params.overlap}"

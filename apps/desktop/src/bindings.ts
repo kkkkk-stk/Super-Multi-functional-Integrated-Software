@@ -673,6 +673,18 @@ export type EngineModel_Deserialize = {
 	fileName?: string | null,
 	/**  该模型是否已下载（运行时填充） */
 	installed?: boolean,
+	/**
+	 *  这个**权重**具体服务于哪些节点。
+	 * 
+	 *  为什么不能靠"它所属引擎被谁用"来推：`onnx-models` 这一个引擎同时承载
+	 *  抠图和超分两组权重，于是在引擎粒度上算出来的结论是
+	 *  "u2netp 被 `image.remove-background` 和 `ai.upscale` 共用" ——
+	 *  那是**假的**。它造成的实际后果不是"界面上多显示一行"，而是：
+	 *  一个验证脚本按"谁服务于 ai.upscale"去挑模型，挑中了 u2netp，
+	 *  于是拿一个**分割模型**去超分，输出了垃圾 —— 而尺寸断言照样通过，
+	 *  整条检查"全绿"。权重与节点的对应只能在权重这一层写清楚，推不出来。
+	 */
+	usedBy?: string[],
 };
 
 /**
@@ -702,6 +714,18 @@ export type EngineModel_Serialize = {
 	fileName?: string | null,
 	/**  该模型是否已下载（运行时填充） */
 	installed: boolean,
+	/**
+	 *  这个**权重**具体服务于哪些节点。
+	 * 
+	 *  为什么不能靠"它所属引擎被谁用"来推：`onnx-models` 这一个引擎同时承载
+	 *  抠图和超分两组权重，于是在引擎粒度上算出来的结论是
+	 *  "u2netp 被 `image.remove-background` 和 `ai.upscale` 共用" ——
+	 *  那是**假的**。它造成的实际后果不是"界面上多显示一行"，而是：
+	 *  一个验证脚本按"谁服务于 ai.upscale"去挑模型，挑中了 u2netp，
+	 *  于是拿一个**分割模型**去超分，输出了垃圾 —— 而尺寸断言照样通过，
+	 *  整条检查"全绿"。权重与节点的对应只能在权重这一层写清楚，推不出来。
+	 */
+	usedBy: string[],
 };
 
 /**  引擎来源 */
