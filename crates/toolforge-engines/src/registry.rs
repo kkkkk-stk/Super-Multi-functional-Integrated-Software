@@ -981,6 +981,16 @@ async fn send_download(client: &reqwest::Client, url: &str) -> ToolforgeResult<r
     })
 }
 
+/// 多久**一个字节都没收到**就判定为卡死。
+///
+/// 客户端总超时是 30 分钟，而"连接建立了但服务端不吐数据"这种卡死会一直
+/// 撑到那一刻 —— 用户看到的是一个 **0% 不动、也没有任何解释**的进度条。
+/// 真机实测过：`www.gyan.dev` 的连接会挂住，文件停在 0 字节十几分钟。
+///
+/// 60 秒是个宽容值：正常的慢速网络也会持续有小块到达，
+/// 真正卡死是"完全静默"，两者的区别很明显。
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 把响应体流式写盘，边写边算 SHA-256。
 async fn stream_to_file(
     resp: reqwest::Response,
@@ -992,6 +1002,7 @@ async fn stream_to_file(
     use sha2::{Digest, Sha256};
 
     let total = resp.content_length().unwrap_or(0);
+    let url_for_error = resp.url().to_string();
     let mut file = tokio::fs::File::create(dest)
         .await
         .map_err(|e| ToolforgeError::io(format!("创建文件 {} 失败：{e}", dest.display())))?;
@@ -1003,7 +1014,34 @@ async fn stream_to_file(
     let mut stream = resp.bytes_stream();
 
     use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
+    loop {
+        // 卡死检测：把"静默"变成一条**说得清的错误**，而不是干等到总超时
+        let next = tokio::time::timeout(STALL_TIMEOUT, stream.next()).await;
+        let chunk = match next {
+            Ok(Some(c)) => c,
+            Ok(None) => break, // 正常结束
+            Err(_) => {
+                let _ = std::fs::remove_file(dest);
+                return Err(ToolforgeError::new(
+                    ErrorCode::Network,
+                    format!(
+                        "下载 {label} 卡住了：{} 秒内没有收到任何数据",
+                        STALL_TIMEOUT.as_secs()
+                    ),
+                )
+                .with_detail(format!(
+                    "已经收到 {}，但连接不再有数据。\nURL：{url_for_error}\n\n\
+                     常见原因：对方服务器限速或不可达、代理把大文件拦了。\n\
+                     可以重试一次；若反复卡在同一处，就手动下载这个文件放进引擎目录。",
+                    if downloaded > 0 {
+                        format!("{} KB", downloaded / 1024)
+                    } else {
+                        "0 字节（连接建立了但服务端没吐数据）".to_string()
+                    }
+                )));
+            }
+        };
+
         job.check()?;
         let chunk = chunk.map_err(|e| {
             ToolforgeError::new(ErrorCode::Network, format!("下载 {label} 中断：{e}"))
