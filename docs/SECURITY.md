@@ -35,8 +35,8 @@
 结论：**判断"现在能不能跑"必须以代码和 CI 输出为准**，本文档只描述代码里存在的安全机制与缺口。下面是**当前**可复核的基线（本文档最早写作时的那份"编译失败 / 59 passed, 2 failed"记录**已完全过期**，它的两个失败项正是上面已修掉的阻塞 1–4）：
 
 ```text
-cargo test --workspace                  →  217 passed / 0 failed
-scripts/devtools/verify-platform.mjs    →  69 项检查全通过（【1】–【11】）
+cargo test --workspace                  →  218 passed / 0 failed
+scripts/devtools/verify-platform.mjs    →  74 项检查全通过（【1】–【12】）
 ```
 
 > ⚠️ **但"全绿"不等于"本文档列的每一条都已修好"**：上面这张 §9 的缺口清单里，第 2–5、7、13、19、22–25、27–30 项**仍然成立**（它们是设计边界或未接线，不是测试失败）。测试绿说明"代码自洽"，不说明"防护完整"。
@@ -966,6 +966,7 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | 18 | ~~`PathResolver::resolve()` 的文档注释仍写「之所以先 `canonicalize` 再比较」~~ | —— | ✅ **已修复**：注释已改为「之所以先做词法规范化再比较」，与实现一致 | 关闭 |
 | 19 | L1 只预检 `fsRead`，**不预检 `fsWrite`**（`run_pipeline` 里只查了 `"src"`） | 未授权写文件要靠后续 `PathResolver` 或节点自身兜住，预检层有缺口 | `PathResolver` + 输出路径由宿主算好（`build_io`） | v0.2（随第 1 项一起补） |
 | 20 | 内置插件默认 `enabled: true` 且**自动授予声明的全部能力** | 前提是"内置目录不可被替换"。打包后它来自 `resource_dir()/plugins/builtin`；开发态直接指向仓库的 `plugins/builtin`。若该目录可被写入，等同"自动全量授权" | 路径解析有多级回退（`resolve_builtin_plugins`），但无完整性校验（内置插件没有 `installed_hash`） | v1.0（"插件来源可信"）/ 待定 |
+| 20a | ~~上面这行描述的"开发态指向仓库目录"**在修复前并不是事实**~~ | `resolve_builtin_plugins()` 原来**一律先看 `resource_dir()`**，而开发构建下 `resource_dir()` 就是可执行文件所在目录 —— `target/debug/plugins/builtin/` 里有一份 `tauri-build` 在构建期拷过去的 `bundle.resources` 陈旧副本（只含最早的 4 个内置插件），于是从 `target/debug/toolforge.exe` 启动只装载 4 个、而仓库里明明有 7 个。**这不是安全问题，但它说明"文档描述与运行时事实不一致"能潜伏很久**：现在改为**开发构建优先用仓库目录、只有发布构建才先看 resource**，与这一行终于对齐 | ✅ **已修复**（见 `docs/ARCHITECTURE.md` 开放项 10） | 关闭 |
 | 21 | ~~传给插件的路径同时存在两套语义~~ | —— | ✅ **已修复**：`initialize` 现在只传 `pluginDir` / `dataDir`（跨任务稳定的插件私有目录），本次任务的 `input` / `output` / `work` 只在每次 `run` 的载荷里给，**全部是真实路径**。契约内不一致消除；同时把"虚拟路径"的说法从注释里删掉，因为它与 L3 是普通进程这一事实不符 | 关闭 |
 | 22 | L3 **没有内核级隔离**（无 Windows Job Object + AppContainer / macOS `sandbox-exec` / Linux seccomp） | 见 §1.4：蓄意插件可绕过代理断网、可读进程可读的任何文件 | `clear_env` + 锁 cwd + 代理变量断网 + 超时强杀 + 优雅关闭；**并在 UI 上如实告知用户** | v0.2（`ROADMAP.md` 的路线图项） |
 | 23 | `plugin_data` / `PluginData` 作用域的写入**没有配额**；运行时写文件也没有总量限制 | 授权 `FsWrite` 的插件可以把磁盘写满（安装路径的 1 MB / 8 MB 上限只约束 `Bundle` 安装，不约束运行期） | 无 | 待定 |

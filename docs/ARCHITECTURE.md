@@ -263,8 +263,18 @@ flowchart TD
 - **图像域的三层降级现在是实现，不再只是 `lib.rs` 里的一张图**：`pick_image_backend()` 按 `libvips → imagemagick → 纯 Rust` 挑后端（`is_available` 读带缓存的状态，不会每个文件都去 spawn 一次 `vips --version`），并把结果**报出去** —— 节点输出里多一个 `backend` 值（`"libvips"` / `"imagemagick"` / `"rust"`），任务日志里多一条 debug 行。**走这条链的是 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个节点；`image.enhance` 与 `image.strip-metadata` 仍是纯 Rust 实现，不问引擎**（详见 `docs/ENGINE-MATRIX.md` 第 5.1、6.2 节）。理由写在代码注释里：后端选择一旦不可观测，"到底走没走 libvips"就只能靠猜，而这个项目已经被"文档说有、实际没有"坑过好几次。
 - **抠图是第四条路，不在这张图里**：`image.remove-background` 已经实现（`image_remove_background`），但它跑的是 **ONNX 推理**，不经过 `pick_image_backend()`，`libvips` / ImageMagick 装得再全也不会让它快一点。推理**不在 Rust 里做**，而是交给 `python` 引擎的子进程执行 —— 理由见决策 9。
 - **模型下载的两条加固**（详见 4.11 第 12 条）：`install_model` 会先对**已存在的本地文件**算哈希，匹配就跳过下载（`u2net` 是 168 MB）；`download()` 对 5xx / 429 / 连接错误**重试一次**（第二次换 `http1_only` 客户端）。
+- **下载失败的错误必须带上原因（本轮新增）**：`describe_reqwest_error()`。起因是装 ImageMagick 时失败，界面上只有一句
+
+  ```
+  请求下载地址失败：error sending request for url (https://github.com/...)
+  ```
+
+  —— reqwest 对连接类错误的 `Display` **只给这一句、不含原因**，于是完全无法判断是 DNS、连接被拒、TLS 还是超时。而**同一时刻用系统 `curl` 拿同一个 URL 是 200 / 11.7 MB 正常下完**（重试一次应用也成功了，说明是瞬时故障）。新函数按 `is_timeout` / `is_connect` / `is_decode` 分类给人话，并把 `source()` 链**逐层展开**（真正的原因如 `tls handshake eof`、`connection refused` 都在链上），detail 里补上"**用 curl 对照一下**"这条最有效的排查手段。
+  > **教训**：`error sending request for url (…)` 这种信息**看起来像一条错误，实际上只是一个标题**。错误处理里最贵的一步是把 `source()` 链丢掉 —— 它把"能自己查清的问题"变成"只能猜的问题"。
 - **引擎下载的卡死检测（本轮新增）**：`stream_to_file()` 用 `tokio::time::timeout(STALL_TIMEOUT, stream.next())` 包住每一次读取，**60 秒内一个字节都没到**就判定卡死、删掉半截文件、报一条说得清的错误（已收到多少 / URL / 常见原因 / 可以怎么做），而不是让进度条停在 0% 一直等到客户端 30 分钟总超时。触发点是一个真机现象：安装 FFmpeg 时进度条停在 **0%** 十几分钟没有任何动静（`www.gyan.dev` 不可达，`curl` 直测同样连不上）。60 秒是刻意的宽容值 —— 慢速网络也会持续有小块到达，真正卡死是"完全静默"。
-  > ⚠️ **这一条没有经过真机运行验证**：本机 `toolforge.exe` 被一个无关进程持有文件句柄，cargo 写不回链接产物（`link.exe` 1104），二进制重建不了。只跑到了 `cargo check --workspace --all-targets`（0 error / 0 warning）与单元测试。改动很小，但**"能编译"不等于"验过"**。
+  > ⚠️ **这条原来跟着一句"没有经过真机运行验证"，现已解除（保留作历史）**：当时本机 `toolforge.exe` 被一个无关进程持有文件句柄，cargo 写不回链接产物（`link.exe` 1104），二进制重建不了，只跑得到 `cargo check` 与单元测试。
+  > ✅ **现在它不只是"验证过"，而且是"可被验证"的** —— 这才是真正修掉的问题。原来的写法把 60 秒**硬编在函数里**，于是唯一能证明它的办法是**干等 60 秒**：那种检查永远不会有人跑，等于没有。现在 stall 超时是 `stream_to_file` 的**参数**（生产传 `STALL_TIMEOUT`，测试传 **300 ms**），于是有了 `stalled_download_fails_with_a_readable_error`：一个**裸 TCP server** 收下请求、回一个声明了 `Content-Length` 的 `200` 头、然后**永远沉默**（这正是真实事故的形状，且不引入任何依赖）。它断言四件事 —— 错误码是 `Network`、信息里说清「卡住」、**很快返回**（<10 s，证明不是靠 30 分钟总超时兜住的）、以及**半截文件被删掉**。
+  > **教训**：一个只能靠"等 60 秒"来验证的检查，真实状态是"没有被验证"。**把时间常数变成参数**这件事本身，比再多写几条断言更有价值 —— 留一个 0 字节的 `.zip` 在地上，用户只会以为"下过了"。
 - **依赖了谁**：`toolforge-core`、`toolforge-process` + `reqwest`（下载）、`image`（含 `png` `jpeg` `webp` `bmp` `tiff` `gif` `ico` `pnm` `qoi` `tga` `dds` `hdr` `ff` feature）、`which` `sha2` `hex` `walkdir` `dashmap` `parking_lot` `futures-util` 等。Cargo feature：`avif = ["image/avif"]`、`heavy-formats = ["image/exr"]`，**两者默认关闭**。
 - **被谁依赖**：`toolforge-plugins`、`apps/desktop/src-tauri`。
 
@@ -678,7 +688,7 @@ std::fs::create_dir_all(&workspace).ok();
 
    > ✅ **这条原来是 4 个：`doc.ocr`、`ebook.convert`、`ai.upscale`、`ai.describe`**（更早是 5 个，第一个是 `image.remove-background` —— 产品的招牌功能，此前从未真正工作过）。四个是**本轮一次补完**的：`ebook.convert` 走 Calibre 优先 / Pandoc 兜底并在调用 pandoc 前按能力表把关；`ai.describe` 走视觉模型；`doc.ocr` 走 tesseract 或视觉模型（**明确拒绝 PDF 输入**）；`ai.upscale` 走 Real-ESRGAN + 分块推理。逐个的实测与理由见 `docs/ENGINE-MATRIX.md` 第 3.2、3.3、3.5、6.7 节。
    >
-   > ⚠️ **但"全部实现"不等于"每一档环境都测过"**：`verify-platform.mjs`【8】覆盖抠图、【9】电子书、【10】AI 视觉、【11】超分，而 macOS、ImageMagick 档位、以及"两个可选引擎都缺失"的完整环境矩阵仍然没有基线。
+   > ⚠️ **但"全部实现"不等于"每一档环境都测过"**：`verify-platform.mjs`【8】覆盖抠图、【9】电子书、【10】AI 视觉、【11】超分、【12】中间档（ImageMagick）后端切换，而 macOS、以及"两个可选引擎都缺失"的完整环境矩阵仍然没有基线（ImageMagick 档位本轮已补上，见 11a）。
 
    ✅ **这份名单有唯一真相来源**：`UNIMPLEMENTED_NODES`（`pipeline.rs`）同时被两处消费 —— `nodes::run` 的兜底分支与 IPC 的 `NodeCatalogResponse.unimplemented`（前端的节点面板/画布/Inspector 从 IPC 拿，**不再硬编**）。以前它在**四个地方**各存一份（Rust 执行器、SDK 文档、示例清单注释、前端的 `node-support.ts`），每实现一个节点要手工同步四处。它现在**保留为空数组**而不是删除，正是因为前端那句"该能力尚未实现"的提示还需要一个数据来源。
    两条测试守着它与真实分发表的一致性：`unimplemented_list_matches_actual_dispatch`（**遍历真实分发表**，对名单里的每个节点断言它确实还落在 `not_implemented` 上，反方向也查）与 `is_implemented_is_the_complement_of_the_list`。第一条守的正是本条刚刚发生过的那次失误形态 —— **实现完了却忘了从名单里删掉**（或反方向），那会让用户看到与真实行为相反的提示。
@@ -688,10 +698,16 @@ std::fs::create_dir_all(&workspace).ok();
 8. ✅ **`jobs_retry` 已存在**。命令已注册；`plugins_run` 会注册重放闭包，任务中心的「重试」按钮因此可用。`AiGenerate` 与 `EngineInstall` 仍然**不**可重试（有副作用/成本）。
 9. ✅ **`settings_patch` 改并发度已作用到队列**。新增 `JobQueue::set_concurrency()` 并在命令层调用。**降低并发是渐近生效的**（`Semaphore::forget_permits` 只能收回空闲许可），这一点写在该方法的文档注释里。
 10. ✅ **打包后内置插件会被分发**。`tauri.conf.json` 的 `bundle.resources` 已改为 `{ "../../../plugins/builtin": "plugins/builtin" }`，与 `resolve_builtin_plugins()` 打包态查找的 `resource_dir()/plugins/builtin` 对齐。
+    - 🐛 **修好"会被分发"之后，又暴露出一个更隐蔽的版本：开发态被 `target/` 里的一份陈旧拷贝遮蔽（本轮发现并修复，最严重的一条）**。重建后从规范路径 `target/debug/toolforge.exe` 启动，**7 个内置插件只装载了 4 个**，另外 3 个报「未安装」；而**同一个二进制**从 `target/debug/deps/` 启动却是 7 个。
+    - **根因**：`resolve_builtin_plugins()` 原来**一律"先看 `resource_dir()`"**。开发构建下 `resource_dir()` 就是**可执行文件所在目录**，而 `target/debug/` 里有一份 `tauri-build` 在**构建期**拷过去的 `bundle.resources`（`plugins/builtin`）——它只在构建脚本认为需要时刷新，**新增一个内置插件不会触发它**，于是那份拷贝永远停在只有 4 个插件的时间点。后果是"仓库里明明有 7 个，应用只装载 4 个；换个启动目录又变成 7 个"，而表面上看起来像插件本身坏了。
+    - **修法**：**开发构建优先用仓库目录**（那才是开发时的真相来源），**只有发布构建才先看 `resource`**。这条同时消掉了 `docs/SECURITY.md` 第 20 项里"开发态直接指向仓库的 `plugins/builtin`"那句长期与运行时事实不符的描述。
+    - **而这一条最值得记住的不是修法，是它为什么这么久没被发现**：那个二进制因为文件句柄被占，**好几轮没有重建过**。于是 —— **"编译通过 + 单测全绿"对一个没有被重新构建的二进制毫无意义。** 测试绿的是源码，不是你手上那个 exe；真机验证的第一步应当是确认它确实是新的。
 11. ✅ **引擎下载源已回填 7 条**（此前每一项的 `sha256` 都是 `null`，导致任何引擎都装不上）。现在 `ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux`，以及本轮新增的 **`imagemagick@windows`**（7.1.2-31 便携版 `.7z`，11,739,115 字节，`stripComponents: 0`）都带**实际核对过的哈希 + 版本固定直链**；macOS 四条与 `ffmpeg@linux` 仍为 `null`，`install` 对它们返回 `EngineInstallOutcome::HashRequired`（由 `commands.rs::engines_install` 映射成 `ErrorCode::IntegrityCheckFailed`）。`allow_unverified = true` 时才会走未校验路径。详见 README「已知风险」第 2 条与 `docs/ROADMAP.md` §3。
-    - **`imagemagick` 此前是"声明了下载却没有来源"**，这也是上面「探测失败 → 提示语」那一条缺陷的起因：界面显示「一键下载」，点下去必然失败。补来源时验证了三件原本不确定的事（**直接执行**，不是推断）：官方 Windows 便携包只有 `.7z`；**Windows 自带的 `tar`（bsdtar / libarchive）能读 7z**（`tar -xf` 退出码 0、`magick.exe -version` 正常输出），所以装它**不依赖先装 7-Zip**；包内**没有顶层目录**，所以 `stripComponents` 必须是 0。⚠️ **应用内的完整安装链路未复验**（同一个 `toolforge.exe` 句柄问题）。
-    - ⚠️ **FFmpeg 的安装在本机没有完成过**：本次会话里 `www.gyan.dev` 不可达（`curl` 直测 `Failed to connect ... after 21107 ms`），依赖它的 `video.*` / `audio.*` 节点在那台机器上不可用。这是**环境事实，不是代码缺陷**；`ffmpeg@windows` 的哈希取自上游随包发布的 `.sha256`，能证明来源写对了，但替代不了一次真实安装。
+    - **`imagemagick` 此前是"声明了下载却没有来源"**，这也是上面「探测失败 → 提示语」那一条缺陷的起因：界面显示「一键下载」，点下去必然失败。补来源时验证了三件原本不确定的事（**直接执行**，不是推断）：官方 Windows 便携包只有 `.7z`；**Windows 自带的 `tar`（bsdtar / libarchive）能读 7z**（`tar -xf` 退出码 0、`magick.exe -version` 正常输出），所以装它**不依赖先装 7-Zip**；包内**没有顶层目录**，所以 `stripComponents` 必须是 0。
+    - ✅ **那四个前提现在升级成了"整条链路端到端跑通"**（此前写的是"应用内的完整安装链路未复验"，原因是同一个 `toolforge.exe` 句柄问题）：句柄释放后重建并真的装了一遍 —— 11.7 MB 下载 → SHA-256 校验通过 → 系统 `tar` 解开 `.7z` → `magick.exe` 落在 `…/engines/imagemagick/magick.exe`，**241.5 MB**，探测到的版本是 `ImageMagick 7.1.2-31 Q16 x64`。顺带拿到了**中间档的环境基线**（详见下面 11a）。
+    - ⚠️ **FFmpeg 的安装在本机没有完成过**：`www.gyan.dev` 不可达（`curl` 直测 `Failed to connect ... after 21107 ms`），依赖它的 `video.*` / `audio.*` 节点在那台机器上不可用。这是**环境事实，不是代码缺陷**；`ffmpeg@windows` 的哈希取自上游随包发布的 `.sha256`，能证明来源写对了，但替代不了一次真实安装。**注意区分**：FFmpeg 没装成是因为**网络上不去**，不是因为这条安装代码坏了 —— ImageMagick 装通了恰好证明同一条代码路径本身是好的。
     - **而且这条路径现在真的跑通过**：通过应用安装过一次 **libvips 8.18.6**（下载 → SHA-256 校验 → 解压 → 探测为 `installed`，落在 `<data_dir>/engines/libvips/bin/vips.exe`，约 29.67 MB）。跑通它顺带暴露了两个 `toolforge-process` 的缺陷（裸命令名不查 PATH、`quiet` 丢光输出），见 3.2。
+    - **11a** ✅ **三层降级链的中间那一档终于有了环境基线**（这条空白在文档里挂了很久）。做法是**把 `engines/libvips` 临时改名**成 `engines_probe_all`，于是 `image.convert` 的后端日志变成 `后端 = ImageMagick（格式最全）`，并真的产出了**有损 VP8** 的 WebP；随后改名还原，探测状态恢复 `libvips = installed`。**三档现在都有证据：libvips ✓、ImageMagick ✓、纯 Rust ✓。** 这个动作已固化进 `verify-platform.mjs`【12】（藏目录 → 断言 → **`finally` 里还原**，失败也会还原，否则一次失败的验证会永久污染这台机器的引擎状态）。它只在两个引擎**都装了**时才跑，否则显式记为跳过。
 12. ✅ **模型权重下载已落地**。以前 `EngineRegistry.models` 是一张**永远空的 map**（只有 `register_model` 能填，而没有任何调用点），于是 UI 列出模型、每次点下载都答「未在注册表里登记」。现在 `EngineRegistry::new` 直接从 `toolforge_core::engine::engine_catalog()` 建这张表（**注册表 map 这个"第二真相来源"已被删掉**），并新增三条 IPC：`models_list` / `models_install` / `models_remove`。目录里现在是 **8 个**权重（抠图 5 + 超分 3），其中 **5 个**可直接下载。
     - `EngineModel` 增加了 `file_name`：GitHub 的资产名与模型 id **不一致**（`isnet-general` 的资产是 `isnet-general-use.onnx`），文件落在 `<data_dir>/models/<model_id>/<file_name>`。
     - `u2net` / `u2netp` / `isnet-general` 三个 rembg 权重，以及 `realesr-general-x4v3` / `realesrgan-anime6b` 两个 Hugging Face 超分权重，都带**真实下载后算出来的** SHA-256；rembg 三条用固定 tag（`v0.0.0`）直链，超分两条用 `resolve/main/<资产名>` 直链。**哈希不匹配就删文件**（`registry.rs::install_model` 用 `remove_file` + `IntegrityCheckFailed`），绝不"下坏了也凑合用"。

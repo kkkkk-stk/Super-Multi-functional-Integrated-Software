@@ -45,14 +45,14 @@
 > | 项 | 现在的值 |
 > | --- | --- |
 > | 编译 | `cargo check --workspace --all-targets` **0 error / 0 warning** |
-> | 测试 | `cargo test --workspace` **217 passed / 0 failed** |
+> | 测试 | `cargo test --workspace` **218 passed / 0 failed** |
 > | 前端 | `apps/desktop/src` 下有 93 个文件；`tsc --noEmit` 0 错误、`vite build` 通过 |
 > | `Cargo.lock` | **已存在并入库** |
 > | IPC 命令 | **32 个**（`COMMAND_NAMES` 与生成的 `bindings.ts` 逐条对齐，由 `export_bindings` 守卫） |
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **7 个** |
 > | 引擎下载源 | `engine-sources.json` 共 **12 条**（5 个引擎 × 各平台），其中 **7 条**的 SHA-256 是真实下载后核对过的；其余 5 条 `sha256: null`，`install` 会对它们返回 `HashRequired` 而**不放行** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **69 项全通过** |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **74 项全通过**（【1】–【12】） |
 >
 > 下面这段原始快照保留原样，**不要据此判断现状**：
 
@@ -374,6 +374,22 @@
 - **仍未定义的部分**：`EngineState::Outdated`（版本过旧）**没有最低版本判定标准**，
   所以"能读到版本号"成立、"低于多少算过旧"仍待定。
 
+### 阻塞 16：三个**"只有真的重建一次才会暴露"**的缺陷 ✅ 已修复
+
+> **这一条本身就是教训。** 它之所以晚了这么多轮才被发现，是因为 `toolforge.exe` 被一个**无关的游戏进程**持有文件句柄，cargo 写不回链接产物（`link.exe` 1104），于是**那个二进制好几轮没有重建过**。
+> 期间 `cargo check` 0 error、单测全绿、文档一路在更新 —— 而这一切说的都是**源码**，不是那个跑起来的 exe。
+> **"编译通过 + 单测全绿"对一个没有重新构建的二进制毫无意义。** 句柄一释放、重建一次，三个缺陷立刻同时现形。
+
+1. **内置插件目录被 `target/` 里的陈旧副本遮蔽（最严重）**。
+   - **现象**：从规范路径 `target/debug/toolforge.exe` 启动，**7 个内置插件只装载 4 个**，另外 3 个报「未安装」；**同一个二进制**从 `target/debug/deps/` 启动却是 7 个。表面上看起来像"插件坏了"，实际是**路径解析**。
+   - **成因**：`resolve_builtin_plugins()` 一律"先看 `resource_dir()`"。开发构建下它就是**可执行文件所在目录**，而 `target/debug/plugins/builtin/` 里有一份 `tauri-build` 在**构建期**拷过去的 `bundle.resources` —— 它只在构建脚本认为需要时刷新，**新增一个内置插件不会触发它**，于是那份拷贝永远停在只有 4 个插件的时间点。
+   - **修复**：**开发构建优先用仓库目录**（那才是开发时的真相来源），**只有发布构建才先看 `resource`**。详见 `docs/ARCHITECTURE.md` 开放项 10。
+2. **下载失败的错误信息把原因吃掉了**。装 ImageMagick 时报的是 `请求下载地址失败：error sending request for url (https://github.com/...)` —— reqwest 的连接类错误 `Display` **只给这一句、不含原因**，而**同一时刻系统 `curl` 拿同一个 URL 是 200 / 11.7 MB 正常下完**。于是完全无法判断是 DNS、连接被拒、TLS 还是超时。
+   - **修复**：新增 `describe_reqwest_error()` —— 按 `is_timeout` / `is_connect` / `is_decode` 分类给人话，并把 `source()` 链**逐层展开**（真正的原因如 `tls handshake eof`、`connection refused` 都在链上），detail 里补上"**用 curl 对照一下**"。详见 `docs/ARCHITECTURE.md` 3.3。
+3. **卡死检测只能靠"等 60 秒"来验证 → 等于没有被验证**。stall 超时原来**硬编在 `stream_to_file` 里**，唯一的验证方式是干等 60 秒，没人会做。
+   - **修复**：把它变成**参数**（生产传 `STALL_TIMEOUT`，测试传 300 ms），于是 `stalled_download_fails_with_a_readable_error` 能用一个**裸 TCP server**（收请求 → 回 `200` 头 → 永远沉默）真的测它，断言错误码 `Network`、信息里说清「卡住」、**<10 s 返回**（证明不是靠 30 分钟总超时）、**半截文件被删掉**。`toolforge-engines` 测试数 37 → 38。
+   - **次生收获**：CDP 脚手架自己的报错也在骗人 —— `cdp.mjs::evaluate()` 只取 `exception?.description ?? text`，页面 reject 一个**普通对象**（Tauri 的错误就是这么走的）时两者都是 `undefined`，最终抛出一句 `Error: Object`。**真实原因被自己的错误处理吃掉了**，那几轮"脚本挂了但不知道为什么"就是这么来的。现在它把 description / text / value / preview 全摊开，于是立刻看到真凶：`插件 com.toolforge.builtin.ebook-convert 未安装`（也就是上面第 1 条）。
+
 ### 基线（历史实测：阻塞 1–13 修复后）
 
 阻塞 1–13 全部修复后的**真实**运行结果（分两层：静态检查，与**真机运行**）。注意：这是**历史值**，当前值见下面的「基线再更新」：
@@ -424,22 +440,33 @@ pnpm build          # tsc --noEmit && vite build
 
 ```text
 【静态】
-cargo test --workspace                  →  217 passed / 0 failed
+cargo test --workspace                  →  218 passed / 0 failed
 cargo run -p toolforge --bin export-bindings
   → 生成 32 个命令的绑定 + 4 项守卫（其中「命令清单逐条核对」已取代被删除的魔数断言）
 
 【真机运行】
-scripts/devtools/verify-platform.mjs    →  69 项检查全通过（【1】–【11】）
+scripts/devtools/verify-platform.mjs    →  74 项检查全通过（【1】–【12】）
                                             （run.mjs 里的第 5 个脚本；【6】= 图片后端，
                                              【7】= 任意角度旋转，【8】= 抠图整条 ONNX 链路，
                                              【9】= 电子书降级与拦停，【10】= ai.describe 的
                                              请求形状（假端点 mock-openai.mjs），
-                                             【11】= 超分是不是真的按倍数放大）
+                                             【11】= 超分是不是真的按倍数放大，
+                                             【12】= 藏掉 libvips 目录、断言后端真的切到
+                                             ImageMagick、再在 finally 里还原
+                                             （只在这两个引擎都装了时才跑，否则显式跳过））
 一键安装引擎                            →  libvips 8.18.6 真实装上：
                                             下载 ≈30 MB → SHA-256 校验 → 解压 → installed
                                             落盘 <data_dir>/engines/libvips/bin/vips.exe（≈29.67 MB）
+                                         →  imagemagick 也真实装上（这条以前记的是"未复验"）：
+                                            11.7 MB → SHA-256 校验 → 系统 tar 解开 .7z
+                                            → magick.exe 落在 …/engines/imagemagick/magick.exe
+                                              241.5 MB，探测版本 ImageMagick 7.1.2-31 Q16 x64
+                                         ⚠️ FFmpeg 仍未装成：www.gyan.dev 在本机不可达（环境事实，不是代码缺陷）
 图片三层降级                            →  image.convert / resize / crop / rotate 真的挑后端，
                                             节点输出报 backend、日志写明用的是哪个
+                                         →  中间档（ImageMagick）也实测过：临时改名藏掉 engines/libvips
+                                            → 后端日志 = ImageMagick（格式最全）、产出有损 VP8 WebP
+                                            → 还原后 libvips = installed
 AI 抠图（image.remove-background）      →  托管 Python 3.11.16（145.2 MB，tar.gz 路径）装成；
                                             独立 venv 自动装上 onnxruntime-1.30.0 /
                                             numpy-2.4.6 / pillow-12.3.0；
@@ -458,7 +485,9 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
                                              跑完已还原用户的 AI 设置
 ```
 
-**这份基线里仍然为空的**：`image.enhance` / `image.strip-metadata` 未接外部后端（仍是纯 Rust 实现，而且已不再声明引擎依赖）；**「仅 ImageMagick」这一档仍然没有实测记录**（本轮补齐了它的 Windows 下载源，但应用内的安装链路未复验，见 §3 与开放项 8）；macOS 没有环境基线；**三档输出的结果一致性没有测试**；"两个可选引擎都缺失"这类组合环境没有专门基线。
+**这份基线里仍然为空的**：`image.enhance` / `image.strip-metadata` 未接外部后端（仍是纯 Rust 实现，而且已不再声明引擎依赖）；macOS 没有环境基线（四条下载源的 `sha256` 全是 `null`）；**三档输出的结果一致性没有测试**；"两个可选引擎都缺失"这类组合环境没有专门基线。
+> ✅ **已从这份"为空"名单里划掉一条**：原来这里写着"**「仅 ImageMagick」这一档仍然没有实测记录**（本轮补齐了它的 Windows 下载源，但应用内的安装链路未复验，见 §3 与开放项 8）"。现在应用内安装成功、中间档也实测走通了（见上面的输出与开放项 8），这空白已被 `verify-platform.mjs`【12】固化。
+> ⚠️ **仍然不成立的两件事，别顺手一起"修好"**：FFmpeg 在本机**没有**装成（`www.gyan.dev` 不可达）；macOS 四条源**仍然**是 `sha256: null`。
 
 > ⚠️ **关于【8】号检查的诚实说明**：它需要先有模型权重与 Python 运行时，而那些都要下载。**前置条件不满足时它是"跳过"，不是"通过"** —— 脚本会明确打一条 skip（`c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）')`），不会把"没测"算成"测过了"。
 
@@ -554,7 +583,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 >
 > - `image.convert`、`image.resize`、`image.crop`、`image.rotate` **四个节点会真的按 `libvips → ImageMagick → 纯 Rust` 挑后端**，把结果报在节点输出的 **`backend`**（`"libvips"` / `"imagemagick"` / `"rust"`）与一条 debug 日志里。后端可观测是刻意的：不看日志就只能靠猜，而这个项目已经被"文档说有、实际没有"坑过好几次。
 > - `image.rotate` 的任意角度不再是"直接报缺 ImageMagick"：libvips 可用时走 `vips similarity --angle N`，ImageMagick 可用时走 `-rotate N`，**只有纯 Rust 可用时才返回 `EngineMissing`** —— 仍然**不会静默取整**（取整会让用户以为转了 45°，实际拿到没转的图）。
-> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错；整个脚本 **69 项检查全通过**。
+> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错，【12】号检查把 `engines/libvips` 临时藏起来、断言后端真的切到 ImageMagick。整个脚本 **74 项检查全通过**（【1】–【12】）。
 > - **收益要说准**：libvips 档位带来的是**按质量换体积的能力**（WebP/JPEG 有损编码），纯 Rust 后端的 WebP 只能无损。**但"有损一定更小"是错的**，实测 320×200 合成渐变图：无损 508 字节 vs 有损 1808 字节（所以【6】只断言"确实走了有损编码"，不断言体积）。
 >
 > **本条原来还剩两件事，现在都做完了**：
@@ -563,7 +592,8 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 >
 > 这两件事是同一类漂移（`provides` ↔ 节点声明，共 5 处），所以除了逐处修，还加了一条**双向守卫测试** `provides_matches_node_declarations`，并做了反证确认它真的会红。详见 `docs/ENGINE-MATRIX.md` 第 6.2 节。
 >
-> 另外：**ImageMagick 档位只有代码路径、没有实测记录**（本机没有装 ImageMagick，也没有一个"只有 ImageMagick 可用"的环境基线）。本轮给它补上了 **Windows 下载源**并做了直接执行验证（见 §3），但那只是让它**可装**，不等于"测过这一档"。
+> ~~另外：**ImageMagick 档位只有代码路径、没有实测记录**（本机没有装 ImageMagick，也没有一个"只有 ImageMagick 可用"的环境基线）。本轮给它补上了 **Windows 下载源**并做了直接执行验证（见 §3），但那只是让它**可装**，不等于"测过这一档"。~~
+> ✅ **上面这句已作废（保留作历史）**：本机现在装了 ImageMagick，中间档也实测走通了 —— 藏掉 `engines/libvips` 后 `image.convert` 的后端日志变成 `后端 = ImageMagick（格式最全）` 并产出有损 VP8 WebP。**"只有 ImageMagick 可用"这一档现在有环境基线了**，而且 `verify-platform.mjs`【12】会一直替你重跑它。
 >
 > 以下原文保留作为历史。
 
@@ -590,7 +620,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   | `python` | linux | 3.11.16 (同上) | 46.6 MB | 下载后自行计算 |
 
 - **`imagemagick@windows` 是本轮新增的**（此前 `imagemagick` 声明了 `Download` 却没有来源，界面于是显示一个点下去必然失败的「一键下载」按钮 —— 那条提示语也一并修了）。三件事是**直接执行**验证的，不是推断：官方 Windows 便携包**只有 `.7z`**；**Windows 自带的 `tar`（bsdtar / libarchive）能读 7z**（`tar -xf` 退出码 0、`magick.exe -version` 打印 `ImageMagick 7.1.2-31 Q16 x64`），所以装它**不需要先装 7-Zip**；包内**没有顶层目录**（23 个条目直接在根），所以 `stripComponents` 是 **0** 而不是习惯上的 1。Linux / macOS **故意不写来源**（走 `apt` / `brew`）。
-  > ⚠️ **应用内的完整安装链路尚未复验**：`toolforge.exe` 被一个无关的第三方进程持有文件句柄，cargo 写不回链接产物（`link.exe` 1104），二进制重建不了、跑不了。上面四点才是原本的风险所在，它们已由直接执行验证。
+  > ✅ **这条 ⚠️ 已解除（保留作历史）**：原文是"应用内的完整安装链路尚未复验"——`toolforge.exe` 被一个无关的第三方进程持有文件句柄，cargo 写不回链接产物（`link.exe` 1104），二进制重建不了、跑不了。句柄释放后重建并**真的装了一遍**：11.7 MB 下载 → SHA-256 校验通过 → 系统 `tar` 解开 `.7z` → `magick.exe` 落在 `…/engines/imagemagick/magick.exe`，**241.5 MB**，探测版本 `ImageMagick 7.1.2-31 Q16 x64`。上面那四点从"直接执行验证过的前提"升级为"整条链路端到端跑通"。顺带还拿到中间档的环境基线（见开放项 8）。
 - ⚠️ **一条环境事实，不是代码缺陷**：本次会话里**本机连不上 `www.gyan.dev`**（`curl` 直测 `Failed to connect ... after 21107 ms`），所以 **FFmpeg 的安装在本机没有完成过**，依赖它的 `video.*` / `audio.*` 节点在那台机器上不可用。`ffmpeg@windows` 这条来源的哈希取自上游**随包发布的 `.sha256` 文件**（比自己下载后计算更可信），但那只能证明"来源写对了"，**不能替代一次真实安装**。
 
 - **同时把所有可用 URL 改成版本固定直链**。原来 `ffmpeg` 用的是 `ffmpeg-release-essentials.zip`（滚动指向最新版）—— 那类 URL 上的哈希**必然失效**，表现为"昨天能装、今天全部失败"。`libvips` 的源仓库也从 `libvips/libvips` 改为 `libvips/build-win64-mxe`（前者的 release 里没有 Windows 资产，实测 404）。
@@ -639,10 +669,10 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 5 | ~~**`doc.ocr` 的参数枚举与执行器对不上**~~ **已修** | 枚举原为 `auto` / `tesseract` / `paddleocr`，执行器认 `auto` / `tesseract` / `ai`。填 `ai` 有效但不在下拉里；填 `paddleocr` 能选中却走到"两者都不满足"的分支。**已把枚举改成 `ai` 并把 PaddleOCR 文案删掉** | 这是一类值得记的漂移：**参数名对了但取值对不上**，比参数名写错更难发现 —— 界面照常显示、执行器照常运行，只有结果不符合预期 |
 | 6 | ~~**`doc.ocr` 的可用性判定严于实现**~~ **已修** | 原来 `requiresEngines` 是 `["python"]`，缺 Python 时整个节点被标灰；但 tesseract 那条路根本不碰 Python。**已改为 `requiresEngines: []` + `optionalEngines: ["tesseract", "ai-provider"]`** | 正是"能用却显示不可用"（这个项目在 `onnx-models` 上踩过反方向的坑） |
 | 7 | ~~**`doc.ocr` 的 AI 路径没有声明 `ai-provider`**~~ **已修** | 现在 `doc.ocr` 的 `optionalEngines` 含 `ai-provider`，`ai-provider.provides` 也含 `doc.ocr`，两个方向都对齐 | 同第 6 条，一并由 `provides_matches_node_declarations` 这条双向测试守住 |
-| 8 | **ImageMagick 档位与 macOS 没有环境基线** | "只有 ImageMagick 可用"这一档从未被单独测过（本机没装 ImageMagick）。本轮补齐了它的 **Windows 下载源**，并**直接执行**验证了原本有风险的四点（哈希、`tar` 能解 7z、`magick.exe` 可运行、包内无顶层目录 —— 见 §3），但**应用内的安装链路未复验**，所以这一档现在是"可装"，仍不是"测过"。macOS 四条下载源（ffmpeg / libvips / pandoc / python）也仍是 `null`（没有环境核对哈希） | 不是"没实现"—— 代码路径在，缺的是验证记录 |
-| 9 | **验证脚本的覆盖面仍然是"我们可控的那部分"** | `ai.describe` 用假端点验证请求形状（这是对的，真模型不可复现、要花钱），但它**验不了**"模型答得好不好"；同理【11】验的是倍数与尺寸，不是超分画质 | 这是**刻意的边界**，不是疏漏。写清楚是为了避免有人把"69 项全通过"读成"AI 能力已经验收" |
+| 8 | ~~**ImageMagick 档位与 macOS 没有环境基线**~~ → **ImageMagick 档位已关闭，macOS 仍然开着** | 原文：「"只有 ImageMagick 可用"这一档从未被单独测过（本机没装 ImageMagick）。本轮补齐了它的 **Windows 下载源**，并**直接执行**验证了原本有风险的四点（哈希、`tar` 能解 7z、`magick.exe` 可运行、包内无顶层目录 —— 见 §3），但**应用内的安装链路未复验**，所以这一档现在是"可装"，仍不是"测过"」。**现在三件事都做完了**：应用内安装成功（241.5 MB 的 `magick.exe`，版本 7.1.2-31 Q16 x64）、中间档实测走通（藏掉 `engines/libvips` → 后端日志 = ImageMagick（格式最全）、产出有损 VP8 WebP）、`verify-platform.mjs`【12】把这一步固化成检查。**三档现在都有证据：libvips ✓、ImageMagick ✓、纯 Rust ✓。** ⚠️ **macOS 那半条仍然成立**：四条下载源（ffmpeg / libvips / pandoc / python）的 `sha256` 仍是 `null`（没有 macOS 环境核对哈希） | ImageMagick 部分已关闭；macOS 部分仍是"不是没实现，缺的是验证记录" |
+| 9 | **验证脚本的覆盖面仍然是"我们可控的那部分"** | `ai.describe` 用假端点验证请求形状（这是对的，真模型不可复现、要花钱），但它**验不了**"模型答得好不好"；同理【11】验的是倍数与尺寸，不是超分画质 | 这是**刻意的边界**，不是疏漏。写清楚是为了避免有人把"74 项全通过"读成"AI 能力已经验收" |
 
-> **一句话总结这一轮**：节点的账已经平了（32/32，`UNIMPLEMENTED_NODES` 为空）。上面这 9 条里，第 2、5、6、7 条都属于**"声明与实现 / UI 之间的小漂移"**，现已全部修掉（5/6/7 是同一类：`doc.ocr` 的声明；2 是 `provides` ↔ 节点声明那 5 处），并且由双向测试守着 —— 这类问题不会让构建变红，只会让用户在看到真实行为时感到意外，比"缺一个功能"更难发现，所以专门列在这里而不是埋进正文。剩下的三类是：**真的还没做**（1 的固定尺寸补边、3 的 PDF 栅格化）、**知情时机**（4）、**还没有验证记录**（8 的 ImageMagick / macOS 档位、9 的验证覆盖面边界）。
+> **一句话总结这一轮**：节点的账已经平了（32/32，`UNIMPLEMENTED_NODES` 为空）。上面这 9 条里，第 2、5、6、7 条都属于**"声明与实现 / UI 之间的小漂移"**，现已全部修掉（5/6/7 是同一类：`doc.ocr` 的声明；2 是 `provides` ↔ 节点声明那 5 处），并且由双向测试守着 —— 这类问题不会让构建变红，只会让用户在看到真实行为时感到意外，比"缺一个功能"更难发现，所以专门列在这里而不是埋进正文。剩下的三类是：**真的还没做**（1 的固定尺寸补边、3 的 PDF 栅格化）、**知情时机**（4）、**还没有验证记录**（8 只剩 macOS 那一半、9 的验证覆盖面边界）—— 第 8 条的 ImageMagick 半边已随本轮真机验证关闭。
 
 ---
 
@@ -719,7 +749,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 ### 验收标准
 
 1. `cargo test --workspace` 全绿，且 `cargo test -p toolforge-core` 恰好 **61 个测试通过、0 失败**。
-   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **217 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
+   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **218 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
 2. `cargo clippy --workspace -- -D warnings` 与 `cargo fmt --check` 无输出（零告警、零格式差异）。
 3. `cargo check --workspace --all-targets` 成功（即 `pnpm check:rust` 通过），且 `Cargo.lock` 已生成并入库。
 4. `pnpm check:all` 退出码为 0。
@@ -752,8 +782,8 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 - [ ] ⛔ 回填**全部 12 条**下载源的 `sha256`，否则 `install` 会按设计拒绝下载（不一致 3）
 - [ ] 🚧 许可证闸门：把 `requires_license_ack` 接进 `install` 路径，未确认不得安装；确认结果落盘（不一致 4）
 - [ ] 🚧 引擎接入：ffmpeg / pandoc / libreoffice / 7zip 已在 `nodes.rs` 中真实接线，需在真实环境逐个跑通
-  > 进度：**libvips 已跑通**（一键安装成功 + 四个图像节点真实调用，见上面两条与「阻塞 14」）；ffmpeg / pandoc / libreoffice / 7zip 这四个"必需引擎"档位的逐个真机跑通仍未完成。ImageMagick **没有装过、也没有实测记录**（本轮只补齐了它的 Windows 下载源，并对"能不能装"做了直接执行验证，见 §3）。另外 FFmpeg 在本机因 `www.gyan.dev` 不可达而**未能完成安装** —— 那是环境问题，不是代码缺陷（见 §3）。
-- [ ] 🚧 **真实接通图片加速链路（libvips 已达成，ImageMagick 与两个节点仍缺）**：`libvips` 已由 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 真实调用并可在日志/节点输出里观测（`verify-platform.mjs`【6】在真机上验证）；仍缺的是 —— `image.enhance` / `image.strip-metadata` 不接外部后端（这是性能议题，声明侧已经不再谎称"装了会更快"）、**`ImageMagick` 档位没有实测记录**（下载源已补齐、安装未复验）、**三档结果一致性没有测试**（见不一致 2 的更新）。
+  > 进度：**libvips 已跑通**（一键安装成功 + 四个图像节点真实调用，见上面两条与「阻塞 14」）；**ImageMagick 现在也装过、也实测过了**（本轮：应用内安装成功 241.5 MB 的 `magick.exe`，版本 7.1.2-31 Q16 x64；藏掉 `engines/libvips` 后后端日志 = ImageMagick（格式最全）、产出有损 VP8 WebP，见 §3 与开放项 8）。ffmpeg / pandoc / libreoffice / 7zip 这四个"必需引擎"档位的逐个真机跑通仍未完成。另外 FFmpeg 在本机因 `www.gyan.dev` 不可达而**未能完成安装** —— 那是环境问题，不是代码缺陷（见 §3）。
+- [ ] 🚧 **真实接通图片加速链路（libvips 与 ImageMagick 都已达成，图像域那两个节点仍缺）**：`libvips` 已由 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 真实调用并可在日志/节点输出里观测（`verify-platform.mjs`【6】在真机上验证），**中间档 ImageMagick 也已实测被挑中**（【12】）；仍缺的是 —— `image.enhance` / `image.strip-metadata` 不接外部后端（这是性能议题，声明侧已经不再谎称"装了会更快"）、**三档结果一致性没有测试**（见不一致 2 的更新）。
 - [ ] 🚧 `scripts/enginectl.mjs`：`list` / `install` / `verify` / `clean` 子命令
 - [ ] 🚧 离线 / 镜像源可配置（企业内网可用）
 
@@ -794,8 +824,8 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 3. **引擎可安装**：12 条源中的每一条在 `sha256` 回填后，`install` 能成功下载、校验、落地；`sha256` 缺失时**拒绝安装**的行为有测试守护。
 4. **许可证确认可验证**：在全新用户数据目录下首次安装/调用需要确认的引擎（如 ffmpeg、calibre、tesseract）前，必须出现许可证确认；拒绝确认时任务**不会**执行，且不留下部分产物；确认记录可在审计日志中查到。
 5. **降级可验证**：分别测「无任何外部引擎」「仅系统安装 ImageMagick」「安装 libvips」三种环境，同一图片转换任务都能完成，输出在尺寸/通道/格式上一致（编码字节允许差异）。
-   > 进度（🚧）：**「安装 libvips」一档已有真机证据**（`verify-platform.mjs`【6】断言实际后端与引擎状态一致，且该脚本 69 项全通过）；**另两档还没有专门的环境基线** —— 尤其是"仅 ImageMagick"这一档从未被单独测过。"三档输出一致"也还没有测试。
-6. **加速链路真实可用** ✅ **已达成**：有 libvips 的环境下，`image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个节点会真的走 libvips 而非纯 Rust，并**通过节点输出的 `backend` 与一条 debug 日志证实**（`verify-platform.mjs`【6】的核心断言就是"日志里写明了实际使用的图片后端"且"与引擎状态一致"）。对应「不一致 2」——**部分关闭**：`image.enhance` / `image.strip-metadata` 仍只有纯 Rust 路径，`ImageMagick` 档位仍无实测记录。
+   > 进度（🚧）：**三档里现在有两档有真机证据** —— 「安装 libvips」档由 `verify-platform.mjs`【6】断言实际后端与引擎状态一致（该脚本 **74 项全通过**）；**「仅 ImageMagick」档本轮由【12】补上**（临时藏掉 `engines/libvips` → 断言后端切成 ImageMagick → `finally` 还原）。**「无任何外部引擎」档仍然没有专门的环境基线** —— 纯 Rust 这条路径每个节点都在走，但"把两档都藏掉"跑一遍还没有做过。**"三档输出一致"也仍然没有测试。**
+6. **加速链路真实可用** ✅ **已达成**：有 libvips 的环境下，`image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个节点会真的走 libvips 而非纯 Rust，并**通过节点输出的 `backend` 与一条 debug 日志证实**（`verify-platform.mjs`【6】的核心断言就是"日志里写明了实际使用的图片后端"且"与引擎状态一致"；【12】进一步证实中间档 ImageMagick 也真的会被挑中）。对应「不一致 2」——**部分关闭**：`image.enhance` / `image.strip-metadata` 仍只有纯 Rust 路径（`ImageMagick` 档位已不再缺实测记录）。
 7. **L2 沙箱可验证**：尝试文件读取/网络访问的 WASM 插件被拒绝并返回明确错误；分配超限内存或耗尽燃料时被终止，宿主进程存活且后续调用正常。
 8. **L2 宿主函数白名单可验证**：仅 `log` / `kv` 可调用；调用未白名单宿主函数返回「未定义函数」类错误；`allowHostFunctions` 里写其它名字在装载期即被拒绝。
 9. **L3 常驻可验证**：连续调用同一 Python 插件 100 次，进程数保持为 1，总耗时显著低于 100 次冷启动。
@@ -834,7 +864,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   - **实测数据（真机，非推断）**：托管 Python **3.11.16 / 145.2 MB / tar.gz 路径**（此前只跑过 zip 路径）；venv 自动装上 `onnxruntime-1.30.0`、`numpy-2.4.6`、`pillow-12.3.0`；对一张 **400×300**（白底 + 一个红椭圆）的测试图输出 **RGBA PNG（colorType 6）、400×300、椭圆中心 alpha 254、角落 alpha 0、前景覆盖 18.87%**（与椭圆真实面积吻合）；**运行时就绪后单张推理约 0.7 秒**（首次含 pip 约 32 秒）。
   - **测试方法上的一个坑**：**显著性模型不能用渐变图测** —— 在没有明显主体的渐变图上，模型正确报告约 0% 覆盖并让节点发一条警告。验收脚本因此改用**有真实主体**的图。
   - 参数现在是 `model` / `mode`（`alpha` | `color`）/ `background` / `threshold` / `feather`；**旧的 `alphaMatting` 已被删除**（它从登记起就没有实现，是个**假参数**）。默认模型从 `u2net`（168 MB）改成 **`u2netp`（4.4 MB）** —— "先让它跑起来"比"一上来就要下 168 MB"重要得多。
-  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（整个脚本 **69 项检查全通过**）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
+  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（整个脚本 **74 项检查全通过**）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
   - **配套修掉的一个引擎层缺陷**：`probe()` 原来只对 `install_modes == [Remote]` 的引擎特判，而 `onnx-models` **没有可执行文件**（它只是权重文件的宿主），于是永远探测为 `Missing` —— 结果是这个节点**永远显示不可用，哪怕用户已经把权重下好了**。现在 `probe()` 对它单独判：**至少有一个权重已安装 = 可用**。另外 `EngineInstallRequest` 新增 **`force`** 标志 + 引擎卡片上的「另外安装应用托管版本」按钮：系统 Python 3.14 会被探到、显示可用，却跑不了 `onnxruntime` —— **"探测到可用"不等于"满足这个节点的要求"**。
 - [x] ✅ **AI 超分（`ai.upscale`）—— 已实现，真机跑通**
   - 以前的写法是「🚧 AI 超分（`ai.upscale`，当前 `not_implemented`）」。它曾经是"最有可能接着做的一个"，因为可以照抄抠图那条"模型 + 推理"链 —— 这一轮正是这么做的。
@@ -989,15 +1019,15 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 检查点 | 命令/动作 | 期望 |
 | --- | --- | --- |
 | 领域层健康 | `cargo test -p toolforge-core` | 61 通过 / 0 失败（**写本文档时的目标值**；当前全仓合计见下一行，不再逐 crate 维护） |
-| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 217 passed / 0 failed** |
+| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 218 passed / 0 failed** |
 | 全目标检查 | `cargo check --workspace --all-targets` | 退出码 0 |
 | 静态质量 | `cargo clippy --workspace -- -D warnings`、`cargo fmt --check` | 无输出 |
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | 退出码 0（需前端工程先落地） |
 | 聚合 | `pnpm check:all` | 退出码 0 |
 | 类型桥 | `pnpm bindings` 连续两次 | 第二次后 `git status` 干净（该命令同时跑 4 项守卫，含 `COMMAND_NAMES` 与注册命令的逐条核对） |
-| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **69 项检查全通过**（【1】–【11】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】；【8】【9】【11】在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"） |
+| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **74 项检查全通过**（【1】–【12】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】、**中间档 ImageMagick 后端切换**【12】；【8】【9】【11】【12】在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"） |
 | 最小闭环 | `pnpm tauri:dev` → 图片转换任务 | 任务完成、输出存在 |
-| 引擎 | `pnpm engines:list` / `engines:install` | 能探测、能安装并通过 SHA-256 校验；**libvips 已实测装成功**（哈希回填的 **7 条**仍限 Windows / Linux；`imagemagick@windows` 的来源已补齐、应用内安装未复验；FFmpeg 因本机 `www.gyan.dev` 不可达而未装成，见 §3） |
+| 引擎 | `pnpm engines:list` / `engines:install` | 能探测、能安装并通过 SHA-256 校验；**libvips 与 imagemagick 都已实测装成功**（哈希回填的 **7 条**仍限 Windows / Linux；FFmpeg 因本机 `www.gyan.dev` 不可达而未装成，见 §3） |
 | 图标 | `pnpm icons` | 成功（需先补 `assets/icon-source.png`） |
 
 ## 附 B：本文件的核对方法说明

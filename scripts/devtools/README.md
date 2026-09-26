@@ -3,7 +3,7 @@
 ToolForge 的 UI 跑在 WebView2 里。这一套脚本通过 **CDP（Chrome DevTools Protocol）**
 读取 WebView 的**真实渲染状态**，用来补上自动化测试覆盖不到的那一层。
 
-> **为什么需要它**：本项目的自动化检查（`cargo check`、217 个单元测试、
+> **为什么需要它**：本项目的自动化检查（`cargo check`、218 个单元测试、
 > `tsc --noEmit`、`vite build`）**全部通过**的情况下，真机跑一次仍然找出了
 > **一批发布级缺陷**。共同点是"组件各自正确，连起来不对" ——
 > 单元测试验证组件，集成测试验证接口形状，而**真实数据流**只有真跑一次才会经过。
@@ -13,6 +13,12 @@ ToolForge 的 UI 跑在 WebView2 里。这一套脚本通过 **CDP（Chrome DevT
 > 于是挑中了一个**抠图模型**；分割模型输出的单通道蒙版被当成图片放大，
 > **尺寸断言完全通过**。修法不是"把断言写严一点"，而是从源头去掉那个错误的推断
 > （见 `EngineModel.used_by` 与 `py/upscale.py` 里的自检）。
+>
+> 还有一个更基本的前提，最新一轮才吃到教训：**"单测全绿"说的是源码，不是你刚跑的那个 exe。**
+> `toolforge.exe` 曾因为文件句柄被占好几轮没重建过，而一重建就冒出 3 个缺陷
+> —— 最刺眼的是 `target/debug/plugins/builtin/` 里那份**构建期拷贝**是陈旧的，
+> 导致从 `target/debug/toolforge.exe` 启动只装载 4 个内置插件（换成从 `deps/` 启动就是 7 个）。
+> 所以：**跑真机验证之前先确认二进制是新的。**
 
 ---
 
@@ -35,7 +41,7 @@ node scripts/devtools/inspect.mjs   # 单页体检
 node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
-node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（69 项）
+node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（74 项）
 ```
 
 `pnpm dev:cdp` 与 `pnpm verify:app` 是上面两条命令的简写。
@@ -56,6 +62,23 @@ WebView2 的内容由**独立的合成进程**绘制，`PrintWindow` 只能抓�
 而且能读到页面异常。
 
 `inspect.mjs` 里的 `Page.captureScreenshot` 抓的才是真实内容。
+
+### 脚手架自己的报错也会骗人（最新一轮修掉）
+
+`cdp.mjs::evaluate()` 原来只取 `exception?.description ?? text`。而页面 **reject 一个普通对象**时
+（Tauri 的错误就是这么传过来的）两者都是 `undefined`，于是它抛出的是光秃秃的一句：
+
+```
+Error: Object
+```
+
+**真实原因被自己的错误处理吃掉了。** 那几轮"脚本挂了但不知道为什么"就是这么来的 ——
+一个验证工具在最需要它说真话的时刻闭上了嘴。现在它把 `description` / `text` / `value` / `preview`
+全部摊开，于是立刻看到真凶：`插件 com.toolforge.builtin.ebook-convert 未安装`
+（也就是下面【12】那条同批发现的插件目录遮蔽问题）。
+
+**教训**：验证工具的错误处理路径和被测代码一样需要被验证。**"工具报了一个我看不懂的错"** 与
+**"工具报了一个错的错"** 是两种问题，而后者会把排查方向整个带偏。
 
 ---
 
@@ -105,7 +128,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 ### `verify-platform.mjs` —— 平台能力（**这一轮新增的主要内容**）
 
 `verify.mjs` 验的是**安全属性**，这个脚本验的是**平台声称能做到的事是不是真的做到了**。
-十一节，69 项：
+十二节，74 项：
 
 | 节 | 验什么 | 它抓到过什么 |
 |---|---|---|
@@ -120,6 +143,12 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 | 【9】 | 电子书转换的降级与**拦截** | pandoc 遇到写不出的格式会**假装成功**（给你一个扩展名骗人的 HTML） |
 | 【10】 | AI 视觉链路的请求形状与下游接线 | 见下 |
 | 【11】 | 超分是否真的按倍数放大 | 见下 |
+| 【12】 | 中间档（ImageMagick）是否真的被挑中 | 三层降级图的中间那一格**从来没有单独测过**（本机没装 ImageMagick） |
+
+**【12】的做法值得单说**：它把 `engines/libvips` **临时改名**藏起来，断言
+`image.convert` 的后端日志变成 `后端 = ImageMagick（格式最全）`（并且真的产出有损 VP8 WebP），
+然后在 `finally` 里改名还原 —— **失败也会还原**，否则一次失败的验证会永久污染这台机器的引擎状态。
+它只在 **libvips 与 imagemagick 都装了**的前提下才跑，否则**显式记为跳过**。
 
 前置条件不满足时（没下权重、没装引擎）会**显式记为跳过**，
 而不是悄悄放过 —— "跳过"和"通过"是两回事。
