@@ -35,7 +35,7 @@
         "enable": true,
         "scope": ["$APPDATA/**", "$APPLOCALDATA/**", "$DOWNLOAD/**", "$PICTURE/**", "$VIDEO/**", "$AUDIO/**", "$DOCUMENT/**", "$DESKTOP/**"]
       },
-      "freezePrototype": true
+      "freezePrototype": false
     }
   },
   "bundle": {

@@ -13,9 +13,13 @@
 //!    它会把相对路径规范化后检查是否真的落在允许的根目录内 ——
 //!    这一步专门用来挡 `../../../../etc/passwd` 这类穿越。
 //!
-//! 注意 [`PathScope`] 的设计意图：插件**从来不能**直接写宿主机绝对路径，
-//! 它只能引用逻辑作用域（输入目录 / 输出目录 / 自己的数据目录），
-//! 由宿主把它翻译成真实路径。这样"插件能碰哪些文件"完全由宿主决定。
+//! 注意 [`PathScope`] 的设计意图：插件引用的是**逻辑作用域**（输入目录 / 输出目录 /
+//! 自己的工作目录），由宿主决定它们各自对应哪个真实目录。所以"插件能碰哪些文件"
+//! 完全由宿主决定。
+//!
+//! ⚠️ **但不要说成"插件拿不到绝对路径"** —— 那是错的，而且曾经因此写出一个发布级
+//! bug（见 [`PathResolver::resolve`] 的文档）。`${src}` / `${output.dst}` 注入流水线的
+//! 就是真实绝对路径。正确的表述是：**插件无法引用授权根之外的任何路径**。
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -455,10 +459,36 @@ impl PathResolver {
         }
     }
 
-    /// 在 `scope` 内解析相对路径 `rel`，并做穿越检查。
+    /// 在 `scope` 内解析路径 `rel`，并做穿越检查。
     ///
     /// 之所以先做词法规范化再比较：`a/../../b` 这类路径必须被展开后才能判断，
     /// 单纯做字符串前缀匹配是挡不住的。
+    ///
+    /// # 绝对路径为什么必须被接受
+    ///
+    /// 这里最初是"绝对路径一律拒绝"，理由是"插件只能用逻辑作用域，不能自己指定
+    /// 宿主机位置"。**那条规则自相矛盾，而且让整个应用跑不了任何文件**：
+    ///
+    /// * `l1.rs` 把 `${src}` / `${input.<port>}` / `${output.<port>}` 绑定成
+    ///   **真实的绝对路径**（因为那就是用户选中的文件）；
+    /// * 内置节点于是拿着绝对路径调 `resolve()`，撞上拒绝；
+    /// * 表现是任何一次真实转换都以 `PERMISSION_DENIED`
+    ///   「插件不允许使用绝对路径」失败。
+    ///
+    /// 这个 bug 躲过了 194 个单元测试和 5 个集成测试 —— 因为**没有任何测试走过
+    /// "用户选中的绝对路径 → 流水线 → 节点"这条真实数据流**，全都是拿相对路径
+    /// 直接调 `resolve()`。它是靠真跑一次应用、提交一个真实任务才暴露的。
+    ///
+    /// 现在改为：**绝对路径与相对路径走同一条检查**，唯一的判据是
+    /// "最终路径是否落在授权根内"。这**没有削弱安全性** ——
+    /// 真正挡住穿越的从来就是那个 `starts_with`，而不是"必须相对"这个代理规则：
+    ///
+    /// | 输入 | 旧行为 | 新行为 |
+    /// |---|---|---|
+    /// | 根内相对路径 `a/b.png` | 放行 | 放行 |
+    /// | 根内绝对路径 `D:\in\a.png` | **拒绝（bug）** | 放行 |
+    /// | 逃逸相对路径 `../../etc/passwd` | 拒绝 | 拒绝 |
+    /// | 根外绝对路径 `C:\Windows\System32` | 拒绝（理由错） | 拒绝（理由对） |
     pub fn resolve(&self, scope: &PathScope, rel: &str) -> ToolforgeResult<PathBuf> {
         // Explicit 作用域走 glob 校验，不在这里解析具体文件
         if let PathScope::Explicit { pattern } = scope {
@@ -471,31 +501,29 @@ impl PathResolver {
                 scope.describe()
             ))
         })?;
+        // 两侧都做词法规范化，否则 `starts_with` 会因为 `.` / `..` / 尾随分隔符
+        // 这类纯粹写法上的差异判错
+        let root_norm = normalize_lexically(root);
 
-        // 绝对路径一律拒绝：插件只能用逻辑作用域，不能自己指定宿主机位置
-        let rel_path = Path::new(rel);
-        if rel_path.is_absolute() {
-            return Err(ToolforgeError::denied(format!(
-                "插件不允许使用绝对路径：{rel}"
-            ))
-            .with_detail("请改用相对于输入/输出/工作目录的路径"));
-        }
+        let given = Path::new(rel);
+        let candidate = if given.is_absolute() {
+            normalize_lexically(given)
+        } else {
+            normalize_lexically(&root_norm.join(given))
+        };
 
-        let joined = root.join(rel_path);
-        let normalized = normalize_lexically(&joined);
-
-        if !normalized.starts_with(root) {
+        if !candidate.starts_with(&root_norm) {
             return Err(ToolforgeError::denied(format!(
                 "路径逃逸被拦截：{rel} 解析后落在授权目录之外"
             ))
             .with_detail(format!(
                 "授权根目录：{}\n实际解析：{}",
-                root.display(),
-                normalized.display()
+                root_norm.display(),
+                candidate.display()
             )));
         }
 
-        Ok(normalized)
+        Ok(candidate)
     }
 
     /// Explicit 作用域：用 glob 匹配。仍然拒绝绝对路径以外的花招由 glob 本身收敛。
@@ -587,9 +615,57 @@ mod tests {
         // 逃逸必须被拦
         let err = r.resolve(&PathScope::Input, "../../../etc/passwd").unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
-        // 绝对路径必须被拦
+        // 根**之外**的绝对路径必须被拦
         let err = r.resolve(&PathScope::Input, "C:\\Windows\\System32").unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn absolute_path_inside_root_is_allowed() {
+        // 回归测试：这条曾经是**发布级阻塞 bug**。
+        //
+        // `l1.rs` 把 `${src}` / `${output.dst}` 绑定成真实的绝对路径，
+        // 而 `resolve()` 曾经一律拒绝绝对路径 —— 于是**任何一次真实转换都会以
+        // PERMISSION_DENIED 失败**："插件不允许使用绝对路径：D:\...\a.png"。
+        //
+        // 194 个单测 + 5 个集成测试全都没抓到，因为没有一个测试走过
+        // "用户选中的绝对路径 → 流水线 → 节点"这条真实数据流。
+        // 它是靠真跑一次应用、提交一个真实任务才暴露的。
+        let r = PathResolver::new()
+            .with_input("/srv/input")
+            .with_output("/srv/output");
+
+        // 授权根内的绝对路径必须放行（这才是真实的调用形态）
+        assert_eq!(
+            r.resolve(&PathScope::Input, "/srv/input/a/b.png").unwrap(),
+            Path::new("/srv/input/a/b.png")
+        );
+        assert!(r.resolve(&PathScope::Output, "/srv/output/x.webp").is_ok());
+
+        // 但根**外**的绝对路径仍然必须被拒 —— 安全性没有削弱，
+        // 挡住穿越的从来是 starts_with，不是"必须相对"这个代理规则
+        let err = r.resolve(&PathScope::Input, "/etc/passwd").unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert!(
+            err.message.contains("逃逸"),
+            "根外绝对路径的拒绝理由应当是「逃逸」而不是别的：{}",
+            err.message
+        );
+
+        // 绝对路径里的 `..` 也要被正确展开后再判定
+        assert!(r.resolve(&PathScope::Input, "/srv/input/a/../b.png").is_ok());
+        let err = r
+            .resolve(&PathScope::Input, "/srv/input/../../etc/passwd")
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+    }
+
+    #[test]
+    fn dotted_and_trailing_separator_roots_compare_correctly() {
+        // 两侧都做词法规范化，否则 `starts_with` 会因为纯写法差异判错
+        let r = PathResolver::new().with_input("/srv/./input/");
+        assert!(r.resolve(&PathScope::Input, "a.png").is_ok());
+        assert!(r.resolve(&PathScope::Input, "/srv/input/a.png").is_ok());
     }
 
     #[test]

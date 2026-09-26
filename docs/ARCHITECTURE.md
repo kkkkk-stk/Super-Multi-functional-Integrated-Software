@@ -846,9 +846,10 @@ if !probe.function_exists(&def.entry) { return Err(PluginInvalid(...)) }
    - `engines/nodes.rs::not_implemented` 原文：「刻意**不返回假的成功**：插件作者与用户都必须立刻知道这个能力还没做，否则会出现"流水线显示跑通了但没产出文件"这种最难排查的问题。」
    - 同理 `l1.rs` 对 `onError: skip/continue` 的处理也拒绝静默：「明确记录跳过原因，绝不静默」；命令层对"跑完但零产出"会 `ctx.warn("流水线执行成功但没有产出任何文件，请检查步骤的输出端口绑定")`。
    - 注意：这条边界在**节点可用性展示**上还没贯彻（见 4.11 第 6 条：`pipeline_nodes` 的 `availability` 不考虑"未实现"）。
-8. **不允许插件使用宿主机绝对路径或逃出授权目录**。
-   - `PathResolver::resolve` 对绝对路径直接返回 `PermissionDenied`（"插件不允许使用绝对路径"），对规范化后落在根目录外的路径返回 `PermissionDenied`（"路径逃逸被拦截"）。
-   - `PathScope` 的模块文档原文：「插件**从来不能**直接写宿主机绝对路径，它只能引用逻辑作用域（输入目录 / 输出目录 / 自己的数据目录），由宿主把它翻译成真实路径。这样"插件能碰哪些文件"完全由宿主决定。」
+8. **不允许插件逃出授权目录**。
+   - `PathResolver::resolve` 把绝对路径与相对路径**走同一条检查**：两侧都做词法规范化，然后 `starts_with(授权根)`。落在根外 → `PermissionDenied`「路径逃逸被拦截」。
+   - ⛔ **曾经**它是对绝对路径直接返回 `PermissionDenied`（"插件不允许使用绝对路径"）—— 那是**发布级 bug**：`l1.rs` 把 `${src}` / `${output.dst}` 注入成真实绝对路径，于是任何一次真实转换都失败。真跑一次才暴露，详见 `docs/SECURITY.md` §4.1。
+   - `PathScope` 的正确表述是：**插件无法引用授权根之外的任何路径**（而不是"插件拿不到绝对路径"）。
    - 唯一的逃生舱是 `PathScope::Explicit(glob)`，文档标注「**这是逃生舱口，风险等级直接拉到 Critical**，UI 会用红色警示并要求二次确认」，`validate` 会发 `HOST_PATH_WRITE` 警告，`is_sandboxed()` 对它返回 `false`。
    - `paths.rs::sanitize_id` 是最后一道防线，注释：「虽然插件 ID 在校验阶段已经限制过字符集，但**目录名拼接是最后一道防线**：任何时候把外部输入拼进路径都必须再过一次」。
 9. **不允许插件在运行期提权**。`python.rs::handle_notification` 对 `host.request` 只 `job.warn(...)` 并明确拒绝，理由：「能力必须在装载前由用户授权，运行期提权是"点击劫持"的经典入口。」`CapabilityGuard::check` 返回 `Deny` 时，`permission.rs` 的注释要求调用方「**一定要向上冒泡成 `ErrorCode::PluginCapabilityViolation`**，由调用方同时写审计日志。静默降级（比如"读不到就当空文件"）会让攻击面隐形。」

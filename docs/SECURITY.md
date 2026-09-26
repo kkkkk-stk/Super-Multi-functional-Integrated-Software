@@ -288,7 +288,9 @@ permissions:
     scope: { kind: input }
 ```
 
-**含义**：读取某个逻辑作用域内的文件。作用域由宿主分配，插件拿不到真实绝对路径（`PathScope::describe()` 的文案直接渲染在 UI 上）。
+**含义**：读取某个逻辑作用域内的文件。作用域由宿主分配。
+
+> 早期版本这里写的是"插件拿不到真实绝对路径"。**那是错的**：`${src}` / `${output.dst}` 传的就是真实绝对路径（见 §4.1 的更正）。真正成立的说法是：**插件无法引用授权根之外的任何路径** —— 它给的路径会被规范化后与授权根做组件级比较。
 
 `risk()`：**Low**。唯一例外是 `PathScope::Explicit(_)`，返回 **High**（但见 §3.8：这个分支目前不可达）。
 
@@ -508,7 +510,12 @@ pub enum PathScope {
 
 `crates/toolforge-core/src/permission.rs` 的 `PathResolver::resolve(scope, rel)` 依次做三件事：
 
-1. **拒绝绝对路径**：`Path::new(rel).is_absolute()` 为真 → `ErrorCode::PermissionDenied`，附 `detail`「请改用相对于输入/输出/工作目录的路径」。设计前提是"插件只能用逻辑作用域，不能自己指定宿主机位置"。
+1. ~~**拒绝绝对路径**：`Path::new(rel).is_absolute()` 为真 → `PermissionDenied`。设计前提是"插件只能用逻辑作用域，不能自己指定宿主机位置"。~~
+   > ⛔ **这条规则曾是发布级 bug，已改正。** 它自相矛盾：`l1.rs` 把 `${src}` / `${output.dst}` 绑定成**真实的绝对路径**（那就是用户选中的文件），而 `resolve()` 又一律拒绝绝对路径 —— 于是**任何一次真实转换都会以 `PermissionDenied`「插件不允许使用绝对路径」失败**。
+   >
+   > 现在**绝对路径与相对路径走同一条检查**，唯一判据是"最终路径是否落在授权根内"（两侧都先做词法规范化）。这没有削弱安全性：挡住穿越的从来是 `starts_with`，不是"必须相对"这个代理规则。
+   >
+   > 它是靠**真跑一次应用、提交一个真实任务**才暴露的 —— 196 个单元测试与 6 个集成测试全都没抓到（没有一个测试走过"用户选中的绝对路径 → 流水线 → 节点"这条真实数据流）。回归测试：`absolute_path_inside_root_is_allowed`、`dotted_and_trailing_separator_roots_compare_correctly`。
 2. **拼接 + 词法规范化**：`root.join(rel)` 之后走 `normalize_lexically()`，逐组件展开：`.` 丢弃；`..` **只在栈顶是一个真正的目录名（`Component::Normal`）时才回退**，否则继续累积 `..`。
 3. **边界判定**：`!normalized.starts_with(root)` → 拒绝，`detail` 里同时给出"授权根目录"与"实际解析"两条路径，便于用户判断是插件写错了还是有人在试探。
 

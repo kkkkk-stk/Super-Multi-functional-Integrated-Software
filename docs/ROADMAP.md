@@ -256,23 +256,92 @@
 - 修复：在**外壳层的事件桥**里，收到 `JobFinished` 且状态为终态时删除该目录。
   刻意不放在 `JobQueue` 里：队列属于领域层，**不应该知道磁盘布局**。
 
+### 阻塞 12：🔴 绝对路径被一律拒绝，导致**任何真实转换都失败** ✅ 已修复
+
+> **这是整个项目发现过的最严重的功能性缺陷**，而且它躲过了当时全部的自动化检查：
+> 196 个单元测试 + 6 个集成测试 + 完整的前端类型检查 + 9 个页面的渲染冒烟 **全绿**。
+> 它是靠**真跑一次应用、提交一个真实任务**才暴露的。
+
+- **现象**：在真机窗口里对一个真实 PNG 提交转换，任务立刻失败：
+
+  ```text
+  错误码    : PERMISSION_DENIED
+  错误信息  : 插件不允许使用绝对路径：D:\...\gradient.png
+  ```
+
+- **成因**：`PathResolver::resolve()` 对绝对路径一律拒绝，而 `l1.rs` 把
+  `${src}` / `${input.<port>}` / `${output.<port>}` 绑定成**真实的绝对路径**
+  （那就是用户选中的文件）。规则自相矛盾：宿主自己注入绝对路径，又禁止绝对路径。
+- **为什么测试没抓到**：所有 `PathResolver` 的测试都是拿**相对路径**直接调 `resolve()`，
+  没有一个走过"用户选中的绝对路径 → 模板渲染 → 节点 → resolver"这条真实数据流。
+  这正是"单元测试全绿但集成没接线"的又一形态。
+- **修复**：绝对路径与相对路径**走同一条检查** —— 两侧都做词法规范化，然后
+  `starts_with(授权根)`。**安全性没有削弱**：挡住穿越的从来是那个组件级比较，
+  而不是"必须相对"这个代理规则。
+
+  | 输入 | 旧行为 | 新行为 |
+  |---|---|---|
+  | 根内相对路径 `a/b.png` | 放行 | 放行 |
+  | 根内绝对路径 `D:\in\a.png` | **拒绝（bug）** | 放行 |
+  | 逃逸相对路径 `../../etc/passwd` | 拒绝 | 拒绝 |
+  | 根外绝对路径 `C:\Windows\System32` | 拒绝（理由错） | 拒绝（理由对） |
+
+- **回归测试**：`absolute_path_inside_root_is_allowed`、
+  `dotted_and_trailing_separator_roots_compare_correctly`。
+- **端到端验证**（`.tools/cdp-verify.mjs`，通过 CDP 驱动真实 WebView）：
+  装一个**恶意清单**（步骤里写死 `C:\Windows\System32\drivers\etc\hosts`）、授权、启用、
+  真跑一次 → 任务在真实链路上被拒绝（`PERMISSION_DENIED — 路径逃逸被拦截`），
+  然后再把它卸掉。**12 项检查全通过。**
+
+### 阻塞 13：`freezePrototype: true` 让整个前端白屏 ✅ 已修复
+
+- **现象**：`pnpm tauri:dev` 能起窗口，但页面**全白** —— React 从未挂载
+  （`#root` 子节点数 = 0）。
+- **真因**（靠 CDP 读 WebView 的异常抓到的，`PrintWindow` 截图抓不到 WebView 内容）：
+
+  ```text
+  TypeError: Cannot assign to read only property 'constructor' of object '[object Object]'
+      at define_default (@xyflow_react.js:1323)
+  ```
+
+  `tauri.conf.json` 的 `app.security.freezePrototype: true` 会冻结 `Object.prototype`，
+  而 `@xyflow/react`（流程编辑器，需求里点名的技术选型）在模块初始化时就要写它 ——
+  一个顶层 import 抛异常，整个应用白屏。
+- **修复**：`freezePrototype: false`。取舍是明确的：`freezePrototype` 是纵深防御的一层
+  （防原型污染），但它与一个**必需依赖**不兼容。主要的防护仍是严格 CSP、
+  `withGlobalTauri: false`、以及能力白名单。
+- **教训**：这条**只有真跑才会暴露**。任何"渲染冒烟"如果不检查 `#root` 有没有子节点、
+  不读取页面异常，就只是"dev server 起来了"而已。
+
 ### 基线（最新实测）
 
-阻塞 1–11 全部修复后的**真实**运行结果：
+阻塞 1–13 全部修复后的**真实**运行结果（分两层：静态检查，与**真机运行**）：
 
 ```text
+【静态】
 cargo check --workspace --all-targets   →  0 error / 0 warning
-cargo test（core / process / engines / plugins / ai）
+cargo test（core / process / engines / plugins / ai + plugins 集成测试）
   toolforge-ai       25 passed
-  toolforge-core     68 passed
+  toolforge-core     72 passed
   toolforge-process  19 passed
-  toolforge-plugins  34 passed
-  toolforge-engines  21 passed
+  toolforge-plugins  38 passed
+  toolforge-engines  35 passed
+  example_plugins     5 passed   （6 个真实示例清单逐个跑当前校验器）
   ─────────────────────────────
-  合计              167 passed; 0 failed
+  合计              194 passed; 0 failed
 
 cargo run -p toolforge --bin export-bindings
-  → apps/desktop/src/bindings.ts（29 个命令）
+  → apps/desktop/src/bindings.ts（29 个命令 + AppEvent）
+  → 并执行 4 项守卫（AppEvent / 事件通道常量 / 命令清单逐条核对 / 节点实现状态）
+
+【真机运行】pnpm tauri:dev + CDP 驱动真实 WebView（.tools/cdp-*.mjs）
+  窗口          → 句柄非 0、标题 ToolForge
+  9 个页面      → 全部渲染、0 运行时异常、0 骨架屏卡死
+  IPC 往返      → system_status 真实返回「引擎 2/11、存储正常、windows、debug」
+  真实任务      → 320x200 PNG → 无损 WebP（VP8L 解码确认尺寸一致）
+  多文件扇出    → 3 张进、3 个**不同**文件出、磁盘上 3 个
+  安全（端到端）→ 装一个路径穿越的恶意插件并运行 → 被拒绝、且已清理
+  小计          → 12 项检查全通过
 ```
 
 前端侧（`apps/desktop`）由并行开发补齐，验收命令是：
