@@ -3160,6 +3160,319 @@ c.section('【21】任务取消：子进程真的被杀掉、队列记账对得�
   }
 }
 
+// ============================================================================
+// 【22】流程编辑器：画布 → plugin.yaml → 校验 → 安装 → 真的跑起来
+// ============================================================================
+//
+// 这是**最后一条没有运行时证据的用户创建路径**。它和 AI 生成那条不一样：
+// 这里没有模型，产物完全由前端的一个**纯函数** `buildPluginYaml()` 决定
+// （`apps/desktop/src/lib/pipeline-yaml.ts`），后端只负责校验与执行。
+//
+// 也就是说，这条链路上有一道**典型的集成缝**：
+//
+//   前端写的 YAML  ←→  后端的 `PluginManifest` 校验器
+//
+// 两边各自的单元测试都过，缝里却可能对不上 —— 比如前端写出
+// `permissions: [...]`（裸数组）而后端期望 `{capabilities: [...]}`，
+// 或者前端引用了没声明的端口。这类问题**只有把前端真的产物交给后端**才看得见。
+//
+// 做法：在**页面上下文里**动态 import 那个模块（Vite dev server 直接提供 TS 模块），
+// 构造一份画布状态喂给 `buildPluginYaml()`，再把产出的 YAML 原样交给
+// `plugins_validate` / `plugins_install` / `plugins_run`。
+// 这样"用户在画布上连线、点导出、点安装、点运行"这条路径就真的被走过一遍了。
+c.section('【22】流程编辑器：画布 → plugin.yaml → 后端校验 → 安装 → 真的跑起来');
+{
+  const CANVAS_ID = 'com.verify.canvas';
+
+  /** 页面上下文里的模块句柄（用动态 import，不依赖任何构建产物的路径约定） */
+  const buildCanvasYaml = async (payload) =>
+    client.evaluate(`(async () => {
+      // ⚠️ 查询参数 ?t= 是**缓存穿透**，不是装饰：页面已经 import 过这个模块，
+      // 再 import 同一个 URL 会拿到浏览器缓存的旧模块 —— 那样"改了前端代码、
+      // 验证却看不到变化"，甚至可能拿旧代码的通过结果去背书新代码。
+      const mod = await import('/src/lib/pipeline-yaml.ts?t=' + Date.now());
+      const p = ${JSON.stringify(payload)};
+      const mk = (id, descriptor, x) => ({
+        id,
+        type: 'toolforge',
+        position: { x, y: 0 },
+        data: {
+          descriptorName: descriptor.name,
+          label: descriptor.label,
+          description: descriptor.description,
+          category: descriptor.category,
+          inputs: descriptor.inputs,
+          outputs: descriptor.outputs,
+          params: descriptor.params,
+          available: true,
+          missingEngines: [],
+          paramValues: p.values[id] ?? {},
+        },
+      });
+      const nodes = p.nodeIds.map((id, i) => mk(id, p.descriptors[i], i * 320));
+      const edges = p.edges.map((e, i) => ({
+        id: 'e' + i,
+        source: e.source,
+        target: e.target,
+        sourceHandle: e.sourceHandle ?? null,
+        targetHandle: e.targetHandle ?? null,
+      }));
+      const r = mod.buildPluginYaml(p.meta, nodes, edges);
+      return { yaml: r.yaml, errors: r.errors, warnings: r.warnings, ids: {
+        suggest: mod.suggestPluginId('我的 工具箱 v2'),
+        validOk: mod.isValidPluginId('com.verify.canvas'),
+        validBad: mod.isValidPluginId('Com.Verify Canvas'),
+      } };
+    })()`);
+
+  const catalog = await client.invoke('pipeline_nodes');
+  const byName = new Map((catalog.nodes ?? []).map((n) => [n.name, n]));
+  const need = ['image.resize', 'image.convert'];
+  if (need.some((n) => !byName.has(n))) {
+    c.note(`（节点目录里没有 ${need.join(' / ')}，跳过画布验证）`);
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    const payload = {
+      meta: {
+        pluginId: CANVAS_ID,
+        name: '画布验证流水线',
+        description: '由 verify-platform 构造的画布状态',
+        onError: 'fail',
+        timeoutMs: 120000,
+      },
+      nodeIds: ['resize', 'convert'],
+      descriptors: [byName.get('image.resize'), byName.get('image.convert')],
+      edges: [{ source: 'resize', target: 'convert', sourceHandle: 'dst', targetHandle: 'src' }],
+      values: {
+        resize: { width: { kind: 'int', value: 400 } },
+        convert: { format: { kind: 'str', value: 'webp' }, quality: { kind: 'int', value: 82 } },
+      },
+    };
+
+    const built = await buildCanvasYaml(payload);
+    console.log(`   画布导出：${built.yaml.split('\n').length} 行 YAML，errors=${built.errors.length} warnings=${built.warnings.length}`);
+    if (built.warnings.length) console.log(`   提示：${built.warnings.join('；')}`);
+    c.check(built.errors.length === 0, '① 一块合法画布导出的 YAML 没有阻断性错误', built.errors.join('；'));
+    c.check(built.yaml.includes(CANVAS_ID), '② 导出的清单带上了画布上的插件 id', CANVAS_ID);
+    c.check(
+      built.yaml.includes('image.resize') && built.yaml.includes('image.convert'),
+      '③ 两个节点都写进了 steps'
+    );
+    // ★ 连线必须翻译成**传路径**，而不是 `${steps.<上游>.<端口>}`。
+    //
+    // 这条是 `docs/PLUGIN-SDK.md` §3.4 结尾明写的规则："想做多步文件接力，正确做法是
+    // 给插件声明两个输出端口，用 `${output.frame}` / `${output.dst}` 传路径，
+    // **而不是指望 `${steps.frame.dst}`**"。原因是后端把文件类产出只放进
+    // `NodeOutput.outputs`（任务产出列表），**不放进 `values`**（`${steps.<id>.<key>}`
+    // 只能引用后者）—— 所以那个写法**必然**报"模板变量无法解析"。
+    // 画布导出原来写的就是 `${steps.resize.dst}`，于是**任何多节点画布导出的插件都跑不起来**。
+    const resizeDst = /\n\s+dst: "\$\{output\.([^}]+)\}"/.exec(
+      built.yaml.slice(built.yaml.indexOf('- id: "resize"'), built.yaml.indexOf('- id: "convert"'))
+    )?.[1];
+    const convertSrc = /- id: "convert"[\s\S]*?\n\s+src: "\$\{output\.([^}]+)\}"/.exec(built.yaml)?.[1];
+    c.check(
+      Boolean(resizeDst) && resizeDst === convertSrc,
+      '★ ④ 连线被翻译成"下游读上游写的那条路径"（`${output.<上游端口>}`），而不是 `${steps.*}`',
+      `上游 dst=${resizeDst} 下游 src=${convertSrc}`
+    );
+    c.check(
+      !/\$\{steps\.[^}]*\}/.test(built.yaml),
+      '④b 导出结果里没有 `${steps.<文件端口>}` 这种引用（那类引用解析不了）',
+      (built.yaml.match(/\$\{steps\.[^}]*\}/) ?? ['(没有)'])[0]
+    );
+
+    // ★ 集成缝：把**前端真的产物**交给后端校验器
+    const validate = await client.invoke('plugins_validate', {
+      req: { source: { kind: 'manifest', yaml: built.yaml } },
+    });
+    // 响应形状是 `{validation: {ok, issues}, capabilities, requiredEngines, missingEngines}`
+    // —— 第一版按 `validate.ok` 取，取到 `undefined`，于是把一次**成功的**校验判成了失败。
+    const validation = validate?.validation ?? validate?.report ?? {};
+    const issueCodes = (validation.issues ?? []).map((i) => i.code);
+    console.log(
+      `   后端校验：ok=${validation.ok} issues=${JSON.stringify(issueCodes)} capabilities=${(validate?.capabilities ?? []).length}`
+    );
+    c.check(
+      validation.ok === true,
+      '★ ⑤ 前端导出的 YAML 能通过**后端**的清单校验（集成缝对得上）',
+      JSON.stringify(issueCodes)
+    );
+
+    // ★ 真跑的前提：**每个步骤都要有输出路径**。
+    // 这条断言是冲着上面那个真缺陷来的：中间步骤的输出端口被连线消费之后，
+    // 生成器原来**不给它绑定 `${output.*}`**，于是执行器报
+    // `PLUGIN_NODE 缺少必需参数 dst` —— 单节点画布没事，多节点画布必炸。
+    const stepBlocks = built.yaml.split(/\n {6}- id: /).slice(1);
+    const stepsWithoutDst = stepBlocks
+      .map((blk) => ({ id: (blk.match(/^"([^"]+)"/) ?? [])[1], hasDst: /\n {10}dst: /.test(blk) }))
+      .filter((s) => !s.hasDst)
+      .map((s) => s.id);
+    c.check(
+      stepsWithoutDst.length === 0,
+      '★ ⑤b 每个步骤都绑定了自己的输出路径（中间产物也要有，否则执行器报"缺少必需参数 dst"）',
+      stepsWithoutDst.length ? `缺 dst 的步骤：${stepsWithoutDst.join(', ')}` : `检查了 ${stepBlocks.length} 个步骤`
+    );
+
+    // ---- 安装 + 真跑：这条路径的验收标准是"产出正确"，不是"任务成功" ----
+    const work = join(REPO_ROOT, '.tools', 'smoke', 'out-canvas');
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+
+    const existing = await client.invoke('plugins_get', { pluginId: CANVAS_ID }).catch(() => null);
+    if (existing) {
+      await client.invoke('plugins_set_enabled', { pluginId: CANVAS_ID, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: CANVAS_ID }).catch(() => {});
+    }
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'bundle', yaml: built.yaml, files: [] },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: false,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: CANVAS_ID,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'output' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: CANVAS_ID, enabled: true });
+
+    const src = join(work, 'canvas-in.png');
+    writeFileSync(src, makePng(800, 600, 7));
+
+    // ★ 跑的时候要带上**声明过的参数默认值**，而不是空 `params`。
+    //
+    // 这不是为了让测试好看，而是**前端就是这么做的**：`plugin-runner.tsx` 用
+    // `initialParamValues(manifest.io.params)` 把所有声明的参数（含默认值）填好，
+    // 整个 map 发给 `plugins_run`。而后端的 `build_io` 是用**运行期参数**
+    // （不是清单里的 default）去决定输出文件扩展名的：
+    // `params.format` 优先 → 端口 `accept` → 源扩展名。
+    //
+    // 第一版传了空 `params`，于是"画布上选了 WebP"没有生效，产出是一个
+    // **扩展名与内容都是 PNG** 的文件 —— 差一点把它当成产品缺陷报出去。
+    // 这条顺带把"声明的默认值真的能到达运行期"这件事一起验了。
+    const runParams = {};
+    for (const desc of [byName.get('image.resize'), byName.get('image.convert')]) {
+      for (const spec of desc.params ?? []) {
+        const edited = payload.values[desc.name === 'image.resize' ? 'resize' : 'convert']?.[spec.id];
+        const value = edited ?? spec.default;
+        if (value) runParams[spec.id] = value;
+      }
+    }
+    console.log(`   运行参数（含默认值）：${JSON.stringify(runParams)}`);
+
+    const sub = await client.invoke('plugins_run', {
+      req: { pluginId: CANVAS_ID, inputs: { src: [src] }, params: runParams, outputDir: join(work, 'out') },
+    });
+    const job = await client.waitJob(sub.jobId, 180, 1000);
+    console.log(`   运行画布产物：${job.status}${job.error ? ` — ${job.error.code}: ${job.error.message}` : ''}`);
+    c.check(job.status === 'succeeded', '★ ⑥ 画布导出的插件真的能跑（不是"导出成功但一跑就崩"）', job.status);
+
+    const outDir = join(work, 'out');
+    const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+    const webpName = produced.find((f) => f.toLowerCase().endsWith('.webp'));
+    if (webpName) {
+      const buf = readFileSync(join(outDir, webpName));
+      c.check(
+        buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP',
+        '★ ⑦ 产出是真的 WebP',
+        `${webpName}：${buf.subarray(0, 12).toString('latin1')}`
+      );
+      const info = webpInfo(buf);
+      c.check(
+        info?.width === 400,
+        '★ ⑧ 画布上设的参数（宽 400）真的生效了',
+        info ? `${info.width}x${info.height}` : '(读不出尺寸)'
+      );
+    } else {
+      c.check(false, '★ ⑦ 画布产物产出了 WebP', produced.join(', ') || '(输出目录为空)');
+    }
+
+    // ---- 反证：成环的画布必须被前端拦下（后端也会拦，但用户不该等到那时才知道）----
+    const cyclic = await buildCanvasYaml({
+      ...payload,
+      edges: [
+        { source: 'resize', target: 'convert', sourceHandle: 'dst', targetHandle: 'src' },
+        { source: 'convert', target: 'resize', sourceHandle: 'dst', targetHandle: 'src' },
+      ],
+    });
+    c.check(
+      cyclic.errors.some((e) => e.includes('环')),
+      '⑨ 成环的画布在前端就被拦下（不是等后端校验才报）',
+      cyclic.errors.join('；') || '(没有报错)'
+    );
+
+    // ---- 反证：空画布不能导出 ----
+    const empty = await buildCanvasYaml({ ...payload, nodeIds: [], descriptors: [], edges: [], values: {} });
+    c.check(
+      empty.errors.length > 0 && empty.yaml === '',
+      '⑩ 空画布导出被拒绝（不产出半份 YAML）',
+      empty.errors.join('；')
+    );
+
+    // ---- 反证：两个节点都产出 `dst` 时，端口 id 不能撞车 ----
+    //
+    // 所有图像节点的输出端口都叫 `dst`，所以"两个互不相连的节点"是**很常见**的画布。
+    // 原来直接拿节点的端口 id 当插件输出端口 id，于是两个步骤会写到**同一个文件**上，
+    // 后一个静默覆盖前一个 —— 产出一个文件、用户以为两个都在。
+    const collide = await buildCanvasYaml({
+      ...payload,
+      nodeIds: ['a', 'b'],
+      descriptors: [byName.get('image.resize'), byName.get('image.convert')],
+      edges: [],
+      values: {
+        a: { width: { kind: 'int', value: 200 } },
+        b: { format: { kind: 'str', value: 'webp' } },
+      },
+    });
+    const outIds = (() => {
+      // 只取 `outputs:` 那一段里的 `- id:`（`inputs:` 与 `params:` 也有 id，别混进来）
+      const start = collide.yaml.indexOf('\n  outputs:');
+      const end = collide.yaml.indexOf('\n  params:', start);
+      const block = start >= 0 && end > start ? collide.yaml.slice(start, end) : '';
+      return [...block.matchAll(/- id: "([^"]+)"/g)].map((m) => m[1]);
+    })();
+    const boundPaths = [...collide.yaml.matchAll(/dst: "\$\{output\.([^}]+)\}"/g)].map((m) => m[1]);
+    console.log(`   撞车画布：输出端口=${JSON.stringify(outIds)} 绑定的路径=${JSON.stringify(boundPaths)}`);
+    c.check(
+      new Set(boundPaths).size === boundPaths.length && boundPaths.length === 2,
+      '★ ⑪ 两个节点都叫 `dst` 时，绑定到**两个不同的**输出路径（不会互相覆盖）',
+      JSON.stringify(boundPaths)
+    );
+    c.check(
+      outIds.length === 2,
+      '⑫ 插件声明了两个输出端口（用户能看到两份产出）',
+      JSON.stringify(outIds)
+    );
+
+    // ---- 顺带：两个纯函数的边界 ----
+    console.log(`   插件 id 工具：suggest=${built.ids.suggest} valid(canvas)=${built.ids.validOk} valid(带空格大写)=${built.ids.validBad}`);
+    c.check(
+      built.ids.validOk === true && built.ids.validBad === false,
+      '⑪ `isValidPluginId` 认可合法 id、拒绝带空格与大写的 id',
+      `${built.ids.validOk} / ${built.ids.validBad}`
+    );
+    c.check(
+      typeof built.ids.suggest === 'string' && /^[a-z0-9.\-_]+$/.test(built.ids.suggest),
+      '⑫ `suggestPluginId` 从中文名生成的是合法 id（小写、无空格）',
+      built.ids.suggest
+    );
+
+    // 收尾
+    await client.invoke('plugins_set_enabled', { pluginId: CANVAS_ID, enabled: false }).catch(() => {});
+    await client.invoke('plugins_uninstall', { pluginId: CANVAS_ID }).catch(() => {});
+    const left = await client.invoke('plugins_get', { pluginId: CANVAS_ID }).catch(() => null);
+    c.check(!left, '⑬ 画布验证产生的插件已卸载干净', left ? '还在' : '已卸载');
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

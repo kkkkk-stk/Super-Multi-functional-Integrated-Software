@@ -21,9 +21,26 @@
  * 1. `with` 里只放**结构性的路径绑定**：`src` / `dst` / `path` 之类；
  *    节点的可调参数由执行器从插件自己的 `io.params` 里按**同名 id** 读取，
  *    写进 `with` 反而无效 —— 所以参数统一进 `io.params`（按 id 去重）。
- * 2. `${src}` = 本次任务的第一个输入文件；`${output.<端口id>}` = 宿主分配的输出路径；
- *    `${steps.<步骤id>.<键>}` = 前序步骤产出的值。
- * 3. 步骤顺序由数组顺序决定，`dependsOn` 表示画布上的连线（DAG 校验由后端再做一遍）。
+ * 2. `${src}` = 本次任务的第一个输入文件；`${output.<端口id>}` = 宿主分配的输出路径。
+ * 3. **多步文件接力靠 `${output.<端口id>}` 传路径，不能用 `${steps.<id>.<端口>}`。**
+ *    这条是 `docs/PLUGIN-SDK.md` §3.4 明写的：文件类产出只进
+ *    `NodeOutput.outputs`（任务产出列表），**不进 `values`**，而
+ *    `${steps.<id>.<key>}` 只能引用后者。所以每个节点都要有自己的输出端口，
+ *    下游读的是**上游写的那条路径**。
+ *    > 本文件此前写的是 `${steps.<上游>.<端口>}`，于是**任何多节点的画布导出的插件
+ *    > 都跑不起来**（`模板变量 ${steps.resize.dst} 无法解析`）—— 而类型检查、
+ *    > 单元测试、后端清单校验全都过得去。是 `verify-platform.mjs`【22】
+ *    > 把前端产物真跑一遍才发现的。
+ * 4. 步骤顺序由数组顺序决定，`dependsOn` 表示画布上的连线（DAG 校验由后端再做一遍）。
+ *
+ * ## 输出端口命名的两条规矩（都由后端行为倒推出来的）
+ *
+ * * **末端端口优先拿到 `dst` 这个名字**：`build_io` 只对端口 id 恰好是 `dst` 的
+ *   输出套用 `params.format`（其余按端口 `accept` 或源扩展名命名），而"转换类"
+ *   节点是**按输出扩展名**选编码器的（vips/magick 后端）。先到先得的话，
+ *   中间步骤会占掉 `dst`，用户在画布上选的 WebP 就会被静默降级成 PNG。
+ * * **其余端口按出现顺序去重**（`<节点id>_<端口id>`）：所有图像节点的输出端口都叫
+ *   `dst`，不去重就会有两个步骤写到同一个文件上、后者静默覆盖前者。
  *
  * ## 输出格式
  *
@@ -141,9 +158,88 @@ export function buildPluginYaml(
   }
 
   // ---------------------------------------------------------------- 步骤与端口绑定
-  // 记录"哪些出口已经被连线消费"，只有**完全没被消费**的输出端口才当作流水线产出
+  //
+  // ⚠️ 这一段的规则是照着 **`docs/PLUGIN-SDK.md` §3.4 结尾那句话**写的：
+  //
+  //   > 想做"多步文件接力"，正确做法是给插件声明两个输出端口，用
+  //   > `${output.frame}` / `${output.dst}` 传路径，**而不是指望 `${steps.frame.dst}`**。
+  //
+  // 而这里原来恰恰写的就是 `${steps.<上游>.<端口>}` —— 于是**任何多节点的画布
+  // 导出的插件一跑就报** `模板变量 ${steps.resize.dst} 无法解析`。
+  // 原因在后端：文件类产出只进 `NodeOutput.outputs`（任务产出列表），**不进
+  // `NodeOutput.values`**（`${steps.<id>.<key>}` 只能引用后者），所以文件路径
+  // 根本没有一个 `steps.*` 键可以引用。这不是缺陷，是设计 —— 文档写得很清楚，
+  // 是**画布导出这一侧没有照着文档写**。
+  //
+  // 同时修掉另一处：**每一个输出端口都要有路径绑定**，被连线消费的也不例外。
+  // 节点执行器是从 `with` 里取输出路径的（`nodes.rs` 的 `arg(args, "dst")?`），
+  // 没绑定就报 `节点缺少必需参数 dst`。
+  //
+  // 第三处：**输出端口 id 会撞车**。原来直接拿节点的端口 id 当插件输出端口 id，
+  // 而"两个节点都叫 `dst`"是常态（所有图像节点都如此）—— 两个步骤会写到**同一个
+  // 文件**上，后一个静默覆盖前一个。现在按出现顺序去重：第一个用原 id，
+  // 后面重复的用 `<节点id>_<端口id>`。
+  //
+  // 这三条都是 `verify-platform.mjs`【22】把前端产物**真跑一遍**才发现的：
+  // 类型检查、单元测试、后端的清单校验全都过得去（清单在语法与声明层面完全合法），
+  // 错的是"清单与执行器/文档的约定"。
+  // 先给**所有**节点的输出端口分配 id —— 连线要用到上游的 id，
+  // 所以这一步必须排在生成步骤之前（不能边生成边分配）。
+  //
+  // ⚠️ **分配顺序有讲究：末端端口优先拿到 `dst` 这个名字。**
+  // 后端的 `build_io` 有一条规则：`params.format` 只作用于**端口 id 恰好是 `dst`**
+  // 的那个输出（见 `commands.rs` 的 `ext` 优先级表），其余端口按端口自己的
+  // `accept` 或源扩展名命名。而"转换类"节点正是靠 `format` 决定输出格式的
+  // （`image.convert` 的 vips/magick 后端是**按输出文件扩展名**选编码器的）。
+  //
+  // 于是：如果先到先得，第一个节点（通常是中间步骤）会占掉 `dst`，
+  // 末端端口被改名成 `convert_dst` —— 结果 `format: webp` 被忽略，
+  // 用户拿到一个**扩展名是 .png、内容也是 PNG** 的文件，而他在画布上明明选了 WebP。
+  // 这个"静默降级成别的格式"是 `verify-platform.mjs`【22】真跑一遍才暴露出来的。
   const consumedOutputs = new Set(edges.map((e) => `${e.source}:${e.sourceHandle ?? "out"}`));
   const terminalOutputs = new Map<string, { label: string; type: string }>();
+  const usedOutputIds = new Set<string>();
+
+  /** 给一个输出端口分配**全局唯一**的插件输出端口 id */
+  const uniqueOutputId = (nodeId: string, portId: string): string => {
+    if (!usedOutputIds.has(portId)) {
+      usedOutputIds.add(portId);
+      return portId;
+    }
+    let candidate = `${nodeId}_${portId}`;
+    let n = 2;
+    while (usedOutputIds.has(candidate)) {
+      candidate = `${nodeId}_${portId}_${n++}`;
+    }
+    usedOutputIds.add(candidate);
+    return candidate;
+  };
+
+  /** 输出端口按"末端优先"排序：末端端口先拿名字（见上面的说明） */
+  const portsInPriorityOrder = [
+    ...nodes.flatMap((node) =>
+      node.data.outputs
+        .filter((port) => !consumedOutputs.has(`${node.id}:${port.id}`))
+        .map((port) => ({ node, port }))
+    ),
+    ...nodes.flatMap((node) =>
+      node.data.outputs
+        .filter((port) => consumedOutputs.has(`${node.id}:${port.id}`))
+        .map((port) => ({ node, port }))
+    ),
+  ];
+
+  const outputIdOf = new Map<string, string>();
+  for (const { node, port } of portsInPriorityOrder) {
+    const outId = uniqueOutputId(node.id, port.id);
+    outputIdOf.set(`${node.id}:${port.id}`, outId);
+    terminalOutputs.set(outId, {
+      label: consumedOutputs.has(`${node.id}:${port.id}`)
+        ? `中间产物：${port.label}（${node.data.label}）`
+        : port.label,
+      type: port.type,
+    });
+  }
 
   interface StepOut {
     id: string;
@@ -158,7 +254,7 @@ export function buildPluginYaml(
     const withBindings: Record<string, string> = {};
     const dependsOn: string[] = [];
 
-    // 基于连线推导顺序与取值
+    // 连线 → **传路径**（不是传 `${steps.*}`，见上面那段说明）
     for (const edge of edges) {
       if (edge.target !== node.id) continue;
       const source = nodes.find((n) => n.id === edge.source);
@@ -166,7 +262,9 @@ export function buildPluginYaml(
       if (!dependsOn.includes(source.id)) dependsOn.push(source.id);
       const sourcePort = edge.sourceHandle ?? "out";
       const targetPort = edge.targetHandle ?? node.data.inputs[0]?.id ?? "src";
-      withBindings[targetPort] = `\${steps.${source.id}.${sourcePort}}`;
+      const upstreamOutId = outputIdOf.get(`${edge.source}:${sourcePort}`);
+      if (!upstreamOutId) continue; // 连到了一个不存在的端口：交给 dependsOn 与后端校验去报
+      withBindings[targetPort] = `\${output.${upstreamOutId}}`;
     }
 
     // 未连接的输入端口：文件类绑到 ${src}（第一个输入文件）
@@ -177,13 +275,12 @@ export function buildPluginYaml(
       }
     }
 
-    // 未被连线消费的输出端口：视为流水线产出，绑到 ${output.<端口id>}
+    // 输出端口：**全部**绑定自己的路径（中间产物也要有）
     for (const port of node.data.outputs) {
-      if (consumedOutputs.has(`${node.id}:${port.id}`)) continue;
-      withBindings[port.id] = `\${output.${port.id}}`;
-      if (!terminalOutputs.has(port.id)) {
-        terminalOutputs.set(port.id, { label: port.label, type: port.type });
-      }
+      if (withBindings[port.id]) continue;
+      const outId = outputIdOf.get(`${node.id}:${port.id}`);
+      if (!outId) continue;
+      withBindings[port.id] = `\${output.${outId}}`;
     }
 
     return {
