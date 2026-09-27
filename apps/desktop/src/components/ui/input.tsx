@@ -36,7 +36,10 @@ export const Label = React.forwardRef<
   HTMLLabelElement,
   React.LabelHTMLAttributes<HTMLLabelElement>
 >(({ className, ...props }, ref) => (
-  // eslint-disable-next-line jsx-a11y/label-has-associated-control
+  // 这是一个**通用**的 Label 包装（`{...props}` 原样透传），它既不知道调用方会不会给
+  // `htmlFor`，也不知道旁边会不会放控件 —— "标签有没有关联控件"是**调用方**的责任，
+  // 在这里判定必然是误报。所以留一条带理由的禁用（规则对其它地方的 `<label>` 照旧生效）。
+  // eslint-disable-next-line jsx-a11y/label-has-associated-control -- 通用包装组件，关联关系由调用方决定
   <label
     ref={ref}
     className={cn("text-sm font-medium leading-none text-foreground", className)}

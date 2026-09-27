@@ -276,7 +276,13 @@ export function CommandPalette() {
                 <div className="flex items-center gap-2 border-b border-border/60 px-4">
                   <CommandIcon className="h-4 w-4 text-muted-foreground" />
                   <input
-                    // 面板打开后自动聚焦，键盘用户不需要再点一下
+                    // 面板打开后自动聚焦，键盘用户不需要再点一下。
+                    //
+                    // `no-autofocus` 的用意是"别在**页面加载**时抢焦点"（那确实会打乱读屏与
+                    // 键盘用户的起点）。这里是**用户主动按快捷键打开的命令面板**，
+                    // 焦点本来就该落在搜索框上 —— 不给 autoFocus 反而要多按一次 Tab。
+                    // 所以按规则留一条**带理由**的禁用，而不是全局关掉这条规则。
+                    // eslint-disable-next-line jsx-a11y/no-autofocus -- 见上：用户主动打开的面板，焦点落在搜索框是期望行为
                     autoFocus
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}

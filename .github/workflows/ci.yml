@@ -135,6 +135,13 @@ jobs:
       - name: 类型检查
         run: pnpm typecheck
 
+      - name: ESLint
+        # 这一步此前**跑不了**：`pnpm lint` 是个空壳（"未安装 ESLint（可选依赖），
+        # 本次回退为 tsc --noEmit"），而验收表里却写着"前端质量：typecheck + lint" ——
+        # 又一条永远不会失败的验收标准。现在 ESLint 真的装了、真的在跑，
+        # 21 处它提出来的问题也都处理完了（见 docs/ROADMAP.md §3.22）。
+        run: pnpm lint
+
       - name: 构建前端
         run: pnpm build
 

@@ -1173,7 +1173,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 脚本编码 | `pnpm check:encodings` | ✅ 退出码 0（§3.13 新增） |
 | 真机验收 | `node scripts/devtools/verify-platform.mjs` | ✅ **345 项全通过**（【0】+【1】–【30】） |
 | 真机验收（**全部六个脚本**） | `node scripts/devtools/run.mjs` | ✅ **六个脚本全部 exit=0**（inspect / smoke / e2e / verify / verify-platform / verify-runtimes，见 §3.18） |
-| 前端质量 | `pnpm typecheck`、`pnpm lint` | ⚠️ `typecheck` ✅；**`pnpm lint` 是个空壳**：它写着"未安装 ESLint（可选依赖），本次回退为 `tsc --noEmit`"，所以**它提供不了任何 `tsc` 之外的检查**（`react-hooks/exhaustive-deps`、`no-explicit-any`、`no-unused-vars` 一条都没在跑）。⚠️ 但要说清：**这是当初刻意的取舍，不是漏做** —— `apps/desktop/.eslintrc.cjs` 开头就写着"本仓库刻意不把 ESLint 装进依赖清单"，并在注释里给了**确切的安装命令**（eslint@8 + @typescript-eslint 7 + react-hooks 4 + react-refresh 0.4）与规则集，连启用时要改成哪条脚本都写了。所以这一行的问题**只在于"验收表里写着它、它却不提供那个保障"**，现已直说。要不要真的启用（会动 `pnpm-lock.yaml`，且第一次跑多半有一批存量告警要清）仍是个**待你拍板**的决定 |
+| 前端质量 | `pnpm typecheck`、`pnpm lint` | ✅ 两条都是真的了：`typecheck` = `tsc --noEmit`；`lint` = **ESLint 8 + TS/React Hooks/jsx-a11y 规则集，`--max-warnings 0`**（§3.22 之前它是回退成 `tsc` 的空壳，见下） |
 | 格式 | `cargo fmt --all --check`（= `pnpm check:fmt`） | ✅ **零格式差异**（§3.20 完成全仓重排并把这一步接进 CI） |
 
 > 这一节的价值不在"跑一遍"，而在于**把"文档里写着"与"真的跑过"分开**：
@@ -1426,6 +1426,40 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 
 > 这一步把 §3.15 那次事故的最后一块拼上了：现在"发现坏文件"（`verify`）与"清掉它让下次重新下载"
 > （`clean`）各有一条命令，而且**默认都不会动用户的东西**。
+
+### 3.22 真的启用 ESLint：`pnpm lint` 从空壳变成检查（顺带修掉 21 处 a11y / 类型问题）
+
+**背景**（§3.16 记过）：`package.json` 的 `lint` 脚本写着"未安装 ESLint（可选依赖），本次回退为
+`tsc --noEmit`" —— 也就是说 `pnpm lint` **提供不了任何 `tsc` 之外的检查**，
+而验收表里却写着"前端质量：typecheck + lint"。与 §3.20 的 `cargo fmt --check` 同一种病：
+**一条永远不会失败的验收标准**。两条现在都变成真的了。
+
+**做法**：按 `apps/desktop/.eslintrc.cjs` 头部原本就写好的那条命令装依赖
+（eslint@8 + @typescript-eslint 7 + react-hooks 4 + react-refresh 0.4），**外加 jsx-a11y**
+（见下），然后把 `lint` 改成 `eslint src --ext .ts,.tsx --max-warnings 0`，
+并把 `pnpm lint` 接进 `check:web` 与 CI 的 web job。
+
+**第一次跑出来的 21 处问题，逐条处理**（都用真机跑出来，不是"应该没有"）：
+
+| 问题 | 数量 | 处理 | 为什么这么处理 |
+|---|---|---|---|
+| `no-explicit-any` | 1 | **忽略生成物**：`.eslintrc.cjs` 的 `ignorePatterns` 加 `src/bindings.ts` | 那个文件由 `pnpm bindings` 从 Rust 类型生成（文件头就写着 Do not edit），里面的 `any` 是第三方类型不兼容时的兜底 —— **手改会被下一次导出覆盖**，对生成物只能是忽略 |
+| `label-has-associated-control` | 10 | **改配置**：`controlComponents` 列出自家控件组件 + `assert: "either"` + `depth: 3` | 规则默认只认原生 `input/select/textarea`，而本项目的勾选框是 Radix 的 `button[role=checkbox]`；标签文字又在第三层 `<span>` 里。修完这 10 条**全是误报**（不是代码问题），而规则本身留在 error 级继续管其它 `<label>` |
+| `no-redundant-roles`（`role="list"` 写在 `<ul>` 上） | 8 | **改配置**：`{ ul: ["list"] }` 放行这一种 | 这**不是冗余**：Tailwind preflight 给 `ul, ol` 设了 `list-style: none`，而 WebKit 在这时会丢掉隐式 list 语义，读屏用户不再被告知"这是一个列表"。显式写回是标准补丁 |
+| `no-noninteractive-tabindex` | 2 | **改配置**：`{ roles: ["region", "list"] }` | 可滚动区域（日志列表、代码块）里没有可聚焦子元素，不给 `tabIndex={0}` 的话**纯键盘用户根本滚不动它**（WCAG 2.1.1）。按**角色**放行而不是就地 disable —— 别处把 tabIndex 加到不可交互元素上仍会报错 |
+| `no-autofocus` | 1 | **就地禁用 + 写清理由**（命令面板的搜索框） | 规则的用意是"别在页面加载时抢焦点"；而这是**用户主动按快捷键打开的面板**，焦点落在搜索框正是期望行为 |
+
+**结果**：`pnpm lint` → **0 error / 0 warning**（`--max-warnings 0`，所以它真的能红）。
+
+> 顺带说明两件**没有**混在一起做的事：
+> * **没有**为了让它变绿而关掉规则再假装通过 —— 三处配置改动各自带了理由（生成物、控件组件、
+>   Tailwind+WebKit 的 list 语义、可滚动区域的键盘可达性），只有 1 处是就地禁用；
+> * **没有**顺便升级到 ESLint 9 的 flat config。那份配置是 legacy 格式，升级要重写配置并确认各插件
+>   新版本兼容，是一次**独立的**改动；把它和"让 lint 真的跑起来"捆在一起，出问题就分不清是谁的锅。
+>   这一条记在 `.eslintrc.cjs` 头部，留给下一次。
+
+实测：`pnpm lint` 退出码 0；`pnpm check:web`（typecheck → lint → build）退出码 0；
+`node scripts/devtools/run.mjs` 六个脚本 exit=0。
 
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
