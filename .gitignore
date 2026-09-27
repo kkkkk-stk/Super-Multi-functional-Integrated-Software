@@ -40,6 +40,15 @@ plugins/**/.venv/
 .tools/
 .cache/
 
+# `pnpm icons` 的移动端产物。本项目是**桌面**应用 —— `bundle.targets = "all"`
+# 指的是 Windows / macOS / Linux 三套**桌面**打包，不含 android / ios，
+# 这两棵树没有任何构建会去读。它们仍会被 `pnpm icons` 照常生成，只是不入库：
+# 入库只会让仓库凭空多出几十个永远用不到的 PNG。
+# 桌面真正要用的那几个（32x32 / 128x128 / 128x128@2x / icon.ico / icon.icns /
+# StoreLogo / Square*Logo）**是入库的**，见 `tauri.conf.json` 的 `bundle.icon`。
+/apps/desktop/src-tauri/icons/android/
+/apps/desktop/src-tauri/icons/ios/
+
 # 前端自动生成的 TS 绑定**要入库**（见 .gitignore 末尾说明），此处不忽略
 # apps/desktop/src/bindings.ts
 
