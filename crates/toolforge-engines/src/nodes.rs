@@ -3560,6 +3560,21 @@ fn file_url(p: &Path) -> String {
     s
 }
 
+/// `keepStructure` → 7-Zip 的解压命令。
+///
+/// * `x` —— eXtract with full paths（保留压缩包里的目录结构）
+/// * `e` —— Extract flat（平铺：所有文件直接落在目标目录下）
+///
+/// 抽成一个纯函数是为了能直接断言这个映射 —— `archive.unpack` 整体要 7-Zip 引擎
+/// 才能跑，而"参数值 ↔ 命令字母"这一层不需要引擎，也不该等着引擎才能验。
+fn sevenzip_extract_command(keep_structure: bool) -> &'static str {
+    if keep_structure {
+        "x"
+    } else {
+        "e"
+    }
+}
+
 fn sevenzip_args_for_format(format: &str) -> (&'static str, &'static str) {
     // (开关, 说明)
     match format {
@@ -3625,8 +3640,17 @@ async fn sevenzip_unpack(
         .map_err(|e| ToolforgeError::io(format!("创建解压目录失败：{e}")))?;
 
     let sevenzip = ctx.engine("7zip").await?;
+
+    // `keepStructure` 直接对应 7-Zip 的两个解压命令：
+    // * `x` —— 带完整路径解压（保留目录结构）
+    // * `e` —— 平铺解压，所有文件都直接落在目标目录下
+    //
+    // 这个参数**此前是装饰品**：声明里有、默认 `true`、界面上有开关，
+    // 而执行器硬编码了 `x`，所以关掉它一点效果都没有
+    // （被 `toolforge-engines` 的静态自省测试 `declared_node_params_are_actually_read_by_their_executor` 抓出来）。
+    let keep_structure = ctx.param_bool("keepStructure", true);
     let mut a = vec![
-        "x".to_string(),
+        sevenzip_extract_command(keep_structure).to_string(),
         src.display().to_string(),
         format!("-o{}", dst.display()),
         "-y".into(),
@@ -3926,6 +3950,30 @@ mod tests {
         assert_eq!(sevenzip_args_for_format("rar").0, "-tzip");
     }
 
+    /// `keepStructure` 真的会改变发给 7-Zip 的命令。
+    ///
+    /// 这条测试的存在本身是有意义的：这个参数**曾经是装饰品** ——
+    /// 声明里有、默认 true、界面上有开关，而执行器硬编码了 `x`。
+    /// 断言"两个取值给出不同的命令"就是"关掉它真的会不一样"的最小证据。
+    #[test]
+    fn sevenzip_unpack_honours_keep_structure() {
+        assert_eq!(
+            sevenzip_extract_command(true),
+            "x",
+            "默认必须是保留目录结构"
+        );
+        assert_eq!(
+            sevenzip_extract_command(false),
+            "e",
+            "关掉它必须换成平铺解压"
+        );
+        assert_ne!(
+            sevenzip_extract_command(true),
+            sevenzip_extract_command(false),
+            "★ 反证：两个取值给出同一个命令的话，这个开关就是个装饰品"
+        );
+    }
+
     /// `-env:UserInstallation` 的 URL 里**不能出现反斜杠**。
     ///
     /// 这条测试守着一个"沉默的挂起"：LibreOffice 收到
@@ -4031,6 +4079,330 @@ mod tests {
                 err.map(|e| e.message)
             );
         }
+    }
+
+    // ========================================================================
+    // 静态自省守卫：节点**声明**的参数，到底有没有人**读**
+    //
+    // 这一条是被一个真实的、活了很久的缺陷逼出来的：`image.rotate` 声明了
+    // `autoOrient`（默认 true、界面上是个默认打开的开关），而执行器里
+    // **一行都没读它** —— 手机竖拍的照片出来是躺着的，开关却显示"已开启"。
+    //
+    // 为什么此前没有任何东西能发现它：
+    // * `validate_param_reachability` 的输入是**插件清单**（`PluginManifest::io`），
+    //   管的是"插件声明的参数能不能到达 `with`"——它看不见**内置节点自己**的参数；
+    // * 节点目录（`builtin_nodes()`）与执行器（本文件）之间**没有任何对账**。
+    //
+    // 于是这里做一次**静态自省**：`include_str!` 把本文件读进测试，
+    // 从 `nodes::run` 的分发表找到每个节点的处理函数，扫出它读了哪些参数键，
+    // 再与 `builtin_nodes()` 声明的参数逐条对账。两个方向都查：
+    // * **声明了没人读** → 界面上是个装饰品；
+    // * **读了没声明** → 用户根本设不了它，只有硬编码的默认值生效。
+    // ========================================================================
+
+    /// "参数被读了"在源码里的写法：**字面量键**的这几种调用形态。
+    ///
+    /// ⚠️ **键名来自变量的读法扫不到**（例如 `arg(args, key)`）。这是这条守卫
+    /// **明说的假阴性** —— 判据宁可窄，也不能靠"猜"去误报：一次误报就会让整条
+    /// 检查被当成噪音关掉，那时连假阴性都没有了（同 `validate_param_reachability` 的取舍）。
+    const PARAM_READ_FORMS: &[&str] = &[
+        "param_str(\"",
+        "param_i64(\"",
+        "param_f64(\"",
+        "param_bool(\"",
+        "arg(args, \"",
+        "arg_i64(args, \"",
+        "arg_bool(args, \"",
+        "arg_opt(args, \"",
+    ];
+
+    /// 被**宿主**读走的参数：节点自己不读，但它确实有用，所以不该从声明里删掉。
+    ///
+    /// 目前只有 `format` 一种情况 —— 输出文件名由 `commands.rs::build_io` 按
+    /// `params.format` 定扩展名，于是"转成什么容器/格式"是**通过输出扩展名**生效的。
+    /// 节点不读它、也不该读它（`ffmpeg_transcode` 里那段注释解释了为什么）。
+    ///
+    /// 之所以列成一张表而不是"把判据放宽"，是为了让**每一个例外都必须写理由**：
+    /// 放宽判据等于悄悄放过一整类缺陷，列成表则下次有人想加例外时，
+    /// 那个空着的理由栏会挡他一下。
+    const HOST_CONSUMED_PARAMS: &[(&str, &str, &str)] = &[
+        (
+            "video.transcode",
+            "format",
+            "容器由输出扩展名决定，扩展名由宿主按 params.format 分配；节点无法也不该再读一个容器参数",
+        ),
+        (
+            "video.thumbnail",
+            "format",
+            "同上：封面图的格式由输出扩展名决定",
+        ),
+        (
+            "ebook.convert",
+            "format",
+            "同上：目标格式由输出扩展名决定，节点自己读的是 dst 的扩展名",
+        ),
+    ];
+
+    /// 端口名（不是参数）：`src` / `dst` / `path` 这些由 `io.inputs` / `io.outputs`
+    /// 声明，走 `arg(args, …)` 读，出现在"读了的键"里是正常的。
+    const PORT_KEYS: &[&str] = &["src", "dst", "path", "ext"];
+
+    /// 本文件的非测试部分（静态自省的全部输入）
+    fn source_before_tests() -> &'static str {
+        let src = include_str!("nodes.rs");
+        match src.find("\nmod tests {") {
+            Some(i) => &src[..i],
+            None => panic!("扫不到 `mod tests`：静态自省的前提变了，先修扫描器再谈结论"),
+        }
+    }
+
+    /// 字符字面量（`'x'` / `'\n'` / `'\''`）的长度，用来在扫描时整段跳过。
+    ///
+    /// ⚠️ **这一段不是可选的**：`name_build` 里有一句
+    /// `matches!(c, '\\' | '/' | … | '"' | …)` —— 那个**字符**字面量里包着一个
+    /// 双引号。不识别字符字面量的话，扫描器会把它当成**字符串的开头**，
+    /// 从此以后的括号配平全错，表现为"找不到函数体"，
+    /// 而真正的原因（一个字符字面量）离现场十万八千里。（第一版就是这么挂的。）
+    ///
+    /// 判据必须排除**生命周期**（`&'a str`、`<'a, 'b>`）：它们同样是撇号开头，
+    /// 但后面没有闭合撇号。所以要求"闭合撇号就在近处，中间是单个字符或一个转义序列"，
+    /// 外加一条便宜的快速否定（ASCII 字母后面紧跟的不是撇号 ⇒ 这是生命周期）。
+    fn char_literal_len(bytes: &[u8], i: usize) -> Option<usize> {
+        if bytes.get(i) != Some(&b'\'') {
+            return None;
+        }
+        // 转义序列：'\n' / '\\' / '\'' / '\u{7f}'
+        if bytes.get(i + 1) == Some(&b'\\') {
+            for len in 3..=12 {
+                match bytes.get(i + len) {
+                    Some(&b'\'') => return Some(len + 1),
+                    Some(_) => {}
+                    None => return None,
+                }
+            }
+            return None;
+        }
+        // 快速否定生命周期：'a 后面不是撇号
+        if bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphanumeric())
+            && bytes.get(i + 2) != Some(&b'\'')
+        {
+            return None;
+        }
+        let rest = std::str::from_utf8(&bytes[i + 1..]).ok()?;
+        let c = rest.chars().next()?;
+        let after = 1 + c.len_utf8();
+        (bytes.get(i + after) == Some(&b'\'')).then_some(after + 1)
+    }
+
+    /// 取一个顶层函数的函数体，按大括号配平；跳过字符串字面量、字符字面量与行注释。
+    ///
+    /// **只认"行首就是定义"的那一处 `fn`**：文档注释里提到 `` `fn foo(…)` `` 时
+    /// 那个 `fn` 前面不是行首（前面还有注释文字），因此不会被当成定义。
+    /// 这一点很重要 —— 认错函数体会让这条守卫**静默地**看错东西
+    /// （要么放过去，要么乱报），而这比不检查更糟。
+    fn fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        // 允许的"行首前缀"：函数定义前面只能有这些修饰词
+        const PREFIXES: &[&str] = &[
+            "",
+            "pub ",
+            "async ",
+            "pub async ",
+            "pub(crate) ",
+            "pub(crate) async ",
+        ];
+        let needle = format!("fn {name}(");
+        let mut from = 0;
+        let start = loop {
+            let at = from + src[from..].find(&needle)?;
+            let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            if PREFIXES.contains(&src[line_start..at].trim_start().to_owned().as_str()) {
+                break at;
+            }
+            from = at + needle.len();
+        };
+        let open = start + src[start..].find('{')?;
+        let bytes = src.as_bytes();
+        let (mut depth, mut i, mut in_str) = (0usize, open, false);
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_str {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'"' => in_str = true,
+                b'\'' => {
+                    if let Some(n) = char_literal_len(bytes, i) {
+                        i += n;
+                        continue;
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&src[open..=i]);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// 扫出函数体里读了哪些参数键（只认 [`PARAM_READ_FORMS`] 那几种字面量写法）
+    fn read_keys(body: &str) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for form in PARAM_READ_FORMS {
+            let mut from = 0;
+            while let Some(rel) = body[from..].find(form) {
+                let at = from + rel + form.len();
+                match body[at..].find('"') {
+                    Some(end) => {
+                        out.insert(body[at..at + end].to_string());
+                        from = at + end + 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        out
+    }
+
+    /// 函数体里出现的 `ident(` 形态的名字（用来找一跳之内的本地辅助函数）
+    fn called_names(body: &str) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let bytes = body.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                let s = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                if bytes.get(i) == Some(&b'(') {
+                    out.insert(body[s..i].to_string());
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn declared_node_params_are_actually_read_by_their_executor() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let src = source_before_tests();
+        let run_body = fn_body(src, "run").expect("找不到 nodes::run 的函数体");
+
+        // ---- 分发表：`"node.name" => handler(ctx, args).await,` ----
+        let mut dispatch: BTreeMap<String, String> = BTreeMap::new();
+        for line in run_body.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix('"') else {
+                continue;
+            };
+            let Some((name, after)) = rest.split_once("\" => ") else {
+                continue;
+            };
+            let handler: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !handler.is_empty() {
+                dispatch.insert(name.to_string(), handler);
+            }
+        }
+
+        let nodes = toolforge_core::pipeline::builtin_nodes();
+        // 扫描器自检：一个都没扫到、或者与节点数对不上，说明是**扫描器坏了**，
+        // 而不是"节点都合规"。少了这一条，扫描器一旦失效，这条测试会一路绿。
+        assert_eq!(
+            dispatch.len(),
+            nodes.len(),
+            "分发表扫出 {} 个节点，节点目录有 {} 个 —— 扫描器或分发表出问题了",
+            dispatch.len(),
+            nodes.len()
+        );
+
+        let mut unread: Vec<String> = Vec::new();
+        let mut undeclared: Vec<String> = Vec::new();
+
+        for node in &nodes {
+            let handler = dispatch.get(&node.name).unwrap_or_else(|| {
+                panic!(
+                    "节点 `{}` 在 builtin_nodes() 里，却不在 nodes::run 的分发表里",
+                    node.name
+                )
+            });
+            let body = fn_body(src, handler).unwrap_or_else(|| {
+                panic!("节点 `{}` 的处理函数 `{handler}` 找不到函数体", node.name)
+            });
+
+            // 自己读的 + 一跳之内调用的本地辅助函数读的
+            // （目前只有 `doc.ocr → rasterize_pdf(pdfDpi, pdfMaxPages)` 这一处）
+            let mut keys = read_keys(body);
+            for callee in called_names(body) {
+                if callee == *handler {
+                    continue;
+                }
+                if let Some(callee_body) = fn_body(src, &callee) {
+                    keys.extend(read_keys(callee_body));
+                }
+            }
+
+            let declared: BTreeSet<&str> = node.params.iter().map(|p| p.id.as_str()).collect();
+
+            for id in &declared {
+                if keys.contains(*id) {
+                    continue;
+                }
+                let excused = HOST_CONSUMED_PARAMS
+                    .iter()
+                    .any(|(n, p, _)| n == &node.name && p == id);
+                if !excused {
+                    unread.push(format!("{}.{id}", node.name));
+                }
+            }
+            for k in &keys {
+                if !declared.contains(k.as_str()) && !PORT_KEYS.contains(&k.as_str()) {
+                    undeclared.push(format!("{}.{k}", node.name));
+                }
+            }
+        }
+
+        assert!(
+            unread.is_empty(),
+            "这些参数**声明了却没有任何执行器读它** —— 界面上的控件是装饰品，\n\
+             用户改了不会有任何效果，任务还会照样「成功」。\n\
+             两种正确做法：① 真的实现它；② 从 `builtin_nodes()` 里删掉这个参数。\n\
+             如果是「宿主读走」的情况（目前只有 `format` 这一类），\n\
+             请加进 `HOST_CONSUMED_PARAMS` 并写清理由。\n\
+             问题参数：{unread:?}"
+        );
+        assert!(
+            undeclared.is_empty(),
+            "这些参数键**执行器在读、但节点目录里没声明** ——\n\
+             用户界面不会出现对应的控件，只有硬编码的默认值生效，用户无从修改。\n\
+             正确做法：在 `builtin_nodes()` 的 `params` 里补上它。\n\
+             问题参数：{undeclared:?}"
+        );
     }
 
     // ========================================================================

@@ -908,7 +908,17 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         optional_engines: vec![],
         inputs: vec![in_file("src", "源文件", &[])],
         outputs: vec![out_file("dst", "目标文件")],
-        params: vec![],
+        // `fs.move` 与 `fs.copy` 共用 `fs_copy` 这个执行器，而它一直在读 `overwrite`
+        // （`arg_bool(args, "overwrite", true)`）—— 只是 `fs.move` 从来没**声明**过它。
+        // 后果是反过来的那种不一致：`fs.move` 永远按 `true` 走（静默覆盖已存在的目标），
+        // 而用户既看不到这个开关、也没法关掉它。声明的意义是让默认值**可见且可改**。
+        params: vec![param(
+            "overwrite",
+            "覆盖已存在文件",
+            ParamType::Bool,
+            Some(true.into()),
+            false,
+        )],
     });
     n.push(NodeDescriptor {
         name: "fs.mkdir".into(),
@@ -930,18 +940,23 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "fs.delete".into(),
         label: "删除文件".into(),
-        description: "删除文件或空目录。**需要 fsWrite 权限**。".into(),
+        description: "删除文件或目录。**需要 fsWrite 权限**。\
+                      ⚠️ 这是**永久删除，不进回收站**。\
+                      这个节点此前声明了一个 `toTrash` 参数（`默认 true`，标签写着\
+                      「移到回收站而非永久删除」），而执行器里**一行都没读它** —— \
+                      实际走的一直是 `remove_file` / `remove_dir_all`。\
+                      也就是说界面在替一个**根本不存在**的安全网做承诺：\
+                      一个以为「删错了还能捞回来」的用户，文件是真的没了。\
+                      参数已删除、说法改成实话；真正的回收站支持记在 ROADMAP 待办里\
+                      （Windows `SHFileOperation` / macOS `NSFileManager` / Linux trash spec，\
+                      要引依赖且三个平台语义不同，不能只做一个平台）。"
+            .into(),
         category: NodeCategory::File,
         requires_engines: vec![],
         optional_engines: vec![],
         inputs: vec![in_file("src", "待删除", &[])],
         outputs: vec![],
-        params: param_many(&[(
-            "toTrash",
-            "移到回收站而非永久删除",
-            ParamType::Bool,
-            Some(true.into()),
-        )]),
+        params: vec![],
     });
 
     // ---------------- 图片 ----------------
@@ -1531,7 +1546,10 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "archive.unpack".into(),
         label: "解压".into(),
-        description: "自动识别格式解压。**内置 Zip Slip 防护**：拒绝解出到目标目录之外的条目。"
+        description: "自动识别格式解压。**内置 Zip Slip 防护**：拒绝解出到目标目录之外的条目。\
+                      `keepStructure`（默认 `true`）= 保留压缩包里的目录结构，对应 7-Zip 的 `x`；\
+                      关掉它改用 `e`（平铺解压，所有文件直接落在目标目录下），\
+                      适合「压缩包里套了一层目录、我只想要里面的文件」这种常见需求。"
             .into(),
         category: NodeCategory::Archive,
         requires_engines: vec![engine("7zip")],
@@ -1830,14 +1848,6 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     });
 
     n
-}
-
-/// 便捷：一次构造多个参数
-fn param_many(items: &[(&str, &str, ParamType, Option<ParamValueish>)]) -> Vec<ParamSpec> {
-    items
-        .iter()
-        .map(|(id, label, ty, def)| param(id, label, *ty, def.clone(), false))
-        .collect()
 }
 
 fn range_param(
