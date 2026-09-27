@@ -1343,6 +1343,27 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 > 而**只有 `verify-runtimes.mjs` 能证明 L2/L3 运行时确实还跑得起来**（它真的装 venv、
 > 真的跑 JSON-RPC、真的做 net 白名单对照实验）。
 
+### 3.19 `bindings.ts` 的**第二个写入者**：debug 应用一启动就会把新绑定覆盖回旧版本（本轮删掉）
+
+- **怎么发现的**：本轮改完 `ModelEntry::installed_size_mb` 的文档注释 → 跑 `pnpm bindings`
+  生成新版 → 提交 → **启动应用**（那个 exe 是改之前构建的）→ `git status` 又冒出一个
+  `bindings.ts` 改动，而且内容是**旧的**。
+- **机制**：`lib.rs::run()` 里有一段 `#[cfg(debug_assertions)]` 的代码，
+  用 `specta_builder()` 把绑定导出到 `apps/desktop/src/bindings.ts`。而生成的输入是
+  **编译进那个二进制里的类型** —— 于是跑一个**比源码旧的 debug 构建**（很常见：
+  只 `cargo check` 过没重新 `cargo build`，或者一边改 Rust 一边跑着上次构建的应用）时，
+  它会在启动阶段把**已经生成好的新绑定覆盖回旧版本**。
+- **为什么这次必须修**：这个文件是**入库的生成物**，CI 有一道专门的 job 从源码重新生成再比对
+  （`git diff --exit-code apps/desktop/src/bindings.ts`）。被旧二进制覆盖之后，那道 job 会红，
+  而人看到的现象只是"我明明导出过"。更糟的一种情形是反过来的：源码**没**改、二进制**改了**
+  （比如你手改了生成的类型又没同步回 Rust），前端会拿着与后端不一致的类型静默跑下去。
+- **修法**：删掉那段自动导出，**只留一个写入者** —— `cargo run -p toolforge --bin export-bindings`
+  （`pnpm bindings`），它从**源码**生成，并由 CI 的 drift job 守住"改了类型没重新生成"。
+  代价是改了 Rust 类型之后要多敲一条命令；比"生成物被旧二进制悄悄改写"划算得多。
+  文档同步改了 `docs/ARCHITECTURE.md` 里两处"两个生成入口"的说法（并在原文旁保留了这段历史）。
+- **验证**：改完重新构建、再跑 `pnpm bindings` 两次（内容稳定、`git status` 只剩源码那一个改动），
+  然后**启动应用** —— 这一次 `git status` 保持干净，说明启动过程**不再**碰这个文件了。
+
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
 - `crates/toolforge-core/src/engine.rs` 里为每个引擎与模型都提供了 `license`、`license_note`、`requires_license_ack`，并且有测试在守护这些字段非空。

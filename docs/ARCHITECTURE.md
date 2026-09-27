@@ -152,7 +152,9 @@ flowchart TD
 **图注**
 
 - **`apps/desktop/src`（React 前端）已落地**（93 个文件），「前端 → `invoke`」与「`listen` → 前端」两条边都已接通。唯一的纪律是：**只有 `lib/ipc.ts` 允许接触 `bindings` / `invoke`**，其它文件一律从它导入具名函数。
-- **`bindings.ts` 已生成并入库**（32 个命令）。两个生成入口：调试构建时 `lib.rs` 自动导出；无 GUI 环境用 `cargo run -p toolforge --bin export-bindings`（即 `pnpm bindings`）。CI 有一个专门的 job 校验它没有漂移。
+- **`bindings.ts` 已生成并入库**（32 个命令）。**只有一个生成入口**：`cargo run -p toolforge --bin export-bindings`（即 `pnpm bindings`）。
+  > ⚠️ 这里原先写着"两个生成入口：调试构建时 `lib.rs` 自动导出 + 上面那条命令"。**那个"自动导出"已经在 2026 年这一轮删掉了**：它的输入是**编译进那个二进制里的类型**，所以当你跑的是一个比源码旧的 debug 构建时，它会在启动时把**已经生成好的新绑定覆盖回旧版本** —— 实测踩到过（改完 Rust 文档注释 → `pnpm bindings` 生成新版 → 启动旧 exe → `bindings.ts` 被悄悄改回去，而 CI 的 drift job 会因此变红）。两个写入者里的那个"会写出旧内容"的，就是它。
+  CI 有一个专门的 job 校验它没有漂移（从**源码**重新生成再比对），那才是权威判据。
 - **L1 不是进程也不是沙箱**：它是 `toolforge-plugins::l1::run_pipeline` 在宿主进程内解释一段数据。图中把它与 L2/L3 并列，是为了对齐三级运行时的概念模型；实现上 L1 **没有**独立的运行时实体。
 - `NET` 节点代表 `toolforge-engines` 与 `toolforge-ai` 各自对 `reqwest` 的依赖。**领域层没有这条边**（`toolforge-core` 不依赖 `reqwest`）。
 - `ENGINES --> PROC` 表示 `nodes.rs` 通过 `toolforge-process::exec` 起子进程，而不是自己 `Command::new`。
@@ -678,7 +680,9 @@ std::fs::create_dir_all(&workspace).ok();
    - `tauri.conf.json` 的 `build.beforeDevCommand = "pnpm dev"`、`devUrl = "http://localhost:1420"`、`frontendDist = "../dist"` 现在都有对应的东西；`dist/` 仍是构建产物，所以 **release 构建前要先 `pnpm build`**（`scripts/ensure-dist.mjs` 会写一个占位页兜住 `cargo check`）；
    - 根 `package.json` 的 `scripts.dev/build/preview/typecheck/lint/tauri` 都是 `pnpm --filter @toolforge/desktop <x>`，`apps/desktop/package.json` 存在，`pnpm-workspace.yaml` 的 `packages: ["apps/*", "packages/*"]` 能解析到它；
    - 步骤 1、2（调用侧）、9 因此都**已接通**。本条原文说"`apps/desktop/src/` 没有目录"是当时的快照。
-2. ✅ **`bindings.ts` 已生成并入库**。`lib.rs::run()` 在 `#[cfg(debug_assertions)]` 下会尝试写 `apps/desktop/src/bindings.ts`，`src/bin/export_bindings.rs` 提供 CI 用的无 GUI 入口（`pnpm bindings`）。`.gitignore` 末尾那句「前端自动生成的 TS 绑定**要入库**」现在是有实际文件对应的。
+2. ✅ **`bindings.ts` 已生成并入库**。生成入口是 `src/bin/export_bindings.rs`（`pnpm bindings`，也从**源码**重新生成一遍再校验关键内容没丢）。
+   > ⚠️ 原文还提到 `lib.rs::run()` 在 `#[cfg(debug_assertions)]` 下会自动导出 —— **那段已删除**（理由见上面「两个生成入口」那条注：它是"会写出旧内容"的第二个写入者，实测把新生成的绑定覆盖回过旧版本）。
+   `.gitignore` 末尾那句「前端自动生成的 TS 绑定**要入库**」现在是有实际文件对应的。
 3. ✅ **`package.json` 的 bindings 脚本包名已改正**：从 `-p toolforge-desktop` 改为 `-p toolforge`，与 `apps/desktop/src-tauri/Cargo.toml` 的 `[package] name = "toolforge"` 一致，也与 `export_bindings.rs` 自己的文档一致。
 4. ✅ **`flow.foreach` 节点已被整个删除**（不是"留着不实现"）。它曾经的描述写着「宿主会按并发度并行调度」，那是**假话** —— 宿主不在流水线内部调度。更根本的问题是语义没法定义：L1 的步骤列表是**平铺的有序列表**，没有嵌套结构，"对剩下的步骤循环 N 次"到底是哪几步？循环后面那些"只想跑一次"的收尾步骤怎么办？
    - 结论是**删掉节点**，而不是继续挂着。真正需要批量的场景**已经由宿主在命令层解决**（`commands.rs::expand_batches`，见步骤 3）：多文件输入与**目录输入**都扇出成单文件批次，逐批调用流水线、上报「处理 3/12」、在批次边界检查取消，清单里可以用 `${batch.index}` 取序号。**清单里从来不需要写循环**，也就不需要这个节点。

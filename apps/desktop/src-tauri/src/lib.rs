@@ -278,17 +278,23 @@ fn resolve_builtin_plugins(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
 pub fn run() {
     let builder = specta_builder();
 
-    // 开发构建里把 TS 绑定写出去，保证前端类型永远跟着 Rust 走
-    #[cfg(debug_assertions)]
-    {
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("src")
-            .join("bindings.ts");
-        if let Err(e) = builder.export(specta_typescript::Typescript::default(), &out) {
-            tracing::warn!("导出 TypeScript 绑定失败：{e}");
-        }
-    }
+    // ⚠️ 这里原来有一段 `#[cfg(debug_assertions)]` 的代码：**应用一启动就把
+    // `apps/desktop/src/bindings.ts` 重新导出一次**（注释写的是"保证前端类型永远跟着
+    // Rust 走"）。本轮把它删掉了，原因是它制造了**第二个写入者**，而且是会**写出旧内容**的那一个：
+    //
+    // 生成 `bindings.ts` 的输入是**编译进这个二进制里的类型**。于是当你跑的是一个
+    // **比源码旧**的 debug 二进制时（很常见：只 `cargo check` 过、没重新 `cargo build`，
+    // 或者一边改 Rust 一边跑着上一次构建的应用），启动过程会把**已经生成好的新绑定
+    // 覆盖回旧版本**。
+    //
+    // 这不是推测，是实测踩到的：本轮改完 `ModelEntry::installed_size_mb` 的文档注释 →
+    // 跑 `pnpm bindings` 生成新版 → 启动应用（那个 exe 还是改之前构建的）→
+    // `bindings.ts` 被**悄悄改回旧注释**。CI 的「绑定是否漂移」那道 job 会因此变红，
+    // 而人看到的现象只是"我明明导出过"。
+    //
+    // 现在只剩**一个**写入者：`cargo run -p toolforge --bin export-bindings`（即 `pnpm bindings`）。
+    // 它从**源码**生成，再由 CI 的 drift job 守住"没重新生成"这件事。
+    // 代价是改了 Rust 类型之后要多敲一条命令 —— 比"生成的类型文件被旧二进制悄悄改写"划算得多。
 
     // 命令注册与 `COMMAND_NAMES` 的一致性**不在这里检查**。
     //
