@@ -340,9 +340,9 @@ EngineModel {
 | `realesr-general-x4v3` | Real-ESRGAN general x4v3 | 通用 4 倍超分（轻量）。**输入尺寸动态**，不需要切块补边；**默认选它** | 约 5 MB（实测 4.87 MB） | `BSD-3-Clause` | 是 | `https://huggingface.co/Heliosoph/realesrgan-onnx/resolve/main/realesr-general-x4v3.onnx` | `09b757accd747d7e423c1d352b3e8f23e77cc5742d04bae958d4eb8082b76fa4` |
 | `realesrgan-anime6b` | Real-ESRGAN anime 6B | 动漫 / 插画 4 倍超分（6 个残差块，完整版 23 个），输入尺寸同样动态 | 约 18 MB（实测 18.35 MB） | `BSD-3-Clause` | 是 | `https://huggingface.co/RekluzLabs/realesrgan_anime6b.onnx/resolve/main/realesrgan_anime6b.onnx` | `45bd54934aeabe8df744c8fdacb9e8846c9b55cb4e60c499db77405d1625a667` |
 | `realesrgan-x4plus` | Real-ESRGAN x4plus | 完整版通用超分，质量最好的一档。**输入尺寸固定 256×256**，走"补齐 → 推理 → 裁回" | 约 67 MB（实测 66,993,533 字节） | `BSD-3-Clause` | 是 | ✅ **有下载源**（`279da294…`，真实下载后核对） | 同上 |
-| `modnet-portrait` | MODNet Portrait | 人像专用抠图。**动态输入尺寸** + **[-1,1] 归一化**（与其它模型不同） | 约 25 MB（实测 25,888,640 字节） | `Apache-2.0`（代码）/ 学术用途权重 | **否**（需确认） | ✅ **有下载源**（`07c308cf…`，应用内下载 + 哈希校验通过；社区镜像，**会抖**，失败重试一次通常就过） | 同上 |
-| `birefnet-lite` | BiRefNet lite | BiRefNet 的轻量版（swin_v1_tiny）。**输入固定 1024×1024** | 约 214 MB（实测 224,005,088 字节） | `MIT` | 是 | ✅ **有下载源**（`5600024376…`，应用内下载 + 哈希校验通过，214 MB 用了 25 秒）。两个来源逐字节相同，选了**实测更快**的那个（hf 镜像 8.5 MB/s vs GitHub 0.4 MB/s 且两次中途卡死） | 同上 |
-| `birefnet-general` | BiRefNet（完整版） | 质量最好的一档，但 927 MB、CPU 单张十几秒 | 约 928 MB（实测 972,666,916 字节） | `MIT`（代码）/ 权重另有条款 | **否**（需确认） | ✅ **有下载源**（`58f621f0…`，来自一次完整下载）。**推理已实测**：1024×1024 / imagenet / 前景占比 19.24%，产出带 alpha 的 PNG | 同上 |
+| `modnet-portrait` | MODNet Portrait | 人像专用抠图。**动态输入尺寸** + **[-1,1] 归一化**（与其它模型不同） | 约 25 MB（实测 25,888,640 字节） | `Apache-2.0`（代码）/ 学术用途权重 | **否**（需确认） | ✅ 官方 `huggingface.co/Xenova/modnet`（+ hf-mirror 兜底）；实测应用内 21 秒下完、哈希校验通过 | `07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9` |
+| `birefnet-lite` | BiRefNet lite | BiRefNet 的轻量版（swin_v1_tiny）。**输入固定 1024×1024** | 约 214 MB（实测 224,005,088 字节） | `MIT` | 是 | ✅ 官方 `huggingface.co/onnx-community/BiRefNet_lite-ONNX`（+ hf-mirror 兜底）；实测应用内 69 秒下完、哈希校验通过。**两个来源逐字节相同**（rembg release 上那份同名资产也是同一份） | `5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333` |
+| `birefnet-general` | BiRefNet（完整版） | 质量最好的一档，但 927 MB、CPU 单张十几秒 | 约 928 MB（实测 972,666,916 字节） | `MIT`（代码）/ 权重另有条款 | **否**（需确认） | ✅ 官方 `huggingface.co/onnx-community/BiRefNet-ONNX`（+ hf-mirror 兜底）。**推理已实测**（1024×1024 / imagenet / 前景占比 19.24%）。下载实测经过一次波折：第一次主源 **502 Bad Gateway**、兜底镜像卡死（两条都失败），**重试一次后从官方源下完（约 570 秒）**、哈希校验通过 | `58f621f00f5d756097615970a88a791584600dcf7c45b18a0a6267535a1ebd3c` |
 
 > ✅ **`realesrgan-x4plus` 现在有下载源了（这一条保留历史，因为它的动机与另外两个完全不同）**：`birefnet-general` / `modnet-portrait` 缺的是"还没核对过的哈希"，而这一个当初缺的是**能用的 ONNX 导出** —— 找到的每一份 x4plus 导出都是**固定输入尺寸**，要先补上「补齐到固定尺寸 → 推理 → 裁回去」。三件事现在都做完了：
 > 1. **补边逻辑**：`py/upscale.py` 读会话的输入形状，固定尺寸时用 `np.pad(mode="edge")`（边缘像素，比补黑边干净）补到 256×256，推理后裁回；
@@ -561,6 +561,29 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
   > ✅ **已修正**：**5 个**权重现在有**真实下载后自己算出来的** SHA-256 与固定直链 —— 三个 rembg 抠图权重（`u2net` / `u2netp` / `isnet-general`，`https://github.com/danielgatis/rembg/releases/download/v0.0.0/`，tag 字面就是 `v0.0.0`）与两个 Hugging Face 超分权重（`realesr-general-x4v3` / `realesrgan-anime6b`）。它们都有独立的 `file_name` 字段（资产名与模型 id 可能不一致，如 `isnet-general` → `isnet-general-use.onnx`）。文件落在 `<data_dir>/models/<model_id>/<file_name>`。三条 IPC 也已补齐：`models_list` / `models_install` / `models_remove`。
   > **哈希不匹配即删文件**：`registry.rs::install_model` 用 `remove_file` + `IntegrityCheckFailed`，不保留没校验过的产物。
   > **模型权重现在全部有下载源，而且全部走通了「应用内下载 → 哈希校验 → 真跑一次推理」**（见上表与 `verify-platform.mjs`【8】）。单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name 三者全有或全无、哈希为 64 位小写十六进制、URL 以 `file_name` 结尾。
+  >
+  > **每个 HF 上的权重都配了「官方优先、镜像兜底」两个地址**（`EngineModel::fallback_url`）：
+  > `huggingface.co` 在**部分网络下整体不可达**（本机实测：没开加速时 DNS/TCP 都不通，开了才 200），
+  > 而社区镜像 `hf-mirror.com` 在同一网络下能用、但**会抖**。只填官方 → 那部分用户一个模型都下不了；
+  > 只填镜像 → 所有用户都依赖第三方。两个都填、按顺序试，才对两边都成立。
+  >
+  > 备用地址必须与主地址指向**同一个资产**，有一条测试（`fallback_urls_point_at_the_same_asset`）
+  > 按"去掉主机名后路径逐字相同"来守 —— 兜底填成另一个版本时，表现会是"下载成功但哈希不符、
+  > 文件被删"，而真正的原因（地址填错了）在报错里完全看不到。
+  >
+  > **兜底真的被触发过一次**（实测记录，值得留着）：主源 HF 对那个 928 MB 的文件回了
+  > **502 Bad Gateway**（HTTP/1.1 重试后仍然失败），于是自动切到镜像，镜像又卡在
+  > "60 秒内没有收到任何数据"，最后报：
+  >
+  > ```text
+  > 下载 birefnet-general 失败：主源与备用源都不通
+  > 主源 huggingface.co：HTTP 502 Bad Gateway（HTTP/1.1 重试后仍然失败）
+  > 备用源 hf-mirror.com：下载卡住了：60 秒内没有收到任何数据
+  > ```
+  >
+  > 这条路径此前**只写在代码里、从没被执行过** —— 而它一被执行就证明了它是对的：
+  > 两个源都说了名字、都说了各自为什么失败。**重试一次之后就成功了**（主源下完 928 MB），
+  > 所以那次失败确实是瞬时的，而不是配置问题。
   > **注意**：上一段关于"模型权重仍全部为 `null`"的旧结论已经不成立。
 - ~~另外 `engine-sources.json` 中 5 个引擎的候选 URL 虽然存在，但**每条 `sha256` 均为 `null`**，因此没有任何一个引擎具备可用的自动安装来源。~~
   > ✅ **已修正**：`engine-sources.json` 已回填 **7 条**带真实核对哈希 + 版本固定直链的来源（`ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux`，以及本轮新增的 **`imagemagick@windows`**）。因此 Windows 上的这 5 个引擎与 Linux 上的 2 个**现在可以自动安装**；macOS 四条与 `ffmpeg@linux` 仍为 `null`。详见 `docs/ROADMAP.md` §3 与 3.2。

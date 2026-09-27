@@ -138,6 +138,22 @@ pub struct EngineModel {
     /// 下载地址与校验值
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// **备用下载地址**：主地址连不上时按顺序再试一个。
+    ///
+    /// # 为什么需要它（不是"多填一个地址保险一点"）
+    ///
+    /// 这些权重的官方源是 `huggingface.co`，而它在**部分网络下不可达**
+    /// （本机实测：没开加速时 DNS/TCP 都不通，开了才 200）。社区镜像
+    /// `hf-mirror.com` 在同一网络下能用，但它是第三方、而且**会抖**。
+    ///
+    /// 只填官方 → 那部分用户完全下不了；只填镜像 → 所有用户都依赖第三方。
+    /// 两个都填，按"官方优先、镜像兜底"的顺序试，才是对两边都成立的答案。
+    ///
+    /// ⚠️ **必须与主地址是同一个文件**：每次下载都会核对 `sha256`，
+    /// 不一致会被删掉并报 `INTEGRITY_CHECK_FAILED`。有一条测试
+    /// （`fallback_urls_point_at_the_same_asset`）强制它与主地址指向同一个资产名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     /// 落盘文件名。
@@ -429,6 +445,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     commercial_use: true,
                     // 哈希是**真实下载后算出来的**，不是抄来的。见下方 `verified_sources_are_pinned`。
                     url: Some(format!("{REMBG_RELEASE}/u2netp.onnx")),
+                    fallback_url: None, // GitHub 源，不需要兜底
                     sha256: Some("309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8".into()),
                     file_name: Some("u2netp.onnx".into()),
                     installed: false,
@@ -442,6 +459,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     license: "Apache-2.0".into(),
                     commercial_use: true,
                     url: Some(format!("{REMBG_RELEASE}/u2net.onnx")),
+                    fallback_url: None, // 同上
                     sha256: Some("8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491".into()),
                     file_name: Some("u2net.onnx".into()),
                     installed: false,
@@ -456,6 +474,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     commercial_use: true,
                     // 注意资产名是 `isnet-general-use.onnx`，与模型 id 不同
                     url: Some(format!("{REMBG_RELEASE}/isnet-general-use.onnx")),
+                    fallback_url: None, // 同上
                     sha256: Some("60920e99c45464f2ba57bee2ad08c919a52bbf852739e96947fbb4358c0d964a".into()),
                     file_name: Some("isnet-general-use.onnx".into()),
                     installed: false,
@@ -473,7 +492,12 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     // 之前这一条**没有下载源**，理由是"哈希必须来自真实下载"。
                     // 现在补上了（972,666,916 字节的哈希是自己下载后算的），
                     // 并且用同一套脚本真跑过一遍 —— 见 `verify-platform.mjs`【8】。
-                    url: Some("https://hf-mirror.com/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model.onnx".into()),
+                    // **官方优先、镜像兜底**：`huggingface.co` 在部分网络下不可达
+                    // （本机实测：没开加速时连不上，开了才 200），而社区镜像
+                    // `hf-mirror.com` 在同一网络下能用。两个地址指向**同一个资产**，
+                    // 所以 `sha256` 对两边都成立 —— 有测试盯着这一点。
+                    url: Some("https://huggingface.co/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model.onnx".into()),
+                    fallback_url: Some("https://hf-mirror.com/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model.onnx".into()),
                     sha256: Some("58f621f00f5d756097615970a88a791584600dcf7c45b18a0a6267535a1ebd3c".into()),
                     file_name: Some("model.onnx".into()),
                     installed: false,
@@ -489,10 +513,9 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     approx_size_mb: 25,
                     license: "Apache-2.0（代码）/ 学术用途权重".into(),
                     commercial_use: false,
-                    // 社区镜像。**huggingface.co 直连在部分网络下不可达**，而这个镜像实测能下
-                    // （25 MB 一次成功、哈希校验通过）；但它**会抖** —— 第一次尝试时
-                    // 连接超时，重试就过了。所以失败信息里那句"重试一次"不是客套话。
-                    url: Some("https://hf-mirror.com/Xenova/modnet/resolve/main/onnx/model.onnx".into()),
+                    // 官方优先、镜像兜底（理由见 `birefnet-general` 那条）
+                    url: Some("https://huggingface.co/Xenova/modnet/resolve/main/onnx/model.onnx".into()),
+                    fallback_url: Some("https://hf-mirror.com/Xenova/modnet/resolve/main/onnx/model.onnx".into()),
                     sha256: Some("07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9".into()),
                     file_name: Some("model.onnx".into()),
                     installed: false,
@@ -509,13 +532,11 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     license: "MIT".into(),
                     commercial_use: true,
                     // 两个来源**逐字节相同**（224,005,088 字节 / sha256 `5600024376…`）：
-                    // rembg 官方 release 的 `BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx`
-                    // 与 HF 上 `onnx-community/BiRefNet_lite-ONNX` 的 `model.onnx`。
-                    // 选后者是因为**实测更快**：同一天里 hf 镜像下 928 MB 用了 140 秒
-                    // （6.6 MB/s），而 GitHub 下这个 213 MB 用 curl 花了 553 秒、
-                    // 在应用里还两次卡在"连接后不再有数据"（60 秒静默就被判超时）。
-                    // 换源不是"想换个新的"，是原来那个在当前线路上跑不动。
-                    url: Some("https://hf-mirror.com/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx".into()),
+                    // HF 上 `onnx-community/BiRefNet_lite-ONNX` 的 `model.onnx`
+                    // 与 rembg 官方 release 的 `BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx`。
+                    // 官方优先、镜像兜底（理由见 `birefnet-general` 那条）。
+                    url: Some("https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx".into()),
+                    fallback_url: Some("https://hf-mirror.com/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx".into()),
                     sha256: Some("5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333".into()),
                     file_name: Some("model.onnx".into()),
                     installed: false,
@@ -529,6 +550,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     license: "BSD-3-Clause".into(),
                     commercial_use: true,
                     url: Some("https://huggingface.co/Heliosoph/realesrgan-onnx/resolve/main/realesr-general-x4v3.onnx".into()),
+                    fallback_url: Some("https://hf-mirror.com/Heliosoph/realesrgan-onnx/resolve/main/realesr-general-x4v3.onnx".into()),
                     sha256: Some("09b757accd747d7e423c1d352b3e8f23e77cc5742d04bae958d4eb8082b76fa4".into()),
                     file_name: Some("realesr-general-x4v3.onnx".into()),
                     installed: false,
@@ -542,6 +564,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     license: "BSD-3-Clause".into(),
                     commercial_use: true,
                     url: Some("https://huggingface.co/RekluzLabs/realesrgan_anime6b.onnx/resolve/main/realesrgan_anime6b.onnx".into()),
+                    fallback_url: Some("https://hf-mirror.com/RekluzLabs/realesrgan_anime6b.onnx/resolve/main/realesrgan_anime6b.onnx".into()),
                     sha256: Some("45bd54934aeabe8df744c8fdacb9e8846c9b55cb4e60c499db77405d1625a667".into()),
                     // 用**下划线**（`realesrgan_anime6b`），与远端资产名逐字一致。
                     // 落盘名刻意跟远端保持一致 —— 两边拼法一旦不同，
@@ -572,7 +595,8 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     //
                     // 这个 ONNX 导出**确实是固定输入**（`[1,3,256,256]` → `[1,3,1024,1024]`），
                     // 不是"看着像"。选购型时用 onnxruntime 读过它的输入形状才敢写进来。
-                    url: Some("https://hf-mirror.com/AXERA-TECH/Real-ESRGAN/resolve/main/onnx/realesrgan-x4-256.onnx".into()),
+                    url: Some("https://huggingface.co/AXERA-TECH/Real-ESRGAN/resolve/main/onnx/realesrgan-x4-256.onnx".into()),
+                    fallback_url: Some("https://hf-mirror.com/AXERA-TECH/Real-ESRGAN/resolve/main/onnx/realesrgan-x4-256.onnx".into()),
                     sha256: Some("279da2949cfc4f4f87ca90df784e443e304ed82b8cbc27b40b995c745cbd3d5c".into()),
                     file_name: Some("realesrgan-x4-256.onnx".into()),
                     installed: false,
@@ -832,6 +856,37 @@ mod tests {
         let before = keys.len();
         keys.dedup();
         assert_eq!(before, keys.len(), "同一个模型 id 出现了两次：{keys:?}");
+
+        // 备用地址必须与主地址指向**同一个资产**。
+        //
+        // 判据是"去掉主机名之后剩下的路径逐字相同"：`huggingface.co` 与
+        // `hf-mirror.com` 的路径规则完全一致，所以同一份权重的两个地址只在
+        // 主机名上不同。这条守的是**真实会发生的灾难**：兜底地址填成了另一个
+        // 版本/另一个模型的导出 → 主地址失败时切过去 → 下载成功但哈希不符 →
+        // 文件被删、用户看到 `INTEGRITY_CHECK_FAILED`，而真正的原因（地址填错了）
+        // 在报错里完全看不到。
+        for m in &onnx.models {
+            let (Some(url), Some(fb)) = (m.url.as_deref(), m.fallback_url.as_deref()) else {
+                continue;
+            };
+            let path_of = |u: &str| {
+                u.split_once("://")
+                    .map(|(_, rest)| rest.split_once('/').map(|(_, p)| p.to_string()))
+                    .flatten()
+                    .unwrap_or_default()
+            };
+            assert_eq!(
+                path_of(url),
+                path_of(fb),
+                "模型 {} 的备用地址与主地址不是同一个资产：\n  主：{url}\n  备：{fb}",
+                m.id
+            );
+            assert!(
+                fb.ends_with(m.file_name.as_deref().unwrap_or_default()),
+                "模型 {} 的备用地址没有以 file_name 结尾：{fb}",
+                m.id
+            );
+        }
     }
 
     /// `EngineDescriptor::provides` 与节点自己声明的引擎依赖必须**互相吻合**。

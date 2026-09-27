@@ -156,6 +156,10 @@ pub struct ModelSpec {
     pub id: String,
     pub engine_id: String,
     pub url: String,
+    /// 备用下载地址（主地址连不上时按顺序再试）。见
+    /// [`toolforge_core::engine::EngineModel::fallback_url`] 的说明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_url: Option<String>,
     pub sha256: Option<String>,
     /// 目标文件名
     pub file_name: String,
@@ -231,6 +235,7 @@ impl EngineRegistry {
                         id: m.id.clone(),
                         engine_id: desc.id.clone(),
                         url,
+                        fallback_url: m.fallback_url.clone(),
                         sha256: m.sha256.clone(),
                         file_name: m
                             .file_name
@@ -845,7 +850,7 @@ impl EngineRegistry {
             }
         }
 
-        let actual = download(&spec.url, &dest, model_id, job, self.tx.clone()).await?;
+        let actual = download_with_fallback(spec, &dest, model_id, job, self.tx.clone()).await?;
         if let Some(exp) = &expected {
             if !actual.eq_ignore_ascii_case(exp) {
                 let _ = std::fs::remove_file(&dest);
@@ -858,6 +863,75 @@ impl EngineRegistry {
         }
         Ok(dest)
     }
+}
+
+/// 按"主地址 → 备用地址"的顺序下载。
+///
+/// # 为什么要有这一层
+///
+/// 这些权重的官方源是 `huggingface.co`，它在**部分网络下整体不可达**
+/// （本机实测：没开加速时连不上）。只填官方 → 那部分用户一个模型都下不了；
+/// 只填镜像 → 所有用户都依赖第三方镜像、而且镜像本身会抖。
+/// 两个都填、按顺序试，是唯一对两边都成立的答案。
+///
+/// 日志里会写明**这次是从哪儿下的** —— 用户与排查的人都需要知道
+/// "兜底到底有没有被用上"。
+async fn download_with_fallback(
+    spec: &ModelSpec,
+    dest: &Path,
+    label: &str,
+    job: &JobCtx,
+    tx: Option<tokio::sync::broadcast::Sender<AppEvent>>,
+) -> ToolforgeResult<String> {
+    let primary = download(&spec.url, dest, label, job, tx.clone()).await;
+    let Err(first_err) = primary else {
+        return primary;
+    };
+
+    let Some(fallback) = spec.fallback_url.as_deref() else {
+        return Err(first_err);
+    };
+
+    job.warn(format!(
+        "主下载源（{}）失败，改用备用源重试：{}",
+        url_host(&spec.url),
+        first_err.message
+    ));
+    tracing::warn!(
+        model = %spec.id,
+        primary = %spec.url,
+        fallback = %fallback,
+        "主下载源失败，改用备用源"
+    );
+
+    // 主地址有可能留下半截文件（比如卡死之后）—— 重试前删掉，
+    // 否则第二次下载会从半截的地方继续/覆盖出奇怪的结果。
+    let _ = std::fs::remove_file(dest);
+
+    match download(fallback, dest, label, job, tx).await {
+        Ok(h) => {
+            job.info(format!("已从备用源（{}）下载完成", url_host(fallback)));
+            Ok(h)
+        }
+        Err(second) => Err(ToolforgeError::new(
+            ErrorCode::Network,
+            format!("下载 {label} 失败：主源与备用源都不通"),
+        )
+        .with_detail(format!(
+            "主源 {}：{}\n备用源 {}：{}",
+            url_host(&spec.url),
+            first_err.message,
+            url_host(fallback),
+            second.message
+        ))),
+    }
+}
+
+/// 从 URL 里取主机名（只用于日志/报错，不参与任何判断）
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let end = rest.find('/').unwrap_or(rest.len());
+    &rest[..end]
 }
 
 /// 对一个已存在的文件算 SHA-256（同步、分块读，避免把 170 MB 整个读进内存）。
