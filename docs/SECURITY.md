@@ -35,8 +35,8 @@
 结论：**判断"现在能不能跑"必须以代码和 CI 输出为准**，本文档只描述代码里存在的安全机制与缺口。下面是**当前**可复核的基线（本文档最早写作时的那份"编译失败 / 59 passed, 2 failed"记录**已完全过期**，它的两个失败项正是上面已修掉的阻塞 1–4）：
 
 ```text
-cargo test --workspace                  →  276 passed / 0 failed
-scripts/devtools/verify-platform.mjs    →  328 项检查全通过（【1】–【29】）
+cargo test --workspace                  →  280 passed / 0 failed
+scripts/devtools/verify-platform.mjs    →  341 项检查全通过（【1】–【30】）
 ```
 
 > ⚠️ **但"全绿"不等于"本文档列的每一条都已修好"**：上面这张 §9 的缺口清单里，第 2–5、7、13、19、22–25、27–30 项**仍然成立**（它们是设计边界或未接线，不是测试失败）。测试绿说明"代码自洽"，不说明"防护完整"。

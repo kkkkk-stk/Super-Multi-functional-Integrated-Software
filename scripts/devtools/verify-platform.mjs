@@ -55,6 +55,33 @@ const client = await connect();
 const DATA_DIR = join(homedir(), 'AppData', 'Roaming', 'com.toolforge.desktop');
 
 // ============================================================================
+// 【0】前置自检：**WebView 里不许残留上一次运行的注入**
+// ============================================================================
+//
+// 这一条是被自己坑出来的。【29】用 `Page.addScriptToEvaluateOnNewDocument` 往页面里注入
+// 记录器/假数据，而**注入的脚本活在整个 WebView 会话里**（不只是当前文档）。
+// 有一次忘了摘最早那份，于是它在后续每一个新文档里继续生效 ——
+// 下一次运行到【25】时，`engines_install` 被那份旧注入拦下并回了一个假 jobId，
+// 于是"不带 licenseAccepted 必须被拒"这条检查读到的是**假成功**，
+// 再往下 `waitJob(假 id)` 拿到 null，脚本直接崩在 `job.status` 上。
+//
+// 排查这种崩溃的成本远高于写这三行自检。判据：页面里既没有记录器，
+// 也没人动过 `window.fetch`。
+c.section('【0】前置自检：页面里没有上一次运行的残留注入');
+{
+  const state = await client.evaluate(`(() => ({
+    recorder: typeof window.__tfIpc,
+    fetchIsNative: String(window.fetch).includes('[native code]'),
+  }))()`);
+  console.log(`   记录器=${state.recorder}  fetch 是原生的=${state.fetchIsNative}`);
+  c.check(
+    state.recorder === 'undefined' && state.fetchIsNative === true,
+    '★ 页面是干净的（没有上一次运行留下的 fetch 记录器）—— 有残留就重启应用再跑',
+    state.recorder === 'undefined' && state.fetchIsNative ? '' : '检测到残留注入：请重启应用'
+  );
+}
+
+// ============================================================================
 // 【1】batch-rename：规则化的**多输入**（必须一次跑好几个文件才看得出问题）
 // ============================================================================
 c.section('【1】batch-rename 是否真的按规则改名（而不是只把文件挪个位置）');
@@ -4683,24 +4710,28 @@ ${withYaml}
 //    而请求与响应其实完全正常（第一次就是这么栽的）。
 c.section('【29】许可证勾选框的点击穿透（前端会不会替用户点头）');
 {
-  // ---- 造前提 1：把不可商用模型的权重挪走（同卷！跨卷 rename 会报 EXDEV） ----
-  const modelDir = join(DATA_DIR, 'models', 'birefnet-general');
-  const stash = join(DATA_DIR, 'verify-stash-license-gating');
-  rmSync(stash, { recursive: true, force: true });
-  mkdirSync(stash, { recursive: true });
-  const moved = [];
-  if (existsSync(modelDir)) {
-    for (const f of readdirSync(modelDir)) {
-      if (f.endsWith('.onnx')) {
-        renameSync(join(modelDir, f), join(stash, f));
-        moved.push(f);
-      }
-    }
-  }
-  console.log(`   挪走的权重：${moved.join(', ') || '（本来就没有）'}`);
-
-  /** 页面内的 fetch 记录器。install 类命令只记录不转发；可选改写目录响应。 */
-  const recorderSource = (catalogPatch = null) => `
+  // ==========================================================================
+  // 造前提：**只改喂给界面的数据，一个真实文件都不动**
+  // ==========================================================================
+  //
+  // ⚠️ 这一节最早的做法是"把 928 MB 的 `birefnet-general` 权重同卷 rename 挪走"，
+  // 用真实的"未安装"状态驱动界面。那是个**危险**的前提，本轮真的踩到了：
+  //
+  //   * 只要有任何一次点击没被页面记录器拦住（页面重载、记录器被覆盖、某条命令走了
+  //     另一条 IPC 通道……），后端就会真的开始下载；
+  //   * 而下载的第一步是 `File::create` —— **把用户的权重文件截成 0 字节**，
+  //     然后以 10 MB/s 慢慢重下（实测：928 MB 花了 1.5 分钟，中间还把主源失败重试了一次）；
+  //   * 更糟的是收尾的 `finally` 会把暂存的原文件 rename 回去，看起来"什么都没发生"，
+  //     而真正写进去的是半截下载 —— 我花了十几分钟才把这条时间线捋清。
+  //
+  // 现在的做法：**文件原样不动**，只把 `models_list` / `engines_catalog` 的响应改写成
+  // "未安装"。万一某次点击漏到了后端，代价也是**零**：
+  // `registry.rs::install_model` 会发现本地文件哈希与预期一致并**短路跳过下载**
+  // （"本地已有校验通过的 …，跳过下载"）—— 不写盘、不截断、不联网。
+  //
+  // 也就是说：这一节的合成**只影响界面看到的状态**，而所有"会改磁盘"的路径都因为
+  // 真实文件的存在而自动变成 no-op。这比"靠记录器挡住"可靠得多。
+  const recorderSource = ({ modelsPatch = null, catalogPatch = null } = {}) => `
 (() => {
   window.__tfIpc = [];
   const orig = window.fetch;
@@ -4716,6 +4747,10 @@ c.section('【29】许可证勾选框的点击穿透（前端会不会替用户�
       return respond('job-ui-probe-fake');
     }
     const res = await orig.apply(this, arguments);
+    ${modelsPatch ? `if (cmd === 'models_list') {
+      const data = await res.clone().json();
+      return respond(data.map(${modelsPatch}));
+    }` : ''}
     ${catalogPatch ? `if (cmd === 'engines_catalog') {
       const data = await res.clone().json();
       return respond(data.map(${catalogPatch}));
@@ -4724,9 +4759,6 @@ c.section('【29】许可证勾选框的点击穿透（前端会不会替用户�
   };
 })();
 `;
-  const installRecorder = (catalogPatch = null) => client.evaluate(recorderSource(catalogPatch));
-  const removeRecorder = () =>
-    client.evaluate(`(() => { delete window.__tfIpc; return 'removed'; })()`);
   const ipcCalls = async () => JSON.parse(await client.evaluate('JSON.stringify(window.__tfIpc || [])'));
   const clearIpc = () => client.evaluate('window.__tfIpc = []');
 
@@ -4817,28 +4849,112 @@ c.section('【29】许可证勾选框的点击穿透（前端会不会替用户�
   const boot = () => client.send('Page.reload').then(() => sleep(4500));
 
   let preDocScript = null;
-  const patchCatalogAndBoot = async (catalogPatch) => {
+  /**
+   * 挂一份"喂给界面的假数据"并整页刷新（必须在页面脚本之前挂，否则查询已经拿到真数据了）。
+   *
+   * ⚠️ **每次都要先摘掉上一份**。`Page.addScriptToEvaluateOnNewDocument` 注册的脚本会一直
+   * 作用于**之后每一个新文档**；忘了摘，第一份假数据就会跟着跑到收尾检查里 ——
+   * 实测现象是：收尾那一步读到 `models_list` 还写着"未安装"，于是"没有副作用"这条检查假红。
+   * 换句话说，**测试替身比被测代码更难收拾**，收尾必须当成正经代码来写。
+   */
+  const patchAndBoot = async (patches) => {
+    await undoPatch();
     const r = await client.send('Page.addScriptToEvaluateOnNewDocument', {
-      source: recorderSource(catalogPatch),
+      source: recorderSource(patches),
     });
     preDocScript = r.identifier;
     await boot();
   };
-  const undoCatalogPatch = async () => {
+  const undoPatch = async () => {
     if (preDocScript) {
       await client.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: preDocScript });
       preDocScript = null;
     }
   };
 
+  /** 把 `birefnet-general` 说成"未安装、未确认"——磁盘上的文件原样不动。 */
+  const MODEL_UNINSTALLED = `(m) => m.id === 'birefnet-general'
+    ? { ...m, installed: false, installedSizeMb: null, licenseAcknowledged: false, licenseAcknowledgedAt: null }
+    : m`;
+
+  /** 权重文件当前字节数（用来证明这一节**没有改动磁盘**）。 */
+  const weightBytes = () => {
+    const dir = join(DATA_DIR, 'models', 'birefnet-general');
+    if (!existsSync(dir)) return -1;
+    const f = readdirSync(dir).find((x) => x.endsWith('.onnx'));
+    return f ? statSync(join(dir, f)).size : -1;
+  };
+  const weightBefore = weightBytes();
+  console.log(`   权重文件 ${weightBefore} 字节（这一节全程不动它）`);
+
+  /**
+   * 判据：**不许真的开始下载**，而不是"不许出现任务"。
+   *
+   * 这一节的第一次实现把这两件事搞混了，值得写下来：
+   *
+   *   * 记录器按 **URL 的末段**去认命令，而 Tauri 的 IPC 有两条通道 ——
+   *     custom protocol（命令名在 URL 里）与回退通道 `window.ipc.postMessage`
+   *     （命令名在 **body** 里）。后者不经过 `window.fetch`，于是"记录到了"并不等于"拦住了"。
+   *   * 但它**不需要被拦住**：权重文件本来就在磁盘上，`install_model` 会先算哈希、
+   *     发现与预期一致直接短路（日志里写着「本地已有校验通过的 …，跳过下载」），
+   *     引擎同理（「已经可用，跳过下载」）。实测这两个漏网任务分别在 0.06 s / 0.6 s 内
+   *     `succeeded`，**一个字节都没写**。
+   *   * 所以正确的判据是：**没有真的在下载**（任务没有停在 running / 日志里有短路证据），
+   *     且**权重文件的字节数一字未变**。只数"任务个数"会把一次无害的短路判成事故，
+   *     然后你会去 cancel 它 —— 那反而可能掐断一次正在做的哈希校验。
+   */
+  const snapshotInstallJobs = async (kind, id) => {
+    const snap = await client.invoke('jobs_list', { req: { filter: { statuses: [], kinds: [] } } });
+    return (snap?.jobs ?? [])
+      .filter((j) =>
+        kind === 'model'
+          ? j.kind?.kind === 'modelDownload' && j.kind?.modelId === id
+          : j.kind?.kind === 'engineInstall' && j.kind?.engineId === id
+      )
+      .map((j) => j.id);
+  };
+
+  /** 点击之后：不许**真的下载**，也不许磁盘上的权重变样。 */
+  const assertNothingDownloaded = async (kind, id, baseline, label) => {
+    await sleep(1500); // 短路是毫秒级；真下载会一直 running
+    const now = await snapshotInstallJobs(kind, id);
+    const fresh = now.filter((jid) => !baseline.includes(jid));
+    const active = [];
+    const shortCircuited = [];
+    for (const jid of fresh) {
+      const detail = await client.invoke('jobs_get', { jobId: jid }).catch(() => null);
+      const logs = (detail?.logs ?? []).map((l) => l.message).join(' | ');
+      if (['queued', 'running'].includes(detail?.status)) {
+        active.push(`${jid}(${detail?.status})`);
+      } else {
+        shortCircuited.push(/跳过下载|已经可用/.test(logs) ? `${jid}:跳过下载` : `${jid}:${detail?.status}`);
+      }
+    }
+    for (const entry of active) {
+      await client.invoke('jobs_cancel', { jobId: entry.split('(')[0] }).catch(() => {});
+    }
+    const bytesNow = weightBytes();
+    const unchanged = bytesNow === weightBefore;
+    c.check(
+      active.length === 0 && unchanged,
+      label,
+      active.length || !unchanged
+        ? `⚠️ 真的开始下载了：${active.join(', ')}；权重 ${weightBefore} → ${bytesNow} 字节`
+        : `${fresh.length ? `请求漏到后端但已短路（${shortCircuited.join(', ')}）` : '请求被拦下'}；权重仍是 ${bytesNow} 字节`
+    );
+  };
+
+  /** 许可证确认记录：这一节若被漏网请求写进新记录，收尾要还原。 */
+  const acksFile = join(DATA_DIR, 'license-acks.json');
+  const acksBefore = existsSync(acksFile) ? readFileSync(acksFile, 'utf8') : null;
+
   try {
     // ---- 模型面板 ----
     //
-    // ⚠️ 挪完权重必须**整页刷新**：React Query 里那份 `models_list` 还是旧的，
+    // ⚠️ 必须**整页刷新**：React Query 里那份 `models_list` 还是旧的，
     // SPA 跳转不会重取 —— 第一次就是这么把"已安装"的卡片当成目标卡片的。
-    await boot();
+    await patchAndBoot({ modelsPatch: MODEL_UNINSTALLED });
     await navTo('/settings?tab=engines');
-    await installRecorder();
 
     // ① 对照：可商用且未安装
     const commercial = await readModelCard('u2net');
@@ -4874,11 +4990,12 @@ c.section('【29】许可证勾选框的点击穿透（前端会不会替用户�
     c.check(checked.downloadDisabled === false, '④b 勾上之后「下载」按钮可用');
 
     await clearIpc();
+    const installBaseline = await snapshotInstallJobs('model', 'birefnet-general');
     const clicked = await clickModelCard('birefnet-general', '下载');
     await sleep(800);
     const installCalls = await ipcCalls();
-    const installCall = installCalls.find((x) => x.url.endsWith('/models_install'));
-    console.log(`   点下载（${clicked}）→ ${JSON.stringify(installCall?.body ?? null)}`);
+    const installCall = installCalls.find((x) => x.url.endsWith('/models_install') || x.body.includes('models_install'));
+    console.log(`   点下载（${clicked}）→ ${JSON.stringify(installCall ?? null)}`);
     c.check(!!installCall, '★ ⑤ 点「下载」真的发出了 models_install（走 http://ipc.localhost）');
     c.check(
       JSON.parse(installCall?.body || '{}')?.req?.licenseAccepted === true,
@@ -4889,6 +5006,13 @@ c.section('【29】许可证勾选框的点击穿透（前端会不会替用户�
       JSON.parse(installCall?.body || '{}')?.req?.modelId === 'birefnet-general',
       '⑤c 请求指向被点的那张卡片',
       installCall?.body
+    );
+    // ★ 关键判据：即便这一发漏到后端，也**不许真的开始下载**（权重文件原样在，install_model 会短路）
+    await assertNothingDownloaded(
+      'model',
+      'birefnet-general',
+      installBaseline,
+      '★ ⑤d 这一发没有真的下载（权重文件字节数一字未变；若请求漏到后端，`install_model` 会因哈希相符而短路）'
     );
 
     // ⑥ 未勾选：点不动，且一个请求都发不出去
@@ -4920,13 +5044,20 @@ c.section('【29】许可证勾选框的点击穿透（前端会不会替用户�
       '★ ⑦b 没勾选时处理器发的是 `licenseAccepted: false` —— 不是硬编的 true（历史缺陷正是硬编 true）',
       forcedCall?.body
     );
+    await assertNothingDownloaded(
+      'model',
+      'birefnet-general',
+      installBaseline,
+      '⑦c 这一次绕过也没有真的下载（同上，字节数不变）'
+    );
 
-    // ---- 引擎安装对话框（合成的目录数据驱动真实组件） ----
-    await removeRecorder();
-    await patchCatalogAndBoot(`(e) => e.descriptor.id === 'ffmpeg'
+    // ---- 引擎安装对话框（同样只改喂给界面的数据） ----
+    await patchAndBoot({
+      catalogPatch: `(e) => e.descriptor.id === 'ffmpeg'
       ? { ...e, status: { ...e.status, state: 'missing', source: 'none', path: null, version: null },
           licenseAcknowledged: false, licenseAcknowledgedAt: null }
-      : e`);
+      : e`,
+    });
     await navTo('/settings?tab=engines');
     await sleep(800);
 
@@ -4992,6 +5123,7 @@ c.section('【29】许可证勾选框的点击穿透（前端会不会替用户�
     c.check(d2.confirmDisabled === false, '⑩ 勾上之后确认按钮可用');
 
     await clearIpc();
+    const engineBaseline = await snapshotInstallJobs('engine', 'ffmpeg');
     await clickDialog('confirm');
     await sleep(800);
     const engCall = (await ipcCalls()).find((x) => x.url.endsWith('/engines_install'));
@@ -5007,13 +5139,20 @@ c.section('【29】许可证勾选框的点击穿透（前端会不会替用户�
       '⑪c 请求指向被点的那个引擎',
       engCall?.body
     );
+    await assertNothingDownloaded(
+      'engine',
+      'ffmpeg',
+      engineBaseline,
+      '⑪d 这一发没有真的安装（ffmpeg 已装好，`engines_install` 会「已经可用，跳过下载」）'
+    );
 
     // ⑫ 已确认过 → 预先勾上（省一次点击，但**不是**跳过确认）
-    await undoCatalogPatch();
-    await patchCatalogAndBoot(`(e) => e.descriptor.id === 'ffmpeg'
+    await patchAndBoot({
+      catalogPatch: `(e) => e.descriptor.id === 'ffmpeg'
       ? { ...e, status: { ...e.status, state: 'missing', source: 'none', path: null, version: null },
           licenseAcknowledged: true, licenseAcknowledgedAt: '2026-01-02T03:04:05.000Z' }
-      : e`);
+      : e`,
+    });
     await navTo('/settings?tab=engines');
     await sleep(800);
     const opened2 = await openEngineDialog();
@@ -5028,26 +5167,143 @@ c.section('【29】许可证勾选框的点击穿透（前端会不会替用户�
     c.check(d3.text.includes('你已于'), '⑫b 并显示"已于…确认过"，用户知道它为什么是勾上的');
     c.check(d3.confirmDisabled === false, '⑫c 预先勾上时确认按钮直接可用');
   } finally {
-    // ---- 收尾：恢复权重、摘掉注入的脚本、整页刷新 ----
-    // 权重必须还原（**失败也还原**）：这台机器上后面每一个抠图检查都要用它。
-    await undoCatalogPatch().catch(() => {});
-    await removeRecorder().catch(() => {});
-    for (const f of moved) {
-      try {
-        renameSync(join(stash, f), join(modelDir, f));
-      } catch (e) {
-        console.log(`   ⚠️ 还原 ${f} 失败：${e.message}`);
-      }
-    }
-    rmSync(stash, { recursive: true, force: true });
+    // ---- 收尾：摘掉注入的假数据、等页面**真的**回到干净状态、还原许可证记录 ----
+    await undoPatch().catch(() => {});
     await client.send('Page.reload').catch(() => {});
-    await sleep(4000);
+    await sleep(2500);
+    // ⚠️ 光 sleep 不够：必须在**新文档**里确认注入的脚本确实没了。
+    // 第一次只等了 4 秒就断言，结果读到的还是上一个文档里那份被改过的 `models_list`
+    // （它把模型说成"未安装"），于是收尾检查假红了一次。
+    for (let i = 0; i < 20; i++) {
+      const patched = await client.evaluate('typeof window.__tfIpc !== "undefined"').catch(() => true);
+      if (!patched) break;
+      await sleep(500);
+    }
+    c.check(
+      (await client.evaluate('typeof window.__tfIpc !== "undefined"').catch(() => true)) === false,
+      '⑬ 注入的假数据确实已经摘掉（新文档里没有记录器）'
+    );
+    // 许可证记录：若漏网请求写进了新的确认记录，这里还原成这一节开始前的样子
+    if (acksBefore === null) {
+      rmSync(acksFile, { force: true });
+    } else {
+      writeFileSync(acksFile, acksBefore, 'utf8');
+    }
     const models = await client.invoke('models_list').catch(() => []);
     const m = (models ?? []).find((x) => x.id === 'birefnet-general');
     c.check(
-      m?.installed === true,
-      '⑬ 收尾：权重已还原、模型重新被认作已安装（这一节不留副作用）',
-      `installed=${m?.installed}`
+      m?.installed === true && weightBytes() === weightBefore,
+      '⑬b 收尾：模型仍被认作"已安装"，权重文件字节数与本节开始时一致（**全程没动过磁盘**）',
+      `installed=${m?.installed} 字节=${weightBytes()}`
+    );
+  }
+}
+
+// ============================================================================
+// 【30】权重文件被截断时，应用还会不会声称"已就绪"
+// ============================================================================
+//
+// 这一节是一次**真实事故**的直接产物（见 ROADMAP §3.15）：一次被中断的下载把 928 MB 的
+// `birefnet-general` 截成了 **0 字节**，而当时"装好了吗"的判据是 `Path::is_file()`
+// —— 0 字节的文件同样为真。于是：
+//
+//   * 界面显示「已就绪」；
+//   * `image.remove-background` 把空文件交给 onnxruntime；
+//   * 用户看到的错误是「抠图脚本执行失败」，真正的原因（protobuf 解析失败）
+//     埋在 Python 的 stderr 里，跟"文件是空的"隔了三层。
+//
+// 现在 `toolforge_core::engine::model_size_looks_complete()`（0 字节、或不足标称体积 60%
+// → 不完整）同时用在两处：状态接口（不再谎报"已就绪"）与两个 ONNX 节点（推理之前拦住，
+// 并给出"去「设置 → 引擎管理 → 模型权重」重新下载"这种能照做的提示）。
+//
+// 做法：拿 **4.65 MB 的 `realesr-general-x4v3`** 开刀 —— 小到可以随手备份、原样拷回。
+// ⚠️ 刻意**不用** 928 MB 的 `birefnet-general`：那是"用一次两分钟的恢复换一条断言"，
+// 而且会把它从一台已经就绪的机器上拿走。
+c.section('【30】权重文件被截断时，应用还会不会声称"已就绪"');
+{
+  const dir = join(DATA_DIR, 'models', 'realesr-general-x4v3');
+  const file = join(dir, 'realesr-general-x4v3.onnx');
+  const backup = join(REPO_ROOT, '.tools', 'smoke', 'realesr-general-x4v3.onnx.bak');
+  const hadFile = existsSync(file);
+  const originalBytes = hadFile ? statSync(file).size : 0;
+
+  try {
+    c.check(hadFile, '① 前置：这个权重本来是装好的（否则这条检查测的是别的东西）', file);
+    if (!hadFile) throw new Error('前置不满足：realesr-general-x4v3 没装');
+
+    mkdirSync(dirname(backup), { recursive: true });
+    copyFileSync(file, backup);
+    writeFileSync(file, Buffer.alloc(0)); // 截成 0 字节 —— 正是事故里的形态
+
+    // ---- ② 状态接口不许再谎报"已就绪" ----
+    const list = await client.invoke('models_list');
+    const entry = (list ?? []).find((x) => x.id === 'realesr-general-x4v3');
+    c.check(
+      entry?.installed === false,
+      '★ ② 0 字节的权重**不再**被报成"已就绪"（此前 `is_file()` 为真就算装好了）',
+      `installed=${entry?.installed} size=${entry?.installedSizeMb}`
+    );
+
+    // ---- ③ 节点必须在**推理之前**拦住，并说清该怎么办 ----
+    const work = join(REPO_ROOT, '.tools', 'smoke', 'out-truncated-weight');
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+    const src = join(work, 'in.png');
+    writeFileSync(src, makePng(160, 120, 21));
+    const outDir = join(work, 'out');
+    mkdirSync(outDir, { recursive: true });
+
+    const sub = await client.invoke('plugins_run', {
+      req: {
+        pluginId: 'com.toolforge.builtin.image-upscale',
+        inputs: { src: [src] },
+        params: { model: { kind: 'str', value: 'realesr-general-x4v3' } },
+        outputDir: outDir,
+      },
+    });
+    const job = await client.waitJob(sub.jobId, 120, 1000);
+    const text = (job.logs ?? []).map((l) => String(l.message)).join('\n');
+    console.log(`   截断权重下的任务：${job.status}${job.error ? ` — ${job.error.code}` : ''}`);
+    console.log(`   ${text.replace(/\s+/g, ' ').slice(0, 240)}`);
+    c.check(job.status === 'failed', '③ 任务失败（而不是"成功"地产出一张垃圾图）', job.status);
+    c.check(
+      job.error?.code === 'INTEGRITY_CHECK_FAILED',
+      '★ ③b 错误码说的是**完整性**，而不是一句笼统的「抠图脚本执行失败」',
+      job.error?.code ?? '(没有错误码)'
+    );
+    const fullText = `${job.error?.message ?? ''}\n${job.error?.detail ?? ''}\n${text}`;
+    c.check(
+      fullText.includes('不完整') || fullText.includes('0 字节'),
+      '★ ③c 信息里点明了"文件不完整"（这正是事故里缺的那一句）',
+      (job.error?.message ?? '').slice(0, 80)
+    );
+    c.check(
+      fullText.includes('重新下载') || fullText.includes('模型权重'),
+      '③d 并给出了可照做的下一步（去「模型权重」重新下载）',
+      (job.error?.detail ?? '').split('\n')[0]?.slice(0, 80)
+    );
+    c.check(
+      !existsSync(join(outDir, 'in.png')) && readdirSync(outDir).length === 0,
+      '③e 失败时没有留下半截产出',
+      readdirSync(outDir).join(', ') || '（空）'
+    );
+  } finally {
+    // ---- 收尾：把权重原样拷回去（**失败也拷**：这台机器上后面还要用它跑真机验证） ----
+    if (hadFile) {
+      try {
+        copyFileSync(backup, file);
+        rmSync(backup, { force: true });
+      } catch (e) {
+        console.log(`   ⚠️ 还原权重失败：${e.message}（备份留在 ${backup}）`);
+      }
+    }
+    const restored = existsSync(file) ? statSync(file).size : -1;
+    const list2 = await client.invoke('models_list').catch(() => []);
+    const entry2 = (list2 ?? []).find((x) => x.id === 'realesr-general-x4v3');
+    c.check(
+      restored === originalBytes && entry2?.installed === true,
+      '④ 收尾：权重已原样还原（字节数一致）且重新被认作已安装',
+      `${originalBytes} → ${restored} 字节，installed=${entry2?.installed}`
     );
   }
 }

@@ -334,10 +334,9 @@ where
             .with_detail(if requested.components().count() > 1 {
                 "可能是引擎尚未安装，或路径被移动。请到「引擎管理」重新探测。".to_string()
             } else {
-                format!(
-                    "它在系统 PATH 里也找不到。请安装它，或把它所在的目录加入 PATH 后重启应用。\n\
-                     （PATH 里若已有同名文件，请确认它有可执行后缀。）"
-                )
+                "它在系统 PATH 里也找不到。请安装它，或把它所在的目录加入 PATH 后重启应用。\n\
+                 （PATH 里若已有同名文件，请确认它有可执行后缀。）"
+                    .to_string()
             }));
         }
     };

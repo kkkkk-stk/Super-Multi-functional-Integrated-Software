@@ -1072,7 +1072,7 @@ runtime:
         let m = PluginManifest::from_yaml(MINIMAL_L1).expect("should parse");
         assert_eq!(m.metadata.id, "com.example.resize");
         assert_eq!(m.runtime.kind(), RuntimeKind::Pipeline);
-        assert!(m.runtime.requires_artifact() == false);
+        assert!(!m.runtime.requires_artifact());
         let report = m.validate();
         assert!(report.ok, "issues: {:?}", report.issues);
     }

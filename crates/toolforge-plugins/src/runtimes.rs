@@ -85,7 +85,10 @@ pub struct PluginCallRequest {
 /// 已装载的插件实例
 pub enum RunningPlugin {
     Wasm(wasm::WasmPlugin),
-    Python(python::PythonPlugin),
+    /// ⚠️ **装箱不是装饰**：`PythonPlugin` 有 576 字节，而 `WasmPlugin` 只有 120 ——
+    /// 不装箱的话整个枚举就是 576 字节，而它是按插件挂在 `HashMap` 里的，
+    /// 每次移动/取出都要按最大的那个变体付账（clippy 的 `large_enum_variant` 说的就是这个）。
+    Python(Box<python::PythonPlugin>),
 }
 
 impl RunningPlugin {
@@ -284,7 +287,7 @@ impl PluginRunner {
                                 .collect::<Vec<_>>(),
                         })),
                 );
-                RunningPlugin::Python(p)
+                RunningPlugin::Python(Box::new(p))
             }
         };
 

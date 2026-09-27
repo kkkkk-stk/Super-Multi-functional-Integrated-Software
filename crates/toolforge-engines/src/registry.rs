@@ -2510,7 +2510,7 @@ mod tests {
     /// * `ai-provider` 是远程 HTTP 服务。
     ///
     /// 探测器与二进制表都应该跳过它们。
-    pub const VIRTUAL_ENGINES: &'static [&'static str] = &["onnx-models", "ai-provider"];
+    pub const VIRTUAL_ENGINES: &[&str] = &["onnx-models", "ai-provider"];
 
     #[test]
     fn binary_table_covers_catalog_engines() {
@@ -2568,7 +2568,7 @@ mod tests {
                 s.id,
                 s.platform
             );
-            assert!(raw.is_empty() == false);
+            assert!(!raw.is_empty());
             verified += 1;
         }
         // 目前应当至少有 6 条已核对（ffmpeg/libvips Windows、pandoc 两平台、python 两平台）。

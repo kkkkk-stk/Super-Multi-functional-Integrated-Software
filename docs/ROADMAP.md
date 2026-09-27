@@ -52,8 +52,8 @@
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
-> | 运行时测试总数 | `cargo test --workspace` **276 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **328 项全通过**（【1】–【29】） |
+> | 运行时测试总数 | `cargo test --workspace` **280 passed / 0 failed** |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **341 项全通过**（【1】–【30】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -641,7 +641,7 @@ pnpm build          # tsc --noEmit && vite build
 ### 基线再更新（**当时的值**，保留作历史）
 
 > ⚠️ 下面这组数是**当时**取的，**不是现状**。当前值见本文档开头的「实测数据」表
-> （`cargo test --workspace` **276 passed / 0 failed**、`verify-platform.mjs` **328 项**）。
+> （`cargo test --workspace` **280 passed / 0 failed**、`verify-platform.mjs` **341 项**）。
 > 留在这里是为了保留"那一轮到底测到了什么"。
 
 阻塞 14、15 修复后重新取的一组数（上面那组保留为历史，**不要把两组混用**）：
@@ -795,7 +795,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 >
 > - `image.convert`、`image.resize`、`image.crop`、`image.rotate` **四个节点会真的按 `libvips → ImageMagick → 纯 Rust` 挑后端**，把结果报在节点输出的 **`backend`**（`"libvips"` / `"imagemagick"` / `"rust"`）与一条 debug 日志里。后端可观测是刻意的：不看日志就只能靠猜，而这个项目已经被"文档说有、实际没有"坑过好几次。
 > - `image.rotate` 的任意角度不再是"直接报缺 ImageMagick"：libvips 可用时走 `vips similarity --angle N`，ImageMagick 可用时走 `-rotate N`，**只有纯 Rust 可用时才返回 `EngineMissing`** —— 仍然**不会静默取整**（取整会让用户以为转了 45°，实际拿到没转的图）。
-> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错，【12】号检查把 `engines/libvips` 临时藏起来、断言后端真的切到 ImageMagick。**写下这一条时**整个脚本是 **82 项检查全通过**（【1】–【13】）；当前共 **328 项**（【1】–【29】），见本文档开头的「实测数据」表。
+> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错，【12】号检查把 `engines/libvips` 临时藏起来、断言后端真的切到 ImageMagick。**写下这一条时**整个脚本是 **82 项检查全通过**（【1】–【13】）；当前共 **341 项**（【1】–【30】），见本文档开头的「实测数据」表。
 > - **收益要说准**：libvips 档位带来的是**按质量换体积的能力**（WebP/JPEG 有损编码），纯 Rust 后端的 WebP 只能无损。**但"有损一定更小"是错的**，实测 320×200 合成渐变图：无损 508 字节 vs 有损 1808 字节（所以【6】只断言"确实走了有损编码"，不断言体积）。
 >
 > **本条原来还剩两件事，现在都做完了**：
@@ -1104,6 +1104,100 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 - **它当场抓到了第二个同病文件**：`scripts/env.ps1`（文档里让人 `. .\scripts\env.ps1` 的那个）同样**有中文、没有 BOM**，外加 40 处裸 LF。它今天**碰巧**还能解析 —— 只是它的中文注释后面恰好没有紧跟 `}` / `{` / `"`。这种"靠运气通过"的状态最危险，已一并修好（只改编码，内容一字未动）。
 - **反证**：把 `dev-with-cdp.ps1` 的 BOM 去掉 → 守卫立刻变红（`✗ 1 处问题`，退出码 1），且 PowerShell 5.1 同时报出 9 个解析错误；加回去 → 两者都归零。
 
+### 3.14 **CI 一直是红的**：`clippy -D warnings` 从来没在本地跑过（本轮发现并修掉）
+
+- **怎么发现的**：为了核对本文档「附 A」里那句"静态质量：`cargo clippy --workspace -- -D warnings`、`cargo fmt --check` → **无输出**"，我去跑了一遍 —— 结果第一步就卡住：
+  ```text
+  error: 'cargo-clippy.exe' is not installed for the toolchain 'stable-x86_64-pc-windows-msvc'
+  error: 'cargo-fmt.exe' is not installed for the toolchain 'stable-x86_64-pc-windows-msvc'
+  ```
+  本仓库的 Rust 工具链隔离装在 `.tools/rust` 下，而当初装的时候**没有装这两个 component**。
+  也就是说：**这条检查点从来没有被本机执行过**，而 CI 里它是一条 `-D warnings` 的硬门。
+- **装上之后立刻见红**：`cargo clippy --workspace --all-targets -- -D warnings` 报 **13 处错误 / 5 个 crate**。
+  也就是说：**CI 上的 Rust job 从某一刻起就一直是红的**，而本地"四道检查"（`cargo test` / `cargo check --all-targets` / `tsc` / `vite build`）**没有一条会碰 clippy** —— 这是一个纯粹的**关口错位**：CI 卡的本地不问，本地问的 CI 不卡。
+- **修掉的 13 处**（按 crate）：
+
+  | crate | lint | 处理 |
+  |---|---|---|
+  | `toolforge-core` | `vec_init_then_push`（`builtin_nodes()` 里 32 个 `n.push(...)`） | **显式 `#[allow]` + 写清理由**：那 32 个描述符各自带注释与说明，`push` 的写法让每一项能独立增删；改成一个大 `vec![…]` 字面量之后，任何增删节点都变成在上千行表达式里挪逗号。这是**风格取舍，不是没听见提示** |
+  | `toolforge-core` | `map(..).flatten()` / `assert_eq!(x, true)` / `x == false` | 改成 `and_then` / `assert!` / `!x` |
+  | `toolforge-process` | `useless_format!` | 直接给字符串字面量 |
+  | `toolforge-engines` | 冗余 `'static` ×2、手写字符比较、按下标遍历、手写 `match Ok/Err`、`== false` | `&[&str]`、`[' ', '-', '_']`、`iter_mut().enumerate()`、`.err()`、`!` |
+  | `toolforge-plugins` | `useless .into()` ×2 | 删掉（`ToolforgeError → ToolforgeError` 的空转换） |
+  | `toolforge-plugins` | `large_enum_variant`（`RunningPlugin::Python` 576 B vs `Wasm` 120 B） | **装箱**：枚举按插件挂在 `HashMap` 里，不装箱就得按最大的变体付移动代价 |
+  | `toolforge`（外壳） | `needless_borrow` / `field_reassign_with_default` / `redundant_closure` | 逐个改掉 |
+
+- ★ **其中一处是我这一轮自己写出来的**（`sources_to_delete(&inputs, …)` 里那个多余的 `&`，见 §3.10 的实现）—— 说明这个盲区**不只影响老代码**：本地关口不查的东西，新写的代码同样不会被拦住。
+- **过程上的修法（比修 13 处更重要）**：新增 `pnpm check:clippy`（与 CI 同一条命令）并接进 `pnpm check:all`：
+  ```text
+  check:all = check:encodings → check:rust → check:clippy → check:web
+  ```
+  这样"本地聚合检查"与"CI 硬门"至少在这三条上对齐了。**没对齐的是 fmt**，见下。
+- ⚠️ **`cargo fmt --check` 仍然不干净**，这一条**故意没有动**：
+  * 实测 **271 处 diff / 30 个文件**（`pipeline.rs` 57、`nodes.rs` 44、`commands.rs` 28……）；
+  * **CI 并没有把它列为必过项**（CI 的 Rust job 只跑 check / test / clippy），所以它不是"红的"，只是本文档里"无输出"那句话是**错的**；
+  * 全仓重排是一次纯机械但**覆盖面很大**的改动，会把这一轮的 diff 淹掉，而且它跟"这个项目现在能不能跑"没有关系。所以本轮只做两件事：**把文档里的假话改掉**（附 A 与验收标准 §2 都标注了实测数字），并把"要不要 `cargo fmt --all`"留成一个**明确的待决项**（`docs/ROADMAP.md` 里那条 🚧）。
+- 实测：`clippy --workspace --all-targets -- -D warnings` **退出码 0**；`cargo test --workspace` **280 passed / 0 failed**；`cargo check --workspace --all-targets` **0 error / 0 warning**；`verify-platform.mjs` **341 项全通过**。
+
+### 3.15 一次**自己造成的事故**：928 MB 的权重被截成 0 字节（本轮发生、定位、修复并补上防线）
+
+这一条记的是一次**验证脚本把用户数据弄坏了**的事故。写这么细，是因为它同时暴露了**测试替身的设计问题**和**产品的一处真实缺口**。
+
+#### 发生了什么
+
+做【29】（许可证勾选框的 UI 点击穿透）时，为了让"不可商用的权重"在界面上呈现"未下载"状态，脚本把 `birefnet-general` 的权重文件（928 MB）**同卷 rename 挪走**，然后真的去点了「下载」，指望页面里的 fetch 记录器把那一发请求拦下。结果：
+
+1. 记录器**记到了**请求（URL 与请求体都对），前端也确实拿到了假响应；
+2. 但后端**真的开了一个下载任务**，而下载的第一步是 `File::create` —— **把权重文件截成了 0 字节**；
+3. 脚本的 `finally` 又把暂存的原文件 rename 回去，于是**表面上什么都没发生**；
+4. 大约半小时后【8】真机验证失败（`birefnet-general` 报「抠图脚本执行失败」），追下去才发现那个文件是 0 字节。
+
+恢复用了 1.5 分钟重下 —— 顺带验证了备用源的价值：日志第一行是
+`主下载源（huggingface.co）失败，改用备用源重试`，然后以约 10 MB/s 完成。**之前给权重补 `fallbackUrl` 的工作，这次真的救了场。**
+
+#### 根因一：测试替身的前提**本身是破坏性的**
+
+旧设计是"把真实文件挪走造状态 + 靠拦截防止写入"。这两件事凑在一起意味着：**拦截只要有一个缺口，代价就是用户的数据** —— 而"拦截有没有缺口"恰恰是最不该拿来赌的东西。
+
+新设计把前提改成**只改喂给界面的数据**：`models_list` / `engines_catalog` 的响应在页面里被改写成"未安装"，**磁盘一个字节都不动**。于是即便请求漏到后端，代价也是零 —— 因为真实文件在，`install_model` 会先算哈希、发现与预期一致直接短路。这不是推测，是任务日志里的原话：
+
+```text
+job-fbeb0ac1d689  0.6 s  succeeded  本地已有校验通过的 birefnet-general（927.6 MB），跳过下载
+job-bead3ba4df57  0.06 s succeeded  已经可用，跳过下载
+```
+
+**判据也跟着改了**：不再数"有没有新任务"（那会把一次无害的短路判成事故，然后去 cancel 它 —— 反而可能掐断一次正在做的哈希校验），而是断言**没有真的在下载**（任务不能停在 running，日志里要有短路证据）且**权重文件字节数一字未变**。
+
+#### 根因二："记录了 ≠ 拦住了"
+
+Tauri 的 IPC 有**两条通道**：
+
+| 通道 | 命令名在哪 | 经过 `window.fetch` |
+|---|---|---|
+| custom protocol | URL 里（`http://ipc.localhost/<命令>`） | ✅ |
+| 回退（`window.ipc.postMessage`） | **body** 里 | ❌ |
+
+记录器按 **URL 的末段**去认命令，于是在回退通道上它只记录、**照原样转发**；而 `customProtocolIpcFailed` 一旦置位是**粘的**。结论写进【29】的注释了：**UI 验证的判据不能建立在"我拦住了"之上，只能建立在"后端状态没变"之上。**
+
+#### 根因三（这一条是**产品**的缺口，也是本轮真正的收获）
+
+"这个权重装好了吗"当时的判据是 `Path::is_file()` —— **0 字节的文件同样为真**。于是：
+
+* 界面显示「已就绪」；
+* `image.remove-background` 把空文件交给 onnxruntime；
+* 用户看到「抠图脚本执行失败」，而真正的原因（protobuf 解析失败）埋在 Python 的 stderr 里，跟"文件是空的"隔了三层。
+
+修法（判据只写一次，两处共用）：
+
+* 新增 `toolforge_core::engine::model_size_looks_complete(len, approx_mb)`：**0 字节、或不足标称体积的 60% → 不完整**。判据刻意宽松 —— `approx_size_mb` 本身就写着"约"（上游会换同名资产），而**把完好文件误判成损坏比漏判更糟**：前者让用户反复重下几百 MB，后者只是让错误晚一步暴露。精确一致性仍然由下载时的 SHA-256 负责。配 4 条单测（0 字节 / 半截 / 完好且有 40% 余量 / 没有标称体积时不误判）。
+* `models_list` 用它：0 字节的权重不再被报成「已就绪」。
+* `image.remove-background` 与 `ai.upscale` 在**推理之前**用它：报 `INTEGRITY_CHECK_FAILED`，并写清"多半是上一次下载被中断或被截断 → 去「设置 → 引擎管理 → 模型权重」重新下载（会重新做 SHA-256 校验）"。
+* **【30】（8 项）**端到端验它：拿 **4.65 MB** 的 `realesr-general-x4v3` 开刀（刻意**不用** 928 MB 那个 —— 那是"用一次两分钟的恢复换一条断言"）：截成 0 字节 → 状态接口如实报"未安装" → 节点任务失败且错误码是 `INTEGRITY_CHECK_FAILED`、信息里点明"不完整"并给出下一步 → 失败时不留半截产出 → 收尾原样还原（字节数一致）并重新认作已安装。
+
+#### 顺带一条关于"清理测试替身"的教训
+
+**测试替身比被测代码更难收拾。** `Page.addScriptToEvaluateOnNewDocument` 注册的脚本会作用于**之后每一个新文档**；而我只记住了"最新那一份"的 id，忘了摘最早那份 —— 于是第一份假数据（把模型说成未安装）跟着跑到了收尾检查里，让"没有副作用"这条检查**假红**了一次。现在 `patchAndBoot()` 每次先摘上一份，收尾还会轮询确认新文档里确实没有注入物。
+
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
 - `crates/toolforge-core/src/engine.rs` 里为每个引擎与模型都提供了 `license`、`license_note`、`requires_license_ack`，并且有测试在守护这些字段非空。
@@ -1223,7 +1317,8 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 - [x] ✅ `.gitignore` 已就绪（含前端口径：`bindings.ts` 要入库）
 - [x] ✅ `scripts/env.ps1`、`scripts/gen-icon.mjs` 已存在
 - [x] ✅ 补 `scripts/enginectl.mjs`（`package.json` 已引用；`list` 只读打印引擎目录 + 来源表状态，`install` 打印实际哈希）。**本机实测**（`node scripts/enginectl.mjs list`，退出码 0）：12 个引擎的"安装方式 / 核心 / 许可证 / 需确认许可证 / 下载源"五列全部打印出来，并会**主动警告**"`engine-sources.json` 里有 N 条下载源没有 sha256"（当前 N = 1，即 `ffmpeg@macos`）—— 它不会假装全部就绪。
-- [ ] 🚧 CI 基线：`cargo fmt --check`、`cargo clippy --workspace -- -D warnings`、`cargo test --workspace` 三条必过
+- [x] ✅ CI 基线：`cargo clippy --workspace --all-targets -- -D warnings` **已成为 CI 的一个 job，且本机实测全绿**（见 §3.14 —— 它此前是**红的**，而本地四道检查里没有它，所以一直没被发现）。
+- [ ] 🚧 `cargo fmt --check`：**当前不干净** —— 实测 **271 处 diff / 30 个文件**（见 §3.14 末尾）。CI **没有**把它列为必过项，所以它不是"红的"，只是本文档 §附 A 里那句"无输出"是**错的**。要不要跑一次 `cargo fmt --all` 做全仓重排，是一个**待你拍板**的决定（一次机械重排，diff 会很大）。
 - [ ] 🚧 `pnpm check:rust` / `check:web` / `check:all` 可执行
 - [ ] 🚧 `README.md` 更新为 ToolForge 架构说明（当前仍是占位内容）
 - [ ] 🚧 补 `docs/SECURITY.md` 与 `docs/PLUGIN-SDK.md`（已被代码与示例引用）
@@ -1231,8 +1326,9 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 ### 验收标准
 
 1. `cargo test --workspace` 全绿，且 `cargo test -p toolforge-core` 恰好 **61 个测试通过、0 失败**。
-   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **276 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
-2. `cargo clippy --workspace -- -D warnings` 与 `cargo fmt --check` 无输出（零告警、零格式差异）。
+   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **280 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
+2. `cargo clippy --workspace --all-targets -- -D warnings` 无输出（零告警）。**当前实测：全绿**（§3.14 修掉了最后 13 处）。
+   `cargo fmt --check` **目前不干净**（271 处 diff / 30 个文件），且 **CI 不检查它** —— 这一条要么补上 fmt 重排、要么把这句话改掉，不能就这么挂着（见 §3.14 末尾）。
 3. `cargo check --workspace --all-targets` 成功（即 `pnpm check:rust` 通过），且 `Cargo.lock` 已生成并入库。
 4. `pnpm check:all` 退出码为 0。
 5. `pnpm bindings` 成功生成 `bindings.ts`；**连续执行两次，第二次后 `git status` 为干净**（生成结果稳定、且文件已入库）。
@@ -1349,7 +1445,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   - **实测数据（真机，非推断）**：托管 Python **3.11.16 / 145.2 MB / tar.gz 路径**（此前只跑过 zip 路径）；venv 自动装上 `onnxruntime-1.30.0`、`numpy-2.4.6`、`pillow-12.3.0`；对一张 **400×300**（白底 + 一个红椭圆）的测试图输出 **RGBA PNG（colorType 6）、400×300、椭圆中心 alpha 254、角落 alpha 0、前景覆盖 18.87%**（与椭圆真实面积吻合）；**运行时就绪后单张推理约 0.7 秒**（首次含 pip 约 32 秒）。
   - **测试方法上的一个坑**：**显著性模型不能用渐变图测** —— 在没有明显主体的渐变图上，模型正确报告约 0% 覆盖并让节点发一条警告。验收脚本因此改用**有真实主体**的图。
   - 参数现在是 `model` / `mode`（`alpha` | `color`）/ `background` / `threshold` / `feather`；**旧的 `alphaMatting` 已被删除**（它从登记起就没有实现，是个**假参数**）。默认模型从 `u2net`（168 MB）改成 **`u2netp`（4.4 MB）** —— "先让它跑起来"比"一上来就要下 168 MB"重要得多。
-  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（**写下这一条时**整个脚本是 **82 项检查全通过**；当前共 **328 项**，见本文档开头的「实测数据」表）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
+  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（**写下这一条时**整个脚本是 **82 项检查全通过**；当前共 **341 项**，见本文档开头的「实测数据」表）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
   - **配套修掉的一个引擎层缺陷**：`probe()` 原来只对 `install_modes == [Remote]` 的引擎特判，而 `onnx-models` **没有可执行文件**（它只是权重文件的宿主），于是永远探测为 `Missing` —— 结果是这个节点**永远显示不可用，哪怕用户已经把权重下好了**。现在 `probe()` 对它单独判：**至少有一个权重已安装 = 可用**。另外 `EngineInstallRequest` 新增 **`force`** 标志 + 引擎卡片上的「另外安装应用托管版本」按钮：系统 Python 3.14 会被探到、显示可用，却跑不了 `onnxruntime` —— **"探测到可用"不等于"满足这个节点的要求"**。
 - [x] ✅ **AI 超分（`ai.upscale`）—— 已实现，真机跑通**
   - 以前的写法是「🚧 AI 超分（`ai.upscale`，当前 `not_implemented`）」。它曾经是"最有可能接着做的一个"，因为可以照抄抠图那条"模型 + 推理"链 —— 这一轮正是这么做的。
@@ -1504,13 +1600,15 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 检查点 | 命令/动作 | 期望 |
 | --- | --- | --- |
 | 领域层健康 | `cargo test -p toolforge-core` | 61 通过 / 0 失败（**写本文档时的目标值**；当前全仓合计见下一行，不再逐 crate 维护） |
-| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 276 passed / 0 failed** |
+| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 280 passed / 0 failed** |
 | 全目标检查 | `cargo check --workspace --all-targets` | 退出码 0 |
-| 静态质量 | `cargo clippy --workspace -- -D warnings`、`cargo fmt --check` | 无输出 |
+| 静态质量 | `cargo clippy --workspace --all-targets -- -D warnings`（= `pnpm check:clippy`） | **当前实测全绿**（§3.14 之前是红的） |
+| 格式 | `cargo fmt --check` | ⚠️ **不干净**：271 处 diff / 30 个文件；CI 目前不检查它（要不要全仓重排待定，见 §3.14） |
+| 脚本编码 | `pnpm check:encodings` | 退出码 0（`.ps1` 含非 ASCII 必须有 BOM，行尾必须 CRLF；见 §3.13） |
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | 退出码 0（需前端工程先落地） |
 | 聚合 | `pnpm check:all` | 退出码 0 |
 | 类型桥 | `pnpm bindings` 连续两次 | 第二次后 `git status` 干净（该命令同时跑 4 项守卫，含 `COMMAND_NAMES` 与注册命令的逐条核对） |
-| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **当前实测 328 项检查全通过**（【1】–【29】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】、**中间档 ImageMagick 后端切换**【12】、**纯 Rust 兜底档**【13】、音视频真实属性【17】、压缩包标准归档【18】、Office → PDF【19】、一句话生成插件闭环【20】、任务取消无孤儿【21】、画布导出跑通【22】、SDK 节点表对账【23】、API Key 生命周期与脱敏【24】、许可证确认与记录【25】、前端能力边界【26】、**「保留源文件」真的在删文件**【27】、**插件参数能不能到达执行器**【28】、**许可证勾选框的 UI 点击穿透**【29】；【8】【9】【11】【12】【13】在缺权重 / 缺运行时（或没有可临时藏起的托管引擎）时会显式记为"跳过"而不是"通过"） |
+| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **当前实测 341 项检查全通过**（【1】–【30】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】、**中间档 ImageMagick 后端切换**【12】、**纯 Rust 兜底档**【13】、音视频真实属性【17】、压缩包标准归档【18】、Office → PDF【19】、一句话生成插件闭环【20】、任务取消无孤儿【21】、画布导出跑通【22】、SDK 节点表对账【23】、API Key 生命周期与脱敏【24】、许可证确认与记录【25】、前端能力边界【26】、**「保留源文件」真的在删文件**【27】、**插件参数能不能到达执行器**【28】、**许可证勾选框的 UI 点击穿透**【29】、**权重被截断时不再谎报"已就绪"**【30】；【8】【9】【11】【12】【13】在缺权重 / 缺运行时（或没有可临时藏起的托管引擎）时会显式记为"跳过"而不是"通过"） |
 | 最小闭环 | `pnpm tauri:dev` → 图片转换任务 | 任务完成、输出存在 |
 | 引擎 | `pnpm engines:list` / `engines:install` | 能探测、能安装并通过 SHA-256 校验；**libvips 与 imagemagick 都已实测装成功**（哈希回填的 **7 条**仍限 Windows / Linux；FFmpeg 因本机 `www.gyan.dev` 不可达而未装成，见 §3） |
 | 图标 | `pnpm icons` | 成功（需先补 `assets/icon-source.png`） |

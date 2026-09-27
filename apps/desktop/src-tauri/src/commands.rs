@@ -392,11 +392,21 @@ pub async fn models_list(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Vec
         for m in desc.models {
             let registered_spec = registered.get(&m.id);
             let path = state.engines.model_path(&m.id);
-            let installed_size = path
+            let installed_bytes = path
                 .as_ref()
-                .filter(|p| p.exists())
                 .and_then(|p| std::fs::metadata(p).ok())
-                .map(|meta| meta.len() as f64 / (1024.0 * 1024.0));
+                .map(|meta| meta.len());
+
+            // ⚠️ **"文件存在"不等于"已就绪"**：0 字节（或被截断的）权重同样 `is_file()`
+            // 为真。本轮实测撞到过 —— 一次中断的下载把 928 MB 的 birefnet-general 截成 0 字节，
+            // 而界面一直显示「已就绪」，直到推理时甩出一句「抠图脚本执行失败」。
+            // 判据与节点侧共用同一个函数（`model_size_looks_complete`），刻意宽松，
+            // 见它的文档：误判完好文件为损坏比漏判更糟。
+            let installed = installed_bytes
+                .map(|len| {
+                    toolforge_core::engine::model_size_looks_complete(len, m.approx_size_mb)
+                })
+                .unwrap_or(false);
 
             // 归属**只认权重自己写的 `used_by`**，不再从"所属引擎被谁用"去推。
             //
@@ -413,8 +423,8 @@ pub async fn models_list(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Vec
                 license: m.license.clone(),
                 commercial_use: m.commercial_use,
                 approx_size_mb: m.approx_size_mb,
-                installed: installed_size.is_some(),
-                installed_size_mb: installed_size,
+                installed,
+                installed_size_mb: installed_bytes.map(|b| b as f64 / (1024.0 * 1024.0)),
                 downloadable: registered_spec.is_some() && m.sha256.is_some(),
                 used_by_nodes,
                 engine_id: desc.id.clone(),
@@ -905,7 +915,7 @@ fn submit_plugin_run(
             // （就地处理、产出与输入同路径、文件已经被搬走）用真机跑很难穷举，
             // 而它们**每一条都是数据丢失风险**。纯函数可以逐条钉单测。
             if !keep_original {
-                for path in sources_to_delete(&inputs, &produced_all, keep_original) {
+                for path in sources_to_delete(inputs, &produced_all, keep_original) {
                     match std::fs::remove_file(&path) {
                         Ok(()) => ctx.info(format!("已按设置删除源文件：{}", path.display())),
                         Err(e) => ctx.warn(format!("删除源文件失败（{}）：{e}", path.display())),

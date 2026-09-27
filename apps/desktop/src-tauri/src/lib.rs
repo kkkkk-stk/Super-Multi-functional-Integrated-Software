@@ -220,7 +220,7 @@ fn resolve_data_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
         Err(e) => {
             tracing::warn!("无法解析应用数据目录（{e}），改用用户主目录下的 .toolforge");
             dirs::home_dir()
-                .unwrap_or_else(|| std::env::temp_dir())
+                .unwrap_or_else(std::env::temp_dir)
                 .join(".toolforge")
         }
     }

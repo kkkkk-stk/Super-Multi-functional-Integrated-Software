@@ -659,7 +659,7 @@ async fn name_build(ctx: &mut NodeCtx) -> ToolforgeResult<NodeOutput> {
         "lower" => name.to_lowercase(),
         "upper" => name.to_uppercase(),
         "title" => name
-            .split_inclusive(|c: char| c == ' ' || c == '-' || c == '_')
+            .split_inclusive([' ', '-', '_'])
             .map(|word| {
                 let mut cs = word.chars();
                 match cs.next() {
@@ -1475,14 +1475,14 @@ async fn image_enhance(
         for y in 1..h.saturating_sub(1) {
             for x in 1..w.saturating_sub(1) {
                 let mut acc = [0f32; 3];
-                for ch in 0..3 {
+                for (ch, slot) in acc.iter_mut().enumerate() {
                     let center = rgb.get_pixel(x, y).0[ch] as f32;
                     let mut lap = 5.0 * center;
                     lap -= rgb.get_pixel(x - 1, y).0[ch] as f32;
                     lap -= rgb.get_pixel(x + 1, y).0[ch] as f32;
                     lap -= rgb.get_pixel(x, y - 1).0[ch] as f32;
                     lap -= rgb.get_pixel(x, y + 1).0[ch] as f32;
-                    acc[ch] = center + (lap - center) * amount;
+                    *slot = center + (lap - center) * amount;
                 }
                 sharpened.put_pixel(
                     x,
@@ -1502,6 +1502,39 @@ async fn image_enhance(
         .map_err(|_| ToolforgeError::invalid("无法从输出路径推断格式"))?;
     encode_image(&out, &dst, fmt, 92)?;
     Ok(NodeOutput::file(dst.display().to_string()))
+}
+
+/// 权重文件"存在"不等于"能用"：0 字节、半截下载的文件同样 `is_file()` 为真。
+///
+/// # 这条检查是一次真实事故换来的
+///
+/// 一次被中断的下载把 928 MB 的 `birefnet-general` 截成了 **0 字节**，于是：
+/// 界面显示「已就绪」、节点把空文件交给 onnxruntime、用户看到的是
+/// 「抠图脚本执行失败」—— 真正的原因埋在 Python 的 stderr 里，跟"文件是空的"隔了三层。
+///
+/// 判据用 [`toolforge_core::engine::model_size_looks_complete`]（0 字节、或不足标称体积
+/// 的 60%）。**刻意宽松**：把完好文件误判成损坏会让用户反复重下几百 MB，
+/// 而漏判只是让错误晚一步暴露。精确一致性仍然由下载时的 SHA-256 负责。
+fn ensure_weight_file_complete(model_id: &str, path: &Path) -> ToolforgeResult<()> {
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let approx = toolforge_core::engine::find_model(model_id)
+        .map(|m| m.approx_size_mb)
+        .unwrap_or(0);
+    if toolforge_core::engine::model_size_looks_complete(len, approx) {
+        return Ok(());
+    }
+    Err(ToolforgeError::new(
+        ErrorCode::IntegrityCheckFailed,
+        format!("模型 {model_id} 的权重文件不完整（实际 {len} 字节，标称约 {approx} MB）"),
+    )
+    .with_detail(format!(
+        "文件：{}\n\
+         多半是上一次下载被中断或被截断 —— 空文件/半截文件在文件系统上「存在」，\
+         所以它会被当成已安装，直到推理时才炸出一句看不懂的错误。\n\
+         请到「设置 → 引擎管理 → 模型权重」里重新下载它：下载会重新做 SHA-256 校验，\
+         校验不过会删掉重下。",
+        path.display()
+    )))
 }
 
 /// `ai.upscale`：Real-ESRGAN 超分辨率放大。
@@ -1540,6 +1573,8 @@ async fn ai_upscale(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> Toolf
                 .to_string(),
         ));
     }
+    // 文件在 ≠ 文件能用（0 字节 / 半截下载都会骗过 `is_file()`）
+    ensure_weight_file_complete(&model_id, &model_path)?;
 
     ctx.job.progress_now(toolforge_core::job::JobProgress::indeterminate(format!(
         "放大 {}",
@@ -1746,6 +1781,8 @@ async fn image_remove_background(
                 .to_string(),
         ));
     }
+    // 文件在 ≠ 文件能用（0 字节 / 半截下载都会骗过 `is_file()`）
+    ensure_weight_file_complete(&model_id, &model_path)?;
 
     // 归一化方式**按模型来**，喂错了不会报错、只会得到一张糊掉的蒙版
     // （见 `py/rembg.py` 模块文档第 2 条），所以这里显式查表而不是让脚本猜。
@@ -3712,10 +3749,8 @@ mod tests {
         for node in toolforge_core::pipeline::builtin_nodes() {
             // 用空参数调用：已实现的节点会因为缺参数返回 PluginInvalid/EngineMissing 等，
             // 未实现的必定返回 Internal + "尚未在 v0.1 中实现"。
-            let err = match run(&mut ctx, &node.name, &BTreeMap::new()).await {
-                Ok(_) => None, // 无参数也能跑通的节点（flow.log 有必填 message，不会走到这）
-                Err(e) => Some(e),
-            };
+            // （无参数也能跑通的节点会返回 Ok，于是这里是 None —— flow.log 有必填 message，不会走到那）
+            let err = run(&mut ctx, &node.name, &BTreeMap::new()).await.err();
 
             let hit_not_implemented = err
                 .as_ref()

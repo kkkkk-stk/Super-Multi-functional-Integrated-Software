@@ -737,6 +737,46 @@ pub fn find_engine(id: &str) -> Option<EngineDescriptor> {
     engine_catalog().into_iter().find(|e| e.id == id)
 }
 
+/// 按 id 查一个模型权重（跨所有引擎），拿得到它的许可证、标称体积与文件名。
+pub fn find_model(model_id: &str) -> Option<EngineModel> {
+    engine_catalog()
+        .into_iter()
+        .flat_map(|d| d.models)
+        .find(|m| m.id == model_id)
+}
+
+/// 权重文件"**看起来是完整的**"吗。
+///
+/// # 为什么需要它（一次真实事故）
+///
+/// 判断"这个权重装好了吗"此前用的是 `Path::is_file()` —— 而**0 字节的文件同样为真**。
+/// 本轮实测撞到了这条路径的代价：一次被中断的下载把 928 MB 的 `birefnet-general`
+/// 截成了 0 字节，于是
+///
+/// * 界面上它显示「已就绪」（`models_list` 只看文件在不在）；
+/// * `image.remove-background` 拿到这个空文件，交给 onnxruntime；
+/// * 用户看到的错误是「抠图脚本执行失败」—— 真正的原因（protobuf 解析失败）
+///   埋在 Python 的 stderr 里，跟"文件是空的"这件事隔了三层。
+///
+/// 判据刻意**宽松**：只挡"明显不对"，即 0 字节、或不足标称体积的 60%。
+/// 不拿 `approx_size_mb` 做精确比对，因为那个值本身就写着"约"
+/// （上游偶尔会换同名资产），**误判一个完好文件为损坏比漏判更糟**：
+/// 前者会让用户反复重下 900 MB，后者只是让错误晚一步暴露。
+///
+/// 真正的一致性判据仍然是 SHA-256（`EngineRegistry::install_model` 会核对并重下）。
+/// 这个函数只负责让"明显不完整"在**进入推理之前**就被拦住，并给出一句能照做的提示。
+pub fn model_size_looks_complete(actual_bytes: u64, approx_size_mb: u32) -> bool {
+    if actual_bytes == 0 {
+        return false;
+    }
+    let approx = (approx_size_mb as u64).saturating_mul(1024 * 1024);
+    if approx == 0 {
+        // 没有标称体积可比（不该发生，但真发生了不能因此误判）
+        return true;
+    }
+    actual_bytes >= approx * 6 / 10
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,8 +984,7 @@ mod tests {
             };
             let path_of = |u: &str| {
                 u.split_once("://")
-                    .map(|(_, rest)| rest.split_once('/').map(|(_, p)| p.to_string()))
-                    .flatten()
+                    .and_then(|(_, rest)| rest.split_once('/').map(|(_, p)| p.to_string()))
                     .unwrap_or_default()
             };
             assert_eq!(
@@ -1043,8 +1082,43 @@ mod tests {
                 );
             }
             if e.install_modes == vec![EngineInstallMode::System] {
-                assert_eq!(e.approx_size_mb > 0, true, "{} 应为系统安装", e.id);
+                assert!(e.approx_size_mb > 0, "{} 应为系统安装", e.id);
             }
         }
+    }
+
+    /// 权重完整性判据：**0 字节必须被判为不完整**（这是本轮真实事故的形态）。
+    #[test]
+    fn empty_model_file_is_not_complete() {
+        assert!(!model_size_looks_complete(0, 928));
+        assert!(!model_size_looks_complete(0, 4));
+    }
+
+    #[test]
+    fn obviously_truncated_model_file_is_not_complete() {
+        let approx = 928 * 1024 * 1024u64;
+        assert!(!model_size_looks_complete(approx / 2, 928), "半截下载应当被判为不完整");
+        assert!(!model_size_looks_complete(approx * 59 / 100, 928));
+    }
+
+    /// 反过来也要钉住：**完好的文件绝不能被误判**。
+    ///
+    /// `approx_size_mb` 是"约"，上游偶尔换同名资产；把它当精确值会让用户
+    /// 反复重下几百 MB。所以 60% 以上的都放过。
+    #[test]
+    fn complete_model_file_is_accepted_with_slack() {
+        let approx = 928 * 1024 * 1024u64;
+        assert!(model_size_looks_complete(approx, 928));
+        assert!(model_size_looks_complete(approx * 61 / 100, 928));
+        assert!(model_size_looks_complete(approx * 105 / 100, 928), "比标称大也算完整");
+        // 真实实测值：birefnet-general 标称 928，磁盘上 927.61 MB
+        assert!(model_size_looks_complete(972_686_045, 928 - 1));
+    }
+
+    /// 没有标称体积时不能因此误判成"损坏"。
+    #[test]
+    fn unknown_approx_size_never_flags_a_nonempty_file() {
+        assert!(model_size_looks_complete(1, 0));
+        assert!(!model_size_looks_complete(0, 0));
     }
 }

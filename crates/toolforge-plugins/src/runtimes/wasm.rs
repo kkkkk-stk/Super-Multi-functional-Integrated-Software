@@ -295,8 +295,7 @@ impl WasmPlugin {
                  \x20   cargo build --target wasm32-unknown-unknown --release\n\n\
                  关闭 WASI 不是配置口味问题：它是「插件没有文件系统」这条保证的实现手段。\
                  打开它等于把宿主的文件描述符交给插件。",
-            )
-            .into());
+            ));
         }
 
         let disallowed = imports.disallowed_host_functions(&def.allow_host_functions);
@@ -312,8 +311,7 @@ impl WasmPlugin {
                  日志请用 Extism PDK 自带的 `info!` / `warn!`（走内置导入，不需要声明）；\
                  KV 存储推迟到 v0.2。",
                 def.allow_host_functions
-            ))
-            .into());
+            )));
         }
 
         let pages = Self::pages_for_memory(def.memory_limit_mb);

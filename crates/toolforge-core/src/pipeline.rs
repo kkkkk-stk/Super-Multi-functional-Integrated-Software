@@ -861,6 +861,15 @@ pub fn is_implemented(node: &str) -> bool {
 
 /// 内置节点目录。**这里就是"主程序能力"的完整边界** ——
 /// 想加新能力，先在这里加一个节点（或加一个引擎），而不是在每个功能页里写 if。
+///
+/// # 为什么允许 `clippy::vec_init_then_push`
+///
+/// clippy 会提示这里应该写成 `vec![…]` 字面量（`vec_init_then_push`）。**刻意不改成那样**：
+/// 这 32 个描述符各自带着自己的文档注释与一段表格式说明，`push` 的写法让每一项
+/// 都能独立地"一块一块读、一块一块删"；改成一个大字面量之后，任何一次增删节点
+/// 都会变成在一个上千行的表达式里挪逗号。这是**风格取舍**，不是没听见提示 ——
+/// 所以显式 `allow` 并写在这里，而不是让 CI 一直红着。
+#[allow(clippy::vec_init_then_push)]
 pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     let mut n: Vec<NodeDescriptor> = Vec::new();
 

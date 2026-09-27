@@ -240,11 +240,13 @@ mod tests {
     #[test]
     fn round_trip_preserves_edited_fields() {
         let paths = temp_paths("roundtrip");
-        let mut s = Settings::default();
-        s.theme = "dark".into();
-        s.concurrency = 7;
-        s.default_output_dir = "D:\\out".into();
-        s.ambient_effects = false;
+        let s = Settings {
+            theme: "dark".into(),
+            concurrency: 7,
+            default_output_dir: "D:\\out".into(),
+            ambient_effects: false,
+            ..Settings::default()
+        };
         save(&paths, &s).unwrap();
 
         let loaded = load(&paths);
