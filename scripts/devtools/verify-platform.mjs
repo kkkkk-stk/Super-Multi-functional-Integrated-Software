@@ -44,7 +44,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
 
-import { Checker, connect, decodePng, makeDocx, makePng, makeQuadrantPng, pixelAt, quadrantName, REPO_ROOT, sleep, webpInfo, writeInputPdf } from './cdp.mjs';
+import { Checker, connect, decodePng, makeDocx, makePng, makeQuadrantPng, pixelAt, quadrantName, REPO_ROOT, sleep, webpInfo, writeInputPdf, zipStore } from './cdp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -6128,6 +6128,330 @@ runtime:
       await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
       await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
     }
+  }
+}
+
+// ============================================================================
+// 【33】三个「声明与行为不一致」的文件类节点
+// ============================================================================
+//
+// 这一节的起点是**新写的一条静态自省测试**
+// （`toolforge-engines` 的 `declared_node_params_are_actually_read_by_their_executor`）：
+// 它把 `nodes.rs` 的源码读进测试，从分发表找到每个节点的执行器，
+// 扫出它读了哪些参数键，再与 `builtin_nodes()` 声明的参数逐条对账。
+//
+// 第一次跑它就报了三条 —— 三条都是真的，而且在此之前**没有任何东西能发现它们**：
+//
+// | 问题 | 性质 |
+// |---|---|
+// | `fs.delete.toTrash` | 声明了、默认 `true`、标签写着「移到回收站而非永久删除」，而执行器**一行都没读它**，一直硬删。**界面在替一个不存在的安全网做承诺** |
+// | `archive.unpack.keepStructure` | 同类：默认 `true`、界面上有开关，执行器硬编码了 `7z x`，关掉它毫无效果 |
+// | `fs.move.overwrite` | 反向：执行器一直在读 `overwrite`，但 `fs.move` 从来没**声明**过它 —— 用户既看不见这个开关也没法关掉，只能吃默认的静默覆盖 |
+//
+// 为什么此前没有守卫能抓到：
+// * `validate_param_reachability` 的输入是**插件清单**，管不到内置节点自己的参数；
+// * —— 详 §3.24。
+//
+// 这一节把三处都验一遍：声明层用 `pipeline_nodes` 对账，行为层用真机跑。
+c.section('【33】`fs.delete` / `archive.unpack` / `fs.move`：声明与行为是否终于一致');
+{
+  const work = join(REPO_ROOT, '.tools', 'smoke', 'out-fs-nodes');
+  rmSync(work, { recursive: true, force: true });
+  mkdirSync(work, { recursive: true });
+
+  // ---- ① 声明层：三个节点的参数表现在说的是实话 ----
+  const catalog = await client.invoke('pipeline_nodes');
+  const byName = new Map((catalog.nodes ?? []).map((n) => [n.name, n]));
+  const paramsOf = (n) => (byName.get(n)?.params ?? []).map((p) => p.id);
+
+  c.check(
+    !paramsOf('fs.delete').includes('toTrash'),
+    '★ ① `fs.delete` 不再声明 `toTrash` —— 那个「移到回收站而非永久删除」的开关已经撤掉（它从来没生效过）',
+    paramsOf('fs.delete').join(', ') || '(无参数)'
+  );
+  c.check(
+    /永久删除/.test(byName.get('fs.delete')?.description ?? ''),
+    '★ ①b `fs.delete` 的说明里**明说**是永久删除、不进回收站（说法改成实话）',
+    (byName.get('fs.delete')?.description ?? '').slice(0, 60) + '…'
+  );
+  c.check(
+    paramsOf('fs.move').includes('overwrite'),
+    '★ ② `fs.move` 现在声明了 `overwrite` —— 执行器一直在读它，只是以前用户看不见也关不掉',
+    paramsOf('fs.move').join(', ')
+  );
+  c.check(
+    paramsOf('archive.unpack').includes('keepStructure') &&
+      /保留压缩包里的目录结构/.test(byName.get('archive.unpack')?.description ?? ''),
+    '②b `archive.unpack` 的 `keepStructure` 在说明里写清了两种取值的含义（x / e）',
+    paramsOf('archive.unpack').join(', ')
+  );
+
+  const install = async (id, dir) => {
+    const existing = await client.invoke('plugins_get', { pluginId: id }).catch(() => null);
+    if (existing) {
+      await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+    }
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'directory', path: dir },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: false,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: id,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'output' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: id, enabled: true });
+  };
+  const uninstall = async (id) => {
+    await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+    await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+  };
+  const writePlugin = (dir, yaml) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'plugin.yaml'), yaml, 'utf8');
+  };
+
+  const MOVE_ID = 'com.verify.fs-move';
+  const UNPACK_ID = 'com.verify.unpack-flat';
+
+  try {
+    // ---- ③ 真机：`fs.move` 的 `overwrite=false` 真的会挡住覆盖 ----
+    writePlugin(
+      join(work, 'move-plugin'),
+      `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${MOVE_ID}
+  name: 移动（验证用）
+  version: 1.0.0
+  description: 仅用于验证 fs.move 的 overwrite 参数。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 源文件
+      type: file
+      required: true
+  outputs:
+    - id: dst
+      label: 目标
+      type: file
+      required: true
+  params:
+    - id: overwrite
+      label: 覆盖已存在文件
+      type: bool
+      default: { kind: bool, value: true }
+      required: false
+runtime:
+  kind: pipeline
+  pipeline:
+    steps:
+      - id: mv
+        uses: fs.move
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+          overwrite: "\${params.overwrite}"
+`
+    );
+    await install(MOVE_ID, join(work, 'move-plugin'));
+
+    const inDir = join(work, 'move-in');
+    const outDir = join(work, 'move-out');
+    mkdirSync(inDir, { recursive: true });
+    mkdirSync(outDir, { recursive: true });
+    const srcPath = join(inDir, 'payload.bin');
+    // 目标名由输入主干决定 —— 每次跑都用同一个名字，才谈得上"目标已存在"
+    const target = join(outDir, 'payload.bin');
+
+    const runMove = async (overwrite) => {
+      // 上一轮把输入移走了，所以每轮都要重新造一个
+      writeFileSync(srcPath, Buffer.from(`round-${overwrite}-${Date.now()}`));
+      const sub = await client.invoke('plugins_run', {
+        req: {
+          pluginId: MOVE_ID,
+          inputs: { src: [srcPath] },
+          params: { overwrite: { kind: 'bool', value: overwrite } },
+          outputDir: outDir,
+        },
+      });
+      return client.waitJob(sub.jobId, 120, 1000);
+    };
+
+    const first = await runMove(false);
+    c.check(
+      first.status === 'succeeded' && existsSync(target),
+      '③ 前置：`overwrite=false` 在目标**不存在**时正常移动（否则后面的失败就说明不了什么）',
+      `${first.status}${first.error ? ` / ${first.error.code}` : ''}`
+    );
+
+    const second = await runMove(false);
+    console.log(
+      `   overwrite=false 且目标已存在：${second.status}${second.error ? ` — ${second.error.code}` : ''}`
+    );
+    c.check(
+      second.status === 'failed',
+      '★ ③b `overwrite=false` 且目标已存在时必须**失败**（以前这个开关根本不存在，永远静默覆盖）',
+      second.status
+    );
+    c.check(
+      (second.error?.message ?? '').includes('overwrite=false'),
+      '★ ③c 错误信息点名了是 `overwrite=false` 造成的，而不是一句泛泛的失败',
+      (second.error?.message ?? '(无信息)').slice(0, 80)
+    );
+
+    const third = await runMove(true);
+    c.check(
+      third.status === 'succeeded',
+      '★ ③d `overwrite=true` 时照常覆盖 —— 两个取值都能观测到（不是"永远挡住"）',
+      `${third.status}${third.error ? ` / ${third.error.code}` : ''}`
+    );
+
+    // ---- ④ 真机：`keepStructure` 真的改变解压结果的目录结构 ----
+    // 素材是一个**带两层目录**的 zip（stored 条目，零依赖手搓，见 cdp.mjs::zipStore）。
+    // 刻意叫 `bundle.zip`：宿主的目录类输出端口会按**输入主干**分配落点
+    // （`<输出目录>/bundle`），所以解压根目录与压缩包内的 `nested/` 不会重名 ——
+    // 第一版素材叫 `nested.zip`，于是路径长成 `nested/nested/deep/...`，
+    // 既难读、也让我把断言写错了地方（见下）。
+    const zipPath = join(work, 'bundle.zip');
+    writeFileSync(
+      zipPath,
+      zipStore([
+        ['top.txt', 'top-level file\n'],
+        ['nested/deep/inner.txt', 'nested file\n'],
+      ])
+    );
+    c.check(
+      readFileSync(zipPath).subarray(0, 2).toString('latin1') === 'PK',
+      '④ 前置：素材是合法 ZIP，且**带目录层级**（否则这条检查测的是空气）',
+      `${readFileSync(zipPath).length} 字节`
+    );
+
+    writePlugin(
+      join(work, 'unpack-plugin'),
+      `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${UNPACK_ID}
+  name: 平铺解压（验证用）
+  version: 1.0.0
+  description: 仅用于验证 archive.unpack 的 keepStructure 参数。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 压缩包
+      type: file
+      required: true
+  outputs:
+    - id: dst
+      label: 输出目录
+      type: directory
+      required: true
+  params:
+    - id: keepStructure
+      label: 保留目录结构
+      type: bool
+      default: { kind: bool, value: true }
+      required: false
+runtime:
+  kind: pipeline
+  pipeline:
+    steps:
+      - id: unpack
+        uses: archive.unpack
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+          keepStructure: "\${params.keepStructure}"
+`
+    );
+    await install(UNPACK_ID, join(work, 'unpack-plugin'));
+
+    const runUnpack = async (keepStructure, outName) => {
+      const dir = join(work, outName);
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+      const sub = await client.invoke('plugins_run', {
+        req: {
+          pluginId: UNPACK_ID,
+          inputs: { src: [zipPath] },
+          params: { keepStructure: { kind: 'bool', value: keepStructure } },
+          outputDir: dir,
+        },
+      });
+      return { job: await client.waitJob(sub.jobId, 180, 1000), dir };
+    };
+
+    const keep = await runUnpack(true, 'unpack-keep');
+    const flat = await runUnpack(false, 'unpack-flat');
+    console.log(`   解压（保留结构）：${keep.job.status} / 解压（平铺）：${flat.job.status}`);
+    c.check(
+      keep.job.status === 'succeeded' && flat.job.status === 'succeeded',
+      '④b 两种模式都成功',
+      `${keep.job.status} / ${flat.job.status}`
+    );
+
+    // 输出目录名由宿主分配（`<输入主干>` = `bundle`），所以解压根 =
+    // `<宿主给的输出目录>/bundle`。
+    //
+    // ⚠️ 第一版这里用"从 `job.outputs` 里挑一个不像文件的路径"去猜根目录，
+    // 结果两次都猜到了上一层，两条断言全红 —— 而**行为其实是对的**。
+    // 现在改成显式拼出来，并且先断言它真的存在（前置检查）：
+    // 万一宿主的命名规则变了，这条会**大声**失败，而不是悄悄去检查一个空目录。
+    const rootOf = (r) => join(r.dir, 'bundle');
+    const keepRoot = rootOf(keep);
+    const flatRoot = rootOf(flat);
+    c.check(
+      existsSync(keepRoot) && existsSync(flatRoot),
+      '④c 前置：解压根目录落在 `<输出目录>/bundle`（宿主的目录端口命名规则没变）',
+      `${existsSync(keepRoot)} / ${existsSync(flatRoot)}`
+    );
+    c.check(
+      existsSync(join(keepRoot, 'nested', 'deep', 'inner.txt')) &&
+        existsSync(join(keepRoot, 'top.txt')),
+      '★ ④d 默认（`keepStructure=true`）保留了压缩包里的两层目录（`nested/deep/inner.txt`）',
+      `inner=${existsSync(join(keepRoot, 'nested', 'deep', 'inner.txt'))} top=${existsSync(join(keepRoot, 'top.txt'))}`
+    );
+    const flatInner = existsSync(join(flatRoot, 'inner.txt'));
+    const flatNestedDir = existsSync(join(flatRoot, 'nested'));
+    c.check(
+      flatInner && !flatNestedDir && existsSync(join(flatRoot, 'top.txt')),
+      '★ ④e `keepStructure=false` 时文件被**平铺**到目标目录、没有 `nested/` 层级 —— 这个开关真的起作用了',
+      `inner.txt=${flatInner} top.txt=${existsSync(join(flatRoot, 'top.txt'))} nested/=${flatNestedDir}`
+    );
+    // 反证：两种模式若产出同一棵目录树，上面两条必然有一条红 ——
+    // 这里再显式钉一句"两种模式的落点确实不同"，免得将来有人把断言改松。
+    c.check(
+      !flatNestedDir && existsSync(join(keepRoot, 'nested')),
+      '★ ④f 反证：同一个压缩包、只改这一个开关，目录结构就不同（`keep` 有 `nested/`，`flat` 没有）',
+      `keep/nested=${existsSync(join(keepRoot, 'nested'))} flat/nested=${flatNestedDir}`
+    );
+  } finally {
+    await uninstall(MOVE_ID);
+    await uninstall(UNPACK_ID);
   }
 }
 

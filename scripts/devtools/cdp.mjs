@@ -322,7 +322,14 @@ export function writeInputPng(name, width, height, seed = 0) {
 // CRC 复用上面 `crc32()`（PNG 分块用的同一个），不另写一份。
 
 /** 把一个 entry 列表打成 ZIP（全部用 stored，不压缩） */
-function zipStore(entries) {
+/**
+ * 把 `[名字, 内容]` 列表打成一个 ZIP（全部 stored，不压缩）。
+ *
+ * 导出给验证脚本用：需要"一个**带目录层级**的压缩包"当素材时，
+ * 手搓一个 stored ZIP 比依赖系统 `tar`/`zip` 命令可靠得多
+ * （Windows 的 bsdtar 能读 zip，但 Linux/macOS 的 GNU tar 不写 zip）。
+ */
+export function zipStore(entries) {
   const locals = [];
   const centrals = [];
   let offset = 0;
