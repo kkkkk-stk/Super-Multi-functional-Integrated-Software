@@ -182,7 +182,10 @@ impl PluginRunner {
                 let bytes = std::fs::read(&path).map_err(|e| {
                     ToolforgeError::runtime(format!("读取 {} 失败：{e}", path.display()))
                 })?;
-                let p = wasm::WasmPlugin::load(&bytes, wasm, id.clone())?;
+                // 把**已授权**的能力传进去：WASM 侧要据此设置 Extism 的
+                // `allowed_hosts`，否则用户勾的 `net` 对 L2 插件完全不起作用。
+                let effective = record.effective();
+                let p = wasm::WasmPlugin::load(&bytes, wasm, id.clone(), &effective)?;
                 self.audit.record(
                     AuditEvent::new(AuditEventKind::Installed, "装载 L2 WASM 插件")
                         .subject(&id)
@@ -190,6 +193,7 @@ impl PluginRunner {
                             "wasmBytes": bytes.len(),
                             "memoryLimitMb": wasm.memory_limit_mb,
                             "hostFunctions": wasm.allow_host_functions,
+                            "allowedHosts": wasm::allowed_hosts_from(&effective),
                         })),
                 );
                 RunningPlugin::Wasm(p)

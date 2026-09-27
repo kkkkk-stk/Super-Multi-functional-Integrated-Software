@@ -38,7 +38,54 @@ use toolforge_core::queue::JobCtx;
 
 use crate::runtimes::PluginCallRequest;
 
-/// 把 `timeout_ms` 换算成 wasmtime 燃料上限。
+/// 由**已授权**的能力算出 Extism 的 `allowed_hosts`。
+///
+/// ## 这是在补一个真实的窟窿，不是"顺手加个配置"
+///
+/// Extism PDK 的 `http_request` 是**内置宿主函数**（不需要我们注入），而它在
+/// `pdk.rs` 里是这样判的：
+///
+/// ```text
+/// let host_matches = if let Some(allowed_hosts) = allowed_hosts { …任意匹配… }
+///                    else { false };
+/// if !host_matches { return Err("HTTP request to … is not allowed") }
+/// ```
+///
+/// 也就是说 **`allowed_hosts` 为 `None` 时一切请求都被拒**。我们此前从不设置它，
+/// 于是 L2 插件的网络是"永远不通"——**用户在授权面板里勾了 `net` 也没有任何用**，
+/// 因为宿主根本没把这份授权翻译给沙箱。这是"声明 → 授权 → 生效"链条上的断点：
+/// 方向是安全的（fail-closed，不是漏洞），但功能上是坏的，而且用户看到的是一个
+/// 明明授权了却报「HTTP request is not allowed」的插件。
+///
+/// 现在的映射：
+///
+/// * 没有授权 `net`（或声明为空）→ `None` → **全部拒绝**（保持 fail-closed）；
+/// * `net { hosts: [] }`（任意主机）→ `["*"]` —— 授权面板把空列表显示成
+///   「访问网络（任意主机，无限制）」，那就该如实放行任意主机；
+/// * `net { hosts: [a, b] }` → `[a, b]` —— Extism 用 **glob** 匹配，所以
+///   `*.example.com` 这类写法天然可用。
+///
+/// 与 `Capability::effective()` 同口径：**声明 ∩ 授权**，少一个都不给。
+pub fn allowed_hosts_from(granted: &toolforge_core::permission::PermissionSet) -> Option<Vec<String>> {
+    use toolforge_core::permission::Capability;
+    let mut hosts: Vec<String> = Vec::new();
+    for cap in &granted.capabilities {
+        if let Capability::Net { hosts: declared } = cap {
+            if declared.is_empty() {
+                // 空列表 = 任意主机。Extism 的 glob `*` 匹配任何 host_str。
+                return Some(vec!["*".to_string()]);
+            }
+            hosts.extend(declared.iter().cloned());
+        }
+    }
+    if hosts.is_empty() {
+        None
+    } else {
+        hosts.sort();
+        hosts.dedup();
+        Some(hosts)
+    }
+}
 ///
 /// 经验值：wasmtime 大约每秒消耗 1e8~1e9 燃料（取决于 CPU 与模块复杂度）。
 /// 取 **1e8/秒**作为保守估计，并设一个下限，避免 `timeoutMs: 1` 变成"什么都不许做"。
@@ -61,14 +108,24 @@ pub struct WasmPlugin {
 }
 
 impl WasmPlugin {
+    /// 装载一个 L2 插件。
+    ///
+    /// `granted` 是**已授权的**能力集合（调用方传 `PluginRecord::effective()`）。
+    /// 它在这里的用途只有一个但很关键：把它翻译成 Extism 的 `allowed_hosts`，
+    /// 让用户在授权面板上勾的 `net` 真的生效（见 [`allowed_hosts_from`]）。
     pub fn load(
         wasm_bytes: &[u8],
         def: &WasmRuntimeDef,
         plugin_id: String,
+        granted: &toolforge_core::permission::PermissionSet,
     ) -> ToolforgeResult<Self> {
         let pages = Self::pages_for_memory(def.memory_limit_mb);
+        let allowed = allowed_hosts_from(granted);
         let manifest = extism::Manifest::new([extism::Wasm::data(wasm_bytes.to_vec())])
-            .with_memory_max(pages);
+            .with_memory_max(pages)
+            // 没有授权 `net` 时给的是**空列表**：Extism 逐条 glob 匹配，
+            // 空列表 = 什么都不匹配 = 一切请求被拒。与 `None` 等效，都是 fail-closed。
+            .with_allowed_hosts(allowed.clone().unwrap_or_default().into_iter());
 
         let builder = extism::PluginBuilder::new(manifest)
             // 关闭 WASI：这是"没有文件系统"的实现手段。
@@ -238,12 +295,59 @@ mod tests {
             allow_host_functions: vec![],
         };
         // 这不是合法 wasm，必须给出 PluginRuntime 错误而不是 panic
-        match WasmPlugin::load(b"not a wasm module", &def, "test".into()) {
+        let none = toolforge_core::permission::PermissionSet::empty();
+        match WasmPlugin::load(b"not a wasm module", &def, "test".into(), &none) {
             Ok(_) => panic!("非法 wasm 不应该装载成功"),
             Err(e) => {
                 assert_eq!(e.code, ErrorCode::PluginRuntime);
                 assert!(e.detail.unwrap().contains("wasm32"));
             }
         }
+    }
+
+    // ========================================================================
+    // 网络白名单映射 —— 这一组补的是"授权了但沙箱不知道"的断点
+    // ========================================================================
+
+    /// 没有任何 `net` 授权 → 空列表 → Extism 逐条匹配全不中 → 一切请求被拒。
+    ///
+    /// 这是**安全默认值**，必须钉住：一旦这里变成 `Some(["*"])`，
+    /// 所有 L2 插件就都能随便联网了。
+    #[test]
+    fn no_net_grant_denies_every_host() {
+        let none = toolforge_core::permission::PermissionSet::empty();
+        assert!(
+            allowed_hosts_from(&none).unwrap_or_default().is_empty(),
+            "没有 net 授权时不该放行任何主机"
+        );
+    }
+
+    /// 空 `hosts` 列表 = 任意主机（授权面板就是这么显示的），映射成 glob `*`。
+    #[test]
+    fn empty_hosts_means_any_host() {
+        use toolforge_core::permission::{Capability, PermissionSet};
+        let set = PermissionSet {
+            capabilities: vec![Capability::Net { hosts: vec![] }],
+        };
+        assert_eq!(allowed_hosts_from(&set), Some(vec!["*".to_string()]));
+    }
+
+    /// 有白名单时**只**放行列出的主机，不夹带别的。
+    #[test]
+    fn declared_hosts_are_carried_through_exactly() {
+        use toolforge_core::permission::{Capability, PermissionSet};
+        let set = PermissionSet {
+            capabilities: vec![Capability::Net {
+                hosts: vec!["api.example.com".into(), "*.cdn.example.com".into()],
+            }],
+        };
+        let got = allowed_hosts_from(&set).expect("应当有白名单");
+        assert_eq!(got.len(), 2, "不多不少：{got:?}");
+        assert!(got.contains(&"api.example.com".to_string()));
+        assert!(got.contains(&"*.cdn.example.com".to_string()));
+        assert!(
+            !got.contains(&"*".to_string()),
+            "有具体白名单时**不能**顺带放行任意主机"
+        );
     }
 }

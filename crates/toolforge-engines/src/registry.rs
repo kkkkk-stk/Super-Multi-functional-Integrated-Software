@@ -966,7 +966,7 @@ fn build_download_client(http1_only: bool) -> ToolforgeResult<reqwest::Client> {
     let mut b = reqwest::Client::builder()
         .user_agent(concat!("ToolForge/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(60 * 30));
+        .timeout(total_download_timeout());
     if http1_only {
         b = b.http1_only();
     }
@@ -1037,13 +1037,32 @@ async fn send_download(client: &reqwest::Client, url: &str) -> ToolforgeResult<r
 
 /// 多久**一个字节都没收到**就判定为卡死。
 ///
-/// 客户端总超时是 30 分钟，而"连接建立了但服务端不吐数据"这种卡死会一直
-/// 撑到那一刻 —— 用户看到的是一个 **0% 不动、也没有任何解释**的进度条。
+/// "连接建立了但服务端不吐数据"这种卡死会一直撑到客户端总超时 ——
+/// 用户看到的是一个 **0% 不动、也没有任何解释**的进度条。
 /// 真机实测过：`www.gyan.dev` 的连接会挂住，文件停在 0 字节十几分钟。
 ///
 /// 60 秒是个宽容值：正常的慢速网络也会持续有小块到达，
 /// 真正卡死是"完全静默"，两者的区别很明显。
+///
+/// ⚠️ 这个常量与 [`total_download_timeout`] 是**互补**的两件事，不要合并：
+/// 这个管"卡死"（要快、要可读），那个只管兜住"有数据但慢到不合理"的极端情况。
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 一次下载的**总时长上限**。
+///
+/// ## 为什么是 2 小时，而不是原来的 30 分钟
+///
+/// 原来写的是 30 分钟，当时的理由是"大文件也该够了"。真机把这个假设打破了：
+/// gyan.dev 在这台机器上只有 15~43 KB/s，105 MB 的 FFmpeg **需要 40 分钟以上**，
+/// 于是出现了一种很尴尬的失败 —— **能连上、一直在下、但永远下不完**，
+/// 用户看着进度条走到一半然后报错。
+///
+/// 现在两者的分工是明确的：卡死交给 [`STALL_TIMEOUT`]（60 秒内给出可读错误），
+/// 这个总上限只兜住"每秒几个字节"这类极端情况，所以给得很宽松。
+/// **把总上限调大不会让"卡住"更难发现** —— 那不是它的职责。
+fn total_download_timeout() -> Duration {
+    Duration::from_secs(2 * 3600)
+}
 
 /// 把响应体流式写盘，边写边算 SHA-256。
 ///
