@@ -105,6 +105,13 @@ jobs:
         # 仓库里不放二进制素材，图标由脚本即时生成
         run: node scripts/gen-icon.mjs
 
+      - name: 校验 Windows 脚本的编码与行尾
+        # 纯字节级检查，与操作系统无关 —— 但它守的是"在 Windows 上跑得起来"：
+        # 没有 UTF-8 BOM 的 .ps1 会被 Windows PowerShell 5.1 按 ANSI/GBK 解码，
+        # 注释里的中文会吞掉后面紧邻的 `}`，脚本连解析都过不去。
+        # 详见 scripts/check-encodings.mjs 的头部注释。
+        run: pnpm check:encodings
+
       - name: 类型检查
         run: pnpm typecheck
 

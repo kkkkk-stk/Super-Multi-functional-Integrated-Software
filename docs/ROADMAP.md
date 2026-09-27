@@ -1078,6 +1078,32 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 
 > 至此 §3.8 那条自认空白可以划掉了。仍然没做的是**真实的下载行为**（点下去之后那几百 MB 的下载、SHA-256 校验、失败回滚）—— 那部分由【25】的后端契约与【4】/【18】/【19】的真机安装验证覆盖，本节刻意不重复下载（用假 jobId 拦下），**这一点在检查名里写清楚了**，不冒充端到端。
 
+### 3.13 Windows 脚本的编码：一条被实测逼出来的规则，现在有守卫（本轮）
+
+- **症状**：`scripts/devtools/dev-with-cdp.ps1`（**文档里推荐的启动方式**）在 Windows 自带的 PowerShell 5.1 下**连解析都过不去**，报
+  `Unexpected token '}'` —— 指的却是一个完全正确的行：
+  ```text
+  L100: Unexpected token 'exe' in expression or statement.
+  L100: The hash literal was incomplete.
+  L89: Missing closing '}' in statement block or type definition.
+  ```
+- **原因不是语法，是解码**（实测链条）：
+  1. Windows PowerShell 5.1 在文件**没有 BOM** 时按 **ANSI/GBK** 解码；PowerShell 7 默认按 UTF-8 读 —— 所以这个问题**只在"用系统自带 PowerShell 跑"时出现**，而那是 Windows 用户的默认情况。
+  2. 注释里的中文是多字节 UTF-8 序列，GBK 会把其中某些字节当成**后继字节**，把它后面紧邻的 ASCII 字符**吞掉**。
+  3. GBK 的后继字节范围 `0x40–0x7E` **正好包含 `}`**。于是 `@{ a = 1; b = '中文' }` 里的 `}` 被吃掉，括号配对崩掉。
+- **判据（可复现，也是这条结论的全部依据）**：
+  ```powershell
+  [System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$errs)
+  ```
+  去掉 BOM → 立刻 1–9 个 `Unexpected token`；加回去 → 0 个。**报错数量随注释内容漂移**，所以"这次看起来能跑"完全不可靠。
+- ★ **这不是一次性的坑，它会自己回来**：本轮一次普通的文本编辑之后，编辑工具**悄悄丢掉了 BOM**，脚本立刻变成 9 个解析错误 —— 而这一点在任何"我改了脚本"的自检里都不会出现（因为自检通常只跑 `node`、不跑 PowerShell）。所以修法不能只是"记得加 BOM"。
+- **补上的守卫**：`scripts/check-encodings.mjs` —— 扫描全仓 `.ps1` / `.bat` / `.cmd`，两条规则：
+  * 含非 ASCII 字符 → **必须**带 UTF-8 BOM；
+  * 行尾必须是 CRLF（`.gitattributes` 已经这么声明了，这里顺带核对工作区是不是也这样 —— 否则一次 `git` 触碰就会把整个文件重写）。
+  已接进 `pnpm check:all`（`check:encodings` → `check:rust` → `check:web`），并加进 CI 的 Web job（纯字节级检查，与操作系统无关，但守的是"在 Windows 上跑得起来"）。
+- **它当场抓到了第二个同病文件**：`scripts/env.ps1`（文档里让人 `. .\scripts\env.ps1` 的那个）同样**有中文、没有 BOM**，外加 40 处裸 LF。它今天**碰巧**还能解析 —— 只是它的中文注释后面恰好没有紧跟 `}` / `{` / `"`。这种"靠运气通过"的状态最危险，已一并修好（只改编码，内容一字未动）。
+- **反证**：把 `dev-with-cdp.ps1` 的 BOM 去掉 → 守卫立刻变红（`✗ 1 处问题`，退出码 1），且 PowerShell 5.1 同时报出 9 个解析错误；加回去 → 两者都归零。
+
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
 - `crates/toolforge-core/src/engine.rs` 里为每个引擎与模型都提供了 `license`、`license_note`、`requires_license_ack`，并且有测试在守护这些字段非空。

@@ -70,27 +70,49 @@ if (-not $NoStop) {
         Start-Sleep -Milliseconds 700
     }
 
-    $exe = Join-Path $repoRoot '.tools\probe\target\debug\toolforge.exe'
-    $locked = $false
-    if (Test-Path $exe) {
-        $locked = $true
-        for ($i = 0; $i -lt 20; $i++) {
-            try { [System.IO.File]::OpenWrite($exe).Close(); $locked = $false; break }
-            catch { Start-Sleep -Milliseconds 500 }
-        }
-    }
-
     # 锁可能**根本不属于我们**。
     #
     # 实测：本机有个带反作弊的游戏进程（`DeltaForceClient-Win64-Shipping.exe`，
     # 用 Restart Manager 查出来的）会抓住仓库里新写出来的 exe 不放，于是
     # `cargo build` 报 `failed to remove file ...toolforge.exe`。
-    # 重启应用没有用 —— 句柄不在我们手里。这种情况下改用一个独立编译目录继续，
-    # 而不是让人对着一个 os error 32 干等。
-    if ($locked) {
-        Write-Warning "$exe 被本应用之外的进程占用（见脚本注释）；改用 .tools\probe\target-app 编译"
-        $env:CARGO_TARGET_DIR = Join-Path $repoRoot '.tools\probe\target-app'
+    # 重启应用没有用 —— 句柄不在我们手里。
+    #
+    # 而且它**不止抓一个**：实测先抓走 `target`，换到 `target-app` 之后又被抓走。
+    # 所以这里按顺序挑一个"当前可写"的编译目录，而不是写死一个备胎。
+    # 挑中的目录会打印出来 —— 出问题时第一件要知道的事就是"这次到底用的哪个目录"。
+    $candidates = @('target', 'target-app', 'target-app2', 'target-app3')
+    $chosen = $null
+    $lockedDirs = @()
+    foreach ($name in $candidates) {
+        $dir = Join-Path $repoRoot ('.tools\probe\' + $name)
+        $exe = Join-Path $dir 'debug\toolforge.exe'
+        if (-not (Test-Path $exe)) {
+            # 还没有产物 —— 建一次全量（慢），但一定是干净的
+            $chosen = @{ dir = $dir; name = $name; why = '还没有产物' }
+            break
+        }
+        $free = $false
+        for ($i = 0; $i -lt 6; $i++) {
+            try { [System.IO.File]::OpenWrite($exe).Close(); $free = $true; break }
+            catch { Start-Sleep -Milliseconds 400 }
+        }
+        if ($free) {
+            $chosen = @{ dir = $dir; name = $name; why = 'exe 可写' }
+            break
+        }
+        $lockedDirs += $name
     }
+    if (-not $chosen) {
+        # 全都锁着：只能开一个新的（代价是一次全量重建）
+        $name = 'target-app' + (Get-Date -Format 'MMddHHmm')
+        $chosen = @{ dir = (Join-Path $repoRoot ('.tools\probe\' + $name)); name = $name; why = '前面几个都被占用' }
+    }
+
+    if ($chosen.name -ne 'target') {
+        Write-Warning ("编译目录被本应用之外的进程占用（{0}），改用 .tools\probe\{1}（{2}）" -f ($lockedDirs -join '、'), $chosen.name, $chosen.why)
+    }
+    $env:CARGO_TARGET_DIR = $chosen.dir
+    Write-Host ("编译目录: " + $chosen.dir) -ForegroundColor DarkGray
 }
 
 # ---- 2) 工具链环境 ----
@@ -105,7 +127,8 @@ if (Test-Path (Join-Path $repoRoot '.tools\rust\rustup')) {
     $env:CARGO_HOME = Join-Path $repoRoot '.tools\rust\cargo'
 }
 # 复用 devtools 的 target 缓存，避免 tauri dev 触发一次全量重建
-# （除非上面检测到 exe 被外部进程占用，那时已经换成 target-app）
+# （上面已经挑好了这次的编译目录：默认 `target`，被外部进程占用时依次退到
+#   `target-app` / `target-app2` / …，见那一段的注释）
 $sharedTarget = Join-Path $repoRoot '.tools\probe\target'
 if ((Test-Path $sharedTarget) -and -not $env:CARGO_TARGET_DIR) {
     $env:CARGO_TARGET_DIR = $sharedTarget

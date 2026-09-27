@@ -60,6 +60,13 @@ PowerShell 7 默认按 UTF-8 读，所以这个问题**只在"用系统自带 Po
 判据很好复现：`[System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$errs)`
 在没有 BOM 时报 1–2 个 `Unexpected token '}'`，加上就是 0 个。
 
+> ★ **这条规则现在有守卫了**：`pnpm check:encodings`（`scripts/check-encodings.mjs`，
+> 已接进 `pnpm check:all` 与 CI）扫描全仓 `.ps1` / `.bat` / `.cmd`，要求
+> 「含非 ASCII → 必须带 UTF-8 BOM」且行尾为 CRLF。
+> 为什么需要守卫而不是"记得加"：本轮一次普通的文本编辑之后，**编辑工具悄悄丢掉了 BOM**，
+> 脚本立刻变成 9 个解析错误 —— 而一般的自检只跑 `node`、不跑 PowerShell，根本看不见。
+> 它当场还抓到第二个同病文件 `scripts/env.ps1`（有中文、没有 BOM，今天只是**碰巧**能解析）。
+
 **② 编译产物可能被"不属于本应用"的进程抓住。**
 `cargo build` 报 `failed to remove file ...toolforge.exe ... os error 32` 时，
 先别怀疑自己的进程没退干净 —— 用 **Restart Manager** 查一下到底是谁拿着句柄：

@@ -1,4 +1,4 @@
-# ToolForge 本地工具链环境（沙箱 / CI 隔离安装用）
+﻿# ToolForge 本地工具链环境（沙箱 / CI 隔离安装用）
 #
 #   . .\scripts\env.ps1
 #

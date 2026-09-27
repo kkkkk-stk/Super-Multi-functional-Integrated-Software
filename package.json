@@ -28,9 +28,10 @@
     "engines:install": "node scripts/enginectl.mjs install",
     "icons": "node scripts/gen-icon.mjs && pnpm --filter @toolforge/desktop tauri icon ./assets/icon-source.png",
     "ensure-dist": "node scripts/ensure-dist.mjs",
+    "check:encodings": "node scripts/check-encodings.mjs",
     "check:rust": "node scripts/ensure-dist.mjs && cargo check --workspace --all-targets",
     "check:web": "pnpm typecheck && pnpm build",
-    "check:all": "pnpm check:rust && pnpm check:web"
+    "check:all": "pnpm check:encodings && pnpm check:rust && pnpm check:web"
   },
   "devDependencies": {
     "typescript": "5.9.3"
