@@ -1449,6 +1449,99 @@ runtime:
   }
 }
 
+// ============================================================================
+// 【16】节点的"可用性"说的是不是实话（知情时机的落差）
+// ============================================================================
+//
+// ROADMAP §7 第 4 项：「`ebook.convert` 在两个可选引擎都没有时的 UI 提示……
+// 运行期会返回明确的 EngineMissing，但**节点可用性判定仍只看 requiresEngines**，
+// 所以这种机器上它依旧显示"可用"」。同类问题还有一个更隐蔽的版本：
+// `ai.upscale` 依赖 `onnx-models`，而那个虚拟引擎的判据是"下过至少一个权重" ——
+// 于是只下了**抠图**权重的机器上，超分节点也显示可用。
+//
+// 这一节不去硬编"本机应该是什么状态"（那会随装了哪些引擎而变），而是验
+// **UI 的判断与真实的引擎/权重状态是否一致** —— 那才是"有没有说谎"的定义。
+c.section('【16】节点可用性判定与真实引擎/权重状态是否一致');
+{
+  const catalog = await client.invoke('pipeline_nodes');
+  const engines = await client.invoke('engines_probe_all');
+  const models = await client.invoke('models_list');
+
+  const usable = (id) => {
+    const e = engines.find((x) => x.descriptor.id === id);
+    return Boolean(e && (e.status.state === 'detected' || e.status.state === 'installed'));
+  };
+  const installedFor = (node) =>
+    (models ?? []).some((m) => m.installed && (m.usedByNodes ?? []).includes(node));
+
+  const avail = catalog.availability ?? {};
+  const nodesByName = new Map((catalog.nodes ?? []).map((n) => [n.name, n]));
+
+  // 这台机器上"实际能不能跑"独立算一遍
+  const truth = (node) => {
+    for (const e of node.requiresEngines ?? []) {
+      if (!usable(e)) return false;
+    }
+    const rule = RULES[node.name];
+    if (rule?.atLeastOneOf?.length) {
+      if (!rule.atLeastOneOf.some(usable)) return false;
+    }
+    if (rule?.requiresModelWeight && !installedFor(node.name)) return false;
+    return true;
+  };
+  // 补充规则与 Rust 侧 `NODE_AVAILABILITY_RULES` 必须一致（这里只镜像判定逻辑，
+  // 规则本身从 Rust 来不了 —— 它是内部表。镜像的代价由下面的一致性断言兜住。）
+  const RULES = {
+    'ebook.convert': { atLeastOneOf: ['calibre', 'pandoc'] },
+    'doc.ocr': { atLeastOneOf: ['tesseract', 'ai-provider'] },
+    'image.remove-background': { requiresModelWeight: true },
+    'ai.upscale': { requiresModelWeight: true },
+  };
+
+  const mismatched = [];
+  for (const [name, node] of nodesByName) {
+    const claimed = avail[name];
+    const actual = truth(node);
+    if (claimed !== actual) mismatched.push(`${name}: UI=${claimed} 实际=${actual}`);
+  }
+  console.log(`   检查了 ${nodesByName.size} 个节点的可用性判定`);
+  c.check(
+    mismatched.length === 0,
+    '每个节点的"可用"与真实引擎/权重状态一致（没有撒谎的节点）',
+    mismatched.join('；')
+  );
+
+  // ★ 具体到那两条已知的落差：把它们的判据摊开来看
+  for (const name of ['ebook.convert', 'doc.ocr']) {
+    const rule = RULES[name];
+    const enginesOk = rule.atLeastOneOf.filter(usable);
+    console.log(
+      `   ${name}: 声明可用=${avail[name]}；析取组 ${rule.atLeastOneOf.join('/')} 里可用的有 [${enginesOk.join(', ')}]`
+    );
+    c.check(
+      avail[name] === enginesOk.length > 0,
+      `${name} 的可用性等于「析取组里至少有一个真的可用」`,
+      `可用=${avail[name]}，实际可用引擎=${enginesOk.join(',') || '无'}`
+    );
+  }
+  c.check(
+    !RULES['doc.ocr'].atLeastOneOf.includes('poppler'),
+    'poppler 不在 doc.ocr 的识别引擎析取组里（它只管 PDF 栅格化）',
+    ''
+  );
+
+  // ★ 权重归属按**权重**算：`ai.upscale` 的可用性必须看有没有"超分"权重，
+  //   而不是"有没有任何权重"。
+  const upModels = (models ?? []).filter((m) => m.installed && (m.usedByNodes ?? []).includes('ai.upscale'));
+  const anyModel = (models ?? []).some((m) => m.installed);
+  console.log(`   已装权重 ${(models ?? []).filter((m) => m.installed).length} 个，其中超分权重 ${upModels.length} 个`);
+  c.check(
+    avail['ai.upscale'] === upModels.length > 0,
+    'ai.upscale 的可用性取决于**超分**权重，而不是"有没有任何权重"',
+    `可用=${avail['ai.upscale']}，超分权重=${upModels.length}，任何权重=${anyModel}`
+  );
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

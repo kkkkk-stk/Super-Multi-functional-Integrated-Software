@@ -162,6 +162,13 @@ pub struct ModelSpec {
     /// 是否允许商用（来自 [`toolforge_core::engine::EngineModel`]，此处冗余一份便于独立校验）
     #[serde(default)]
     pub commercial_use: bool,
+    /// 这个权重服务于哪些内置节点（原样来自 `EngineModel.used_by`）。
+    ///
+    /// 可用性判定要用它：`onnx-models` 是个**虚拟引擎**，它的状态是
+    /// "下过至少一个权重" —— 那不等于"下过 `ai.upscale` 能用的权重"。
+    /// 只下了抠图权重的机器上，超分节点必须显示**不可用**。
+    #[serde(default)]
+    pub used_by: Vec<String>,
 }
 
 // ============================================================================
@@ -232,6 +239,7 @@ impl EngineRegistry {
                             // 没写 file_name 的模型上面已经被 continue 掉了。
                             .unwrap_or_else(|| format!("{}.onnx", m.id)),
                         commercial_use: m.commercial_use,
+                        used_by: m.used_by.clone(),
                     },
                 );
             }

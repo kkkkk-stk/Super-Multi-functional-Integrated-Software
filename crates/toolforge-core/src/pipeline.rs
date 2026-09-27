@@ -417,6 +417,77 @@ pub struct NodeDescriptor {
     pub params: Vec<ParamSpec>,
 }
 
+/// 可用性判定的**补充规则**。
+///
+/// # 为什么不直接加字段到 `NodeDescriptor` 上
+///
+/// `NodeDescriptor` 在这个文件里有 **32 个构造点**，每加一个字段就要改 32 处，
+/// 而这几个特例一共只涉及 4 个节点。所以单独一张表，按节点名查。
+/// 代价是"同一件事分了两处写"，因此配了一条**漂移守卫**测试
+/// （`availability_rules_reference_real_nodes_and_engines`）：表里的节点名必须真实存在，
+/// 表里的引擎名必须出现在该节点自己的 `requires_engines` / `optional_engines` 里。
+///
+/// # 它解决的是什么
+///
+/// `optional_engines` 的语义是"有它更好、没有也能跑" —— 对 `image.convert`
+/// （纯 Rust 兜底）完全正确。但有一类节点恰恰相反：**所有路径都需要某个引擎，
+/// 只是不限定是哪一个**：
+///
+/// | 节点 | 能用它的条件 |
+/// |---|---|
+/// | `ebook.convert` | Calibre **或** Pandoc |
+/// | `doc.ocr` | Tesseract **或** 配好的 AI 服务 |
+///
+/// 这类节点以前只能把引擎写进 `optional_engines`，于是**可用性判定看不见它们**：
+/// 两个引擎都没装的机器上节点照样显示可用，用户点下去才撞到 `EngineMissing`。
+/// ROADMAP §7 第 4 项把这种落差记成"不是安全问题，是**知情时机的落差**"。
+#[derive(Debug, Clone, Copy)]
+pub struct NodeAvailabilityRule {
+    /// 节点全名
+    pub node: &'static str,
+    /// 这一组里**至少要有其中一个**可用了，节点才算可用（析取）
+    pub at_least_one_of: &'static [&'static str],
+    /// 需要至少一个"属于本节点"的模型权重（`EngineModel.used_by` 含本节点名）
+    pub requires_model_weight: bool,
+}
+
+/// 见 [`NodeAvailabilityRule`]。
+pub const NODE_AVAILABILITY_RULES: &[NodeAvailabilityRule] = &[
+    NodeAvailabilityRule {
+        node: "ebook.convert",
+        // 两个都是"能写电子书"的后端，但不是互为降级 —— 是**二选一必需**：
+        // 两个都没有时，这个节点一点用都没有（`ebook_convert` 会直接返回 EngineMissing）。
+        at_least_one_of: &["calibre", "pandoc"],
+        requires_model_weight: false,
+    },
+    NodeAvailabilityRule {
+        node: "doc.ocr",
+        // 识别那两条路二选一必需。**`poppler` 不在这一组**：它只决定"能不能吃 PDF"，
+        // 图片输入根本不需要它 —— 把它塞进来会让"装了 poppler 但没有任何识别引擎"
+        // 的机器把这个节点显示成可用，而那正是我们要消掉的那种落差。
+        at_least_one_of: &["tesseract", "ai-provider"],
+        requires_model_weight: false,
+    },
+    NodeAvailabilityRule {
+        node: "image.remove-background",
+        at_least_one_of: &[],
+        // 权重归属按 **模型自己的 `used_by`** 算，不能按引擎算：
+        // `onnx-models` 同时承载抠图与超分，"装了至少一个权重"不等于
+        // "装了这个节点能用的权重"。
+        requires_model_weight: true,
+    },
+    NodeAvailabilityRule {
+        node: "ai.upscale",
+        at_least_one_of: &[],
+        requires_model_weight: true,
+    },
+];
+
+/// 查某个节点的补充规则
+pub fn availability_rule(node: &str) -> Option<&'static NodeAvailabilityRule> {
+    NODE_AVAILABILITY_RULES.iter().find(|r| r.node == node)
+}
+
 // ---- 构造辅助（把样板压到最低） ----
 
 fn port(id: &str, label: &str, ty: PortType, required: bool) -> IoPort {
@@ -1189,6 +1260,59 @@ pub fn engines_referenced() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **漂移守卫**：补充规则表里的节点与引擎必须真实存在。
+    ///
+    /// `NODE_AVAILABILITY_RULES` 与 `builtin_nodes()` 是两份数据、说同一件事
+    /// （这个节点靠哪些引擎活着）。表里的名字一旦拼错，后果是可用性判定**静默失效** ——
+    /// 节点永远显示可用，用户点下去才失败，也就是这张表本来要消掉的那个问题。
+    /// 所以这里既查节点名，也查引擎名。
+    #[test]
+    fn availability_rules_reference_real_nodes_and_engines() {
+        let nodes = builtin_nodes();
+        for rule in NODE_AVAILABILITY_RULES {
+            let node = nodes
+                .iter()
+                .find(|n| n.name == rule.node)
+                .unwrap_or_else(|| panic!("补充规则引用了不存在的节点：{}", rule.node));
+
+            for e in rule.at_least_one_of {
+                assert!(
+                    node.requires_engines.contains(&(*e).to_string())
+                        || node.optional_engines.contains(&(*e).to_string()),
+                    "节点 {} 的补充规则里写了引擎 `{e}`，但该节点自己的 \
+                     requires_engines / optional_engines 里没有它 —— \
+                     两处对不上时，可用性判定会静默失效",
+                    rule.node
+                );
+            }
+
+            // 反过来：凡是"所有路径都需要某类引擎"的节点，都该有一条规则。
+            // 这条只能对**已知特例**断言（没法自动判断"哪些节点属于这一类"），
+            // 但至少能防止有人删掉规则却留下 optional_engines 的假承诺。
+            if rule.requires_model_weight {
+                assert!(
+                    node.requires_engines.contains(&"onnx-models".to_string()),
+                    "{} 声明需要模型权重，却没把 onnx-models 列进必需引擎",
+                    rule.node
+                );
+            }
+        }
+    }
+
+    /// `doc.ocr` 的析取组里**不能**有 `poppler`：它只决定"能不能吃 PDF"，
+    /// 图片输入不需要它。写进去会让"装了 poppler 但没有任何识别引擎"的机器
+    /// 把这个节点显示成可用 —— 正是要消掉的那种落差。
+    #[test]
+    fn doc_ocr_disjunction_is_about_recognition_not_rasterization() {
+        let rule = availability_rule("doc.ocr").expect("doc.ocr 应当有补充规则");
+        assert!(rule.at_least_one_of.contains(&"tesseract"));
+        assert!(rule.at_least_one_of.contains(&"ai-provider"));
+        assert!(
+            !rule.at_least_one_of.contains(&"poppler"),
+            "poppler 只影响 PDF 输入，不该进识别引擎的析取组"
+        );
+    }
 
     #[test]
     fn every_builtin_node_has_unique_name_and_nonempty_label() {

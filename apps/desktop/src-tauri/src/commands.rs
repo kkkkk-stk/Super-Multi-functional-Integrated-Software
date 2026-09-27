@@ -1039,8 +1039,18 @@ pub async fn pipeline_nodes(state: State<'_, Arc<AppState>>) -> ToolforgeResult<
     let mut availability: HashMap<String, bool> = HashMap::new();
     let mut missing_engines: HashMap<String, Vec<String>> = HashMap::new();
 
+    // 已下载的权重（按**权重自己的** `used_by` 归属，见下面的补充规则）
+    let installed_models: Vec<(String, Vec<String>)> = state
+        .engines
+        .models()
+        .into_iter()
+        .filter(|m| state.engines.is_model_installed(&m.id))
+        .map(|m| (m.id.clone(), m.used_by.clone()))
+        .collect();
+
     for n in &nodes {
         let mut ok = true;
+        // ① 必需引擎（合取）
         for e in &n.requires_engines {
             if !state.engines.is_available(e).await {
                 ok = false;
@@ -1050,6 +1060,47 @@ pub async fn pipeline_nodes(state: State<'_, Arc<AppState>>) -> ToolforgeResult<
                     .push(n.name.clone());
             }
         }
+
+        // ② 补充规则（见 `NodeAvailabilityRule`）
+        //
+        // 没有这两条的时候，UI 会**对用户撒谎**：`ebook.convert` 在既没有
+        // Calibre 也没有 Pandoc 的机器上显示可用；`ai.upscale` 在只下了抠图
+        // 权重的机器上也显示可用。用户点下去才撞到 EngineMissing。
+        if let Some(rule) = toolforge_core::pipeline::availability_rule(&n.name) {
+            // ②a "这一组里至少有一个"（析取）
+            if !rule.at_least_one_of.is_empty() {
+                let mut any = false;
+                for e in rule.at_least_one_of {
+                    if state.engines.is_available(e).await {
+                        any = true;
+                        break;
+                    }
+                }
+                if !any {
+                    ok = false;
+                    for e in rule.at_least_one_of {
+                        missing_engines
+                            .entry((*e).to_string())
+                            .or_default()
+                            .push(n.name.clone());
+                    }
+                }
+            }
+            // ②b "至少有一个**属于本节点**的权重"
+            if rule.requires_model_weight {
+                let has = installed_models
+                    .iter()
+                    .any(|(_, used_by)| used_by.iter().any(|u| u == &n.name));
+                if !has {
+                    ok = false;
+                    missing_engines
+                        .entry("onnx-models".to_string())
+                        .or_default()
+                        .push(n.name.clone());
+                }
+            }
+        }
+
         availability.insert(n.name.clone(), ok);
     }
 
