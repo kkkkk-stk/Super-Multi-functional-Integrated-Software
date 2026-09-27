@@ -115,6 +115,29 @@ pub struct EngineDescriptor {
     /// 支持的平台（`windows` / `macos` / `linux`）
     pub platforms: Vec<String>,
     pub install_modes: Vec<EngineInstallMode>,
+    /// **哪些平台支持"应用内一键下载"**。
+    ///
+    /// # 为什么不能只看 `install_modes`
+    ///
+    /// 那个字段是**引擎级**的，而"能不能一键装"是**平台级**的事实：
+    ///
+    /// | 引擎 | Windows | Linux | macOS |
+    /// |---|---|---|---|
+    /// | `libvips` | ✅ 有预编译包 | ❌ 只有源码包 | ❌ **只有源码包**（上游不发布 macOS 二进制） |
+    /// | `pandoc` | ✅ zip | ✅ tar.gz | ❌ 只发 `.pkg`（要 root 安装，不是可分发的归档） |
+    /// | `imagemagick` | ✅ 便携版 | ❌ 无条目 | ❌ 无条目 |
+    ///
+    /// 把三者都写成 `Download`，macOS 用户就会看到一个**点了必然失败**的按钮；
+    /// 把 `Download` 从 `install_modes` 里删掉，又会砍掉 Windows 的能力。
+    /// 所以"支持的平台"必须单独写出来。
+    ///
+    /// 它与 `engine-sources.json` 的关系是**意图 vs 数据**，由测试做双向核对
+    /// （`download_platforms_are_backed_by_real_sources`）：
+    /// 这里写了某个平台却没有来源条目 → 失败；有来源却没写进来 → 也失败。
+    /// 这样"声明支持某平台下载"这件事在任何操作系统上跑测试都能被查出来，
+    /// 而不再像以前那样**只在当前平台上查**（macOS 的两条死源就是这么漏掉的）。
+    #[serde(default)]
+    pub download_platforms: Vec<String>,
     /// 是否需要在下载前让用户确认许可证
     pub requires_license_ack: bool,
     /// 可选的模型权重（例如抠图的 U2Net），与主程序分开下载
@@ -286,6 +309,9 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             ],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::System, EngineInstallMode::Download],
+            // 三平台都有来源：Windows/Linux 是 BtbN 的版本固定构建，macOS 是 evermeet 的
+            // 版本直链（**没有哈希**，需要用户勾选"允许未校验来源"）
+            download_platforms: vec!["windows".into(), "linux".into(), "macos".into()],
             requires_license_ack: true,
             models: vec![],
         },
@@ -315,6 +341,10 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             ],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::System, EngineInstallMode::Download],
+            // **只有 Windows 有预编译包**：上游 `libvips/libvips` 的 release 里只有
+            // 源码包（`vips-8.18.6.tar.xz`），macOS / Linux 都没有二进制。
+            // Windows 走 `libvips/build-win64-mxe`。
+            download_platforms: vec!["windows".into()],
             requires_license_ack: false,
             models: vec![],
         },
@@ -335,6 +365,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             ],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::System, EngineInstallMode::Download],
+            download_platforms: vec!["windows".into()],
             requires_license_ack: false,
             models: vec![],
         },
@@ -350,6 +381,10 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             provides: vec!["doc.convert".into(), "ebook.convert".into()],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::System, EngineInstallMode::Download],
+            // Windows 是 zip、Linux 是 tar.gz，都带真实哈希；
+            // **macOS 没有**：上游只发 `.pkg`（要 root 用 installer 装到 /usr/local，
+            // 不是一个能解压出来用的归档），所以那条源整个删掉了。
+            download_platforms: vec!["windows".into(), "linux".into()],
             requires_license_ack: true,
             models: vec![],
         },
@@ -365,6 +400,9 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             provides: vec!["doc.to-pdf".into()],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::System],
+            // 上游只发 `.msi` / `.dmg` / `.deb` 安装器，没有"解压即用"的归档，
+            // 所以没有可管理的下载源。
+            download_platforms: vec![],
             requires_license_ack: true,
             models: vec![],
         },
@@ -379,13 +417,22 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             core: true,
             provides: vec!["archive.pack".into(), "archive.unpack".into()],
             platforms: all_platforms(),
-            // 只支持系统安装。原因有两条，都是实测出来的：
-            //   ① 官方只提供 **安装器**（.exe）或 `7z-extra.7z`，而后者需要先有 7-Zip
-            //      才能解压 —— 先有鸡还是先有蛋；
-            //   ② `engine-sources.json` 里那条版本固定直链（7z2408-extra.7z）
-            //      **已经 404**（维护者实测），继续留着只会误导人。
-            // 另外 7-Zip 本体只有 5 MB，让用户自己装一次完全可接受。
-            install_modes: vec![EngineInstallMode::System],
+            // **三平台都能一键装**，但这条路是绕出来的（原来这里写着"只能系统安装"）：
+            //
+            // 那条旧注释给的理由是"官方只提供安装器或 `7z-extra.7z`，而后者需要先有
+            // 7-Zip 才能解压 —— 先有鸡还是先有蛋"。**这个理由是错的**：Windows 自带的
+            // bsdtar 读得懂 7z（ImageMagick 便携版就是 `.7z`，实测装成功过）。
+            // 真正的原因是那条 URL（`7z2408-extra.7z`）**404**，而版本已经落后好几个大版本。
+            // 一个错的理由 + 一个过期的地址 = 一个核心引擎长期只能手动装。
+            //
+            // 现在：Windows 走 `.msi` 的管理安装（`archive: "msi"`，拿到的是**完整版**，
+            // 含 RAR —— `-extra` 里的 `7za.exe` 是精简版、没有 RAR，而 `archive.unpack`
+            // 的输入端口明确收 `.rar`，所以不能用它）；Linux / macOS 走上游发的完整
+            // `7z2603-linux-x64.tar.xz` / `7z2603-mac.tar.xz`（这两个平台上游一直有完整版，
+            // 反而是最简单的一条）。细节与"哪些验证过、哪些没验证"写在
+            // `engine-sources.json` 的 note 里。
+            install_modes: vec![EngineInstallMode::System, EngineInstallMode::Download],
+            download_platforms: vec!["windows".into(), "linux".into(), "macos".into()],
             requires_license_ack: false,
             models: vec![],
         },
@@ -401,6 +448,8 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             provides: vec!["ebook.convert".into()],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::System],
+            // 官方安装器 + `calibre-portable` 需要先有 Calibre 才能自解压，同 7-Zip。
+            download_platforms: vec![],
             requires_license_ack: true,
             models: vec![],
         },
@@ -419,6 +468,9 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             ],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::Download],
+            // Python 的三平台都是 `install_only` 压缩包（解压即用、不写注册表），
+            // 所以三平台都能一键装。
+            download_platforms: vec!["windows".into(), "linux".into(), "macos".into()],
             requires_license_ack: false,
             models: vec![],
         },
@@ -434,6 +486,9 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             provides: vec!["image.remove-background".into(), "ai.upscale".into()],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::Download],
+            // 权重是**直接下文件**，与平台无关 —— 三平台都能下（虚拟引擎，
+            // 不经过 `engine-sources.json`）。
+            download_platforms: vec!["windows".into(), "linux".into(), "macos".into()],
             requires_license_ack: true,
             models: vec![
                 EngineModel {
@@ -616,6 +671,8 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             provides: vec!["doc.ocr".into()],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::System],
+            // 官方 Windows 安装器同样不是归档；Linux 发行版 / brew 里装更省事。
+            download_platforms: vec![],
             requires_license_ack: false,
             models: vec![],
         },
@@ -636,6 +693,7 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             platforms: all_platforms(),
             // Windows 有一键下载；macOS / Linux 走系统包管理（brew install poppler / apt install poppler-utils）
             install_modes: vec![EngineInstallMode::Download, EngineInstallMode::System],
+            download_platforms: vec!["windows".into()],
             requires_license_ack: true,
             models: vec![],
         },
@@ -653,6 +711,8 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             provides: vec!["ai.describe".into(), "doc.ocr".into()],
             platforms: all_platforms(),
             install_modes: vec![EngineInstallMode::Remote],
+            // `Remote` 不是"下载"：没有任何归档要落盘，装的是用户自己填的 endpoint。
+            download_platforms: vec![],
             requires_license_ack: false,
             models: vec![],
         },

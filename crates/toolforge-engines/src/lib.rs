@@ -56,7 +56,14 @@ pub const MANAGED_LAYOUT: &[(&str, &str)] = &[
     ("python", "python"),
 ];
 
-/// 引擎的版本探测参数（拿版本用的命令行参数）
+/// 引擎的版本探测参数（拿版本用的命令行参数）。
+///
+/// **空数组是有含义的取值**：它表示"不带参数跑一次"。目前只有 `7zip` 用它 ——
+/// 7-Zip 不带参数就打印版本横幅并退出 0（本机实测
+/// `7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03`），
+/// 而"更明确"的 `7z i` **反而更糟**：它会打印整张格式表，
+/// [`toolforge_process::exec::probe_version`] 只留尾部，版本横幅会被挤掉。
+/// 调用方（`registry.rs::probe_version_of`）**不能**因为参数为空就跳过探测。
 pub fn version_args(engine_id: &str) -> &'static [&'static str] {
     match engine_id {
         // FFmpeg 把版本打到 stderr
@@ -65,6 +72,7 @@ pub fn version_args(engine_id: &str) -> &'static [&'static str] {
         "imagemagick" => &["-version"],
         "pandoc" => &["--version"],
         "libreoffice" => &["--version"],
+        // 见上方文档注释：空 = 不带参数（7-Zip 的默认动作就是打印版本横幅）
         "7zip" => &[],
         "calibre" => &["--version"],
         "tesseract" => &["--version"],

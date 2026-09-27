@@ -539,6 +539,30 @@ export type EngineDescriptor_Deserialize = {
 	/**  支持的平台（`windows` / `macos` / `linux`） */
 	platforms: string[],
 	installModes: EngineInstallMode[],
+	/**
+	 *  **哪些平台支持"应用内一键下载"**。
+	 * 
+	 *  # 为什么不能只看 `install_modes`
+	 * 
+	 *  那个字段是**引擎级**的，而"能不能一键装"是**平台级**的事实：
+	 * 
+	 *  | 引擎 | Windows | Linux | macOS |
+	 *  |---|---|---|---|
+	 *  | `libvips` | ✅ 有预编译包 | ❌ 只有源码包 | ❌ **只有源码包**（上游不发布 macOS 二进制） |
+	 *  | `pandoc` | ✅ zip | ✅ tar.gz | ❌ 只发 `.pkg`（要 root 安装，不是可分发的归档） |
+	 *  | `imagemagick` | ✅ 便携版 | ❌ 无条目 | ❌ 无条目 |
+	 * 
+	 *  把三者都写成 `Download`，macOS 用户就会看到一个**点了必然失败**的按钮；
+	 *  把 `Download` 从 `install_modes` 里删掉，又会砍掉 Windows 的能力。
+	 *  所以"支持的平台"必须单独写出来。
+	 * 
+	 *  它与 `engine-sources.json` 的关系是**意图 vs 数据**，由测试做双向核对
+	 *  （`download_platforms_are_backed_by_real_sources`）：
+	 *  这里写了某个平台却没有来源条目 → 失败；有来源却没写进来 → 也失败。
+	 *  这样"声明支持某平台下载"这件事在任何操作系统上跑测试都能被查出来，
+	 *  而不再像以前那样**只在当前平台上查**（macOS 的两条死源就是这么漏掉的）。
+	 */
+	downloadPlatforms?: string[],
 	/**  是否需要在下载前让用户确认许可证 */
 	requiresLicenseAck: boolean,
 	/**  可选的模型权重（例如抠图的 U2Net），与主程序分开下载 */
@@ -571,6 +595,30 @@ export type EngineDescriptor_Serialize = {
 	/**  支持的平台（`windows` / `macos` / `linux`） */
 	platforms: string[],
 	installModes: EngineInstallMode[],
+	/**
+	 *  **哪些平台支持"应用内一键下载"**。
+	 * 
+	 *  # 为什么不能只看 `install_modes`
+	 * 
+	 *  那个字段是**引擎级**的，而"能不能一键装"是**平台级**的事实：
+	 * 
+	 *  | 引擎 | Windows | Linux | macOS |
+	 *  |---|---|---|---|
+	 *  | `libvips` | ✅ 有预编译包 | ❌ 只有源码包 | ❌ **只有源码包**（上游不发布 macOS 二进制） |
+	 *  | `pandoc` | ✅ zip | ✅ tar.gz | ❌ 只发 `.pkg`（要 root 安装，不是可分发的归档） |
+	 *  | `imagemagick` | ✅ 便携版 | ❌ 无条目 | ❌ 无条目 |
+	 * 
+	 *  把三者都写成 `Download`，macOS 用户就会看到一个**点了必然失败**的按钮；
+	 *  把 `Download` 从 `install_modes` 里删掉，又会砍掉 Windows 的能力。
+	 *  所以"支持的平台"必须单独写出来。
+	 * 
+	 *  它与 `engine-sources.json` 的关系是**意图 vs 数据**，由测试做双向核对
+	 *  （`download_platforms_are_backed_by_real_sources`）：
+	 *  这里写了某个平台却没有来源条目 → 失败；有来源却没写进来 → 也失败。
+	 *  这样"声明支持某平台下载"这件事在任何操作系统上跑测试都能被查出来，
+	 *  而不再像以前那样**只在当前平台上查**（macOS 的两条死源就是这么漏掉的）。
+	 */
+	downloadPlatforms: string[],
 	/**  是否需要在下载前让用户确认许可证 */
 	requiresLicenseAck: boolean,
 	/**  可选的模型权重（例如抠图的 U2Net），与主程序分开下载 */

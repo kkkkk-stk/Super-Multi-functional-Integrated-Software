@@ -12,22 +12,22 @@
   {
     "id": "ffmpeg",
     "platform": "linux",
-    "url": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
-    "sha256": null,
+    "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-26-13-03/ffmpeg-n8.1.3-linux64-gpl-8.1.tar.xz",
+    "sha256": "add729675e76163d04ba7e5b7e09c2439a20f66a4eaa23994b20d63f8ad75cb7",
     "archive": "tar.xz",
     "stripComponents": 1,
-    "binSubdir": ".",
-    "note": "**哈希待回填**。johnvansickle 的该 URL 指向'最新版'，无法预置稳定哈希；改用版本固定直链（形如 ffmpeg-7.1-amd64-static.tar.xz）后应自行下载并回填 sha256。在此之前 Linux 上请走系统安装（apt/dnf 的 ffmpeg 包）。"
+    "binSubdir": "bin",
+    "note": "**与 Windows 同一个构建（BtbN autobuild-2026-09-26-13-03），同一套理由**。之前这条指向 johnvansickle 的 `ffmpeg-release-amd64-static.tar.xz`：那是**滚动别名**（永远等于\"最新版\"），所以 `sha256` 只能留 null —— 而 null 意味着安装被 `HashRequired` 拦住，Linux 用户实际只能走系统包管理。现在换成版本固定直链并**实际下载后算了哈希**（150,325,156 字节，实测解压后 `bin/ffmpeg` 与 `bin/ffprobe` 都在，所以 binSubdir 是 `bin`、stripComponents 是 1）。\n\n② **哈希是自己算的**：BtbN 不发布校验和，这一条的溯源强度低于\"上游旁挂文件\"，换来的是它**真的能下完**。③ 同样是 **GPL 构建**（`-gpl`）：含 libx264 / libx265，否则 video.compress / video.transcode 在 Linux 上不可用。许可证影响面由\"不随应用分发、用户按需下载\"限制住。"
   },
   {
     "id": "ffmpeg",
     "platform": "macos",
-    "url": "https://evermeet.cx/ffmpeg/getrelease/zip",
+    "url": "https://evermeet.cx/ffmpeg/ffmpeg-9.0.2.zip",
     "sha256": null,
     "archive": "zip",
     "stripComponents": 0,
     "binSubdir": ".",
-    "note": "**哈希待回填**。evermeet.cx 的 getrelease 同样是滚动别名。macOS 上推荐直接用 `brew install ffmpeg`（系统安装模式）。"
+    "note": "**版本固定在 9.0.2，但没有哈希**（这一条与 Windows/Linux 的差别必须说清）。\n\n① 原来这里是 `…/getrelease/zip` —— 一个**滚动别名**，指向\"当前最新版\"，因此永远无法固定哈希（上游一发新版，写死的哈希就失效）。现在改成 evermeet 的版本直链：它的 `https://evermeet.cx/ffmpeg/info/ffmpeg/release` 是一个 JSON 接口，会明确给出当前版本与**带版本号的下载地址**（实测返回 `version: 9.0.2`、`zip.url: …/ffmpeg-9.0.2.zip`、`size: 26198325`，还附了 `.sig` 签名文件）。升级时把版本号换掉即可。\n\n② **哈希仍然是 null**：开发机是 Windows，从这个站取二进制会超时（HEAD 与 GET 都试过；同一台机器上它的 info 接口是通的，所以不是站点整体不可达，更像是这条链路对大文件很慢）。既然拿不到字节，就不能填哈希 —— 抄一个哈希比不填更糟。\n\n③ 因此 macOS 上装 FFmpeg 需要用户**显式勾选「允许安装没有 SHA-256 校验值的来源」**（安装对话框里本来就有这一项，带风险说明）。想避免这个取舍就 `brew install ffmpeg`。"
   },
 
   {
@@ -40,17 +40,6 @@
     "binSubdir": "bin",
     "note": "源仓库是 **libvips/build-win64-mxe**（不是 libvips/libvips —— 后者的 release 里没有 Windows 资产，实测 404）。这里用 `-web` 变体而非 `-all`：web 版已包含 ToolForge 用得到的全部编解码器，体积只有一半。解压后必须保留 lib/ 与 share/，否则 vips 找不到依赖 DLL。"
   },
-  {
-    "id": "libvips",
-    "platform": "macos",
-    "url": "https://github.com/libvips/libvips/releases/download/v8.18.6/vips-8.18.6-arm64-macos.tar.gz",
-    "sha256": null,
-    "archive": "tar.gz",
-    "stripComponents": 1,
-    "binSubdir": "bin",
-    "note": "**未核对**（本机无法验证 macOS 资产名与哈希 —— 仓库里没有 macOS 产物）。macOS 上推荐 `brew install vips`。"
-  },
-
   {
     "id": "imagemagick",
     "platform": "windows",
@@ -82,17 +71,6 @@
     "note": "版本固定直链（3.11，33.3 MB）。sha256 为实际下载后计算。"
   },
   {
-    "id": "pandoc",
-    "platform": "macos",
-    "url": "https://github.com/jgm/pandoc/releases/download/3.11/pandoc-3.11-arm64-macOS.pkg",
-    "sha256": null,
-    "archive": "raw",
-    "stripComponents": 0,
-    "binSubdir": ".",
-    "note": "**不可用于自动安装**：macOS 官方只提供 .pkg 安装包，装它需要 root 且要写 /usr/local。macOS 上请用 `brew install pandoc`。该条目保留只是为了在 UI 上说明情况。"
-  },
-
-  {
     "id": "python",
     "platform": "windows",
     "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.11.16%2B20260924-x86_64-pc-windows-msvc-install_only.tar.gz",
@@ -116,11 +94,11 @@
     "id": "python",
     "platform": "macos",
     "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.11.16%2B20260924-aarch64-apple-darwin-install_only.tar.gz",
-    "sha256": null,
+    "sha256": "d718e3c5c6f4b225ed25f88bf65e4c5d314e0dea0d716ea50bc9d038630c502b",
     "archive": "tar.gz",
     "stripComponents": 1,
     "binSubdir": "bin",
-    "note": "**未核对**（无 macOS 环境验证资产名与哈希）。Intel Mac 请把 aarch64 换成 x86_64。"
+    "note": "同上，**macOS arm64** 变体。这一条原来写着「未核对（无 macOS 环境验证资产名与哈希）」—— 现在的处理是：把**能核对的部分全部核对掉**，把不能核对的写清楚。实际下载（27,088,178 字节，4 秒）后算了哈希；并且用 `tar -tzf` 读过整份清单（2036 个条目），确认解压后是 `python/bin/python3`，所以 `stripComponents: 1` + `binSubdir: \"bin\"` 是照着清单写的，不是照习惯写的。\n\n**仍然没有验证的**：这台机器不是 macOS，所以「解压出来的解释器在 macOS 上真的能跑」这件事**没有被验证过** —— 核对的是**资产的存在性与结构**，不是运行。这不是本项目唯一一处这种边界（`7zip@linux` / `7zip@macos` 同样如此），但它是**最早**的一处。Intel Mac 请把 `aarch64` 换成 `x86_64`（同 release 下存在，未核对哈希）。"
   },
   {
     "id": "poppler",
@@ -131,5 +109,35 @@
     "stripComponents": 1,
     "binSubdir": "Library/bin",
     "note": "**为什么 stripComponents 是 1 而不是 2**：包里是 `poppler-26.09.0/Library/bin/*.exe|*.dll` + `poppler-26.09.0/Library/share/poppler/…`，而 pdftoppm 是按**可执行文件相对位置**去找 `../share/poppler` 的数据文件的。剥 2 层会把数据目录挪到 `poppler/`，二进制就找不到它了 —— 表现是渲染时报 `Couldn't find data directory`。剥 1 层保留 `Library/` 这一层，相对关系原封不动，所以 binSubdir 写成 `Library/bin`（MANAGED_LAYOUT 用同一个相对路径）。② 41.7 MB / 43,709,956 字节，sha256 是自己下载后算的：上游只有 GitHub release，**没有**发布校验和文件。③ 上游 tag 是版本固定的（v26.09.0-0），资产名里也带版本号 —— 别改成别的滚动别名。④ macOS / Linux 上请用系统包管理器（brew install poppler / apt install poppler-utils），没有配下载源。"
+  },
+  {
+    "id": "7zip",
+    "platform": "windows",
+    "url": "https://github.com/ip7z/7zip/releases/download/26.03/7z2603-x64.msi",
+    "sha256": "c0680064d698a62dd4a5a47f403db356a6531a5473e4c4b1d090ea2590513926",
+    "archive": "msi",
+    "stripComponents": 0,
+    "binSubdir": "Files/7-Zip",
+    "note": "**这条路是绕出来的，把绕的过程写清楚比写结论重要。** 7-Zip 官方在 Windows 上只发：① `.exe` 安装器（自解压包，但要用 7-Zip 才能解 —— 先有鸡还是先有蛋）；② `.msi` 安装器；③ `-extra` 包（`7z2603-extra.7z`）。\n\n历史注记写着「只能系统安装，因为 `7z-extra.7z` 需要先有 7-Zip 才能解压」—— **这句话是错的**：Windows 10 1803+ 自带的 `tar`（bsdtar）**能读 7z**（ImageMagick 的便携版就是 `.7z`，实测 `tar -xf` 正常）。所以「解不开」这个理由是假的 —— 当时那条 URL（`7z2408-extra.7z`）404 才是真原因，而版本号已经落后了好几个大版本（当前 26.03）。**一个错误的理由 + 一个过期的地址，让一个核心引擎在 Windows 上一直只能手动装。**\n\n但换到 `-extra` 也不对：它里面是 **`7za.exe`（精简版）**，格式表里**没有 RAR**（`7z2603-extra.7z` 里只有 `7za.exe` + `7za.dll` + `7zxa.dll` + Far 插件）。而 `archive.unpack` 的输入端口明确收 `.rar`，用户会看到「按钮能点、装了却解不了 rar」。\n\n所以最终选 **`.msi` + 管理安装**（`archive: \"msi\"`，实现见 `extract_msi`）：`msiexec /a <msi> /qn TARGETDIR=<dir>` 把包内容原样铺开，**不写注册表、不装服务、不需要管理员权限**（本机实测退出码 0）。拿到的是**完整版** 7-Zip：`Files/7-Zip/7z.exe` + `7z.dll`，`7z.exe i` 里 Rar1/2/3/5 都在（实测 `7z a` 打包也正常）。binSubdir 与 MANAGED_LAYOUT 的差别要注意：MSI 会把文件放在 `Files/7-Zip/` 下，而 `MANAGED_LAYOUT` 写的是 `7z` —— 托管目录的探测会**回退到按文件名递归找**（`ENGINE_BINARIES[\"7zip\"]` 含 `7z`/`7za`/`7zz`），所以能找到；这里保留 binSubdir 只是给 UI 显示解压后的位置。\n\n哈希是自己下载后算的（2,007,040 字节）：上游 release 里只有 `.exe`/`.msi`/`.7z` 资产，**没有**校验和文件。tag `26.03` 与资产名都带版本号，不要改成滚动别名。"
+  },
+  {
+    "id": "7zip",
+    "platform": "linux",
+    "url": "https://github.com/ip7z/7zip/releases/download/26.03/7z2603-linux-x64.tar.xz",
+    "sha256": "dc99eff5008f1ab79bd7084c68513701547a808a89502bf4133683535ab3c695",
+    "archive": "tar.xz",
+    "stripComponents": 0,
+    "binSubdir": ".",
+    "note": "上游从 21.x 起就给 Linux / macOS 发**完整的**命令行版（不是精简版），这就是为什么这两个平台反而是最省事的。实测（1,575,072 字节，下载后算的哈希）解压出来是 `7zz` + `7zzs` 两个**没有顶层目录**的可执行文件，所以 stripComponents 是 0、binSubdir 是 `.`。\n\n两个必须记住的细节：① 二进制叫 **`7zz`**，不叫 `7z` —— `ENGINE_BINARIES[\"7zip\"]` 里的 `7zz` 就是为它准备的，`MANAGED_LAYOUT` 那条 `7z` 在这里找不到，探测靠按文件名递归回退；② 在二进制里能读到 `Rar3` / `Rar5` 字样，说明 **RAR 编解码器是编进去的**（Linux 二进制是 ELF，magic `7f 45 4c 46` 对得上）—— 但**没有在 Linux 上真的跑过**，这一点与 macOS 那三条是同一种边界，别把它当成已验证。"
+  },
+  {
+    "id": "7zip",
+    "platform": "macos",
+    "url": "https://github.com/ip7z/7zip/releases/download/26.03/7z2603-mac.tar.xz",
+    "sha256": "5ca87677072c59f5602e5c49baa27d4694bacd2259b4e507f0094249d4281480",
+    "archive": "tar.xz",
+    "stripComponents": 0,
+    "binSubdir": ".",
+    "note": "同上，macOS 变体（1,863,192 字节，下载后算的哈希）。解压出来是 `7zz` + `readme.txt` + `MANUAL/`，没有顶层目录。\n\n**没有验证的部分，写清楚**：这台机器不是 macOS，所以核对到的是「资产存在、哈希一致、二进制里有 `Rar3`/`Rar5` 字样、清单里确实有 `7zz`」，**不是**「它在 macOS 上能跑」。二进制也没有代码签名（上游就是直接发可执行文件），macOS 上首次运行可能被 Gatekeeper 拦 —— 这是上游的分发方式决定的，不是本应用的配置问题。介意的话 `brew install sevenzip`。"
   }
 ]

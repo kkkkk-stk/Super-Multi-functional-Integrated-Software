@@ -72,24 +72,29 @@ pub const ENGINE_BINARIES: &[(&str, &[&str])] = &[
 ///
 /// 1. **`sha256` 只能是自己算出来或从上游旁挂文件读来的**，不要抄网上的。
 ///    抄来的哈希无法验证；错了的后果是所有用户下载失败，更糟的是"校验通过了一份
-///    被替换的文件"。本仓库当前的做法：ffmpeg 取自 gyan.dev 随包发布的
-///    `.sha256` 旁挂文件（那是上游自己的摘要，比自己算更可信），其余是自己流式
-///    下载后计算的 SHA-256。
+///    被替换的文件"。本仓库当前的做法：全部是自己流式下载后计算的 SHA-256
+///    （上游大多是 GitHub release，**不发布校验和**；换成 gyan.dev 时曾有旁挂
+///    `.sha256`，但那个站实测只有 15~43 KB/s，下不完，见 ffmpeg 那条的 note）。
 /// 2. **URL 必须指向版本固定直链**，不能是 `/latest` 之类的滚动别名 ——
 ///    上游一发新版哈希就失效，表现为"昨天还能装、今天全部失败"。
-///    `ffmpeg-release-essentials.zip` 就属于这类，已换成
-///    `packages/ffmpeg-8.1.2-essentials_build.zip`。
+///    `ffmpeg-release-essentials.zip`、evermeet 的 `/getrelease/zip` 都属于这类。
 /// 3. **未核对的条目不编造哈希**，`sha256` 留 `null` 并在 `note` 里说明原因。
 ///    [`EngineRegistry::install`] 会对它们返回
 ///    [`EngineInstallOutcome::HashRequired`] 而不是放行 —— 这是刻意的安全默认值。
+/// 4. **不存在的来源不要留占位条目**。历史上这里放过两条"注释性"条目
+///    （`libvips`@macos 的 404 地址、`pandoc`@macos 的 `.pkg`），本意是留个说明，
+///    实际后果是 macOS 用户看到一个点了必然失败的按钮。现在直接删除，
+///    解释留在 `docs/ENGINE-MATRIX.md`（**说明属于文档，不属于数据表**）。
 ///
-/// 验证过的可用条目（2026-09 实测）：`ffmpeg`@windows、`libvips`@windows、
-/// `pandoc`@windows/linux、`python`@windows/linux。macOS 的三条都留了 `null`，
-/// 因为仓库里没有 macOS 环境可以核对；macOS 用户应走 Homebrew（系统安装模式）。
+/// 验证过的可用条目（2026-09 实测）：`ffmpeg`@windows/linux、`libvips`@windows、
+/// `imagemagick`@windows、`pandoc`@windows/linux、`python`@windows/linux、
+/// `poppler`@windows。`ffmpeg`@macos 与 `python`@macos 的 `sha256` 是 `null`
+/// （本机取不到字节 / 没有 macOS 环境核对），macOS 用户应优先走 Homebrew。
 ///
 /// 注意：该文件反序列化成 `Vec<Self>`，**不能放注释用的对象**（缺必填字段会让
 /// 整个文件解析失败，而 [Self] 的加载是 `if let Ok(..)`，会静默退化成"零个来源"）。
-/// 单元测试 `builtin_sources_parse` 守着这一点。
+/// 单元测试 `builtin_sources_parse` 守着这一点，`download_platforms_are_backed_by_real_sources`
+/// 守着"没有孤儿条目、没有单边声明"。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineSourceSpec {
@@ -100,7 +105,10 @@ pub struct EngineSourceSpec {
     /// `sha256:<hex>` 或裸 hex。为 `None` 时禁止自动安装。
     #[serde(default)]
     pub sha256: Option<String>,
-    /// `zip` / `tar.gz` / `tar.xz` / `7z` / `raw`
+    /// `zip` / `tar.gz` / `tar.xz` / `7z` / `msi` / `raw`
+    ///
+    /// `msi` 走 Windows Installer 的**管理安装**（解包，不安装），见
+    /// [`EngineRegistry::extract_msi`]。
     #[serde(default = "default_archive")]
     pub archive: String,
     #[serde(default)]
@@ -450,15 +458,8 @@ impl EngineRegistry {
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
-                if entry.file_type().is_file() {
-                    let stem = entry
-                        .path()
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default();
-                    if stem.eq_ignore_ascii_case(name.trim_end_matches(".exe")) {
-                        return Some(entry.path().to_path_buf());
-                    }
+                if entry.file_type().is_file() && is_named_executable(entry.path(), name) {
+                    return Some(entry.path().to_path_buf());
                 }
             }
         }
@@ -733,6 +734,10 @@ impl EngineRegistry {
             return Ok(());
         }
 
+        if kind == "msi" {
+            return Self::extract_msi(archive, dest, job).await;
+        }
+
         // 优先用系统 tar（Windows 10 1803+ 自带 bsdtar，能处理 zip / tar.gz）
         let mut tar_args: Vec<String> = vec!["-xf".into(), archive.display().to_string()];
         tar_args.push("-C".into());
@@ -784,6 +789,50 @@ impl EngineRegistry {
         .with_detail(format!(
             "{detail}\n\n请手动解压到引擎目录后重新探测：{}",
             dest.display()
+        )))
+    }
+
+    /// 用 Windows Installer 的**管理安装**（`msiexec /a`）把一个 `.msi` 解开到目录。
+    ///
+    /// # 为什么需要这条路径
+    ///
+    /// 7-Zip 官方在 Windows 上**只发安装器**（`.exe` / `.msi`）与 `-extra` 包：
+    ///
+    /// * `7z2603-x64.exe` 是自解压包，但要用 7-Zip 才能解 —— 先有鸡还是先有蛋；
+    /// * `7z2603-extra.7z` 能解（Windows 自带的 bsdtar 读得懂 7z），**但里面是 `7za.exe`**：
+    ///   它是"精简版"，格式表里**没有 RAR**，而 `archive.unpack` 的输入端口明确写着收 `.rar`；
+    /// * `.msi` 反而是唯一一条"能拿到完整 7-Zip"的路。
+    ///
+    /// `msiexec /a`（administrative install）**不是安装**：它把包内容按目录结构原样铺到
+    /// `TARGETDIR`，不写注册表、不装服务、不需要管理员权限（本机实测 `/qn` 退出码 0，
+    /// 得到 `Files/7-Zip/7z.exe` + `7z.dll`，`7z.exe i` 里 Rar1/2/3/5 都在）。
+    /// 这也是 `archive: "msi"` 这个取值的全部含义。
+    ///
+    /// 它会顺手把 `.msi` 自己复制进目标目录（Windows Installer 的"管理安装点"行为），
+    /// 属于正常现象，不是解压残留 —— 所以这里**不**做清理，免得下次修复时又把它当 bug 删掉。
+    async fn extract_msi(archive: &Path, dest: &Path, job: &JobCtx) -> ToolforgeResult<()> {
+        let r = toolforge_process::exec(
+            toolforge_process::ExecOptions::new("msiexec.exe")
+                .arg("/a")
+                .arg(archive.display().to_string())
+                .arg("/qn")
+                .arg(format!("TARGETDIR={}", dest.display()))
+                .timeout(Duration::from_secs(600))
+                .cancel(job.cancel.clone())
+                .quiet(true),
+        )
+        .await?;
+
+        if r.success() {
+            return Ok(());
+        }
+        Err(ToolforgeError::internal(format!(
+            "无法解开 {}（Windows Installer 管理安装失败）",
+            archive.display()
+        ))
+        .with_detail(format!(
+            "msiexec 退出码 {}\n{}\n\n请手动安装 7-Zip 后重新探测。",
+            r.exit_code, r.stderr
         )))
     }
 
@@ -1278,9 +1327,19 @@ fn human_speed(bps: f64) -> String {
 
 async fn probe_version_of(path: &Path, engine_id: &str) -> Option<String> {
     let args = crate::version_args(engine_id);
-    if args.is_empty() {
-        return None;
-    }
+    // ⚠️ **参数为空不是"跳过"，而是"不带参数跑一次"**。
+    //
+    // 这里原来写的是 `if args.is_empty() { return None; }`，直接导致 `7zip` 的版本
+    // 永远是「未知」（`version_args("7zip")` 就是空数组，理由见 `lib.rs`）——
+    // 而 7-Zip **不带参数就会打印版本横幅并以 0 退出**（本机实测：
+    // `7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03`）。
+    //
+    // 为什么不用 `7z i` 之类"更明确"的参数：`i` 会打印整张格式表，而
+    // [`toolforge_process::exec::probe_version`] 用的是 `quiet`（**只留尾部**），
+    // 于是真正的版本横幅会被挤掉，取回来的第一行会变成格式表中间某一行。
+    // 不带参数时输出很短（横幅 + 用法），不会被截断。
+    //
+    // 超时是 10 秒，取不到就返回 `None`（版本显示「未知」），所以这里不会挂住探测。
     toolforge_process::exec::probe_version(path, args).await
 }
 
@@ -1298,6 +1357,58 @@ fn with_exe_suffix(p: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 判断 `path` 是不是"名字叫 `name` 的那个可执行文件"。
+///
+/// # 为什么不能比较 `file_stem`
+///
+/// 这里原来比的是**文件主干名**（`file_stem`，即去掉最后一个扩展名）：
+///
+/// ```ignore
+/// let stem = entry.path().file_stem()...;         // ❌ 旧写法
+/// if stem.eq_ignore_ascii_case(name.trim_end_matches(".exe")) { … }
+/// ```
+///
+/// 于是 `7z.dll` 的主干也是 `7z`，**和 `7z.exe` 一模一样** —— 而 7-Zip 的官方
+/// 安装目录里这两个文件都在，`read_dir` 的顺序又把 `7z.dll` 排在前面。
+/// 真机后果（本机实测，一次真实的 7-Zip 安装）：引擎被探测为
+/// `安装完成：…\engines\7zip\Files\7-Zip\7z.dll（版本 未知）` ——
+/// **状态是"已安装"，路径却指向一个 DLL**，之后 `archive.pack` / `archive.unpack`
+/// 拿它去 exec 只会失败。这类错误最难查：探测说可用，用起来报的却是别的错。
+///
+/// 那条路径（`MANAGED_LAYOUT` 命中）用的是 [`with_exe_suffix`]，本来就只认
+/// 真文件 / 补 `.exe`，所以问题只出在**递归回退**这一支 —— 而回退恰恰是
+/// 平台布局与 `MANAGED_LAYOUT` 不一致时唯一的救生索（例如 Windows 的 7-Zip 在
+/// `Files/7-Zip/7z.exe`，而 `MANAGED_LAYOUT` 写的是 `7z`）。
+///
+/// 所以这里要求**完整文件名**相等：Windows 上按 [`with_exe_suffix`] 的规则
+/// （裸名或 `名.exe`），其它平台再要求**可执行位**（tar 会保留它；zip 里没有就
+/// 不认，宁可探测不到也不要把一个数据文件当成程序去执行）。
+fn is_named_executable(path: &Path, name: &str) -> bool {
+    let want: Vec<String> = if cfg!(windows) {
+        let bare = name.trim_end_matches(".exe").to_ascii_lowercase();
+        vec![bare.clone(), format!("{bare}.exe")]
+    } else {
+        vec![name.trim_end_matches(".exe").to_string()]
+    };
+    let Some(file) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let file_lc = file.to_ascii_lowercase();
+    if !want.iter().any(|w| w.to_ascii_lowercase() == file_lc) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = std::fs::metadata(path) {
+            if md.permissions().mode() & 0o111 == 0 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// 各平台常见安装位置（PATH 里找不到时的兜底）。
@@ -1517,6 +1628,249 @@ mod tests {
                 desc.id,
                 EngineSourceSpec::platform_key()
             );
+        }
+    }
+
+    /// **平台无关**的双向核对：`EngineDescriptor::download_platforms` ⟺ `engine-sources.json`。
+    ///
+    /// ## 为什么原来那条不够
+    ///
+    /// 上面那条（`download_mode_engines_have_a_source_for_this_platform`）只在
+    /// **跑测试的那台机器**上核对：CI 与开发机都是 Windows，于是
+    /// `engine-sources.json` 里 macOS / Linux 那几条**从来没被任何测试看过一眼**。
+    /// 代价是真实发生过的：
+    ///
+    /// * `libvips`@macos 指向 `libvips/libvips` 的 release —— 上游**只发源码包**，
+    ///   实测 404。这条 URL 是**编出来的**，却因为"平台不匹配所以跳过"活了很久；
+    /// * `pandoc`@macos 指向 `.pkg` —— 文件真的存在，但 `.pkg` 不是可分发的归档，
+    ///   下载完必然装不上，用户白等 39.8 MB。
+    ///
+    /// 两条都是"只在当前平台取样"的直接后果。现在把"支持哪些平台一键下载"写成
+    /// 数据（`download_platforms`），核对就不再依赖平台了。
+    ///
+    /// ## 断言的四件事
+    ///
+    /// 1. `download_platforms` 里的平台名合法、不重复、且是 `platforms` 的子集；
+    /// 2. 写了的平台**必须有**来源条目；
+    /// 3. 有来源条目的平台**必须写上**（否则 UI 会因为一条多余来源而给出错误承诺）；
+    /// 4. `install_modes` 含 `Download` ⟺ `download_platforms` 非空 ——
+    ///    两者是同一件事的两种说法，不允许漂移。
+    ///
+    /// 第 2、3 条合起来是双向的，所以**任何一边漏写都会失败**。
+    ///
+    /// ## 虚拟引擎为什么跳过第 2、3 条
+    ///
+    /// `onnx-models` 的可下载物是**模型权重**，写在 `EngineDescriptor::models` 里
+    /// （每个模型自带 `url` + `sha256`），入口是 `install_model` 而不是 `install`，
+    /// 与 `engine-sources.json`（引擎归档）无关。它的权重是 ONNX 文件，
+    /// **三平台同一份字节**，所以三条平台都算数。
+    /// `ai-provider` 则是远程服务，没有任何东西要下载。
+    /// 第 1、4 条对它们照常生效。
+    #[test]
+    fn download_platforms_are_backed_by_real_sources() {
+        const KNOWN: &[&str] = &["windows", "macos", "linux"];
+
+        let all: Vec<EngineSourceSpec> = serde_json::from_str(BUILTIN_SOURCES)
+            .expect("engine-sources.json 必须是合法的 EngineSourceSpec 数组");
+
+        // (id, platform) → 出现次数。用次数而不是集合，是为了让重复条目也失败。
+        let mut source_count: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        for s in &all {
+            assert!(
+                KNOWN.contains(&s.platform.as_str()),
+                "{} 的 platform `{}` 非法",
+                s.id,
+                s.platform
+            );
+            *source_count
+                .entry((s.id.clone(), s.platform.clone()))
+                .or_insert(0) += 1;
+        }
+        for ((id, platform), n) in &source_count {
+            assert_eq!(
+                *n, 1,
+                "`{id}`@{platform} 在 engine-sources.json 里出现了 {n} 次 —— \
+                 注册表按 id 建 HashMap，重复条目会**静默丢弃**其中一条"
+            );
+        }
+
+        let mut claimed: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+
+        for desc in engine_catalog() {
+            let mut seen = std::collections::HashSet::new();
+            for p in &desc.download_platforms {
+                assert!(
+                    KNOWN.contains(&p.as_str()),
+                    "`{}` 的 download_platforms 含非法平台名 `{p}`",
+                    desc.id
+                );
+                assert!(
+                    seen.insert(p.clone()),
+                    "`{}` 的 download_platforms 里 `{p}` 写了两次",
+                    desc.id
+                );
+                assert!(
+                    desc.platforms.contains(p),
+                    "`{}` 声明在 `{p}` 上可一键下载，但 platforms 里没有 `{p}`",
+                    desc.id
+                );
+                if VIRTUAL_ENGINES.contains(&desc.id.as_str()) {
+                    // 虚拟引擎不走 engine-sources.json（见上方文档注释）
+                    continue;
+                }
+                assert!(
+                    source_count.contains_key(&(desc.id.clone(), p.clone())),
+                    "`{}` 声明 `{p}` 可一键下载，engine-sources.json 里却没有 `{}`@{p} 的条目 —— \
+                     界面会给一个点了必然失败的按钮。\n\
+                     要么补上真实来源（哈希必须实际下载后算出来），\
+                     要么把这个平台从 download_platforms 里去掉。",
+                    desc.id,
+                    desc.id
+                );
+                claimed.insert((desc.id.clone(), p.clone()));
+            }
+
+            let has_download_mode = desc.install_modes.contains(&EngineInstallMode::Download);
+            assert_eq!(
+                has_download_mode,
+                !desc.download_platforms.is_empty(),
+                "`{}` 的 install_modes 与 download_platforms 不一致：\n\
+                 install_modes={:?}，download_platforms={:?}\n\
+                 含 Download ⟺ download_platforms 非空（两者是同一件事的两种说法）。",
+                desc.id,
+                desc.install_modes,
+                desc.download_platforms
+            );
+        }
+
+        // 反向：不能有"没人认领"的来源条目 —— 多见于改了引擎 id 之后留下的孤儿，
+        // 或者把 `_removed: true` 这种注释对象误当成合法条目。
+        for (id, platform) in source_count.keys() {
+            assert!(
+                claimed.contains(&(id.clone(), platform.clone())),
+                "engine-sources.json 里有 `{id}`@{platform}，但引擎目录里没有哪个引擎\
+                 在 download_platforms 里认领它 —— 孤儿条目（改过 id？还是删引擎时漏删？）"
+            );
+        }
+    }
+
+    /// **递归回退不能把 `.dll` 当成可执行文件**（真实缺陷的回归测试）。
+    ///
+    /// 触发场景是 7-Zip 的官方布局：`Files/7-Zip/` 下同时有 `7z.dll` 与 `7z.exe`，
+    /// 而 `read_dir` 的顺序把 `7z.dll` 排在前面。旧实现比较的是**文件主干名**
+    /// （`file_stem`），两者都是 `7z`，于是引擎被探测为
+    /// 「安装完成：…\7z.dll（版本 未知）」—— **状态可用、路径是个 DLL**，
+    /// 之后 `archive.*` 拿它去 exec 必然失败。这类"探测说可用、用起来报别的错"
+    /// 的缺陷最难查，所以这里同时钉住两件事：只有 DLL 时必须**找不到**；
+    /// 补上真正的可执行文件后必须**找到那一个**。
+    #[test]
+    fn managed_binary_never_returns_a_dll() {
+        // Windows 上 7-Zip 的可执行文件叫 `7z.exe`；类 Unix 上是 `7zz`（上游命名如此）
+        #[cfg(windows)]
+        const REAL: &str = "7z.exe";
+        #[cfg(not(windows))]
+        const REAL: &str = "7zz";
+
+        let tmp = std::env::temp_dir().join("tf-managed-binary-dll");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let reg = EngineRegistry::new(AppPaths::new(&tmp));
+        let dir = reg.paths().engine_dir("7zip");
+        // 复刻真实布局：MSI 管理安装会把文件放在 Files/7-Zip/ 下，比 MANAGED_LAYOUT 深两层
+        let inner = dir.join("Files").join("7-Zip");
+        std::fs::create_dir_all(&inner).unwrap();
+
+        // ① 只有同名的数据文件 → 必须找不到（旧实现会返回这个 DLL）
+        std::fs::write(inner.join("7z.dll"), b"MZ not really a program").unwrap();
+        // 一个"看着像"但不在候选名单里的可执行文件也不该被认领
+        std::fs::write(inner.join("7zFM.exe"), b"MZ gui").unwrap();
+        assert!(
+            reg.managed_binary("7zip").is_none(),
+            "托管目录里只有 7z.dll / 7zFM.exe 时不该认定 7-Zip 已就位 —— \
+             文件名主干相同不等于它是那个程序"
+        );
+
+        // ② 放上真正的可执行文件 → 必须找到它（而不是那个 DLL）
+        let real = inner.join(REAL);
+        std::fs::write(&real, b"MZ real").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&real).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&real, p).unwrap();
+        }
+        let found = reg
+            .managed_binary("7zip")
+            .expect("存在真正的可执行文件时必须找到它");
+        assert_eq!(
+            found.file_name().and_then(|s| s.to_str()),
+            Some(REAL),
+            "找到的应当是 {REAL}，不是同名的 .dll"
+        );
+    }
+
+    /// `archive` 取值必须是已知的那几种，且 `msi` 只能出现在 Windows 上。
+    ///
+    /// `msi` 走 `msiexec.exe`（`extract_msi`）—— 那个可执行文件**只在 Windows 上存在**。
+    /// 一条 `archive: "msi"` 的 Linux/macOS 来源会通过所有其它检查，然后在用户点下
+    /// 下载按钮、等了几十 MB 之后报「找不到 msiexec」：正是本项目反复要避免的那种
+    /// 「按钮能点、必然失败」。
+    ///
+    /// 顺带钉住 URL 后缀与 `archive` 一致 ——`url` 指到 `.msi` 而 `archive` 写着 `zip`
+    /// 这类复制粘贴事故，只有在这里才拦得住（下载器不看后缀，解压器看）。
+    #[test]
+    fn archive_kinds_are_known_and_msi_stays_on_windows() {
+        struct Kind {
+            name: &'static str,
+            suffix: &'static str,
+        }
+        // `raw` 没有后缀约束：它就是把下载到的字节原样当引擎文件（例如单个可执行文件）
+        const KINDS: &[Kind] = &[
+            Kind { name: "zip", suffix: ".zip" },
+            Kind { name: "tar.gz", suffix: ".tar.gz" },
+            Kind { name: "tar.xz", suffix: ".tar.xz" },
+            Kind { name: "7z", suffix: ".7z" },
+            Kind { name: "msi", suffix: ".msi" },
+            Kind { name: "raw", suffix: "" },
+        ];
+
+        let list: Vec<EngineSourceSpec> = serde_json::from_str(BUILTIN_SOURCES)
+            .expect("engine-sources.json 必须是合法的 EngineSourceSpec 数组");
+        assert!(!list.is_empty());
+
+        for s in &list {
+            let Some(kind) = KINDS.iter().find(|k| k.name == s.archive) else {
+                panic!(
+                    "{}@{} 的 archive `{}` 不是已知取值（已知：{}）—— \
+                     新取值必须在 extract() 里有对应分支，否则解压会失败",
+                    s.id,
+                    s.platform,
+                    s.archive,
+                    KINDS.iter().map(|k| k.name).collect::<Vec<_>>().join(" / ")
+                );
+            };
+            if !kind.suffix.is_empty() {
+                let path = s.url.split('?').next().unwrap_or(&s.url);
+                assert!(
+                    path.ends_with(kind.suffix),
+                    "{}@{} 的 archive 是 `{}`，但 URL 不是 `{}` 结尾：{}",
+                    s.id,
+                    s.platform,
+                    s.archive,
+                    kind.suffix,
+                    s.url
+                );
+            }
+            if s.archive == "msi" {
+                assert_eq!(
+                    s.platform, "windows",
+                    "{}@{} 用了 msi 归档，但 `msiexec.exe` 只在 Windows 上存在 —— \
+                     这条来源在 {} 上必然失败",
+                    s.id, s.platform, s.platform
+                );
+            }
         }
     }
 
