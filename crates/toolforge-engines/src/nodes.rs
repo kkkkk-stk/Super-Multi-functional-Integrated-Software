@@ -2162,6 +2162,56 @@ async fn ffprobe_duration(ctx: &NodeCtx, path: &Path) -> Option<f64> {
     r.stdout.trim().parse::<f64>().ok()
 }
 
+/// 找到 ffprobe 可执行文件。与 ffmpeg 是同一个发行包里的两个文件。
+async fn ffprobe_binary(ctx: &NodeCtx) -> Option<PathBuf> {
+    match ctx.engines.resolve("ffmpeg").await {
+        Ok(ffmpeg) => {
+            let sibling = ffmpeg.with_file_name(if cfg!(windows) {
+                "ffprobe.exe"
+            } else {
+                "ffprobe"
+            });
+            if sibling.is_file() {
+                Some(sibling)
+            } else {
+                ctx.engines.system_binary("ffprobe")
+            }
+        }
+        Err(_) => ctx.engines.system_binary("ffprobe"),
+    }
+}
+
+/// 用 ffprobe 拿音频采样率（Hz）。没有音轨或读不到时返回 None。
+///
+/// # 为什么要它
+///
+/// `audio.normalize` 用的是 ffmpeg 的 `loudnorm` 滤镜，而它会**在 192 kHz 上
+/// 内部处理再把结果重采样回编码器的默认值**（mp3 的默认是 48 kHz）。
+/// 于是"只做响度归一化"这个动作会**悄悄把 44.1 kHz 的音频变成 48 kHz** ——
+/// 用户没要求过这件事，而它是一次真实的重采样。有了源采样率就能显式 `-ar` 保住它。
+async fn ffprobe_audio_rate(ctx: &NodeCtx, path: &Path) -> Option<i64> {
+    let ffprobe = ffprobe_binary(ctx).await?;
+    let r = exec(
+        ExecOptions::new(ffprobe)
+            .args([
+                "-v".into(),
+                "error".into(),
+                "-select_streams".into(),
+                "a:0".into(),
+                "-show_entries".into(),
+                "stream=sample_rate".into(),
+                "-of".into(),
+                "default=noprint_wrappers=1:nokey=1".into(),
+                path.display().to_string(),
+            ])
+            .timeout(Duration::from_secs(30))
+            .quiet(true),
+    )
+    .await
+    .ok()?;
+    r.stdout.trim().parse::<i64>().ok().filter(|n| *n > 0)
+}
+
 /// 构造 FFmpeg 命令并执行，同时把 `-progress` 输出翻译成进度。
 async fn run_ffmpeg(
     ctx: &mut NodeCtx,
@@ -2232,6 +2282,33 @@ async fn ffmpeg_transcode(
     let crf = ctx.param_i64("crf", 23);
     let preset = ctx.param_str("preset", "medium");
     let hwaccel = ctx.param_str("hwaccel", "none");
+
+    // ---- 容器与编解码器的兼容性预检 ----
+    //
+    // **容器由输出扩展名决定**（ffmpeg 就是这么工作的），而这个扩展名来自
+    // 插件清单里的 `format` 参数（见 `build_io`）。所以"选 webm"这件事是通过
+    // 扩展名生效的，节点自己不需要（也无法）再读一个容器参数。
+    //
+    // WebM 是唯一一个"不是随便什么编解码器都能装"的常见容器：它只接受
+    // VP8 / VP9 / AV1 视频与 Opus / Vorbis 音频。不预检的话，用户会看到
+    // ffmpeg 那句 `Could not find tag for codec h264 in stream #0` ——
+    // 那句话对用户没有任何指导意义。
+    let dst_ext = file_ext(&dst);
+    if dst_ext == "webm" {
+        let v_ok = matches!(vcodec.as_str(), "libvpx-vp9" | "libvpx" | "av1" | "copy");
+        let a_ok = matches!(acodec.as_str(), "libopus" | "libvorbis" | "copy" | "none");
+        if !v_ok || !a_ok {
+            return Err(ToolforgeError::invalid(format!(
+                "WebM 容器装不下当前的编解码器组合（视频 {vcodec} / 音频 {acodec}）"
+            ))
+            .with_detail(
+                "WebM 只接受 VP8 / VP9 / AV1 视频与 Opus / Vorbis 音频。\n\
+                 请把视频编码改成 `libvpx-vp9`、音频改成 `libopus`，\
+                 或者把输出格式换成 mp4 / mkv（那两个什么都能装）。"
+                    .to_string(),
+            ));
+        }
+    }
 
     let mut a = vec![
         "-y".into(),
@@ -2382,8 +2459,23 @@ async fn ffmpeg_trim(
         // 流复制：不重编码，速度取决于磁盘
         a.push("-c".into());
         a.push("copy".into());
-        a.push("-avoid_negative_ts".into());
-        a.push("make_zero".into());
+        // ⚠️ 这里**曾经**还有 `-avoid_negative_ts make_zero`，它把切片长度搞成了两倍。
+        //
+        // 实测（3 秒 15fps 的源，`-ss 00:00:01 -t 1 -c copy`）：
+        //
+        // | 参数 | 帧数 | 容器时长 |
+        // |---|---|---|
+        // | 源 | 45 | 3.00 s |
+        // | 带 `-avoid_negative_ts make_zero`（旧行为） | **30** | 2.02 s |
+        // | 不带（现在） | **15** | 1.02 s |
+        //
+        // 原理：`-ss` 放在 `-i` 之前是**输入定位**，流复制只能从关键帧开始切，
+        // 于是视频包的时间戳从 0 开始、音频包从 1.0 开始；`make_zero` 再把整条
+        // 时间轴平移，结果容器认为这段有 2 秒。去掉它之后首包时间戳对齐到 0
+        // （`start_time=0.000000`）、帧数正好是请求的 1 秒。
+        //
+        // 教训与这个项目里别处一样：**"看起来更保险的那个参数"反而把行为改坏了**，
+        // 而唯一的发现方式是量一下帧数 —— "任务成功"和"文件时长对"是两件事。
     }
     a.push(dst.display().to_string());
 
@@ -2486,14 +2578,26 @@ async fn ffmpeg_audio_normalize(
     let dst = resolve_path(ctx, "output", arg(args, "dst")?)?;
     let lufs = ctx.param_f64("lufs", -16.0);
 
-    let a = vec![
+    // 保住源采样率 —— `loudnorm` 默认会把结果重采样到编码器的默认值
+    // （44.1k 的 mp3 会变成 48k），而用户只要求"归一化响度"。
+    let rate = ffprobe_audio_rate(ctx, &src).await;
+    if let Some(r) = rate {
+        ctx.job
+            .info(format!("响度归一化到 {lufs} LUFS（保持 {r} Hz 采样率）"));
+    }
+
+    let mut a = vec![
         "-y".into(),
         "-i".into(),
         src.display().to_string(),
         "-af".into(),
         format!("loudnorm=I={lufs}:TP=-1.5:LRA=11"),
-        dst.display().to_string(),
     ];
+    if let Some(r) = rate {
+        a.push("-ar".into());
+        a.push(r.to_string());
+    }
+    a.push(dst.display().to_string());
 
     let duration = ffprobe_duration(ctx, &src).await;
     run_ffmpeg(ctx, a, duration, file_label(&src)).await?;

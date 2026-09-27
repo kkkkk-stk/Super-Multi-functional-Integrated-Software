@@ -839,7 +839,19 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         inputs: vec![in_file("src", "视频", &["video/*"])],
         outputs: vec![out_file("dst", "输出视频")],
         params: vec![
-            enum_param("container", "容器格式", "mp4", &["mp4", "mkv", "webm", "mov", "avi"]),
+            // ⚠️ 参数 id 是 `format` 而**不是** `container`。
+            //
+            // 这里原来是 `container`，而那是**一个装饰性参数**：真正决定输出容器的
+            // 是**输出文件的扩展名**（ffmpeg 按扩展名选 muxer），而扩展名由
+            // `build_io` 从参数表里的 **`format`** 推出来（见那里的 `format_ext`）。
+            // 于是用户在节点面板上把 `container` 选成 mkv，产出仍然是 `.mp4` ——
+            // 参数面板在承诺一件不会发生的事。这与 `image.remove-background`
+            // 曾经那个 `alphaMatting` 是同一类缺陷（**参数是装饰**）。
+            //
+            // 现在统一到 `format`：它与 `image.convert` / `video.extract-audio` /
+            // `audio.convert` 的命名一致，插件清单里声明一个同名参数就能把扩展名
+            // 传下去，节点自己不必再读它。
+            enum_param("format", "容器格式", "mp4", &["mp4", "mkv", "webm", "mov", "avi"]),
             enum_param("vcodec", "视频编码", "libx264", &["libx264", "libx265", "libvpx-vp9", "av1", "copy"]),
             enum_param("acodec", "音频编码", "aac", &["aac", "libopus", "libmp3lame", "copy", "none"]),
             range_param("crf", "质量 CRF（越小越好）", ParamType::Int, 23.0, 0.0, 51.0),

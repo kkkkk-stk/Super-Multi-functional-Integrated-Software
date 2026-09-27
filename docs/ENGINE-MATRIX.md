@@ -148,6 +148,10 @@ EngineModel {
 
 - **主页**：https://ffmpeg.org/
 - **提供的节点（7 个）**：`video.transcode`、`video.trim`、`video.thumbnail`、`video.extract-audio`、`video.compress`、`audio.convert`、`audio.normalize`。
+  > ✅ **这 7 个节点在 FFmpeg 装通之前一次都没被跑过**（界面上它们一直显示"不可用"）。真机跑一遍之后抓到三个缺陷，详见 `docs/ROADMAP.md` 阻塞 18 与 `verify-platform.mjs`【17】：
+  > ① `video.trim` 的流复制路径带 `-avoid_negative_ts make_zero`，**切片长度会变成两倍**（要 1 秒给 2.02 秒 / 30 帧而不是 15 帧）；
+  > ② `video.transcode` 的容器参数叫 `container`，而真正决定容器的是 `build_io` 从 **`format`** 推出来的扩展名 —— 那个参数是**装饰**；现统一为 `format`；
+  > ③ `audio.normalize` 的 `loudnorm` 会**悄悄把 44.1 kHz 重采样成 48 kHz**（滤镜内部按 192 kHz 处理、再落到编码器默认值），现在显式 `-ar` 保住源采样率。
 - **缺失时会发生什么**：上述 7 个节点**全部不可用**，没有降级路径。这是全部功能域中影响面最大的单点依赖——音视频域目前只有这一个引擎。UI 应显示「需要安装 FFmpeg」并提供下载入口。
 - **许可证与分发注意点**：`LGPL-2.1+ / GPL-2.0+（取决于编译选项）`。官方构建常启用 GPL 组件，如果产品闭源分发，必须选用 LGPL 构建或自行编译。`requiresLicenseAck: true`，下载前必须让用户确认。
 

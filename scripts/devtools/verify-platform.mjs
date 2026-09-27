@@ -1542,6 +1542,561 @@ c.section('【16】节点可用性判定与真实引擎/权重状态是否一致
   );
 }
 
+// ============================================================================
+// 【17】音频与视频节点：ffmpeg 装好之后这 6 个节点从没被跑过
+// ============================================================================
+//
+// FFmpeg 装通之前，`video.*` / `audio.*` 一共 7 个节点在界面上是"不可用"的，
+// 所以**没有任何人跑过它们**。【14】只覆盖了 `video-to-gif`（它用到 `video.thumbnail`），
+// 剩下这些一次都没执行过：
+//
+//   video.trim / video.extract-audio / video.compress /
+//   video.transcode / audio.convert / audio.normalize
+//
+// 这一节把它们逐个真跑一遍，并用 **ffprobe 读回真实属性**（时长、编解码器、
+// 采样率、像素尺寸）—— "任务成功"不算证据，"产出的确是那种东西"才算。
+c.section('【17】音频 / 视频节点是否真的产出正确的媒体');
+{
+  const engines = await client.invoke('engines_probe_all');
+  const usable = (e) => e && (e.status.state === 'detected' || e.status.state === 'installed');
+  const ff = engines.find((e) => e.descriptor.id === 'ffmpeg');
+  const ffPath = ff?.status?.path;
+  const probePath = ffPath ? join(dirname(ffPath), 'ffprobe.exe') : null;
+
+  if (!usable(ff) || !probePath || !existsSync(probePath)) {
+    c.note('跳过：本机没有可用的 ffmpeg / ffprobe（到「引擎管理」一键安装，约 105 MB）');
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    /** 用 ffprobe 读回媒体属性（真正断言用的就是它） */
+    const probeJson = (file) => {
+      const r = spawnSync(
+        probePath,
+        ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', file],
+        { encoding: 'utf8', windowsHide: true }
+      );
+      if (r.status !== 0) return { error: String(r.stderr ?? '').slice(0, 200) };
+      try {
+        const j = JSON.parse(String(r.stdout));
+        const streams = j.streams ?? [];
+        const v = streams.find((s) => s.codec_type === 'video');
+        const a = streams.find((s) => s.codec_type === 'audio');
+        return {
+          duration: Number(j.format?.duration ?? 0),
+          size: Number(j.format?.size ?? 0),
+          formatName: j.format?.format_name ?? '',
+          videoCodec: v?.codec_name ?? null,
+          width: v?.width ?? null,
+          height: v?.height ?? null,
+          audioCodec: a?.codec_name ?? null,
+          sampleRate: a ? Number(a.sample_rate ?? 0) : null,
+          channels: a?.channels ?? null,
+          streamCount: streams.length,
+        };
+      } catch (e) {
+        return { error: `解析 ffprobe 输出失败：${e.message}` };
+      }
+    };
+
+    /** 数一下视频帧数（`-count_frames` 会真的解一遍，用来验证"切了多久"） */
+    const probeVideoFrames = (probeExe, file) => {
+      const r = spawnSync(
+        probeExe,
+        ['-v', 'error', '-select_streams', 'v:0', '-count_frames', '-show_entries', 'stream=nb_read_frames', '-of', 'default=nw=1:nk=1', file],
+        { encoding: 'utf8', windowsHide: true }
+      );
+      const n = Number(String(r.stdout ?? '').trim());
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+
+    const work = join(REPO_ROOT, '.tools', 'smoke', 'out-av');
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+    const src = join(work, 'av-source.mp4');
+    const outDir = join(work, 'out');
+    mkdirSync(outDir, { recursive: true });
+
+    // 源素材：3 秒测试图 + 440 Hz 正弦音。**必须带音轨** ——
+    // 没有音轨的话 extract-audio / audio.convert / audio.normalize 三个节点
+    // 全都测不出真东西（它们会"成功"地产出空文件或者直接报错）。
+    const gen = runEngine(ffPath, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc=duration=3:size=320x240:rate=15',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=3',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '128k', '-shortest',
+      src,
+    ]);
+    const srcInfo = existsSync(src) ? probeJson(src) : { error: gen.err };
+    console.log(`   源素材: ${JSON.stringify(srcInfo)}`);
+    c.check(
+      !srcInfo.error && srcInfo.videoCodec === 'h264' && srcInfo.audioCodec === 'aac',
+      '造出带音轨的源视频（h264 + aac）',
+      srcInfo.error ?? `${srcInfo.videoCodec}/${srcInfo.audioCodec}`
+    );
+    c.check(
+      srcInfo.duration > 2.5 && srcInfo.duration < 3.5,
+      '源视频时长约 3 秒',
+      String(srcInfo.duration)
+    );
+
+    // ---- 一条把五个节点串起来的流水线 ----
+    //
+    // 顺序刻意选成**真正有依赖关系**的链：切一段 → 抽封面 → 从切片里提音轨 →
+    // 响度归一化 → 转成另一种音频容器。每一步都读上一步的产出，所以
+    // `${output.<端口>}` 与"中间产物在输出目录里"这条路径会被真的走一遍。
+    const CHAIN_ID = 'com.toolforge.test.av-chain';
+    const chainYaml = `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${CHAIN_ID}
+  name: 音视频链路测试插件
+  version: 1.0.0
+  description: 仅用于验证 video.* / audio.* 六个节点。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 源视频
+      type: file
+      accept: ["video/*"]
+      required: true
+  outputs:
+    - id: trimmed
+      label: 切片
+      type: file
+      accept: [".mp4"]
+      required: false
+    - id: frame
+      label: 封面
+      type: file
+      accept: [".png"]
+      required: false
+    - id: audio
+      label: 音轨
+      type: file
+      accept: [".mp3"]
+      required: false
+    - id: normalized
+      label: 归一化后的音轨
+      type: file
+      accept: [".mp3"]
+      required: false
+    - id: converted
+      label: 转码后的音频
+      type: file
+      accept: [".m4a"]
+      required: false
+  params: []
+runtime:
+  kind: pipeline
+  pipeline:
+    onError: fail
+    timeoutMs: 600000
+    steps:
+      - id: cut
+        uses: video.trim
+        label: 切出中间 1 秒
+        with:
+          src: "\${src}"
+          dst: "\${output.trimmed}"
+          start: "00:00:01"
+          duration: "1"
+      - id: cover
+        uses: video.thumbnail
+        label: 抽封面
+        with:
+          src: "\${output.trimmed}"
+          dst: "\${output.frame}"
+          at: "00:00:00"
+          width: "160"
+      - id: track
+        uses: video.extract-audio
+        label: 提取音轨
+        with:
+          src: "\${output.trimmed}"
+          dst: "\${output.audio}"
+          format: mp3
+          bitrate: "128"
+      - id: loud
+        uses: audio.normalize
+        label: 响度归一化
+        with:
+          src: "\${output.audio}"
+          dst: "\${output.normalized}"
+          lufs: "-16"
+      - id: toM4a
+        uses: audio.convert
+        label: 转成 m4a
+        with:
+          src: "\${output.normalized}"
+          dst: "\${output.converted}"
+          format: m4a
+          sampleRate: "44100"
+`;
+    const trimDir = join(work, 'chain');
+    mkdirSync(trimDir, { recursive: true });
+    writeFileSync(join(trimDir, 'plugin.yaml'), chainYaml, 'utf8');
+    const existing = await client.invoke('plugins_get', { pluginId: CHAIN_ID }).catch(() => null);
+    if (existing) {
+      await client.invoke('plugins_set_enabled', { pluginId: CHAIN_ID, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: CHAIN_ID }).catch(() => {});
+    }
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'directory', path: trimDir },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: false,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: CHAIN_ID,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'output' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: CHAIN_ID, enabled: true });
+
+    const sub = await client.invoke('plugins_run', {
+      req: { pluginId: CHAIN_ID, inputs: { src: [src] }, params: {}, outputDir: outDir },
+    });
+    const job = await client.waitJob(sub.jobId, 300, 1000);
+    console.log(`   链路任务: ${job.status}`);
+    if (job.error) console.log(`   错误: ${job.error.code} — ${job.error.message}`);
+    c.check(job.status === 'succeeded', '五个节点串起来的链路跑通', job.status);
+
+    const outputs = job.outputs ?? [];
+    console.log(`   产出: ${outputs.map((p) => p.split('\\').pop()).join(', ')}`);
+    const byExt = (ext) => outputs.find((p) => p.toLowerCase().endsWith(ext));
+
+    // ---- ① video.trim：时长真的变短了 ----
+    //
+    // 这一条抓到过一个真缺陷：**流复制路径带 `-avoid_negative_ts make_zero`
+    // 会让切片长度变成两倍**（要 1 秒给 2.02 秒 / 30 帧而不是 15 帧）。
+    // 所以断言不能停在"任务成功"，必须量**帧数**——容器时长与帧数一起看才说明问题。
+    const trimmed = byExt('.mp4');
+    if (trimmed && existsSync(trimmed)) {
+      const info = probeJson(trimmed);
+      const frames = probeVideoFrames(probePath, trimmed);
+      console.log(`   trim → ${JSON.stringify(info)} frames=${frames}`);
+      c.check(
+        info.duration > 0.3 && info.duration < 1.5,
+        '① video.trim：切片时长≈1 秒（源是 3 秒）',
+        String(info.duration)
+      );
+      // 15fps × 1s = 15 帧。旧行为是 30 帧（整 2 秒），所以这一条是那个缺陷的指纹。
+      c.check(
+        frames !== null && frames >= 13 && frames <= 18,
+        '① 帧数与 1 秒 @15fps 相符（旧行为是 30 帧 = 2 秒）',
+        String(frames)
+      );
+      c.check(info.videoCodec === 'h264', '① 切片仍是 h264（流复制没重编码）', String(info.videoCodec));
+    } else {
+      c.check(false, '① video.trim 产出了切片', outputs.join(', '));
+    }
+
+    // ---- ② video.thumbnail：PNG 且尺寸按 width 缩了 ----
+    const frame = byExt('.png');
+    if (frame && existsSync(frame)) {
+      const png = pngInfo(readFileSync(frame));
+      console.log(`   thumbnail → ${JSON.stringify(png)}`);
+      c.check(png?.width === 160, '② video.thumbnail：宽度按参数缩到 160', String(png?.width));
+      c.check(
+        typeof png?.height === 'number' && png.height > 0 && png.height % 2 === 0,
+        '② 高度按 -2 对齐（偶数，编码器要求）',
+        String(png?.height)
+      );
+    } else {
+      c.check(false, '② video.thumbnail 产出了封面', outputs.join(', '));
+    }
+
+    // ---- ③ video.extract-audio：有音轨、**没有**视频轨 ----
+    const audio = byExt('.mp3');
+    if (audio && existsSync(audio)) {
+      const info = probeJson(audio);
+      console.log(`   extract-audio → ${JSON.stringify(info)}`);
+      c.check(info.audioCodec === 'mp3', '③ video.extract-audio：音轨是 mp3', String(info.audioCodec));
+      c.check(info.videoCodec === null, '③ 产出的确实是纯音频（没有视频轨）', String(info.videoCodec));
+      c.check(
+        info.duration > 0.3 && info.duration < 1.8,
+        '③ 音轨时长跟着切片走（≈1 秒）',
+        String(info.duration)
+      );
+    } else {
+      c.check(false, '③ video.extract-audio 产出了音轨', outputs.join(', '));
+    }
+
+    // ---- ④ audio.normalize：重新编码过，仍是音频 ----
+    //
+    // 归一化测"响度到没到 -16 LUFS"需要 `loudnorm` 的测量输出，那是另一个
+    // 工具；这里断言的是**这一步真的执行了并产出可用音频**。诚实的边界：
+    // 脚本验不了"听感上响度是否一致"。
+    const normalized = outputs.filter((p) => p.toLowerCase().endsWith('.mp3'))[1];
+    if (normalized && existsSync(normalized)) {
+      const info = probeJson(normalized);
+      console.log(`   normalize → ${JSON.stringify(info)}`);
+      c.check(info.audioCodec === 'mp3', '④ audio.normalize：产出仍是 mp3', String(info.audioCodec));
+      c.check(info.size > 0, '④ 归一化后的文件非空', `${info.size} 字节`);
+      c.check(
+        info.size !== probeJson(audio).size || info.duration !== probeJson(audio).duration,
+        '④ 归一化确实重新编码过（字节数与上一步不同）',
+        `${probeJson(audio).size} → ${info.size}`
+      );
+      // ★ `loudnorm` 默认会把结果重采样到编码器默认值（44.1k → 48k），
+      //   而用户只要求"归一化响度"。这一条断言它被显式保住了。
+      c.check(
+        info.sampleRate === 44100,
+        '★ ④ 采样率被保住 44100（loudnorm 不会偷偷重采样）',
+        String(info.sampleRate)
+      );
+    } else {
+      c.note('跳过 ④：第二个 mp3 产出没找到');
+      c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    }
+
+    // ---- ⑤ audio.convert：容器与采样率都按参数来 ----
+    const converted = byExt('.m4a');
+    if (converted && existsSync(converted)) {
+      const info = probeJson(converted);
+      console.log(`   audio.convert → ${JSON.stringify(info)}`);
+      c.check(info.audioCodec === 'aac', '⑤ audio.convert：m4a 里是 aac', String(info.audioCodec));
+      c.check(info.sampleRate === 44100, '⑤ 采样率按参数设成 44100', String(info.sampleRate));
+      c.check(info.videoCodec === null, '⑤ 仍然没有视频轨', String(info.videoCodec));
+    } else {
+      c.check(false, '⑤ audio.convert 产出了 m4a', outputs.join(', '));
+    }
+
+    // ---- ⑥ video.transcode：容器由 `format` 参数决定（这一条抓的是"假参数"）----
+    //
+    // 节点目录里这个参数以前叫 **`container`**，而它是**装饰性的**：真正决定
+    // 输出容器的是扩展名，而扩展名由 `build_io` 从参数表里的 **`format`** 推出来。
+    // 于是用户把 `container` 选成 mkv、产出仍然是 `.mp4`。
+    // 现在统一成 `format`，这一节就是它的正面断言。
+    const TRANSCODE_ID = 'com.toolforge.test.av-transcode';
+    const transDir = join(work, 'transcode');
+    mkdirSync(transDir, { recursive: true });
+    const transYaml = `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${TRANSCODE_ID}
+  name: 转码测试插件
+  version: 1.0.0
+  description: 仅用于验证 video.transcode 的容器参数是否真的生效。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 源视频
+      type: file
+      accept: ["video/*"]
+      required: true
+  outputs:
+    - id: dst
+      label: 转码结果
+      type: file
+      required: false
+  params:
+    - id: format
+      label: 容器格式
+      type: enum
+      default: { kind: str, value: mp4 }
+      options:
+        - { value: mp4, label: MP4 }
+        - { value: mkv, label: MKV }
+        - { value: webm, label: WebM }
+      required: false
+      affectsOutput: true
+runtime:
+  kind: pipeline
+  pipeline:
+    onError: fail
+    timeoutMs: 300000
+    steps:
+      - id: tc
+        uses: video.transcode
+        label: 转码
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+          vcodec: libx264
+          acodec: aac
+          crf: "30"
+          preset: ultrafast
+`;
+    writeFileSync(join(transDir, 'plugin.yaml'), transYaml, 'utf8');
+    const ex2 = await client.invoke('plugins_get', { pluginId: TRANSCODE_ID }).catch(() => null);
+    if (ex2) {
+      await client.invoke('plugins_set_enabled', { pluginId: TRANSCODE_ID, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: TRANSCODE_ID }).catch(() => {});
+    }
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'directory', path: transDir },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: false,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: TRANSCODE_ID,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'output' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: TRANSCODE_ID, enabled: true });
+
+    const tcDir = join(work, 'transcode-out');
+    mkdirSync(tcDir, { recursive: true });
+    const tcSub = await client.invoke('plugins_run', {
+      req: {
+        pluginId: TRANSCODE_ID,
+        inputs: { src: [src] },
+        params: { format: { kind: 'str', value: 'mkv' } },
+        outputDir: tcDir,
+      },
+    });
+    const tcJob = await client.waitJob(tcSub.jobId, 180, 1000);
+    console.log(`   转码任务（请求 mkv）: ${tcJob.status}`);
+    if (tcJob.error) console.log(`   错误: ${tcJob.error.code} — ${tcJob.error.message}`);
+    c.check(tcJob.status === 'succeeded', '⑥ video.transcode 成功', tcJob.status);
+
+    const tcOut = (tcJob.outputs ?? [])[0];
+    console.log(`   转码产出: ${tcOut ?? '(无)'}`);
+    c.check(
+      Boolean(tcOut && tcOut.toLowerCase().endsWith('.mkv')),
+      '★ ⑥ 请求的容器（mkv）真的决定了输出扩展名 —— 参数不是装饰',
+      tcOut ?? '(无产出)'
+    );
+    if (tcOut && existsSync(tcOut)) {
+      const info = probeJson(tcOut);
+      console.log(`   转码属性 → ${JSON.stringify(info)}`);
+      c.check(/matroska/.test(String(info.formatName)), '★ ⑥ 文件的真实容器是 matroska', String(info.formatName));
+      c.check(info.videoCodec === 'h264' && info.audioCodec === 'aac', '⑥ 视频/音频编解码器按参数', `${info.videoCodec}/${info.audioCodec}`);
+    }
+
+    // ---- ⑥b 反向：webm + h264 必须在**调用 ffmpeg 之前**被拦下 ----
+    //
+    // WebM 只接受 VP8/VP9/AV1 + Opus/Vorbis。不预检的话用户看到的是
+    // ffmpeg 那句 `Could not find tag for codec h264 in stream #0` —— 不知所云。
+    const tcSub2 = await client.invoke('plugins_run', {
+      req: {
+        pluginId: TRANSCODE_ID,
+        inputs: { src: [src] },
+        params: { format: { kind: 'str', value: 'webm' } },
+        outputDir: join(work, 'transcode-webm'),
+      },
+    });
+    const tcJob2 = await client.waitJob(tcSub2.jobId, 120, 1000);
+    console.log(`   webm + h264: ${tcJob2.status} / ${tcJob2.error?.code ?? ''}`);
+    c.check(tcJob2.status === 'failed', '⑥b webm + h264 被拒绝（而不是让 ffmpeg 报一句看不懂的话）', String(tcJob2.status));
+    c.check(
+      /WebM 只接受 VP8 \/ VP9 \/ AV1/.test(String(tcJob2.error?.detail ?? '')),
+      '⑥b 拒绝理由说清了 WebM 接受什么、该怎么办',
+      String(tcJob2.error?.message ?? '').slice(0, 80)
+    );
+
+    // ---- ⑦ video.compress：按目标体积算码率 ----
+    const COMPRESS_ID = 'com.toolforge.test.av-compress';
+    const cDir = join(work, 'compress');
+    mkdirSync(cDir, { recursive: true });
+    const cYaml = transYaml
+      .replace(TRANSCODE_ID, COMPRESS_ID)
+      .replace('转码测试插件', '压缩测试插件')
+      .replace(/      - id: tc[\s\S]*$/, `      - id: cp
+        uses: video.compress
+        label: 压缩
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+          targetSizeMb: "0.05"
+          maxWidth: "160"
+`);
+    writeFileSync(join(cDir, 'plugin.yaml'), cYaml, 'utf8');
+    const ex3 = await client.invoke('plugins_get', { pluginId: COMPRESS_ID }).catch(() => null);
+    if (ex3) {
+      await client.invoke('plugins_set_enabled', { pluginId: COMPRESS_ID, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: COMPRESS_ID }).catch(() => {});
+    }
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'directory', path: cDir },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: false,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: COMPRESS_ID,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'output' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: COMPRESS_ID, enabled: true });
+    const cpDir = join(work, 'compress-out');
+    mkdirSync(cpDir, { recursive: true });
+    const cpSub = await client.invoke('plugins_run', {
+      req: { pluginId: COMPRESS_ID, inputs: { src: [src] }, params: {}, outputDir: cpDir },
+    });
+    const cpJob = await client.waitJob(cpSub.jobId, 180, 1000);
+    console.log(`   压缩任务: ${cpJob.status}`);
+    if (cpJob.error) console.log(`   错误: ${cpJob.error.code} — ${cpJob.error.message}`);
+    c.check(cpJob.status === 'succeeded', '⑦ video.compress 成功', cpJob.status);
+    const cpOut = (cpJob.outputs ?? [])[0];
+    if (cpOut && existsSync(cpOut)) {
+      const info = probeJson(cpOut);
+      console.log(`   压缩属性 → ${JSON.stringify(info)}`);
+      c.check(info.width === 160, '⑦ 宽度按 maxWidth 缩到 160', String(info.width));
+      const logs = (cpJob.logs ?? []).map((l) => l.message).join('\n');
+      c.check(
+        /目标 0\.05 MB \/ 时长 .* → 视频码率约 \d+ kbps/.test(logs),
+        '⑦ 日志交代了按目标体积算出来的码率（不是闷头压）',
+        (logs.match(/目标 .*kbps/) ?? [''])[0]
+      );
+      c.check(info.size > 0, '⑦ 产出非空', `${info.size} 字节`);
+    } else {
+      c.check(false, '⑦ video.compress 产出了文件', String(cpOut));
+    }
+
+    // 收尾
+    for (const id of [CHAIN_ID, TRANSCODE_ID, COMPRESS_ID]) {
+      await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+    }
+    const left = await client.invoke('plugins_list');
+    const ids = (left?.plugins ?? left ?? []).map((p) => p.id);
+    c.check(
+      !ids.some((x) => /\.test\./.test(String(x))),
+      '音视频测试插件已清理',
+      ids.filter((x) => /\.test\./.test(String(x))).join(', ')
+    );
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

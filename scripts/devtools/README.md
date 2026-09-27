@@ -41,7 +41,7 @@ node scripts/devtools/inspect.mjs   # 单页体检
 node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
-node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（116 项）
+node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（145 项）
 node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（70 项）
 ```
 
@@ -129,7 +129,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 ### `verify-platform.mjs` —— 平台能力（**这一轮新增的主要内容**）
 
 `verify.mjs` 验的是**安全属性**，这个脚本验的是**平台声称能做到的事是不是真的做到了**。
-十六节，116 项：
+十七节，145 项：
 
 | 节 | 验什么 | 它抓到过什么 |
 |---|---|---|
@@ -148,6 +148,8 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 | 【13】 | 兜底档（纯 Rust `image` crate）是否真的接得住 | 这一档是"零依赖、始终可用"的那条，**装了引擎的机器上永远走不到它** —— 也正因如此它最难被验到（此前文档只敢写"三档里有两档有证据"） |
 | 【14】 | 视频 → GIF（`video-to-gif`）是否真的跑得通 | **两个叠加的缺陷**：`${output.frame}` 根本解析不了（`build_io` 只给 `dst` 分配路径）；修掉之后又撞上"中间产物在输出目录、下游却用输入作用域去读"→ 路径逃逸拦截。这个内置插件从写出来那天起就没跑通过，而插件列表里它一直是"正常"的 |
 | 【15】 | 扫描件 PDF 的 OCR（Poppler 栅格化 + 逐页识别） | —— 这一节验的是**新做的能力**：3 页 PDF → 假端点收到 **3 次**请求（逐页而不是整篇）、渲染尺寸符合 `pdfDpi` 的预期（584×278 vs 583×278±2）、多页结果之间有 `===== 第 N 页 =====` 分隔 |
+| 【16】 | 节点可用性判定说的是不是实话 | `ebook.convert` 在既没 Calibre 也没 Pandoc 的机器上显示"可用"（点下去才报 `EngineMissing`）；`ai.upscale` 在只下了**抠图**权重的机器上也显示可用。这一节逐个核对 32 个节点的"可用"与真实引擎/权重状态是否一致 —— 判据是**一致性**，不是硬编某台机器的状态 |
+| 【17】 | 音频 / 视频节点是否真的产出正确的媒体 | FFmpeg 装通之前这 7 个节点**一次都没被跑过**。真跑一遍抓到三个：`video.trim` 的切片长度是请求值的**两倍**（`-avoid_negative_ts make_zero` 干的，30 帧 vs 15 帧）、`video.transcode` 的容器参数是**装饰**（它叫 `container`，而扩展名由 `format` 决定）、`audio.normalize` 会**悄悄把 44.1kHz 重采样成 48kHz**。这一节用 ffprobe 读回真实属性（时长/帧数/编解码器/采样率/尺寸/容器）来断言，而不是只看"任务成功" |
 
 **【12】与【13】的做法值得单说**：降级链的**后两档只能靠"临时把更优先的引擎藏起来"才测得到** ——
 libvips 只要在，`image.convert` 就永远走它，中间档与兜底档根本没有机会被执行。

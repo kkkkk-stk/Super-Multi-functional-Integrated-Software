@@ -528,7 +528,7 @@ permissions:
 
 | 节点名 | 中文名 | 必需引擎 | 参数 id | 说明 |
 |---|---|---|---|---|
-| `video.transcode` | 视频转码 | ffmpeg | `container`、`vcodec`、`acodec`、`crf`、`preset`、`hwaccel` | 完整实现 |
+| `video.transcode` | 视频转码 | ffmpeg | `format`、`vcodec`、`acodec`、`crf`、`preset`、`hwaccel` | 完整实现。**`format` 决定输出容器**（它经 `build_io` 变成输出扩展名，ffmpeg 按扩展名选 muxer）—— 这个参数以前叫 `container`，而那是**装饰性的**：选 mkv 也会产出 `.mp4` |
 | `video.extract-audio` | 提取音频 | ffmpeg | `format`、`bitrate` | 完整实现 |
 | `video.thumbnail` | 视频截图 | ffmpeg | `at`、`width`、`format` | 完整实现 |
 | `video.trim` | 视频剪辑 | ffmpeg | `start`、`reencode`、`duration`(从 `with`) | 完整实现 |
