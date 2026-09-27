@@ -49,7 +49,7 @@ use toolforge_core::permission::PermissionSet;
 use toolforge_core::plugin::PythonRuntimeDef;
 use toolforge_core::queue::JobCtx;
 
-use toolforge_process::supervisor::{ChildSupervisor, SpawnSpec};
+use toolforge_process::supervisor::{ChildSupervisor, SpawnSpec, SupervisorState};
 
 use crate::runtimes::PluginCallRequest;
 
@@ -194,11 +194,31 @@ impl PythonPlugin {
 
         // 用 `loop { ... break expr }` 而不是 `Option` 累加器：
         // 后者会触发 `unused_assignments`（初始值被覆盖但从未被读到）。
+        //
+        // `canceled` 是**取消标记**：循环里发现任务被取消时置上，
+        // 循环结束后据此**回收子进程**（见下面那段注释）。
+        let mut canceled = false;
         let outcome = loop {
             tokio::select! {
                 result = &mut call => break result,
                 _ = tokio::time::sleep(Duration::from_millis(80)) => {
-                    job.check()?;
+                    // ★ 取消：**必须回收子进程**，不能只是"不再等它"。
+                    //
+                    // 插件此刻正卡在**任意用户代码**里 —— `time.sleep(60)`、一个
+                    // 死循环、一次 native 调用 —— JSON-RPC 协议上没有任何
+                    // "请停下"的说法，所以唯一的办法是杀掉重建。
+                    //
+                    // 这里此前写的是 `job.check()?`：它确实让任务**立刻**变成
+                    // "已取消"（用户看到的是对的），但那个 Python 进程会一直跑到
+                    // 自己结束。后果有两个，都不好查：
+                    //   ① "取消"并没有真的省下资源（CPU / 模型内存还占着）；
+                    //   ② 它对 stdin 的响应会排在下一次调用的响应前面 ——
+                    //      表现为"取消之后的下一个任务莫名变慢 / 串味"。
+                    // `Timeout` 那条路一直是杀的（见下面的 match），唯独取消漏了。
+                    if let Err(e) = job.check() {
+                        canceled = true;
+                        break Err(e);
+                    }
                     let pending: Vec<Value> = { let mut q = queue.lock().await; q.drain(..).collect() };
                     for n in pending {
                         handle_notification(&plugin_id, n, job);
@@ -217,6 +237,13 @@ impl PythonPlugin {
             handle_notification(&plugin_id, n, job);
         }
 
+        // ★ 取消 → 与 `Timeout` 同等对待：进程已经不可信（正卡在用户代码里），回收掉。
+        // （`kill()` 会把状态置为 `Dead`，下一次 `call` 会重新拉起一个干净的进程。）
+        if canceled {
+            tracing::warn!(plugin = %plugin_id, "任务已取消：回收仍在执行的 Python 子进程");
+            self.supervisor.kill().await;
+        }
+
         match outcome {
             Ok(v) => Ok(v),
             Err(e) => {
@@ -231,6 +258,24 @@ impl PythonPlugin {
 
     pub async fn shutdown(&mut self) {
         self.supervisor.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// 子进程是否**已经退出**。
+    ///
+    /// 退出后这个实例再也无法服务任何调用（`ChildSupervisor::call` 会返回
+    /// `PROCESS_GONE`），所以上层必须把它换掉 —— 否则这个插件会在**本会话里
+    /// 彻底不能用**，除非用户去把插件禁用再启用。
+    ///
+    /// 两种会让它变成 `Dead` 的现实情况：
+    /// * **任务被取消** —— `call()` 主动杀掉子进程（它正卡在用户代码里，
+    ///   JSON-RPC 协议上没法让它停下）；
+    /// * 子进程**意外退出** —— 被 OOM / 杀软干掉，或插件自己崩了。
+    ///
+    /// 注意判据只认 `Dead`，**不认 `Unavailable`**：后者是"插件自己报告它跑不了"
+    /// （依赖装不上、模型加载失败），那种情况下保持缓存是对的 ——
+    /// 每次调用都重新走一遍装载既慢、又会把审计日志刷满，而错误信息本来就已经清楚了。
+    pub fn is_dead(&self) -> bool {
+        self.supervisor.state() == SupervisorState::Dead
     }
 
     pub fn plugin_dir(&self) -> &Path {

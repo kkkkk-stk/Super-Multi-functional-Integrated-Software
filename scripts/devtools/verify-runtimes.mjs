@@ -58,7 +58,7 @@ import { createServer } from 'node:http';
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { Checker, connect, prepareOutDir, REPO_ROOT, SMOKE_DIR, writeInputPng } from './cdp.mjs';
+import { Checker, connect, prepareOutDir, REPO_ROOT, sleep, SMOKE_DIR, writeInputPng } from './cdp.mjs';
 
 const c = new Checker();
 const client = await connect();
@@ -1045,6 +1045,295 @@ runtime:
   }
 
   // ==========================================================================
+  // 【6c】L3 · 常驻进程复用，以及**取消能不能真的把 Python 子进程收掉**
+  // ==========================================================================
+  //
+  // 这两件事在 ROADMAP 的 v0.2 清单里挂了很久，各是一句话：
+  //
+  //   * 「常驻进程复用验证：连续调用同一插件 100 次，进程数保持为 1」
+  //   * 「取消能真正终止正在执行的 Python 调用并回收子进程」
+  //
+  // 实现其实早就有了（`ChildSupervisor` 复用同一个子进程；`python.rs::call` 每 80ms
+  // `job.check()` 一次），但**两条都没有任何验证**。而第二件事在写检查的过程中
+  // 就查出了一个真缺陷：
+  //
+  //   `call()` 里取消走的是 `job.check()?` —— 它让任务**立刻**变成"已取消"
+  //   （用户看到的没错），但那个 Python 进程**没有被杀**，会一直跑到自己结束。
+  //   `Timeout` 那条路一直是杀的（见 `call()` 里的 match），唯独取消漏了。
+  //   后果有两个：① "取消"并没有真的省下资源（CPU / 模型内存还占着）；
+  //   ② 它对 stdin 的响应会排在下一次调用的响应前面 ——
+  //      表现为"取消之后的下一个任务莫名变慢 / 串味"。已修。
+  //
+  // 这一节的判据全部落在**进程**上，不是"任务显示取消了"：
+  //   * 复用：100 次调用的 pid 去重后**恰好 1 个**；
+  //   * ★ 反证：那个 pid 必须是**真的** —— 外部把它杀掉，下一次调用要成功且换成
+  //     新 pid（否则"1 个 pid"可能只是宿主把一个常量回显了 100 次）；
+  //   * 取消：先断言子进程**还活着**，再取消，再断言它**没了** ——
+  //     少了"还活着"这个前提，"取消后没了"就可能只是因为那个 pid 早就死了。
+  c.section('【6c】L3 · 常驻进程复用与取消：子进程有没有被复用、被不被打得死');
+  {
+    const PROC_PROBE = 'com.toolforge.test.proc-probe';
+    const probeDir = join(STAGE, 'proc-probe');
+    rmSync(probeDir, { recursive: true, force: true });
+    mkdirSync(probeDir, { recursive: true });
+    writeFileSync(
+      join(probeDir, 'plugin.yaml'),
+      `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${PROC_PROBE}
+  name: 常驻进程 / 取消探针（测试用）
+  version: 1.0.0
+  description: 仅用于验证 L3 的进程复用与取消回收。只回报自己的 pid，不需要任何能力。
+permissions:
+  capabilities: []
+io:
+  inputs:
+    - id: src
+      label: 任意文本
+      type: text
+      required: true
+  outputs:
+    - id: report
+      label: 报告
+      type: json
+      required: false
+  params:
+    - id: sleepSeconds
+      label: 先睡多少秒
+      type: int
+      default: { kind: int, value: 0 }
+      description: 大于 0 时先 sleep 再回报 —— 用来制造一个"正在执行"的窗口供取消使用。
+      required: false
+runtime:
+  kind: python
+  python:
+    entry: main.py
+    pythonVersion: "3.11"
+    requirements: []
+    timeoutMs: 120000
+    workers: 1
+    allowNetwork: false
+`,
+      'utf8'
+    );
+    // 探针脚本。注意：这段 Python 整个嵌在 JS 模板字符串里，
+    // **不能出现反引号**（一个反引号就会把模板提前结束，报的还是别的错）。
+    writeFileSync(
+      join(probeDir, 'main.py'),
+      `"""常驻进程 / 取消探针：只回报自己的 pid。"""
+import json
+import os
+import sys
+import time
+
+
+def _write(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\\n")
+    sys.stdout.flush()
+
+
+def handle_initialize(params):
+    return {"ok": True}
+
+
+def handle_run(params):
+    p = params.get("params") or {}
+    seconds = float(p.get("sleepSeconds") or 0)
+    if seconds > 0:
+        # 制造一个"正在执行用户代码"的窗口 —— 取消必须能从这里把它打断
+        time.sleep(seconds)
+    return {"outputs": {"report": json.dumps({"pid": os.getpid()})}}
+
+
+def handle_shutdown(params):
+    return {"ok": True}
+
+
+HANDLERS = {"initialize": handle_initialize, "run": handle_run, "shutdown": handle_shutdown}
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        handler = HANDLERS.get(msg.get("method"))
+        if handler is None:
+            continue
+        try:
+            result = handler(msg.get("params") or {})
+            _write({"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
+        except Exception as exc:  # noqa: BLE001
+            _write({"jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32000, "message": str(exc)}})
+
+
+main()
+`,
+      'utf8'
+    );
+
+    /** 从任务日志里抠出插件回报的 pid */
+    const pidOf = (job) => {
+      const m = /pid[^0-9]{0,8}(\d+)/.exec(logText(job));
+      return m ? Number(m[1]) : null;
+    };
+    /** 进程还活着吗（signal 0 = 只探测、不真的发信号） */
+    const alive = (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const waitGone = async (pid, tries = 25, intervalMs = 200) => {
+      for (let i = 0; i < tries; i++) {
+        if (!alive(pid)) return true;
+        await sleep(intervalMs);
+      }
+      return !alive(pid);
+    };
+
+    await install(PROC_PROBE, probeDir, { executableCode: true });
+    await client.invoke('plugins_set_enabled', { pluginId: PROC_PROBE, enabled: true });
+
+    const outDir = prepareOutDir('out-rt-proc-probe');
+    // 注意这里**没有**用文件顶部那个 `run()`：它的 `waitJob` 轮询间隔是 1 秒，
+    // 100 次调用就要白等 100 秒。轮询间隔调到 50ms ——
+    // 这一节要测的是"插件有没有被复用"，不是"宿主轮询得多慢"。
+    const callOnce = async (sleepSeconds) => {
+      const sub = await client.invoke('plugins_run', {
+        req: {
+          pluginId: PROC_PROBE,
+          inputs: { src: ['x'] },
+          params: { sleepSeconds: { kind: 'int', value: sleepSeconds } },
+          outputDir: outDir,
+        },
+      });
+      const job = await client.waitJob(sub.jobId, 200, 50);
+      return { sub, job };
+    };
+
+    // ---- 冷启动一次，顺便确认探针本身可用 ----
+    console.log('   首次调用要建 venv（几秒），之后就该复用同一个进程…');
+    const first = await callOnce(0);
+    const firstPid = pidOf(first.job);
+    c.check(
+      first.job.status === 'succeeded' && firstPid !== null,
+      '① 探针可用，并回报了自己的 pid',
+      `${first.job.status} / pid=${firstPid}`
+    );
+
+    // ---- ②③ 复用：连续 100 次，pid 去重后应恰好 1 个 ----
+    const N = 100;
+    const t0 = Date.now();
+    const pids = new Set();
+    let ok = 0;
+    for (let i = 0; i < N; i++) {
+      const { job } = await callOnce(0);
+      if (job.status === 'succeeded') ok++;
+      const p = pidOf(job);
+      if (p !== null) pids.add(p);
+    }
+    const elapsed = Date.now() - t0;
+    console.log(
+      `   ${N} 次调用：成功 ${ok}，不同 pid ${pids.size} 个（${[...pids].join(', ')}），共 ${(elapsed / 1000).toFixed(1)}s`
+    );
+    c.check(ok === N, `② 连续 ${N} 次调用全部成功`, `${ok}/${N}`);
+    c.check(
+      pids.size === 1,
+      `★ ③ ${N} 次调用只用了 1 个 Python 进程（常驻复用生效，而不是每次都 spawn）`,
+      `${pids.size} 个 pid：${[...pids].join(', ')}`
+    );
+
+    // ---- ④ 反证：那个 pid 是真的 ----
+    // 外部把它杀掉：下一次调用必须**成功**且换成**新** pid。
+    // 少了这条，"1 个 pid"可能只是宿主把一个常量回显了 100 次。
+    let reusedPid = [...pids][0] ?? firstPid;
+    if (reusedPid !== null && reusedPid !== undefined && alive(reusedPid)) {
+      try {
+        process.kill(reusedPid);
+      } catch (e) {
+        c.check(false, '证伪用的 kill 失败了（这条检查失去意义）', String(e.message));
+      }
+      await sleep(300);
+      const afterKill = await callOnce(0);
+      const newPid = pidOf(afterKill.job);
+      c.check(
+        afterKill.job.status === 'succeeded',
+        '★ ④ 外部杀掉子进程后，运行时能自愈（下一次调用仍然成功）',
+        afterKill.job.status
+      );
+      c.check(
+        newPid !== null && newPid !== reusedPid,
+        '★ ④b 自愈后是**新** pid —— 证明前面那个 pid 是真的子进程，不是被回显的常量',
+        `${reusedPid} → ${newPid}`
+      );
+      reusedPid = newPid;
+    }
+
+    // ---- ⑤⑥⑦⑧ 取消：能不能真的把正在执行的子进程收掉 ----
+    // 前置：确认这个 pid 现在**活着**（少了它，"取消后没了"什么也证明不了）
+    const live = reusedPid !== null && reusedPid !== undefined && alive(reusedPid);
+    c.check(
+      live,
+      '⑤ 前置：取消之前子进程**确实活着**（否则"取消后没了"什么也证明不了）',
+      `pid=${reusedPid} alive=${live}`
+    );
+
+    if (live) {
+      const sub = await client.invoke('plugins_run', {
+        req: {
+          pluginId: PROC_PROBE,
+          inputs: { src: ['x'] },
+          params: { sleepSeconds: { kind: 'int', value: 60 } },
+          outputDir: outDir,
+        },
+      });
+      // 给它一点时间真正进到 sleep 里
+      await sleep(2000);
+      const duringJob = await client.invoke('jobs_get', { jobId: sub.jobId });
+      c.check(
+        duringJob?.status === 'running',
+        '⑤b 取消之前那个任务**正在跑**（60 秒的 sleep 给足了窗口）',
+        duringJob?.status
+      );
+
+      const t1 = Date.now();
+      await client.invoke('jobs_cancel', { jobId: sub.jobId });
+      const canceled = await client.waitJob(sub.jobId, 40, 250);
+      const latency = Date.now() - t1;
+      console.log(`   取消：状态 ${canceled?.status}，耗时 ${latency}ms`);
+      c.check(canceled?.status === 'cancelled', '★ ⑥ 任务在取消后进入「已取消」', canceled?.status);
+      c.check(latency < 5000, '★ ⑥b 取消是**及时**的（< 5 秒，而不是等它自己跑完 60 秒）', `${latency}ms`);
+
+      const gone = await waitGone(reusedPid);
+      c.check(
+        gone,
+        '★ ⑦ 那个 Python 子进程**真的被收掉了** —— 这条在修之前是红的（取消只让任务变「已取消」，进程继续跑完 60 秒）',
+        `pid=${reusedPid} alive=${alive(reusedPid)}`
+      );
+
+      // ---- ⑧ 收掉之后运行时仍然可用（回收不能把插件搞死）----
+      const after = await callOnce(0);
+      const pidAfter = pidOf(after.job);
+      c.check(
+        after.job.status === 'succeeded' && pidAfter !== null && pidAfter !== reusedPid,
+        '★ ⑧ 取消回收之后运行时仍然可用，而且是**新**进程（不是留着一个死掉的监督者）',
+        `${after.job.status} / pid=${pidAfter}`
+      );
+    }
+
+    await uninstall(PROC_PROBE);
+  }
+
+  // ==========================================================================
   // 【7】收尾：测试插件不能留在用户的插件列表里
   // ==========================================================================
   c.section('【7】测试插件已清理');
@@ -1060,6 +1349,7 @@ runtime:
       'com.toolforge.test.wasi-wasm',
       'com.toolforge.test.hostfn-wasm',
       'com.toolforge.test.net-port',
+      'com.toolforge.test.proc-probe',
     ];
     for (const id of all) {
       await uninstall(id);

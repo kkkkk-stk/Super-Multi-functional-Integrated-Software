@@ -112,6 +112,18 @@ impl RunningPlugin {
             RunningPlugin::Python(p) => p.shutdown().await,
         }
     }
+
+    /// 这个已装载的实例**需要重新拉起**吗（它的进程已经没了）。
+    ///
+    /// 见 `python::PythonPlugin::is_dead()` 的文档：取消与意外崩溃都会让
+    /// Python 子进程退出，而**缓存里的实例不会自己复活**。
+    pub fn needs_relaunch(&self) -> bool {
+        match self {
+            // L2 的 Extism 实例没有"进程退出"这回事，永远是同一个内存实例
+            RunningPlugin::Wasm(_) => false,
+            RunningPlugin::Python(p) => p.is_dead(),
+        }
+    }
 }
 
 /// 插件运行时工厂 —— 负责"按清单把插件装载起来"。
@@ -158,8 +170,54 @@ impl PluginRunner {
     /// 记审计 —— 这是挡住"装完之后再替换成恶意代码"的关键一步。
     pub async fn ensure_loaded(&self, record: &PluginRecord) -> ToolforgeResult<()> {
         let id = record.id().to_string();
-        if self.loaded.lock().contains_key(&id) {
+
+        // ★ 缓存里那个实例**进程已经没了**时要换掉它，而不是一直复用它。
+        //
+        // 这条判断是补上一个真实缺陷：`kill()` 之后监督者停在 `Dead`，而这里
+        // 原本是 `if contains_key { return Ok(()) }` —— 于是"取消一次任务"
+        // 就等于**把这个插件在本会话里彻底废掉**，除非用户去禁用再启用
+        // （那才会走到 `unload`）。同样的路径也盖住"子进程被 OOM / 杀软干掉"。
+        //
+        // 为什么是在这里、而不是在同一次调用里静默重试：`supervisor.rs` 的模块文档
+        // 说得很清楚 —— **静默重启会把"插件反复崩溃"这件事藏起来**。
+        // 这条改动没有违背它，两者的区别要说准：
+        //   * **调用过程中**崩的 → 那次调用仍然失败（`PROCESS_GONE`，带 stderr 尾巴），
+        //     用户看得见；而且反复崩的插件会**每次都失败**，不会变成"看起来正常"；
+        //   * **调用之间**死的（被杀软 / OOM 干掉、上一次取消留下的）→ 下一次调用
+        //     重新拉起一个干净进程，用户不必去禁用再启用插件。
+        // 也就是说：自愈的是"进程没了"，不是"崩溃被吞了"。
+        //
+        // 顺带说明：`SupervisorState::is_usable()` 此前**只有测试在用**
+        // （全仓库没有一个生产调用点）—— 这条判断本该是它的用武之地，
+        // 但判据刻意更窄（只认 `Dead`，不认 `Unavailable`，理由见 `is_dead()` 的文档）。
+        // 缓存状态：**先在这个不跨 await 的小作用域里取出结论**，再做决定。
+        //
+        // ⚠️ 不能把 `return` 写在持有 guard 的作用域里：`parking_lot` 的
+        // `MutexGuard` 不是 `Send`，而这里的 async 块必须是 `Send`
+        // （它要丢进 tokio 的任务里）。编译器对"提前 return 时 guard 的析构"
+        // 是保守的，会把 guard 判成跨 await 存活，报
+        // `*mut () cannot be sent between threads safely`。
+        let (cached, stale) = {
+            let guard = self.loaded.lock();
+            match guard.get(&id) {
+                None => (false, false),
+                Some(p) => (true, p.needs_relaunch()),
+            }
+        };
+        if cached && !stale {
             return Ok(());
+        }
+        if stale {
+            // ⚠️ 先把取出来的实例**绑到一个变量**上，再 `if let`。
+            // 写成 `if let Some(mut p) = self.loaded.lock().remove(&id) { … await … }`
+            // 的话，scrutinee 里的那个 `MutexGuard` 临时值会活到**整个 `if let` 语句结束**
+            // （包括里面的 `.await`），于是又变成"`!Send` 的 guard 跨 await"。
+            // 上面 `unload()` 里那两行就是这个写法，抄它。
+            let removed = self.loaded.lock().remove(&id);
+            if let Some(mut p) = removed {
+                tracing::warn!(plugin = %id, "已装载实例的进程已退出：重新拉起");
+                p.shutdown().await;
+            }
         }
 
         // 运行前完整性校验：这是挡住"装完之后再替换成恶意代码"的关键一步
