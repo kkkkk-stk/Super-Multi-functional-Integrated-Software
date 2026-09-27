@@ -483,7 +483,7 @@ permissions:
 | `image.convert` | 图片格式转换 | — | libvips、imagemagick | `format`、`quality` | PNG/JPEG/WebP/BMP/TIFF/GIF 互转。**输出 `backend`**（`libvips` / `imagemagick` / `rust`）。装了 libvips 时 WebP/JPEG 才按 `quality` 走**有损**编码；纯 Rust 后端的 WebP **只有无损** |
 | `image.resize` | 图片缩放 | — | libvips、imagemagick | `width`、`height`、`filter` | Lanczos3 重采样；只给一边时另一边按比例推导（**两边都不给会报错**）。**输出 `backend`** |
 | `image.crop` | 裁剪 / 缩略图 | — | libvips、imagemagick | `mode`、`width`、`height`、`x`、`y` | `mode` 取 `center`/`custom`/`smart`（`smart` 目前与 `center` 相同）。**输出 `backend`** |
-| `image.rotate` | 旋转 / 翻转 | — | libvips、imagemagick | `angle`、`flipH`、`flipV`、`autoOrient` | 非 90° 倍数需要**会重采样的后端**：libvips（`similarity --angle`）或 ImageMagick（`-rotate`），libvips 优先；**两者都没有时报 `ENGINE_MISSING`**（detail 让你去装 libvips 或 ImageMagick），**不会静默把角度取整**。**输出 `backend`** |
+| `image.rotate` | 旋转 / 翻转 | — | libvips、imagemagick | `angle`、`flipH`、`flipV`、`autoOrient` | 非 90° 倍数需要**会重采样的后端**：libvips（`similarity --angle`）或 ImageMagick（`-rotate`），libvips 优先；**两者都没有时报 `ENGINE_MISSING`**（detail 让你去装 libvips 或 ImageMagick），**不会静默把角度取整**。`autoOrient`（默认 `true`）按文件里的 EXIF 方向先把图摆正 —— 手机竖拍的照片带 Orientation=6，关掉它就会拿到一张躺着的图。三个后端语义一致（libvips `autorot` → 旋转、ImageMagick 输入后的 `-auto-orient`、纯 Rust `apply_orientation`），PNG 之类没有方向的格式是空操作。**输出 `backend`** |
 | `image.enhance` | 图像增强 | — | — | `brightness`、`contrast`、`saturation`、`sharpen` | 纯 Rust 走内置卷积。**该节点不参与三层降级、没有 `backend` 输出，`optionalEngines` 也已清空** —— 此前它声明了 `libvips`，而实现里一个引擎都不调，界面因此会宣称一个并不存在的加速（已修，见 [ENGINE-MATRIX.md](ENGINE-MATRIX.md) 6.2） |
 | `image.strip-metadata` | 清除元数据 | — | — | — | 重新编码即不保留 EXIF/IPTC/XMP。**纯 Rust 实现，不调用 libvips / ImageMagick，也没有 `backend` 输出**；`optionalEngines` 同样已清空（理由同上） |
 | `image.remove-background` | 抠图去背景 | python、onnx-models | — | `model`、`mode`、`background`、`threshold`、`feather` | AI 抠图。**已实现**（此前是"登记了但执行器没写"）。走一条**独立的 ONNX 推理链**，不属于上面的 libvips / ImageMagick / 纯 Rust 三层降级（见下）。`model` 默认 `u2netp`（4.4 MB），可选 `u2net` / `isnet-general`；`mode` 取 `alpha`（透明背景 PNG）或 `color`（换纯色底，用 `background`）。**首次运行有两步一次性准备**：用户自己去「模型权重」下权重，应用再建一个独立 venv 装 `onnxruntime` / `numpy` / `pillow`（约 30 MB，**这一步要联网**）。之后推理全在本地，**不联网、不上传图片** |
@@ -614,7 +614,7 @@ permissions:
 | `image.probe` | `width`、`height`、`color`、`megapixels` |
 | `image.resize` | `width`、`height`、`backend` |
 | `image.crop` | `width`、`height`、`backend` |
-| `image.rotate` | `width`、`height`、`backend` |
+| `image.rotate` | `backend` |
 | `ai.upscale` | `path`、`model`、`backend`（恒为 `onnx-python`）、`width`、`height` |
 | `ai.describe` | `text`（模型给的描述）、`model`（实际使用的模型名） |
 | `doc.ocr` | `text`（识别出的文字）、`backend`（`tesseract` 或 `ai-vision`） |
@@ -625,6 +625,18 @@ permissions:
 | `archive.unpack` | `path` |
 | `flow.set-var` | `value` |
 | 其它（如 `video.thumbnail`、`video.transcode`、`image.remove-background`） | **没有可引用的值** —— 只能通过 `${output.<portId>}` 传路径 |
+
+> ⚠️ **这张表是本轮新发现的又一处漂移，请把它当"可能过期"看待。**
+> 它此前写着 `image.rotate` 会产出 `width` / `height` —— 而实现里
+> `image_rotate` 只 `with_value("backend", …)`，一个宽高都没有。
+> 写 `when: ${steps.rot.width} > 100` 的人会得到一条"模板变量无法解析"的报错，
+> 而文档说它存在。**根因是这张表没有任何机械对账**：【23】只核对了
+> 3.2 的节点表（名字 / 参数 / 引擎），没核对 3.5 的"产出值"表 ——
+> 因为节点注册表里根本没有"我会产出哪些值"这个字段，它只存在于
+> `NodeOutput::with_value(...)` 的调用点里。
+> 补齐那条对账需要给 `NodeDescriptor` 加一个 `values` 字段（会牵动
+> specta 绑定、前后端类型与 UI），因此**留作待办**（见 ROADMAP）。
+> 在那之前，判断某个节点产出什么，以 `nodes.rs` 的返回值为准。
 
 **`backend` 是什么**：`image.convert` / `image.resize` / `image.crop` / `image.rotate` 会报出**实际使用的图像后端**，取值为 `"libvips"` / `"imagemagick"` / `"rust"`。它让"到底走没走 libvips"这件事变成流程内可判断的事实，例如后续步骤可以写 `when: ${steps.conv.backend} == rust` 来做"纯 Rust 路径下的补偿处理"。`image.enhance` 与 `image.strip-metadata` **不产出这个值**（它们不参与三层降级）；`ebook.convert` / `doc.ocr` / `ai.upscale` 也各有自己的 `backend` 值，含义见上表 —— 名字一样，但**取值域不一样**，别拿一个节点的取值去判断另一个节点。
 
