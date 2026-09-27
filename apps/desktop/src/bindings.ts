@@ -662,6 +662,23 @@ export type EngineModel_Deserialize = {
 	commercialUse: boolean,
 	/**  下载地址与校验值 */
 	url?: string | null,
+	/**
+	 *  **备用下载地址**：主地址连不上时按顺序再试一个。
+	 * 
+	 *  # 为什么需要它（不是"多填一个地址保险一点"）
+	 * 
+	 *  这些权重的官方源是 `huggingface.co`，而它在**部分网络下不可达**
+	 *  （本机实测：没开加速时 DNS/TCP 都不通，开了才 200）。社区镜像
+	 *  `hf-mirror.com` 在同一网络下能用，但它是第三方、而且**会抖**。
+	 * 
+	 *  只填官方 → 那部分用户完全下不了；只填镜像 → 所有用户都依赖第三方。
+	 *  两个都填，按"官方优先、镜像兜底"的顺序试，才是对两边都成立的答案。
+	 * 
+	 *  ⚠️ **必须与主地址是同一个文件**：每次下载都会核对 `sha256`，
+	 *  不一致会被删掉并报 `INTEGRITY_CHECK_FAILED`。有一条测试
+	 *  （`fallback_urls_point_at_the_same_asset`）强制它与主地址指向同一个资产名。
+	 */
+	fallbackUrl?: string | null,
 	sha256?: string | null,
 	/**
 	 *  落盘文件名。
@@ -703,6 +720,23 @@ export type EngineModel_Serialize = {
 	commercialUse: boolean,
 	/**  下载地址与校验值 */
 	url?: string | null,
+	/**
+	 *  **备用下载地址**：主地址连不上时按顺序再试一个。
+	 * 
+	 *  # 为什么需要它（不是"多填一个地址保险一点"）
+	 * 
+	 *  这些权重的官方源是 `huggingface.co`，而它在**部分网络下不可达**
+	 *  （本机实测：没开加速时 DNS/TCP 都不通，开了才 200）。社区镜像
+	 *  `hf-mirror.com` 在同一网络下能用，但它是第三方、而且**会抖**。
+	 * 
+	 *  只填官方 → 那部分用户完全下不了；只填镜像 → 所有用户都依赖第三方。
+	 *  两个都填，按"官方优先、镜像兜底"的顺序试，才是对两边都成立的答案。
+	 * 
+	 *  ⚠️ **必须与主地址是同一个文件**：每次下载都会核对 `sha256`，
+	 *  不一致会被删掉并报 `INTEGRITY_CHECK_FAILED`。有一条测试
+	 *  （`fallback_urls_point_at_the_same_asset`）强制它与主地址指向同一个资产名。
+	 */
+	fallbackUrl?: string | null,
 	sha256?: string | null,
 	/**
 	 *  落盘文件名。
