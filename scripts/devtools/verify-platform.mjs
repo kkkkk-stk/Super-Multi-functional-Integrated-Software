@@ -3473,6 +3473,119 @@ c.section('【22】流程编辑器：画布 → plugin.yaml → 后端校验 →
   }
 }
 
+// ============================================================================
+// 【23】`docs/PLUGIN-SDK.md` 的节点表与真实节点目录**机械对账**
+// ============================================================================
+//
+// 为什么值得单独一条：**这份文档是插件作者的契约**，而"契约与实现漂移"在这个项目里
+// 已经造成过真实损失 —— 画布导出把多步接力写成 `${steps.<上游>.<端口>}`，
+// 而文档 §3.4 结尾明写着要用 `${output.<端口>}` 传路径（见【22】）。
+// 那次是"代码没照文档写"；反过来"文档没跟上代码"同样会发生，
+// 而且更难发现：界面照常工作，只有照着文档写插件的人会踩坑。
+//
+// 做法：把文档里的节点表**按表头**解析（四张小节的列语义不一样：
+// §3.1 那列是"从 `with` 读的参数"，其余是"参数 id 从 `io.params` 读"），
+// 再逐行与 `pipeline_nodes` 对账：必需引擎、可选引擎、参数 id 集合，
+// 以及"目录里有但文档里没有"的节点。
+c.section('【23】`PLUGIN-SDK.md` 的节点表与节点目录是否对得上');
+{
+  const sdkPath = join(REPO_ROOT, 'docs', 'PLUGIN-SDK.md');
+  if (!existsSync(sdkPath)) {
+    c.note('（找不到 docs/PLUGIN-SDK.md，跳过）');
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    const mdLines = readFileSync(sdkPath, 'utf8').split(/\r?\n/);
+
+    // 把连续以 `|` 开头的行聚成表
+    const tables = [];
+    let cur = null;
+    for (let i = 0; i < mdLines.length; i++) {
+      if (/^\s*\|/.test(mdLines[i])) {
+        if (!cur) cur = { start: i, rows: [] };
+        cur.rows.push({ i, text: mdLines[i] });
+      } else if (cur) {
+        tables.push(cur);
+        cur = null;
+      }
+    }
+    if (cur) tables.push(cur);
+
+    const catalog = await client.invoke('pipeline_nodes');
+    const byName = new Map((catalog.nodes ?? []).map((n) => [n.name, n]));
+    const clean = (s) => s.replace(/[`\s]/g, '');
+
+    const problems = [];
+    const documented = new Set();
+    let nodeTables = 0;
+    let rowsChecked = 0;
+
+    for (const t of tables) {
+      const header = t.rows[0]?.text ?? '';
+      if (!header.includes('节点名')) continue;
+      nodeTables++;
+      const cols = header.split('|').map((s) => s.trim());
+      const idxOf = (pred) => cols.findIndex(pred);
+      const nameCol = idxOf((h) => h.includes('节点名'));
+      const reqCol = idxOf((h) => h.includes('必需引擎'));
+      const optCol = idxOf((h) => h.includes('可选引擎'));
+      const paramCol = idxOf((h) => h.includes('参数') || h.includes('从 `with` 读'));
+      // §3.1 那一列写的是"从 `with` 读的参数"，语义与 io.params 不同，不能混着比
+      const paramIsParams = paramCol >= 0 && !cols[paramCol].includes('with');
+
+      for (const r of t.rows.slice(2)) {
+        const cells = r.text.split('|').map((s) => s.trim());
+        const m = /^`([a-z][a-z0-9.\-]*)`$/.exec(cells[nameCol] ?? '');
+        if (!m) continue;
+        const name = m[1];
+        const desc = byName.get(name);
+        if (!desc) {
+          problems.push(`L${r.i + 1} ${name}：文档里有这个节点，但节点目录里没有（改名了？删了？）`);
+          continue;
+        }
+        documented.add(name);
+        rowsChecked++;
+        const diffs = [];
+        const reqReal = (desc.requiresEngines ?? []).join('、') || '—';
+        const optReal = (desc.optionalEngines ?? []).join('、') || '—';
+        if (clean(cells[reqCol] ?? '') !== clean(reqReal)) {
+          diffs.push(`必需引擎：文档「${cells[reqCol]}」 vs 实际「${reqReal}」`);
+        }
+        if (optCol >= 0 && clean(cells[optCol] ?? '') !== clean(optReal)) {
+          diffs.push(`可选引擎：文档「${cells[optCol]}」 vs 实际「${optReal}」`);
+        }
+        if (paramIsParams) {
+          // 括号里的内容不算（例如 `` `duration`(从 `with`) ``）——
+          // 那是对写法的补充说明，不是参数 id
+          const cell = (cells[paramCol] ?? '').replace(/\([^)]*\)/g, '');
+          const docParams = [...cell.matchAll(/`([A-Za-z][A-Za-z0-9]*)`/g)].map((x) => x[1]);
+          const realParams = (desc.params ?? []).map((p) => p.id);
+          const missing = realParams.filter((p) => !docParams.includes(p));
+          const extra = docParams.filter((p) => !realParams.includes(p));
+          if (missing.length) diffs.push(`文档缺参数：${missing.join(', ')}`);
+          if (extra.length) diffs.push(`文档多出参数：${extra.join(', ')}`);
+        }
+        if (diffs.length) problems.push(`L${r.i + 1} ${name}：${diffs.join('；')}`);
+      }
+    }
+
+    const undoc = (catalog.nodes ?? []).map((n) => n.name).filter((n) => !documented.has(n));
+    for (const n of undoc) problems.push(`节点目录里有 \`${n}\`，但文档的节点表里找不到它`);
+
+    console.log(`   节点表 ${nodeTables} 张、核对 ${rowsChecked} 行、目录 ${(catalog.nodes ?? []).length} 个节点`);
+    c.check(nodeTables >= 4, '① 解析到了 4 张节点表（解析器没跑偏）', `${nodeTables} 张`);
+    c.check(
+      rowsChecked >= 25,
+      '② 核对了足够多的行（不是只认出一两行就报通过）',
+      `${rowsChecked} 行`
+    );
+    c.check(
+      problems.length === 0,
+      '★ ③ 文档的节点表与真实目录**逐列对得上**（引擎、参数 id、覆盖范围）',
+      problems.length ? `\n      ${problems.join('\n      ')}` : '没有漂移'
+    );
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

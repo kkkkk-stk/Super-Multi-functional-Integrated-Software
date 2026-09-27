@@ -53,7 +53,7 @@
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
 > | 运行时测试总数 | `cargo test --workspace` **258 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **217 项全通过**（【1】–【21】） |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **237 项全通过**（【1】–【23】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -921,6 +921,18 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   4. **末端端口必须优先拿到 `dst` 这个名字**（这条是修完前三条之后才浮现的）：`build_io` 只对端口 id 恰好是 `dst` 的输出套用 `params.format`，而"转换类"节点（vips/magick 后端）是**按输出扩展名**选编码器的。先到先得的话中间步骤会占掉 `dst`，用户在画布上选的 WebP 会被**静默降级成 PNG**（产出文件扩展名与内容都是 PNG）。现在分配顺序是"末端端口优先"。
 - **【22】的 13 项断言里，几条关键的**：画布导出的 YAML 必须通过**后端**的校验（集成缝）；**每个步骤都要有自己的输出路径**；跑起来产出的必须是**真的 WebP**（`RIFF/WEBP` 魔数）且**画布上设的宽 400 真的生效**（实测 400×300）；成环画布与空画布在前端就被拦下。
 - ⚠️ **一处"差一点误报成产品缺陷"的地方**：第一版测试传了空 `params`，于是产出是 PNG，看起来像"画布选的格式没生效"。实际上**前端本来就发送所有声明的默认值**（`plugin-runner.tsx` 用 `initialParamValues(manifest.io.params)` 填好整个 map），而后端的 `build_io` 用的是**运行期参数**而不是清单里的 `default`。测试改成照前端的做法填默认值之后，WebP 就正确产出了 —— **是测试的假设错了，不是产品错了**。这条顺带把"声明的默认值能到达运行期"一起验了。
+
+### 3.6 `PLUGIN-SDK.md` 的节点表与真实目录对不上（本轮机械对账 + 修掉）
+
+- **为什么值得一条检查**：`docs/PLUGIN-SDK.md` 是**插件作者的契约**，而"契约与实现漂移"这个项目里已经造成过真实损失 —— 【22】发现的画布缺陷正是"代码没照文档写"。反过来"文档没跟上代码"同样会发生，而且更难发现：界面照常工作，只有照着文档写插件的人会踩坑。
+- **做法（【23】）**：把文档里的节点表**按表头**解析（四张小节的列语义不一样：§3.1 那列是"从 `with` 读的参数"，其余是"参数 id（从 `io.params` 读）"），再逐行与 `pipeline_nodes` 对账：必需引擎、可选引擎、参数 id 集合，以及"目录里有但文档里没有"的节点。
+  > ⚠️ **第一版按固定列下标取，把 §3.1 的行全判错了**（那一列装的是 `with` 键，不是参数 id），于是报出一堆假问题。改成按表头定位之后才对。
+- **第一次跑就对出四处漂移**（都已修）：
+  1. `doc.to-pdf` 的参数列还写着 **`format`** —— 那个装饰性参数本轮已经删掉；
+  2. `doc.ocr` 的**可选引擎漏了 `poppler`**、参数漏了 **`pdfDpi` / `pdfMaxPages`**，而且正文还写着"**PDF 输入会被明确拒绝**" —— 那句话在【15】把栅格化做出来之后就已经过期了；
+  3. **`text.replace` 与 `name.build` 两个节点在文档里根本没有** —— 而 `batch-rename` / `ai-describe` 都靠它们工作，"按规则改名"这条最常用的路径因此没有文档；
+  4. `video.trim` 那一格把说明塞进了参数列表（`` `duration`(从 `with`) ``），现在改成规规矩矩的参数列表。
+- **反证**：临时把 `format` 加回 `doc.to-pdf` 那一格，【23】立刻判红并**点名到行号**（`L544 doc.to-pdf：文档多出参数：format`）—— 证明这条检查真的在看文档，而不是永远通过。
 
 ### 4. 许可证确认：**闸门已经有了，记录仍然没有**
 

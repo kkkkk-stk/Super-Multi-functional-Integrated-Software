@@ -531,7 +531,7 @@ permissions:
 | `video.transcode` | 视频转码 | ffmpeg | `format`、`vcodec`、`acodec`、`crf`、`preset`、`hwaccel` | 完整实现。**`format` 决定输出容器**（它经 `build_io` 变成输出扩展名，ffmpeg 按扩展名选 muxer）—— 这个参数以前叫 `container`，而那是**装饰性的**：选 mkv 也会产出 `.mp4` |
 | `video.extract-audio` | 提取音频 | ffmpeg | `format`、`bitrate` | 完整实现 |
 | `video.thumbnail` | 视频截图 | ffmpeg | `at`、`width`、`format` | 完整实现 |
-| `video.trim` | 视频剪辑 | ffmpeg | `start`、`reencode`、`duration`(从 `with`) | 完整实现 |
+| `video.trim` | 视频剪辑 | ffmpeg | `start`、`duration`、`reencode` | 完整实现。`reencode` 为 false 时走流复制（快，但切片边界会吸附到关键帧）；需要精确到帧就打开它 |
 | `video.compress` | 视频压缩 | ffmpeg | `targetSizeMb`、`maxWidth` | 完整实现（两遍编码） |
 | `audio.convert` | 音频格式转换 | ffmpeg | `format`、`bitrate`、`sampleRate` | 完整实现 |
 | `audio.normalize` | 音量标准化 | ffmpeg | `lufs` | EBU R128 响度归一 |
@@ -541,8 +541,8 @@ permissions:
 | 节点名 | 中文名 | 必需引擎 | 可选引擎 | 参数 id | 说明 |
 |---|---|---|---|---|---|
 | `doc.convert` | 文档格式转换 | pandoc | — | `to`、`standalone`、`toc`、`extraArgs` | Markdown/HTML/DOCX/EPUB/LaTeX 互转 |
-| `doc.to-pdf` | 转 PDF（Office） | libreoffice | — | `format` | Word/Excel/PPT → PDF |
-| `doc.ocr` | OCR 文字识别 | — | tesseract、ai-provider | `engine`、`lang` | **已实现**。有 tesseract 就走它（离线、免费、快）；没有就用**多模态模型**（更强但要联网计费）。`engine` 取 `auto` / `tesseract` / `ai`（默认 `auto`）；`lang` 默认 `chi_sim+eng`。**PDF 输入会被明确拒绝**（要按页栅格化，那条链路没做），输入端口也不再声明 `.pdf`。输出可引用 `text` 与 `backend`（`tesseract` 或 `ai-vision`）。**两个引擎都是可选的**：`requiresEngines` 为空，所以只装 Tesseract 的机器照样能用（此前写的是必需 `python`，会让这种机器被无谓标灰） |
+| `doc.to-pdf` | 转 PDF（Office） | libreoffice | — | — | Word/Excel/PPT/ODF → PDF。**没有可调参数**：这个节点就叫 `to-pdf`。它此前声明过一个 `format`（pdf / pdf-a / html / txt），而执行器**从来没读过它** —— 那是个装饰性参数，而且危险：真按 html 输出的话，输出文件仍由宿主按端口声明的扩展名命名，用户会拿到一个**叫 `.pdf` 的 HTML**（`ebook.convert` 上已经打过一次这个坑）。参数已删掉。**注意**：`format` 这类"名字很通用"的参数一旦从目录里删掉，文档里那一格也必须跟着改 —— 否则照着文档写插件的人会用到一个不存在的参数，而【23】这条检查就是拦这个的 |
+| `doc.ocr` | OCR 文字识别 | — | tesseract、ai-provider、poppler | `engine`、`lang`、`pdfDpi`、`pdfMaxPages` | **已实现**。有 tesseract 就走它（离线、免费、快）；没有就用**多模态模型**（更强但要联网计费）。`engine` 取 `auto` / `tesseract` / `ai`（默认 `auto`）；`lang` 默认 `chi_sim+eng`；`pdfDpi`（默认 150）与 `pdfMaxPages`（默认 0 = 全部）只在**输入是 PDF** 时有意义。**✅ PDF 输入现在是支持的**：装了 `poppler` 就先用 `pdftoppm -png -r <pdfDpi>` 逐页栅格化，再逐页识别，输出里用 `===== 第 N 页 =====` 分隔（`verify-platform.mjs`【15】真机验证：3 页 PDF → 假端点收到 3 次请求、渲染尺寸符合 DPI 预期）。没有 poppler 时**明确拒绝** PDF 输入并给出两条出路。输出可引用 `text` 与 `backend`（`tesseract` 或 `ai-vision`）。**三个引擎都是可选的**：`requiresEngines` 为空，所以只装 Tesseract 的机器照样能用 |
 | `archive.pack` | 打包压缩 | 7zip | — | `format`、`level`、`password` | zip / 7z / tar / tar.gz / tar.xz |
 | `archive.unpack` | 解压 | 7zip | — | `password`、`keepStructure` | 内置 Zip Slip 防护 |
 | `ebook.convert` | 电子书转换 | — | calibre、pandoc | `format`、`title`、`author` | **已实现**。`calibre` 优先（MOBI/AZW3/LIT/PDF 只有它能写），缺了退到 `pandoc`（EPUB/DOCX/FB2/HTML/Markdown/RTF/ODT/TXT）。**超出 pandoc 能力表的格式会在调用前被拒绝**（理由见下）。输出可引用 `backend`（`calibre` / `pandoc`） |
@@ -551,6 +551,8 @@ permissions:
 | `flow.branch` | 条件分支 | — | — | `condition` | 见下方说明 |
 | `flow.set-var` | 设置变量 | — | — | `name`、`value` | 写入流水线变量；产出 `${steps.<id>.value}` |
 | `flow.log` | 写日志 | — | — | `message`、`level` | 见下方说明 |
+| `text.replace` | 文本替换 | — | — | `input`、`pattern`、`replacement`、`useRegex`、`caseSensitive`、`all` | 纯计算、不碰文件。对字符串做查找替换（支持正则与大小写控制），输出可被 `${steps.<id>.text}` 引用。**`batch-rename` 的改名规则就靠它** |
+| `name.build` | 拼装文件名 | — | — | `stem`、`ext`、`prefix`、`suffix`、`index`、`indexPad`、`indexSeparator`、`indexPosition`、`case`、`separator` | 纯计算：把主干 / 扩展名 / 前缀 / 后缀 / 序号拼成一个**文件名**（不含目录），接到 `fs.move` 的 `dst` 上就是"按规则改名"。`batch-rename` 与 `ai-describe` 都在用 |
 
 > ⚠️ **`ebook.convert` 为什么必须"在调用前"把关，而不是相信子进程的退出码**：
 > pandoc 对认不出的输出扩展名**不报错** —— 它打一句
