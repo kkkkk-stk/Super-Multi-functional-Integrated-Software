@@ -64,8 +64,14 @@ jobs:
         run: cargo check --workspace --all-targets --locked
 
       - name: cargo test
-        # 领域层与各子系统的单测 + 示例清单的端到端校验。
-        # app crate 的测试需要 WebView，这里不跑（由 web / bindings 两个 job 覆盖）。
+        # 领域层与各子系统的单测 + 示例清单的端到端校验，外加**外壳 crate**。
+        #
+        # ⚠️ 这一行曾经写着"app crate 的测试需要 WebView，这里不跑" —— **那句话是错的**：
+        # `toolforge`（外壳）目前的 16 条测试是 `settings_store`（设置落盘/坏文件隔离）、
+        # `license_acks`（许可证确认指纹）与 `commands::sources_to_delete`（删源文件的边界）
+        # 的纯逻辑与文件 IO，**不构造任何 Tauri 运行时、不需要 WebView**
+        # （本机实测：`cargo test -p toolforge` → 16 passed / 0 failed）。
+        # 那句注释把一个**本来跑得动**的覆盖挡在了 CI 外面。
         run: >
           cargo test
           -p toolforge-core
@@ -73,11 +79,18 @@ jobs:
           -p toolforge-engines
           -p toolforge-plugins
           -p toolforge-ai
+          -p toolforge
           --locked
 
       - name: cargo clippy
+        # 这一步**必须能失败**。
+        #
+        # 它此前带着 `continue-on-error: true`（注释："v0.1 阶段先做提示，不卡合并"），
+        # 结果是：整个 workspace 在 `-D warnings` 下攒了 **13 处错误 / 5 个 crate**
+        # 而没有任何人看见 —— 因为失败的只是一个 step，整轮 CI 一直是绿的。
+        # 现在 workspace 已经干净，这一步就是硬门：文档里写着"零告警"，
+        # 那它就必须能红。本地同款命令：`pnpm check:clippy`。
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-        continue-on-error: true # v0.1 阶段 clippy 先做提示，不卡合并
 
   # ==========================================================================
   # 前端侧：类型检查 + 构建

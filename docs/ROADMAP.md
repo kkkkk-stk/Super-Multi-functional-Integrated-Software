@@ -1104,7 +1104,13 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 - **它当场抓到了第二个同病文件**：`scripts/env.ps1`（文档里让人 `. .\scripts\env.ps1` 的那个）同样**有中文、没有 BOM**，外加 40 处裸 LF。它今天**碰巧**还能解析 —— 只是它的中文注释后面恰好没有紧跟 `}` / `{` / `"`。这种"靠运气通过"的状态最危险，已一并修好（只改编码，内容一字未动）。
 - **反证**：把 `dev-with-cdp.ps1` 的 BOM 去掉 → 守卫立刻变红（`✗ 1 处问题`，退出码 1），且 PowerShell 5.1 同时报出 9 个解析错误；加回去 → 两者都归零。
 
-### 3.14 **CI 一直是红的**：`clippy -D warnings` 从来没在本地跑过（本轮发现并修掉）
+### 3.14 `clippy -D warnings` 从来没在本地跑过；它攒了 13 处错误，而 CI 那一步「不卡合并」（本轮修掉）
+
+> ⚠️ **本文档最初把这一条写成了"CI 一直是红的"，那是错的**（下一轮核对时发现并改正）。
+> CI 里那一步写着 `continue-on-error: true`，注释是"v0.1 阶段 clippy 先做提示，不卡合并"——
+> 所以**整轮 CI 一直是绿的**，失败的只是那一个 step。这个区别很关键：
+> 它不是"红了没人管"，而是**"根本没人会看见"** —— 13 处错误就是这样攒下来的。
+> 改正的做法不是把话改软，而是**把 `continue-on-error` 去掉**（见本节末尾）。
 
 - **怎么发现的**：为了核对本文档「附 A」里那句"静态质量：`cargo clippy --workspace -- -D warnings`、`cargo fmt --check` → **无输出**"，我去跑了一遍 —— 结果第一步就卡住：
   ```text
@@ -1112,9 +1118,10 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   error: 'cargo-fmt.exe' is not installed for the toolchain 'stable-x86_64-pc-windows-msvc'
   ```
   本仓库的 Rust 工具链隔离装在 `.tools/rust` 下，而当初装的时候**没有装这两个 component**。
-  也就是说：**这条检查点从来没有被本机执行过**，而 CI 里它是一条 `-D warnings` 的硬门。
+  也就是说：**这条检查点从来没有被本机执行过**。
 - **装上之后立刻见红**：`cargo clippy --workspace --all-targets -- -D warnings` 报 **13 处错误 / 5 个 crate**。
-  也就是说：**CI 上的 Rust job 从某一刻起就一直是红的**，而本地"四道检查"（`cargo test` / `cargo check --all-targets` / `tsc` / `vite build`）**没有一条会碰 clippy** —— 这是一个纯粹的**关口错位**：CI 卡的本地不问，本地问的 CI 不卡。
+  而本地"四道检查"（`cargo test` / `cargo check --all-targets` / `tsc` / `vite build`）**没有一条会碰 clippy** ——
+  这是一个纯粹的**关口错位**：本地不问、CI 又不卡。
 - **修掉的 13 处**（按 crate）：
 
   | crate | lint | 处理 |
@@ -1133,11 +1140,41 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   check:all = check:encodings → check:rust → check:clippy → check:web
   ```
   这样"本地聚合检查"与"CI 硬门"至少在这三条上对齐了。**没对齐的是 fmt**，见下。
+- ★ **并且把 CI 那一步变成真的会卡**：去掉 `cargo clippy` 上的 `continue-on-error: true`。
+  那句"v0.1 阶段先做提示，不卡合并"在有 13 处错误的前提下**永远不会被修**——
+  它把"没人看见"伪装成了"不影响合并"。现在整个 workspace 在 `-D warnings` 下干净了，
+  这一步就该是硬门：**验收标准是"零告警"，那它必须能失败**。
+  > 顺带把 CI 里测试那一步的注释也改了：它写着"app crate 的测试需要 WebView，这里不跑"，
+  > 而 `toolforge`（外壳）那 16 条测试是 `settings_store` / `license_acks` / `sources_to_delete`
+  > 的纯逻辑与文件 IO，**不需要 WebView**（本机实测：`cargo test -p toolforge` 16 通过 / 0 失败）。
+  > 那句注释把一个**可以跑的覆盖**挡在了 CI 外面，现在把它加回去。
 - ⚠️ **`cargo fmt --check` 仍然不干净**，这一条**故意没有动**：
   * 实测 **271 处 diff / 30 个文件**（`pipeline.rs` 57、`nodes.rs` 44、`commands.rs` 28……）；
   * **CI 并没有把它列为必过项**（CI 的 Rust job 只跑 check / test / clippy），所以它不是"红的"，只是本文档里"无输出"那句话是**错的**；
   * 全仓重排是一次纯机械但**覆盖面很大**的改动，会把这一轮的 diff 淹掉，而且它跟"这个项目现在能不能跑"没有关系。所以本轮只做两件事：**把文档里的假话改掉**（附 A 与验收标准 §2 都标注了实测数字），并把"要不要 `cargo fmt --all`"留成一个**明确的待决项**（`docs/ROADMAP.md` 里那条 🚧）。
 - 实测：`clippy --workspace --all-targets -- -D warnings` **退出码 0**；`cargo test --workspace` **280 passed / 0 failed**；`cargo check --workspace --all-targets` **0 error / 0 warning**；`verify-platform.mjs` **341 项全通过**。
+
+### 3.16 把「文档里写的检查点」逐条真的跑一遍（本轮）
+
+上一轮修完了 clippy，但本文档「附 A：阶段验收总检查点」里还有几条**只在文档里存在**的项。这一轮把它们逐条执行了一遍 —— 结论是**大多数成立、两条需要改口径**：
+
+| 检查点 | 命令 | 实测 |
+|---|---|---|
+| 聚合 | `pnpm check:all` | ✅ 退出码 0（encodings → rust → clippy → web） |
+| 全仓健康 | `cargo test --workspace` | ✅ **280 passed / 0 failed** |
+| 全目标检查 | `cargo check --workspace --all-targets --locked` | ✅ 0 error / 0 warning（`--locked` 也通过，说明 `Cargo.lock` 是完整的） |
+| CI 同款测试 | `cargo test -p <5 个库 crate> --locked` | ✅ 264 passed / 0 failed |
+| 静态质量 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 退出码 0 |
+| 类型桥 | `pnpm bindings` **连续两次** | ✅ 第二次之后 `git status` **干净**（32 个命令 + 4 项守卫全过） |
+| 脚本编码 | `pnpm check:encodings` | ✅ 退出码 0（§3.13 新增） |
+| 真机验收 | `node scripts/devtools/verify-platform.mjs` | ✅ **341 项全通过**（【0】+【1】–【30】） |
+| 前端质量 | `pnpm typecheck`、`pnpm lint` | ⚠️ `typecheck` ✅；**`pnpm lint` 是个空壳**：它写着"未安装 ESLint（可选依赖），本次回退为 `tsc --noEmit`"，所以**它提供不了任何 `tsc` 之外的检查**（`react-hooks/exhaustive-deps`、`no-explicit-any`、`no-unused-vars` 一条都没在跑）。⚠️ 但要说清：**这是当初刻意的取舍，不是漏做** —— `apps/desktop/.eslintrc.cjs` 开头就写着"本仓库刻意不把 ESLint 装进依赖清单"，并在注释里给了**确切的安装命令**（eslint@8 + @typescript-eslint 7 + react-hooks 4 + react-refresh 0.4）与规则集，连启用时要改成哪条脚本都写了。所以这一行的问题**只在于"验收表里写着它、它却不提供那个保障"**，现已直说。要不要真的启用（会动 `pnpm-lock.yaml`，且第一次跑多半有一批存量告警要清）仍是个**待你拍板**的决定 |
+| 格式 | `cargo fmt --check` | ⚠️ 不干净（271 处 diff / 30 个文件），见 §3.14 末尾 |
+
+> 这一节的价值不在"跑一遍"，而在于**把"文档里写着"与"真的跑过"分开**：
+> 上表里每一条都留下了命令与实测值；而 `pnpm lint` 与 `cargo fmt --check` 这两条，
+> 之前都属于"文档说它有、实际它不提供那个保障"的那一类 —— 与 §3.10 的 `keep_original`、
+> §3.11 的装饰品参数是同一个毛病，只是发生在**质量基线**上。
 
 ### 3.15 一次**自己造成的事故**：928 MB 的权重被截成 0 字节（本轮发生、定位、修复并补上防线）
 
@@ -1605,7 +1642,7 @@ Tauri 的 IPC 有**两条通道**：
 | 静态质量 | `cargo clippy --workspace --all-targets -- -D warnings`（= `pnpm check:clippy`） | **当前实测全绿**（§3.14 之前是红的） |
 | 格式 | `cargo fmt --check` | ⚠️ **不干净**：271 处 diff / 30 个文件；CI 目前不检查它（要不要全仓重排待定，见 §3.14） |
 | 脚本编码 | `pnpm check:encodings` | 退出码 0（`.ps1` 含非 ASCII 必须有 BOM，行尾必须 CRLF；见 §3.13） |
-| 前端质量 | `pnpm typecheck`、`pnpm lint` | 退出码 0（需前端工程先落地） |
+| 前端质量 | `pnpm typecheck`、`pnpm lint` | `pnpm typecheck` 退出码 0 ✅；⚠️ **`pnpm lint` 目前回退为 `tsc --noEmit`（本项目刻意不装 ESLint，见 `apps/desktop/.eslintrc.cjs` 头部的说明与安装命令）—— 它不提供 `tsc` 之外的任何检查**。写成"退出码 0"会让人以为有 linter，见 §3.16 |
 | 聚合 | `pnpm check:all` | 退出码 0 |
 | 类型桥 | `pnpm bindings` 连续两次 | 第二次后 `git status` 干净（该命令同时跑 4 项守卫，含 `COMMAND_NAMES` 与注册命令的逐条核对） |
 | 真机验收 | `node scripts/devtools/verify-platform.mjs` | **当前实测 341 项检查全通过**（【1】–【30】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】、**中间档 ImageMagick 后端切换**【12】、**纯 Rust 兜底档**【13】、音视频真实属性【17】、压缩包标准归档【18】、Office → PDF【19】、一句话生成插件闭环【20】、任务取消无孤儿【21】、画布导出跑通【22】、SDK 节点表对账【23】、API Key 生命周期与脱敏【24】、许可证确认与记录【25】、前端能力边界【26】、**「保留源文件」真的在删文件**【27】、**插件参数能不能到达执行器**【28】、**许可证勾选框的 UI 点击穿透**【29】、**权重被截断时不再谎报"已就绪"**【30】；【8】【9】【11】【12】【13】在缺权重 / 缺运行时（或没有可临时藏起的托管引擎）时会显式记为"跳过"而不是"通过"） |
