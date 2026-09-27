@@ -146,7 +146,13 @@ impl PipelineDef {
                     ValidationIssue::error(
                         "STEP_UNKNOWN_NODE",
                         format!(
-                            "步骤 `{}` 引用了未知内置节点 `{}`；可用节点见 docs/ENGINE-MATRIX.md",
+                            // 指向 **`PLUGIN-SDK.md` §3 的节点表**，而不是 ENGINE-MATRIX：
+                            // 前者是**插件作者**的契约，而且有一道机械对账
+                            // （`verify-platform.mjs`【23】逐行核对节点表与真实节点目录）；
+                            // 后者讲的是"节点 ↔ 引擎"与许可证，作者按它查不到完整的可用节点名。
+                            // （ROADMAP 的不一致 6i 记的就是"两处指引指向不同文档"：
+                            //   名字写错 → 节点表；已登记但没实现 → ROADMAP 的实现进度。两者各指其位。）
+                            "步骤 `{}` 引用了未知内置节点 `{}`；可用节点见 docs/PLUGIN-SDK.md 的节点表",
                             step.id, step.uses
                         ),
                     )
