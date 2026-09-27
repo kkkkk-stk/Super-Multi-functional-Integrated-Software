@@ -1213,7 +1213,14 @@ export type ModelEntry_Deserialize = {
 	approxSizeMb: number,
 	/**  是否已经下载到本机 */
 	installed: boolean,
-	/**  已落盘的实际大小（MB）；未安装时为 `None` */
+	/**
+	 *  磁盘上那份文件的**实际大小**（MB）。
+	 * 
+	 *  ⚠️ 语义是"**文件有多大**"，不是"装好了没有"：磁盘上**没有文件**时为 `None`，
+	 *  而 0 字节的坏文件会给出 `0`。界面正是靠这个区别把"从没下过"与
+	 *  "下过、但文件不完整"分开显示的（见 `model-panel.tsx` 的 `incomplete`）。
+	 *  这条注释此前写的是"未安装时为 None" —— 那是 `installed` 的语义，不是它的。
+	 */
 	installedSizeMb?: number | null,
 	/**  是否配置了可校验的下载源。`false` 时界面应禁用下载并说明原因。 */
 	downloadable: boolean,
@@ -1244,7 +1251,14 @@ export type ModelEntry_Serialize = {
 	approxSizeMb: number,
 	/**  是否已经下载到本机 */
 	installed: boolean,
-	/**  已落盘的实际大小（MB）；未安装时为 `None` */
+	/**
+	 *  磁盘上那份文件的**实际大小**（MB）。
+	 * 
+	 *  ⚠️ 语义是"**文件有多大**"，不是"装好了没有"：磁盘上**没有文件**时为 `None`，
+	 *  而 0 字节的坏文件会给出 `0`。界面正是靠这个区别把"从没下过"与
+	 *  "下过、但文件不完整"分开显示的（见 `model-panel.tsx` 的 `incomplete`）。
+	 *  这条注释此前写的是"未安装时为 None" —— 那是 `installed` 的语义，不是它的。
+	 */
 	installedSizeMb?: number | null,
 	/**  是否配置了可校验的下载源。`false` 时界面应禁用下载并说明原因。 */
 	downloadable: boolean,

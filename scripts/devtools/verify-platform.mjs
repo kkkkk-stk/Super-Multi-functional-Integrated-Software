@@ -5244,7 +5244,50 @@ c.section('【30】权重文件被截断时，应用还会不会声称"已就绪
       `installed=${entry?.installed} size=${entry?.installedSizeMb}`
     );
 
-    // ---- ③ 节点必须在**推理之前**拦住，并说清该怎么办 ----
+    // ---- ③ 界面上要看得出来这是"文件不完整"，而不是"从没下过" ----
+    //
+    // 只让后端如实报告还不够：用户看的是卡片。不区分的话他会以为"我压根没下过这个权重"，
+    // 而磁盘上其实躺着一个坏文件。这里用**整页刷新**让 React Query 重新取一次
+    // （truncate 之后查询缓存里还是旧数据，SPA 跳转不会重取）。
+    await client.send('Page.reload');
+    await sleep(4500);
+    await client.evaluate(
+      `(() => { history.pushState({}, '', '/settings?tab=engines');
+                window.dispatchEvent(new PopStateEvent('popstate')); })()`
+    );
+    await sleep(1500);
+    const card = await client.evaluate(`(() => {
+      const holders = [...document.querySelectorAll('*')]
+        .filter((el) => (el.textContent || '').includes('realesr-general-x4v3') && el.querySelector('button'));
+      holders.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+      const el = holders[0];
+      if (!el) return { found: false };
+      return {
+        found: true,
+        text: (el.innerText || '').replace(/\\s+/g, ' '),
+        buttons: [...el.querySelectorAll('button')].map((b) => (b.textContent || '').trim()),
+      };
+    })()`);
+    console.log(`   卡片文案：${(card.text ?? '').slice(0, 180)}`);
+    console.log(`   卡片按钮：${JSON.stringify(card.buttons ?? [])}`);
+    c.check(card.found === true, '③ 截断后模型卡片仍在界面上');
+    c.check(
+      (card.text ?? '').includes('文件不完整'),
+      '★ ③b 卡片上标明「文件不完整」（而不是笼统的"未下载"）',
+      (card.text ?? '').slice(0, 60)
+    );
+    c.check(
+      (card.buttons ?? []).includes('重新下载'),
+      '★ ③c 按钮文案变成「重新下载」—— 告诉用户点下去会覆盖那份坏文件',
+      JSON.stringify(card.buttons ?? [])
+    );
+    c.check(
+      /上次下载被中断|不需要你自己去删文件/.test(card.text ?? ''),
+      '③d 并解释了原因与后果（多半是上次下载被中断；点下载会重新校验并覆盖）',
+      (card.text ?? '').match(/磁盘上那份是不完整的[^。]*。/)?.[0] ?? '(没找到说明)'
+    );
+
+    // ---- ④ 节点必须在**推理之前**拦住，并说清该怎么办 ----
     const work = join(REPO_ROOT, '.tools', 'smoke', 'out-truncated-weight');
     rmSync(work, { recursive: true, force: true });
     mkdirSync(work, { recursive: true });
@@ -5265,26 +5308,26 @@ c.section('【30】权重文件被截断时，应用还会不会声称"已就绪
     const text = (job.logs ?? []).map((l) => String(l.message)).join('\n');
     console.log(`   截断权重下的任务：${job.status}${job.error ? ` — ${job.error.code}` : ''}`);
     console.log(`   ${text.replace(/\s+/g, ' ').slice(0, 240)}`);
-    c.check(job.status === 'failed', '③ 任务失败（而不是"成功"地产出一张垃圾图）', job.status);
+    c.check(job.status === 'failed', '④ 任务失败（而不是"成功"地产出一张垃圾图）', job.status);
     c.check(
       job.error?.code === 'INTEGRITY_CHECK_FAILED',
-      '★ ③b 错误码说的是**完整性**，而不是一句笼统的「抠图脚本执行失败」',
+      '★ ④b 错误码说的是**完整性**，而不是一句笼统的「抠图脚本执行失败」',
       job.error?.code ?? '(没有错误码)'
     );
     const fullText = `${job.error?.message ?? ''}\n${job.error?.detail ?? ''}\n${text}`;
     c.check(
       fullText.includes('不完整') || fullText.includes('0 字节'),
-      '★ ③c 信息里点明了"文件不完整"（这正是事故里缺的那一句）',
+      '★ ④c 信息里点明了"文件不完整"（这正是事故里缺的那一句）',
       (job.error?.message ?? '').slice(0, 80)
     );
     c.check(
       fullText.includes('重新下载') || fullText.includes('模型权重'),
-      '③d 并给出了可照做的下一步（去「模型权重」重新下载）',
+      '④d 并给出了可照做的下一步（去「模型权重」重新下载）',
       (job.error?.detail ?? '').split('\n')[0]?.slice(0, 80)
     );
     c.check(
       !existsSync(join(outDir, 'in.png')) && readdirSync(outDir).length === 0,
-      '③e 失败时没有留下半截产出',
+      '④e 失败时没有留下半截产出',
       readdirSync(outDir).join(', ') || '（空）'
     );
   } finally {
@@ -5302,7 +5345,7 @@ c.section('【30】权重文件被截断时，应用还会不会声称"已就绪
     const entry2 = (list2 ?? []).find((x) => x.id === 'realesr-general-x4v3');
     c.check(
       restored === originalBytes && entry2?.installed === true,
-      '④ 收尾：权重已原样还原（字节数一致）且重新被认作已安装',
+      '⑤ 收尾：权重已原样还原（字节数一致）且重新被认作已安装',
       `${originalBytes} → ${restored} 字节，installed=${entry2?.installed}`
     );
   }

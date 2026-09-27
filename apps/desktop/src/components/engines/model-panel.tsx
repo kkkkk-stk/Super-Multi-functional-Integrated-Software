@@ -133,6 +133,22 @@ function ModelCard({
 
   const consentBlocked = needsConsent && !licenseAccepted;
 
+  /**
+   * 磁盘上**有文件、但不完整**（0 字节 / 半截下载）。
+   *
+   * 后端的 `installed` 判据是 `model_size_looks_complete()`（0 字节、或不足标称体积 60%
+   * → 不完整），所以这种状态下 `installed === false`，而 `installedSizeMb` **仍有值**。
+   *
+   * ⚠️ 判据是"这个字段**有没有值**"，**不是**"它大不大"：后端只在磁盘上**没有文件**时
+   * 才给 `null`（`skip_serializing_if = "Option::is_none"`），0 字节的文件照样给 `0`。
+   * 第一版写的是 `(installedSizeMb ?? 0) > 0` —— 那恰好把**最要命的那种**（0 字节，
+   * 也就是那次事故的形态）漏掉，界面照样显示"未下载"。运行时检查【30】③b 当场抓到了它。
+   *
+   * 为什么不在这里算哈希：那要读几百 MB，而这张列表每次打开设置页都会刷。
+   * 真正的完整性判定由下载时的 SHA-256 与 `enginectl verify` 负责。
+   */
+  const incomplete = !model.installed && model.installedSizeMb != null;
+
   const sizeLabel = model.installed
     ? `${(model.installedSizeMb ?? 0).toFixed(1)} MB`
     : `约 ${model.approxSizeMb} MB`;
@@ -147,6 +163,8 @@ function ModelCard({
         <div className="flex shrink-0 flex-col items-end gap-1">
           {model.installed ? (
             <Badge variant="success">已就绪</Badge>
+          ) : incomplete ? (
+            <Badge variant="warning">文件不完整</Badge>
           ) : model.downloadable ? (
             <Badge variant="outline">未下载</Badge>
           ) : (
@@ -157,6 +175,16 @@ function ModelCard({
       </div>
 
       <p className="text-[11px] leading-relaxed text-muted-foreground">{model.purpose}</p>
+
+      {incomplete && (
+        <p className="rounded-md border border-warning/40 bg-warning/5 p-2 text-[11px]">
+          <span className="font-medium">磁盘上那份是不完整的</span>
+          <span className="mt-0.5 block text-muted-foreground">
+            只有 {(model.installedSizeMb ?? 0).toFixed(1)} MB（标称约 {model.approxSizeMb} MB），
+            多半是上一次下载被中断。点「下载」会重新校验并覆盖它 —— 不需要你自己去删文件。
+          </span>
+        </p>
+      )}
 
       <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
         <dt className="text-muted-foreground">体积</dt>
@@ -235,11 +263,13 @@ function ModelCard({
                 ? "这个模型还没有配置可校验的下载源，装不了"
                 : consentBlocked
                   ? "请先勾选上方的许可条款确认"
-                  : undefined
+                  : incomplete
+                    ? "会重新下载并覆盖磁盘上那份不完整的文件（下载后按 SHA-256 校验）"
+                    : undefined
             }
             onClick={() => onInstall(licenseAccepted)}
           >
-            下载
+            {incomplete ? "重新下载" : "下载"}
           </Button>
         )}
         {!model.downloadable && !model.installed && (
