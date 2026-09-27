@@ -97,6 +97,30 @@ const server = createServer((req, res) => {
       return;
     }
 
+    // ---- "话多的网关"：把请求原样回显（含 Authorization 头）----
+    //
+    // ⚠️ 这一段必须排在 `/models` **之前**。第一版放在后面，于是
+    // `ai_test_connection`（它走的是列模型那条路）先撞上 `/models` 的 200，
+    // 压根没有失败 —— 脱敏断言于是**空过**（"错误信息里没有密钥"，
+    // 因为根本没有错误信息）。检查自己会跑偏这件事，只能靠"断言前置条件"挡。
+    //
+    // 这不是编出来的场景：代理 / 网关 / 开着调试模式的后端**真的会**把请求回显在
+    // 响应体里，而那段响应体正是应用截下来放进错误 detail 给用户看的东西 ——
+    // 于是一个密钥就可能顺着"看得到的错误信息"漏出去。
+    // 用真实请求头回显（而不是我编一个字符串），才能验到应用**真的**在脱敏。
+    if (url.includes('__echo')) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: {
+            message: 'upstream rejected the request',
+            request: { url, headers: req.headers, body: body.slice(0, 200) },
+          },
+        })
+      );
+      return;
+    }
+
     if (url.endsWith('/models')) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ data: [{ id: 'mock-vision' }, { id: 'mock-text' }] }));

@@ -52,8 +52,8 @@
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
-> | 运行时测试总数 | `cargo test --workspace` **258 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **237 项全通过**（【1】–【23】） |
+> | 运行时测试总数 | `cargo test --workspace` **260 passed / 0 failed** |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **252 项全通过**（【1】–【24】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -933,6 +933,18 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   3. **`text.replace` 与 `name.build` 两个节点在文档里根本没有** —— 而 `batch-rename` / `ai-describe` 都靠它们工作，"按规则改名"这条最常用的路径因此没有文档；
   4. `video.trim` 那一格把说明塞进了参数列表（`` `duration`(从 `with`) ``），现在改成规规矩矩的参数列表。
 - **反证**：临时把 `format` 加回 `doc.to-pdf` 那一格，【23】立刻判红并**点名到行号**（`L544 doc.to-pdf：文档多出参数：format`）—— 证明这条检查真的在看文档，而不是永远通过。
+
+### 3.7 设置与密钥：落盘生命周期第一次被逐条验证；脱敏从"猜前缀"改成"按字面量抹掉"
+
+- **原状**：文档（`docs/SECURITY.md` §1.5）把 `ai-key.txt` 的纪律写得很清楚 —— 默认不落盘、勾选后才写、关掉开关/清除 Key 时**必须真的删掉**。但这些都是**可观察的事实却没有被任何检查看过**：没有任何脚本碰过 `persistApiKey` / `ai-key.txt`。
+- **【24】（15 项）逐条验**：勾上「记住 API Key」→ `ai-key.txt` 真的写盘且内容一致；`settings.json` 里**没有**密钥（连 `apiKey` 这个键都没有）；`settings_get` 不回传明文、只回报 `hasKey`；关掉开关 → **磁盘上那份被删掉**（而内存里仍可用）；清除 Key → 内存与磁盘都干净。
+- ★ **脱敏：`redact()` 只认 `sk-` 前缀，那是不够的**。Google 是 `AIza…`、Azure 是一串无前缀十六进制、自建网关常常是任意字符串 —— 全都不命中。而**最现实的泄漏渠道不是"我们把 Key 拼进了错误信息"**（那种低级错误没有），是**对方把请求回显回来**：代理 / 网关 / 调试模式的后端会把 `Authorization` 头带进响应体，而那段响应体正是应用截下来放进错误 `detail`、给用户看的东西。
+  - 新增 `redact_with(text, secret)`：**只要知道密钥是什么就按字面量抹掉**，与它长得像不像 Key 无关（短于 8 字符的不替换，免得抹掉正文里的普通词）；启发式保留，作为第二道拦网。四个错误路径（连接失败 / 非 2xx 响应体 / 列模型失败）全部改用它。
+  - **假端点里加了一条"话多的网关"路由**：把**真实请求头**原样回显在 500 响应体里。断言分三步 —— ⑥b 回显正文**确实进了**给用户看的错误文本（否则"里面没有密钥"可能只是因为整段响应体被丢掉了，那种通过是假的）、⑦ 文本里看不到密钥、⑦b 但留下了可见的 `[REDACTED]` 标记。
+  - 单元测试里**显式记下旧行为会漏**：`assert!(redact(&echoed).contains(secret))` —— 也就是说这条运行时检查不是空过的。
+- **重启行为单独验过**（不在套件里，因为要重启应用）：勾上开关写入 Key → 重启后 `hasKey=true` 且文件内容一致（"记住"这个名字对得上）；开关关掉但磁盘上有残留 → 重启时应用**主动删掉残留**并且 `hasKey=false`。
+
+
 
 ### 4. 许可证确认：**闸门已经有了，记录仍然没有**
 

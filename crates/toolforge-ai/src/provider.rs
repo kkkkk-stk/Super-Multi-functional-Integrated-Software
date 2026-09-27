@@ -415,7 +415,11 @@ impl AiClient {
         let resp = req.send().await.map_err(|e| {
             ToolforgeError::new(
                 ErrorCode::AiUnavailable,
-                format!("无法连接 {}：{}", self.config.kind.describe(), redact(&e.to_string())),
+                format!(
+                    "无法连接 {}：{}",
+                    self.config.kind.describe(),
+                    redact_with(&e.to_string(), &self.config.api_key)
+                ),
             )
             .with_detail(format!(
                 "端点：{url}\n请求体约 {} KB。带图请求被打断时，先确认服务端接受这个大小。",
@@ -445,7 +449,10 @@ impl AiClient {
                 _ => "服务端返回错误。",
             };
             return Err(ToolforgeError::new(code, format!("AI 服务返回 HTTP {status}"))
-                .with_detail(format!("{hint}\n\n{}", redact(&truncate(&text, 1200)))));
+                .with_detail(format!(
+                    "{hint}\n\n{}",
+                    redact_with(&truncate(&text, 1200), &self.config.api_key)
+                )));
         }
 
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
@@ -477,7 +484,10 @@ impl AiClient {
         let resp = req.send().await.map_err(|e| {
             ToolforgeError::new(
                 ErrorCode::AiUnavailable,
-                format!("无法连接：{}", redact(&e.to_string())),
+                format!(
+                "无法连接：{}",
+                redact_with(&e.to_string(), &self.config.api_key)
+            ),
             )
         })?;
         let status = resp.status();
@@ -487,7 +497,7 @@ impl AiClient {
                 ErrorCode::AiUnavailable,
                 format!("获取模型列表失败：HTTP {status}"),
             )
-            .with_detail(redact(&truncate(&text, 600))));
+            .with_detail(redact_with(&truncate(&text, 600), &self.config.api_key)));
         }
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
         let models = v["data"]
@@ -510,8 +520,34 @@ impl AiClient {
 /// 注意 `Bearer` 本身**不是**密钥（它只是认证方案名），所以单独出现时保留，
 /// 只抹掉它后面那一串。调用方关心的不变量是"密钥原文不会出现在输出里"。
 pub fn redact(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for token in text.split_inclusive(|c: char| c.is_whitespace() || c == '"' || c == '\'') {
+    redact_with(text, "")
+}
+
+/// 与 [`redact`] 相同，但**额外把已知的密钥原样抹掉**。
+///
+/// # 为什么需要"知道密钥"这一版
+///
+/// 启发式（`sk-` / `sk_` 开头且够长）只覆盖 OpenAI 风格。而密钥前缀是各家自己的：
+/// Google 是 `AIza…`、Azure 是一串无前缀的十六进制、不少自建网关干脆是任意字符串。
+/// 这些**全都不会被启发式命中**，于是它们一旦出现在错误文本里就会原样进到界面与日志。
+///
+/// 最现实的泄漏渠道不是"我们把 Key 拼进了错误信息"，而是**对方把请求回显了回来**：
+/// 代理 / 网关 / 调试模式的后端会在响应体里带上 `Authorization` 头，而那段响应体
+/// 正是我们截下来放进 `detail` 给用户看的东西。
+///
+/// 所以：**只要知道密钥是什么，就按字面量抹掉**，与它长得像不像 Key 无关。
+pub fn redact_with(text: &str, secret: &str) -> String {
+    let mut s = text.to_string();
+    let secret = secret.trim();
+    // 太短的"密钥"不能按字面量替换：一个 3 个字符的 key 会把正文里的普通词也抹掉。
+    // 8 是折中值 —— 主流服务的 Key 都远长于此。
+    if secret.len() >= 8 {
+        s = s.replace(secret, "[REDACTED]");
+    }
+
+    // 再上启发式：万一有**别的**密钥（或密钥被部分改写）漏进来，仍然拦一道
+    let mut out = String::with_capacity(s.len());
+    for token in s.split_inclusive(|c: char| c.is_whitespace() || c == '"' || c == '\'') {
         let trimmed = token.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'');
         let looks_like_key = (trimmed.starts_with("sk-") || trimmed.starts_with("sk_"))
             && trimmed.len() > 12;
@@ -597,6 +633,38 @@ mod tests {
         assert_eq!(redact("sk-1"), "sk-1");
         // 普通文本原样保留
         assert_eq!(redact("普通 中文 文本"), "普通 中文 文本");
+    }
+
+    /// ★ **不是所有密钥都以 `sk-` 开头**。
+    ///
+    /// 启发式只认 OpenAI 那一种写法，而 Google 是 `AIza…`、Azure 是一串无前缀十六进制、
+    /// 自建网关常常是任意字符串 —— 这些一旦出现在错误文本里就会原样进到界面。
+    /// 最现实的渠道是**对方把请求回显回来**（代理/网关/调试模式的后端会把
+    /// `Authorization` 头带进响应体），而那段响应体正是我们截下来给用户看的。
+    ///
+    /// 所以只要**知道密钥是什么**，就按字面量抹掉 —— 与它长得像不像 Key 无关。
+    #[test]
+    fn redact_with_removes_a_non_openai_style_secret() {
+        let secret = "AIzaSyFAKEverifyKEY1234567890";
+        let echoed = format!(
+            "{{\"error\":\"bad request\",\"request\":{{\"headers\":{{\"Authorization\":\"Bearer {secret}\"}}}}}}"
+        );
+        let out = redact_with(&echoed, secret);
+        assert!(!out.contains(secret), "已知密钥必须被抹掉，实际：{out}");
+        assert!(out.contains("[REDACTED]"), "应当留下可见的替换标记：{out}");
+        // 启发式对它是无效的 —— 这正是需要这一版的原因
+        assert!(redact(&echoed).contains(secret));
+    }
+
+    #[test]
+    fn redact_with_keeps_normal_text_and_ignores_tiny_secrets() {
+        // 空密钥 / 极短"密钥"不能把正文里的普通词也抹掉
+        let text = "连接失败：connection refused (os error 10061)";
+        assert_eq!(redact_with(text, ""), text);
+        assert_eq!(redact_with(text, "abc"), text);
+        // 两个规则叠加时也不会把标记本身再处理一遍
+        let out = redact_with("key sk-abcdefghijklmnop", "sk-abcdefghijklmnop");
+        assert_eq!(out, "key [REDACTED]");
     }
 
     #[test]

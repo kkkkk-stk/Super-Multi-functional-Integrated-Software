@@ -3586,6 +3586,128 @@ c.section('【23】`PLUGIN-SDK.md` 的节点表与节点目录是否对得上');
   }
 }
 
+// ============================================================================
+// 【24】设置的落盘、API Key 的保存/清除，以及**密钥会不会顺着错误信息漏出去**
+// ============================================================================
+//
+// 两件事都从来没有被真机验证过：
+//
+// 1. **API Key 的落盘生命周期**。文档承诺的是"默认只存在内存里；用户显式勾选
+//    「记住 API Key」后才会写到 `ai-key.txt`；关掉开关/清除 Key 时必须把磁盘上
+//    那份**真的删掉**"。这些都是可观察的事实，但此前没有任何检查看过它们。
+// 2. **脱敏**。`redact()` 早就有了，但它只认 `sk-` / `sk_` 开头的密钥 ——
+//    Google 是 `AIza…`、Azure 是一串无前缀十六进制、自建网关常常是任意字符串。
+//    而最现实的泄漏渠道不是"我们把 Key 拼进了错误信息"，是**对方把请求回显回来**
+//    （代理/网关/调试模式的后端会把 `Authorization` 头带进响应体），
+//    而那段响应体正是应用截下来放进 `detail` 给用户看的。
+//
+// 这一节两件都验：文件生命周期逐条断言，脱敏用一个**真的会把请求头回显**的假端点。
+c.section('【24】设置的落盘、API Key 的保存/清除与脱敏');
+{
+  // 用一个**不像 OpenAI 风格**的假密钥：这样"脱敏是否只靠前缀启发式"才会暴露出来
+  const FAKE_KEY = 'AIzaSyFAKEverifyKEY1234567890';
+  const MOCK_PORT = 18125;
+  const mock = spawn(process.execPath, [join(HERE, 'mock-openai.mjs'), String(MOCK_PORT)], {
+    stdio: 'ignore',
+    detached: false,
+  });
+  await sleep(600);
+  const mockBase = `http://127.0.0.1:${MOCK_PORT}`;
+
+  const dataDir = (await client.invoke('app_paths'))?.entries?.find((e) => e.label === '数据目录')?.path;
+  const keyFile = dataDir ? join(dataDir, 'ai-key.txt') : null;
+  const settingsFile = dataDir ? join(dataDir, 'settings.json') : null;
+
+  let restore = null;
+  try {
+    const before = await client.invoke('settings_get');
+    restore = before.ai;
+
+    // ---- ① 勾上「记住 API Key」→ 真的写盘 ----
+    await client.invoke('settings_patch', {
+      patch: {
+        ai: { ...before.ai, provider: 'ollama', baseUrl: `${mockBase}/v1`, model: 'mock-text', persistApiKey: true },
+        aiApiKey: FAKE_KEY,
+      },
+    });
+    const onDisk = keyFile && existsSync(keyFile) ? readFileSync(keyFile, 'utf8').trim() : null;
+    c.check(onDisk === FAKE_KEY, '① 勾上「记住 API Key」之后密钥真的落盘了（`ai-key.txt`）', onDisk ? `长度 ${onDisk.length}` : '(文件不存在)');
+
+    // ---- ② 它**不进** settings.json ----
+    const settingsJson = settingsFile && existsSync(settingsFile) ? readFileSync(settingsFile, 'utf8') : '';
+    c.check(!settingsJson.includes(FAKE_KEY), '② `settings.json` 里没有密钥（它单独存放）', `settings.json ${settingsJson.length} 字节`);
+    c.check(!settingsJson.includes('apiKey'), '②b `settings.json` 里连 `apiKey` 这个键都没有');
+
+    // ---- ③ `settings_get` 不回传明文，只回报"有没有" ----
+    const got = await client.invoke('settings_get');
+    c.check(!JSON.stringify(got).includes(FAKE_KEY), '③ `settings_get` 不回传密钥明文（前端拿不到它）');
+    c.check(got.ai.hasKey === true, '③b 只回报一个布尔：`hasKey: true`', String(got.ai.hasKey));
+
+    // ---- ④ 关掉开关 → 磁盘上那份必须被删掉，但内存里还留着 ----
+    await client.invoke('settings_patch', { patch: { ai: { ...got.ai, persistApiKey: false } } });
+    c.check(keyFile && !existsSync(keyFile), '★ ④ 关掉「记住」之后磁盘上的密钥被**真的删掉**（不是留着不管）', keyFile);
+    const stillInMemory = await client.invoke('settings_get');
+    c.check(stillInMemory.ai.hasKey === true, '④b 但本次会话仍然可用（内存里还留着）', String(stillInMemory.ai.hasKey));
+
+    // ---- ⑤ 明确清除 → 内存和磁盘都干净 ----
+    await client.invoke('settings_patch', { patch: { aiApiKey: '' } });
+    const afterClear = await client.invoke('settings_get');
+    c.check(afterClear.ai.hasKey === false, '★ ⑤ 清除 Key 之后 `hasKey` 变回 false', String(afterClear.ai.hasKey));
+    c.check(keyFile && !existsSync(keyFile), '⑤b 磁盘上也没有残留', keyFile);
+
+    // ---- ⑥ 脱敏：让"话多的网关"把请求回显回来 ----
+    await client.invoke('settings_patch', {
+      patch: {
+        ai: { ...afterClear.ai, provider: 'ollama', baseUrl: `${mockBase}/v1/__echo`, model: 'mock-text' },
+        aiApiKey: FAKE_KEY,
+      },
+    });
+    // ⚠️ `ai_test_connection` **不抛错** —— 它把失败包成 `{ok: false, error}` 返回
+    // （UI 直接渲染那个 `error` 字符串）。第一版断言的是"它会抛错"，于是
+    // ⑥ 失败、⑦ 空过（"错误信息里没有密钥"，因为压根没有错误信息）。
+    const probe = await client.invoke('ai_test_connection');
+    const dumped = JSON.stringify(probe ?? {});
+    console.log(`   回显端点返回：ok=${probe?.ok}，错误文本 ${dumped.length} 字节`);
+    c.check(
+      probe?.ok === false && Boolean(probe?.error),
+      '⑥ 回显端点确实让连接测试失败了（否则后面两条断言没有意义）',
+      String(probe?.error ?? '').slice(0, 100)
+    );
+    // ★ 先确认**服务端回显的内容真的进了错误文本**：否则"里面没有密钥"
+    // 可能只是因为整段响应体被丢掉了 —— 那种通过是假的。
+    c.check(
+      dumped.includes('upstream rejected the request'),
+      '⑥b 服务端回显的内容确实被带进了给用户看的错误文本（前置条件成立）',
+      dumped.includes('upstream rejected the request') ? '包含回显正文' : '回显正文没进来'
+    );
+    c.check(
+      !dumped.includes(FAKE_KEY),
+      '★ ⑦ 服务端把 `Authorization` 头回显回来时，**错误信息里看不到密钥**（按字面量脱敏，不靠前缀猜）',
+      dumped.includes(FAKE_KEY) ? '密钥出现在错误信息里！' : `已脱敏，含 ${(dumped.match(/\[REDACTED\]/g) ?? []).length} 处标记`
+    );
+    c.check(
+      dumped.includes('[REDACTED]'),
+      '⑦b 抹掉之后留下了可见的 `[REDACTED]` 标记（不是静默删掉，排查时能看出这里本该有值）',
+      dumped.slice(0, 160)
+    );
+
+    // ---- ⑧ 审计与设置文件里也不该出现它 ----
+    const audit = await client.invoke('plugins_audit', { limit: 50 }).catch(() => null);
+    const auditText = JSON.stringify(audit ?? {});
+    c.check(!auditText.includes(FAKE_KEY), '⑧ 审计日志里没有密钥', `${auditText.length} 字节`);
+    const settingsAfter = settingsFile && existsSync(settingsFile) ? readFileSync(settingsFile, 'utf8') : '';
+    c.check(!settingsAfter.includes(FAKE_KEY), '⑧b 整个设置文件里也没有密钥', `${settingsAfter.length} 字节`);
+  } finally {
+    // 收尾：把 AI 设置恢复原状，并确保磁盘上没有我们写下的假密钥
+    if (restore) {
+      await client.invoke('settings_patch', { patch: { ai: { ...restore, persistApiKey: false } } }).catch(() => {});
+      await client.invoke('settings_patch', { patch: { aiApiKey: '' } }).catch(() => {});
+    }
+    if (keyFile && existsSync(keyFile)) rmSync(keyFile, { force: true });
+    mock.kill();
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 
