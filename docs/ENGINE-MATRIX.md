@@ -40,9 +40,10 @@
 有两点必须讲清楚：
 
 1. **本文档最早写作时没有运行过 `cargo build` / `cargo test`**，因此当时不对「当前能否构建成功」下结论。可以确认的是：根 `Cargo.toml` 的 `members = ["crates/*", "apps/desktop/src-tauri"]` 现在都有对应目录。
-   > ✅ **已更新（现在有实测数据了）**：`cargo test --workspace` 的 Rust 测试为 **218 passed / 0 failed**；`scripts/devtools/verify-platform.mjs`（`scripts/devtools/run.mjs` 里的第 5 个脚本）**82 项检查全通过**（覆盖【1】–【13】），其中【6】号检查就是盯着"图片后端到底有没有真的被调用"、【7】号检查盯着任意角度旋转会不会静默取整、【8】号检查盯着**抠图这条 ONNX 链路能不能真的出透明背景**、【9】号盯着电子书转换的降级与拦停、【10】号用假 AI 端点验证图像描述的请求形状、【11】号盯着超分是不是真的按倍数放大、【12】号把 `libvips` 目录临时藏起来、断言后端真的切到 ImageMagick 再在 `finally` 里还原（【12】只在 libvips 与 imagemagick **都装了**时才跑，否则显式记为"跳过"）、【13】号把两个引擎的**托管目录都**藏起来、断言兜底档真的接得住（后端 = 纯 Rust image crate、任务仍然成功、产出无损 VP8L、并如实提示「只有无损模式」，同样在 `finally` 里还原）。
+   > ✅ **已更新（现在有实测数据了）**：`cargo test --workspace` 的 Rust 测试为 **246 passed / 0 failed**；`scripts/devtools/verify-platform.mjs`（`scripts/devtools/run.mjs` 里的第 5 个脚本）**172 项检查全通过**（覆盖【1】–【18】），其中【6】号检查就是盯着"图片后端到底有没有真的被调用"、【7】号检查盯着任意角度旋转会不会静默取整、【8】号检查盯着**抠图这条 ONNX 链路能不能真的出透明背景**、【9】号盯着电子书转换的降级与拦停、【10】号用假 AI 端点验证图像描述的请求形状、【11】号盯着超分是不是真的按倍数放大、【12】号把 `libvips` 目录临时藏起来、断言后端真的切到 ImageMagick 再在 `finally` 里还原（【12】只在 libvips 与 imagemagick **都装了**时才跑，否则显式记为"跳过"）、【13】号把两个引擎的**托管目录都**藏起来、断言兜底档真的接得住（后端 = 纯 Rust image crate、任务仍然成功、产出无损 VP8L、并如实提示「只有无损模式」，同样在 `finally` 里还原）、【18】号验证压缩包节点真的产出**标准 zip**（并用系统 tar 独立解回来逐字节比对，见 3.4）。
+   > 上面这句话里的"218 passed / 82 项 / 【1】–【13】"是本条最初写下时的值，**保留作为历史**；当前值是 **246 / 172 / 【1】–【18】**。
    > **节点层面已经没有"未实现"这回事了**：`builtin_nodes()` 登记 32 个，`nodes.rs::run()` 的 32 个分发臂全都指向真实实现，`UNIMPLEMENTED_NODES` 是**空数组**。第 5 节的降级矩阵里，图像域的四行、抠图、电子书、超分、OCR、图像描述都已有实测或明确的失败路径；其余各行仍然只是 `builtin_nodes()` 声明的引擎依赖关系，不是经测试验证的运行时行为。（相关实测结论见 `docs/ROADMAP.md` 的「当前阻塞项」与「基线再更新」。）
-   > ✅ **中间档的环境基线已不再是空白**：以前这里写着"本机没有 ImageMagick，'仅 ImageMagick'这一档始终没有单独的环境基线"。现在它有了 —— 把 `engines/libvips` 临时改名后 `image.convert` 的后端日志变成 `后端 = ImageMagick（格式最全）`，并产出有损 VP8 WebP（见 3.2）；`verify-platform.mjs`【12】把这次验证固化进了套件。**三档现在都有证据：libvips ✓（【6】）、ImageMagick ✓（【12】）、纯 Rust ✓（【13】）。** 仍然没有基线的只有 macOS（它的四条下载源仍是 `sha256: null`）。
+   > ✅ **中间档的环境基线已不再是空白**：以前这里写着"本机没有 ImageMagick，'仅 ImageMagick'这一档始终没有单独的环境基线"。现在它有了 —— 把 `engines/libvips` 临时改名后 `image.convert` 的后端日志变成 `后端 = ImageMagick（格式最全）`，并产出有损 VP8 WebP（见 3.2）；`verify-platform.mjs`【12】把这次验证固化进了套件。**三档现在都有证据：libvips ✓（【6】）、ImageMagick ✓（【12】）、纯 Rust ✓（【13】）。** 仍然没有基线的只有 macOS 本身（那需要一个 macOS 环境）；它的下载源**已经不再是空白** —— 13/14 条带真实哈希，只剩 `ffmpeg@macos` 是 `null`（见 1.3）。`7zip` 的三平台也补上了，压缩包节点现在有真机基线（【18】，见 3.4）。
 2. 本文档因此同时承担两个角色：**引擎层规格说明**（现在就能定下来的接口契约：有哪些引擎、能力边界、许可证约束、降级规则）与**待实现清单**（第 6 节列出尚未落地的部分与已知的数据不一致）。
 
 > 核对说明：任务简报假定「仓库目前只存在 `crates/toolforge-core`，`toolforge-engines` / `toolforge-process` / `toolforge-plugins` / `toolforge-ai` 以及 `apps/desktop` 都还没落地」。实际核对后，这些组件中的多数已经存在（其中一部分正是在核对期间被并行写入的）。本节按仓库实际文件撰写，未沿用该假定。
@@ -83,9 +84,9 @@ EngineModel {
 另外有两点必须如实说明：
 
 - `crates/toolforge-engines/engine-sources.json` 是一个**独立于 `EngineModel` 的来源清单**（对应 `registry::EngineSourceSpec`）。
-  > ✅ **已回填 7 条**（Windows / Linux 的 `ffmpeg` / `libvips` / `pandoc` / `python`，外加 **`imagemagick@windows`**），每条都带**实际核对过的 SHA-256** 与**版本固定直链**；`registry.rs` 规定 `sha256` 为 `None` 时拒绝下载，所以 macOS 四条与 `ffmpeg@linux`（上游是滚动别名）目前仍**不可自动安装**，会返回 `HashRequired`。核对方式与实测版本表见 `docs/ROADMAP.md` §3。**`imagemagick@windows` 是本轮新增的，见 3.2**（它此前声明了 `Download` 却没有来源，属于"界面在骗人"）。
-  > ⚠️ **关于 `ffmpeg@windows` 的一条环境事实**：它的哈希取自 gyan.dev **随包发布的 `.sha256` 旁挂文件**（比我们自己下载后计算更可信），但**本机在本次会话里连不上 `www.gyan.dev`**（`curl` 直测也是 `Failed to connect ... after 21107 ms`），因此 FFmpeg 的安装**在本机没有完成过**。这是环境问题，不是代码缺陷 —— 但也不要据此把 FFmpeg 写成"已装好"。
-  > **`7zip` 的条目已移除**（原先有，现已删除）：官方只提供安装器，或需要先有 7-Zip 才能解压的 `.7z`（先有鸡还是先有蛋），且那条版本固定直链 `7z2408-extra.7z` **实测 404**。因此 `7zip` 在 `engine_catalog()` 里已改为**仅系统安装**。本文档第 2、4 节的「体积」「安装方式」全部取自 `engine_catalog()`，不与 `engine-sources.json` 混用。
+  > ✅ **现在是 14 条，其中 13 条带真实哈希**（Windows 7 / Linux 4 / macOS 3）：`ffmpeg`@windows·linux·macos、`libvips`@windows、`imagemagick`@windows、`pandoc`@windows·linux、`python`@windows·linux·macos、`poppler`@windows、**`7zip`@windows·linux·macos**。每条都带**实际核对的 SHA-256** 与**版本固定直链**；`registry.rs` 规定 `sha256` 为 `None` 时拒绝下载，所以**唯一**仍是 `null` 的是 `ffmpeg@macos`（evermeet 那条取不到字节，见 3.4）。核对方式与实测版本表见 `docs/ROADMAP.md` §3。
+  > ⚠️ **关于 `ffmpeg@windows` 的一条环境事实**：这里的历史注记写着「哈希取自 gyan.dev 随包发布的 `.sha256` 旁挂文件，但本机连不上 gyan.dev，所以 FFmpeg 的安装在本机没有完成过」。**这两件事现在都变了**：① 来源换成了 BtbN 的 GitHub 版本固定直链（gyan.dev 实测只有 15~43 KB/s，105 MB **根本下不完**；GitHub 上 9.3 MB/s），哈希因此变成"自己下载后计算"；② FFmpeg **已经在本机装成功**（n8.1.3，484 MB，`force` 安装，引擎状态 `installed`），Linux 变体也实测下载并核对了哈希。
+  > ✅ **`7zip` 的条目回来了 —— 而且三平台都有**（历史注记曾写着"已移除：官方只提供安装器，或需要先有 7-Zip 才能解压的 `.7z`，且那条直链实测 404，因此改为仅系统安装"）。**那句理由的前半句是错的**：Windows 10 1803+ 自带的 `tar`（bsdtar）**能读 7z** —— ImageMagick 的便携版就是 `.7z`，它的一键安装实测成功过。真正的原因只是那条 URL 过期（`7z2408-extra.7z` → 现在上游是 26.03）。于是现在：Windows 走 `.msi` 的**管理安装**（`msiexec /a`，拿到的是含 RAR 的**完整版**）、Linux / macOS 走上游发的完整 `7z2603-linux-x64.tar.xz` / `7z2603-mac.tar.xz`。**一个错误的理由 + 一个过期的地址，让一个核心引擎在 Windows 上长期只能手动装** —— 这条留在文档里，因为它不是配置问题，是推理问题。详见 3.4 与 `engine-sources.json` 里那条 note。
 - ✅ **「一键安装」现在真的装成功过（这是新事实，不是设计意图）**：通过应用真实安装过一次 **libvips 8.18.6** —— 下载约 30 MB → SHA-256 校验通过 → 解压 → 被探测为 `installed`，可执行文件落在托管布局的 `…/engines/libvips/bin/vips.exe`，磁盘占用约 29.67 MB。**在此之前这条路径从未被跑通过**，原因不是哈希没回填，而是两个 `toolforge-process` 的缺陷（都已修复、都有回归测试）：
   1. **裸命令名不查 PATH**：`exec_streaming` 曾用 `program.exists()` 判断程序是否存在，而 `Path::new("tar").exists()` 对裸名字**永远是 false**（它按当前工作目录解析，不查 PATH）。引擎安装正是用 `ExecOptions::new("tar")` 解压 `.zip` / `.tar.gz`，于是流程是「下载成功 → SHA-256 校验通过 → 解压时报"可执行文件不存在：tar"」——错误信息还把责任指错了地方。现在由公开函数 `toolforge_process::resolve_program()` 统一解析：裸名字走 PATH（Windows 再按 `PATHEXT` 补后缀），**显式路径永不回退到 PATH**。
   2. **`quiet(true)` 曾经把所有输出都丢掉**：它的语义本该是"只保留尾部"（不累积头部），实际却把 stdout / stderr 一起扔了。后果是 `probe_version` 什么都读不到 → **每个引擎的版本都显示「未知」**，引擎失败时 stderr 也是空的（没有任何可操作的细节）。现在 `quiet` = **只留尾部**，与它自己的文档注释一致，版本能正常显示、失败原因带得住。
@@ -117,7 +118,7 @@ EngineModel {
 | `imagemagick` | ImageMagick | 格式覆盖最全的图像处理工具集，作为 libvips 的兜底。 | `ImageMagick License（Apache-2.0 风格）` | 本体宽松，但若链接了 GPL 组件（如部分 delegate）会传染，分发前需确认构建配置。 | 约 60 MB | 仅探测系统已安装；应用按需下载 | `image.convert`<br>`image.resize`<br>`image.crop`<br>`image.rotate` | Windows / macOS / Linux | 否 |
 | `pandoc` | Pandoc（核心引擎） | 文档格式转换的瑞士军刀：Markdown / HTML / DOCX / EPUB / LaTeX 互转。 | `GPL-2.0+` | 以独立进程调用不构成衍生作品，可随闭源应用分发；但不得静态链接进你的二进制。 | 约 40 MB | 仅探测系统已安装；应用按需下载 | `doc.convert`<br>`ebook.convert` | Windows / macOS / Linux | 是 |
 | `libreoffice` | LibreOffice (headless) | Office 文档转 PDF 的事实标准。冷启动 2~5 秒，ToolForge 会复用常驻进程。 | `MPL-2.0` | MPL 是文件级 copyleft，独立进程调用无传染风险。 | 约 420 MB | 仅探测系统已安装 | `doc.to-pdf` | Windows / macOS / Linux | 是 |
-| `7zip` | 7-Zip（核心引擎） | 压缩解压，覆盖 zip / 7z / rar / tar 等格式。 | `LGPL-2.1+（含 unRAR 限制条款）` | unRAR 代码禁止用于开发 RAR 压缩器；解压用途不受影响。 | 约 5 MB | **仅探测系统已安装**（下载源已移除，见 1.3 节） | `archive.pack`<br>`archive.unpack` | Windows / macOS / Linux | 否 |
+| `7zip` | 7-Zip（核心引擎） | 压缩解压，覆盖 zip / 7z / rar / tar 等格式。 | `LGPL-2.1+（含 unRAR 限制条款）` | unRAR 代码禁止用于开发 RAR 压缩器；解压用途不受影响。 | 约 5 MB（26.03：Windows 安装包 2.0 MB / Linux 1.6 MB / macOS 1.9 MB） | 仅探测系统已安装；**三平台都可一键下载**（Windows 走 `.msi` 管理安装，Linux/macOS 走上游 tar.xz） | `archive.pack`<br>`archive.unpack` | Windows / macOS / Linux | 否 |
 | `calibre` | Calibre | 电子书格式转换与元数据管理（EPUB / MOBI / AZW3）。 | `GPL-3.0` | GPL-3.0 为强 copyleft。仅以独立进程调用；如要随包分发请先做合规评审。 | 约 180 MB | 仅探测系统已安装 | `ebook.convert` | Windows / macOS / Linux | 是 |
 | `python` | Python 运行时 | L3 插件的执行环境（独立 3.11 运行时，与系统 Python 隔离）。 | `PSF-2.0` | 宽松许可；注意随包分发的第三方 wheel 各自的许可证。 | 约 150 MB | 应用按需下载 | `image.remove-background`<br>`ai.upscale` | Windows / macOS / Linux | 否 |
 | `onnx-models` | ONNX 模型包 | 抠图 / 超分 / 分割用的模型权重。**不随安装包分发，首次使用时下载**。 | `各模型不同（见下表）` | 代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。 | 约 180 MB（引擎级估算） | 应用按需下载 | `image.remove-background`<br>`ai.upscale` | Windows / macOS / Linux | 是 |
@@ -128,10 +129,12 @@ EngineModel {
 ### 2.1 总表读法
 
 - **核心引擎共 3 个**：`ffmpeg`、`pandoc`、`7zip`。它们在名称后标注了「（核心引擎）」。缺失时应用**仍然能启动**，但依赖它们的节点不可用：`ffmpeg` 缺失 → 5 个 `video.*` 与 2 个 `audio.*` 节点不可用；`pandoc` 缺失 → `doc.convert` 不可用，并且 `ebook.convert` 失去唯一的纯文档转换后端；`7zip` 缺失 → `archive.pack` / `archive.unpack` 不可用。
-- **只有 `System` 一种安装方式的引擎共 4 个**：`libreoffice`（约 420 MB）、`calibre`（约 180 MB）、`tesseract`（约 60 MB）、`7zip`（约 5 MB）。这四个都只探测系统安装、不提供应用内下载。
-  > 📌 **`poppler` 不在这一组**：它是 `Download` + `System` 双模式（Windows 有一键下载，macOS/Linux 走系统包管理器）。它的 `MANAGED_LAYOUT` 是 `Library/bin/pdftoppm` —— 那两层目录不能省，因为 pdftoppm 是按**自己所在目录的相对位置**去找 `../share/poppler` 的数据文件的（`engine-sources.json` 里把这条写进了 note）。
+- **只有 `System` 一种安装方式的引擎共 3 个**：`libreoffice`（约 420 MB）、`calibre`（约 180 MB）、`tesseract`（约 60 MB）。这三个都只探测系统安装、不提供应用内下载，原因是**上游只发安装器**（`.msi` / `.dmg` / `.deb` / `.exe`），没有"解压即用"的归档 —— 这一点现在写在各自的 `download_platforms: []` 旁边。
+  > 📌 **`7zip` 曾经在这一组，现在不在**：它是 `System` + `Download` 双模式、且**三平台都能装**（Windows 走 `.msi` 管理安装、Linux/macOS 走上游的完整 tar.xz）。历史注记给的理由（"`.7z` 需要先有 7-Zip 才能解压"）**是错的** —— Windows 自带的 bsdtar 读得懂 7z；真正的原因只是那条 URL 过期。见 1.3 与 3.4。
+  > 📌 **`poppler` 也不在这一组**：它是 `Download` + `System` 双模式（Windows 有一键下载，macOS/Linux 走系统包管理器）。它的 `MANAGED_LAYOUT` 是 `Library/bin/pdftoppm` —— 那两层目录不能省，因为 pdftoppm 是按**自己所在目录的相对位置**去找 `../share/poppler` 的数据文件的（`engine-sources.json` 里把这条写进了 note）。
 - **只有 `Download` 一种安装方式的引擎共 2 个**：`python`、`onnx-models`。
   > ⚠️ **这句原来接着写的是「二者不探测系统安装」—— 那是错的（本条已修正）。** `install_modes` 只决定「应用能不能替你下载」，**不决定探测范围**：`probe()` 的顺序是 ① 托管目录 → ② PATH → ③ 平台常见路径，对所有引擎一视同仁。所以系统里已有的 Python 会被探到，状态是 `Detected` / `source: System`。这恰恰是 `force` 标志与「另外安装应用托管版本」按钮存在的原因 —— **"探测到可用"不等于"满足这个节点的要求"**，系统 Python 3.14 显示可用却跑不了 `onnxruntime`（见 3.2、3.6）。`onnx-models` 是唯一的例外，它没有二进制，走下面那条虚拟引擎判据。
+- **"能不能一键下载"是平台级的事实，不是引擎级的**：`EngineDescriptor::download_platforms` 就是这条事实的数据形式。它存在的原因是 `install_modes` 太粗 —— `libvips` 声明 `Download` 时只有 Windows 有预编译包，macOS 用户却会看到一个点了必然失败的按钮。它与 `engine-sources.json` 的核对是**双向的**且**平台无关**（`download_platforms_are_backed_by_real_sources`）：写了某平台却没有来源 → 失败；有来源却没写 → 也失败；`install_modes` 含 `Download` ⟺ `download_platforms` 非空。**这条测试能在任何操作系统上跑**，取代了此前"只在当前平台取样"的检查 —— macOS 那两条死源（`libvips` 的 404 地址、`pandoc` 的 `.pkg`）就是这么漏过去的。
 - **只有 `Remote` 一种安装方式的引擎共 1 个**：`ai-provider`。体积记为 0 MB，因为它没有本地二进制。
 - **需要用户确认许可证（`requiresLicenseAck: true`）的引擎共 6 个**：`ffmpeg`、`pandoc`、`libreoffice`、`calibre`、`onnx-models`、`poppler`。UI 必须在用户点击「下载」之前就把许可证讲清楚（这是 `engine.rs` 中 `licenses` 字段刻意保留的原因）。
 - **全部 12 个引擎都声明支持三平台**：Windows / macOS / Linux。当前目录中没有平台受限的引擎。
@@ -261,8 +264,13 @@ EngineModel {
 
 - **主页**：https://www.7-zip.org/
 - **提供的节点（2 个）**：`archive.pack`、`archive.unpack`。
-- **缺失时会发生什么**：两个节点**都不可用**，无降级路径（`requiresEngines: ["7zip"]`）。`7zip` 现在**只支持系统安装**（官方只提供安装器，或需要先有 7-Zip 才能解压的 `.7z`；原候选直链已 404），因此 UI 应直接引导到 https://www.7-zip.org/ ，而不是给一个"一键下载"按钮。
-- **许可证与分发注意点**：`LGPL-2.1+（含 unRAR 限制条款）`。unRAR 代码禁止用于开发 RAR 压缩器；**解压用途不受影响**。`requiresLicenseAck: false`——注意这是唯一一个 `core: true` 但不需要许可证确认的引擎。
+- **缺失时会发生什么**：两个节点**都不可用**，无降级路径（`requiresEngines: ["7zip"]`）。
+- ✅ **三平台现在都能一键装（本轮把这条从未打通的路径打通了）**。历史注记在这里写的是「只支持系统安装（官方只提供安装器，或需要先有 7-Zip 才能解压的 `.7z`；原候选直链已 404），UI 应直接引导到官网」。**那句理由的第一半是错的，而且是可以被证伪的**：Windows 10 1803+ 自带的 `tar`（bsdtar）**能读 7z** —— 这一点在装 ImageMagick 时就被实测证明过（它的 Windows 便携包只有 `.7z`，`tar -xf` 退出码 0）。所以"先有鸡还是先有蛋"这个死结**不存在**；真正的原因只是那条 URL 指向的 `7z2408-extra.7z` 过期了（上游现在发 26.03）。**一个错误的理由会让正确的结论永远不被复查** —— 记在这里。
+- **但换成 `-extra` 也不对**，这是第二个坑：`7z2603-extra.7z` 里是 **`7za.exe`（精简版）**，格式表里**没有 RAR**。而 `archive.unpack` 的输入端口明确收 `.rar`，用户会得到"按钮能点、装完却解不了 rar"。最终选择按平台分开：
+  - **Windows**：`.msi` + **管理安装**（`archive: "msi"` → `msiexec /a <msi> /qn TARGETDIR=<dir>`）。这不是"安装"：不写注册表、不装服务、**不需要管理员权限**（本机实测退出码 0）。拿到的是**完整版** `Files/7-Zip/7z.exe` + `7z.dll`，`7z.exe i` 里 Rar1/2/3/5 都在，`7z a` 实测可用。顺带一提，这条路也顺手证明了"官方只发安装器"并不等于"拿不到可分发的东西"。
+  - **Linux / macOS**：上游从 21.x 起就给这两个平台发**完整的**命令行版，直接是 `7z2603-linux-x64.tar.xz` / `7z2603-mac.tar.xz`，解压出来是 `7zz`（注意**不叫 `7z`**；`ENGINE_BINARIES` 里的 `7zz` 就是为它准备的）。这两个平台反而最简单。
+  - **一句话的验证边界**：Windows 那条是**端到端实测**的；Linux/macOS 两条核对到的是「资产存在、哈希一致、清单里有 `7zz`、二进制里有 `Rar3`/`Rar5` 字样」，**没有在真实 Linux/macOS 上跑过**（本机没有那两个系统）。
+- **许可证与分发注意点**：`LGPL-2.1+（含 unRAR 限制条款）`。unRAR 代码禁止用于开发 RAR 压缩器；**解压用途不受影响**。`requiresLicenseAck: false`——注意这是唯一一个 `core: true` 但不需要许可证确认的引擎。分发方式上有一条被反复复用的限制：**不随应用分发、由用户按需下载**，应用只是指向上游地址。
 
 ### 3.5 电子书域
 
@@ -460,7 +468,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 | `audio.normalize` | 音量归一化 | `ffmpeg`（必需） | **无降级路径** | 节点完全不可用。同上提示 |
 | `doc.convert` | 文档格式转换 | `pandoc`（必需） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 Pandoc」并提供下载入口 |
 | `doc.to-pdf` | Office 文档转 PDF | `libreoffice`（必需） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 LibreOffice (headless)」，且必须说明该引擎**只有系统安装模式**，需用户自行安装（约 420 MB） |
-| `archive.pack` | 打包压缩 | `7zip`（必需） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 7-Zip」；建议优先引导系统安装 |
+| `archive.pack` | 打包压缩 | `7zip`（必需） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 7-Zip」；**三平台都提供一键下载**（Windows 走 `.msi` 管理安装，Linux/macOS 走上游 tar.xz），系统安装仍然可用 |
 | `archive.unpack` | 解压 | `7zip`（必需） | **无降级路径** | 节点完全不可用。同上提示 |
 | `ai.upscale` | 图像超分辨率放大 | `python` + `onnx-models`（**均为必需**） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 Python 运行时」与「需要安装 ONNX 模型包」 |
 | `ai.describe` | 图像描述 / 大模型调用 | `ai-provider`（必需） | **无降级路径** | 节点完全不可用。由于该引擎是 `Remote` 模式，UI 应引导用户配置服务商与 API Key，而不是「下载」 |
@@ -586,8 +594,9 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
   > 所以那次失败确实是瞬时的，而不是配置问题。
   > **注意**：上一段关于"模型权重仍全部为 `null`"的旧结论已经不成立。
 - ~~另外 `engine-sources.json` 中 5 个引擎的候选 URL 虽然存在，但**每条 `sha256` 均为 `null`**，因此没有任何一个引擎具备可用的自动安装来源。~~
-  > ✅ **已修正**：`engine-sources.json` 已回填 **7 条**带真实核对哈希 + 版本固定直链的来源（`ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux`，以及本轮新增的 **`imagemagick@windows`**）。因此 Windows 上的这 5 个引擎与 Linux 上的 2 个**现在可以自动安装**；macOS 四条与 `ffmpeg@linux` 仍为 `null`。详见 `docs/ROADMAP.md` §3 与 3.2。
-- 处理方式：**模型权重这一项已经关闭** —— 8 个权重全部有下载源，其中 6 个的哈希来自真实下载，且**每一个都走通了「应用内下载 → 哈希校验 → 真跑一次推理」**（`verify-platform.mjs`【8】逐个模型断言）。剩下的未核对项是 **macOS 的四条引擎下载源**（没有 macOS 环境）。
+  > ✅ **已修正，并且条数又涨了两轮**：`engine-sources.json` 现在是 **14 条**，其中 **13 条**带真实核对哈希 + 版本固定直链（`ffmpeg`@windows·linux·macos、`libvips`@windows、`imagemagick`@windows、`pandoc`@windows·linux、`python`@windows·linux·macos、`poppler`@windows、`7zip`@windows·linux·macos）。**唯一**没有哈希的是 `ffmpeg@macos`。平台覆盖：Windows 7 条 / Linux 4 条 / macOS 3 条。详见 `docs/ROADMAP.md` §3 与 1.3。
+  > ✅ **同时补上了一条"平台无关"的守卫**：`download_platforms_are_backed_by_real_sources`（`registry.rs`）对 `EngineDescriptor::download_platforms` 与 `engine-sources.json` 做**双向**核对，因此在 Windows 上跑测试也能查出 macOS/Linux 那几条的问题 —— 此前那条检查只在**当前平台**取样，macOS 的两条死源（`libvips` 的 404 地址、`pandoc` 的 `.pkg`）正是这么漏掉的。配套的 `archive_kinds_are_known_and_msi_stays_on_windows` 则拦住"`msi` 归档写到非 Windows 平台"这类必然失败的组合。
+- 处理方式：**模型权重这一项已经关闭** —— 8 个权重全部有下载源，其中 6 个的哈希来自真实下载，且**每一个都走通了「应用内下载 → 哈希校验 → 真跑一次推理」**（`verify-platform.mjs`【8】逐个模型断言）。剩下的未核对项缩到 **1 条**：`ffmpeg@macos`（evermeet 的 `ffmpeg-9.0.2.zip` 取不到字节，哈希仍为 `null`，安装时返回 `HashRequired`，可由用户在对话框里显式勾选"允许安装没有校验值的来源"）。**macOS 的运行验证仍然没有** —— 那需要一台 Mac，不是网络问题。
   > ✅ **另一件事已经不再成立**：这条原来说「依赖模型的节点执行器仍未实现，所以 v0.1 仍用不上模型」—— **抠图与超分两个执行器都已实现并真机跑通**（`image_remove_background` / `ai_upscale`：下权重 → 独立 venv 装 `onnxruntime` → ONNX 推理 → 出结果），所以模型现在**真的被用上了**。本轮新填的两个超分权重（`realesr-general-x4v3` / `realesrgan-anime6b`）就是为 `ai.upscale` 服务的。
 
 **下载链路上后来加的几件事（都是实测逼出来的）：**
@@ -635,7 +644,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 
 > **状态更新**：本条最初写作时 `apps/desktop/src-tauri/src/`、`crates/toolforge-ai` 与 `apps/desktop/src/` 都还不存在，随后被并行开发补齐。以下保留原判断并标注最新观察结果。
 >
-> ⚠️ **下面"没有运行过 `cargo test`、第 5 章未经过测试回归验证"这句已经过期**（保留作为历史）。当前有可复核的实测数据：`cargo test --workspace` **218 passed / 0 failed**、`scripts/devtools/verify-platform.mjs` **82 项检查全通过**（【1】–【13】，其中【8】抠图、【9】电子书、【10】AI 视觉、【11】超分、【12】中间档后端切换、【13】纯 Rust 兜底档）、一次真实的 libvips 一键安装、一次真实的 ImageMagick 一键安装（见 3.2）、以及抠图/超分整条链路的真机验证（见 1.3、3.2、5.1）。不过要分清范围：**测试全绿 ≠ 第 5 章每一行都验证过** —— 图像域那 4 个节点的后端选择有【6】、【7】两条运行时检查，中间档有【12】，兜底档有【13】，抠图有【8】，其余各行仍然没有专门的运行时检查（macOS 始终没有环境基线）。
+> ⚠️ **下面"没有运行过 `cargo test`、第 5 章未经过测试回归验证"这句已经过期**（保留作为历史）。当前有可复核的实测数据：`cargo test --workspace` **246 passed / 0 failed**、`scripts/devtools/verify-platform.mjs` **172 项检查全通过**（【1】–【18】，其中【8】抠图、【9】电子书、【10】AI 视觉、【11】超分、【12】中间档后端切换、【13】纯 Rust 兜底档、【17】音视频真实属性、【18】压缩包标准归档）、一次真实的 libvips 一键安装、一次真实的 ImageMagick 一键安装、一次真实的 FFmpeg / Poppler / **7-Zip** 一键安装（见 3.2、3.4）、以及抠图/超分整条链路的真机验证（见 1.3、3.2、5.1）。不过要分清范围：**测试全绿 ≠ 第 5 章每一行都验证过** —— 图像域那 4 个节点的后端选择有【6】、【7】两条运行时检查，中间档有【12】，兜底档有【13】，抠图有【8】，音视频有【17】，压缩包有【18】，其余各行仍然没有专门的运行时检查（macOS 始终没有环境基线）。
 
 - 根 `Cargo.toml` 的 `members = ["crates/*", "apps/desktop/src-tauri"]`：两个模式都有对应目录。`apps/desktop/src-tauri/src/` 已存在（`main.rs` / `lib.rs` / `commands.rs` / `ipc.rs` / `state.rs` / `settings_store.rs` / `bin/`）。
 - ✅ **前端 `apps/desktop/src/` 现在存在**（React 18 + TS + Vite，含 `package.json`、生成的 `bindings.ts`），根 `package.json` 里指向 `@toolforge/desktop` 的脚本因此可以解析。本条原文说"仍不存在"是当时的快照。
@@ -653,14 +662,14 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 | `crates/toolforge-core/src/pipeline.rs` | 第 5 节的权威来源：`builtin_nodes()`（32 个节点）、`NodeDescriptor.requiresEngines` / `optionalEngines`、`UNIMPLEMENTED_NODES`（**空数组**，仍保留给前端做灰显数据源，见 6.7） |
 | `crates/toolforge-core/src/ai.rs` | `VisionClient` / `VisionRequest` / `BoxFut` 抽象。`toolforge-engines` **不能**依赖 `toolforge-ai`（会构成 `cyclic package dependency`），所以"看图说话"这件事通过这个 trait 注入（`NodeCtx.vision`），见 3.6 与 `docs/ARCHITECTURE.md` 的决策 10 |
 | `crates/toolforge-engines/src/lib.rs` | 引擎层的职责划分与图像域三层降级设计的说明；`MANAGED_LAYOUT`、`version_args()` |
-| `crates/toolforge-engines/src/registry.rs` | 引擎探测 / 下载 / 校验的实现；`EngineSourceSpec`、`ModelSpec`、`EngineRegistry`（含「`sha256` 为 `None` 时拒绝下载」的规则与 `has_download_source()`）；`probe()` 里对 `onnx-models` 这个**虚拟引擎**的特判也在这里（见 3.6）；`install_hint(desc, has_source)` 与下载的**卡死检测**（60 秒无数据即失败）同样在本文档的 6.5 节有说明 |
+| `crates/toolforge-engines/src/registry.rs` | 引擎探测 / 下载 / 校验的实现；`EngineSourceSpec`（含 `archive` 的六种取值，`msi` 走 `extract_msi`）、`ModelSpec`、`EngineRegistry`（含「`sha256` 为 `None` 时拒绝下载」的规则与 `has_download_source()`）；`probe()` 里对 `onnx-models` 这个**虚拟引擎**的特判也在这里（见 3.6）；`install_hint(desc, has_source)` 与下载的**卡死检测**（60 秒无数据即失败）同样在本文档的 6.5 节有说明；平台无关的守卫 `download_platforms_are_backed_by_real_sources` / `archive_kinds_are_known_and_msi_stays_on_windows` 也在本文件，见 2.1 |
 | `crates/toolforge-engines/src/nodes.rs` | 节点执行实现：`run()` 分发**覆盖全部 32 个节点**（`not_implemented` 只剩"名字拼错"这一种落点，见 6.7）；`pick_image_backend()` / `ImageBackend` 是第 5.1 节那张三层图的**真实实现**（四个节点走它，两个不走）；`image_remove_background` 与 `ai_upscale` 是**第 3.2 节那条 ONNX 路径**（不经过三层链）；`ebook_convert` / `doc_ocr` / `ai_describe` 是本轮新增的三个执行器；模块文档自带一张降级表，但与实现存在出入，见第 6.6 节 |
 | `crates/toolforge-engines/py/rembg.py` | 抠图推理脚本，用 `include_str!` 编进二进制、运行时释放到 `<data>/cache/onnx-runtime/`；见第 3.2 节 |
 | `crates/toolforge-engines/py/upscale.py` | 超分推理脚本（256 px 分块、16 px 重叠、只取中心贴回），同样 `include_str!` 编进二进制；自带输入/输出形状自检，并返回 `modelScale` / `targetScale` / `uncoveredRatio` 报告；见第 3.2 节 |
 | `crates/toolforge-process/src/exec.rs` | 子进程执行：`resolve_program()`（裸名字走 PATH、显式路径不回退）、`ExecOptions::quiet` 的"只留尾部"语义、`ExecResult` 的输出裁剪；见第 1.3 节 |
-| `crates/toolforge-engines/engine-sources.json` | 下载来源清单：**7 条已回填真实哈希 + 版本固定直链**（Windows 的 ffmpeg/libvips/pandoc/python/imagemagick，Linux 的 pandoc/python），macOS 四条与 `ffmpeg@linux` 仍为 `null`（安装时返回 `HashRequired`）。见第 1.3 与 6.5 节 |
+| `crates/toolforge-engines/engine-sources.json` | 下载来源清单：**14 条，其中 13 条**带真实核对哈希 + 版本固定直链（Windows 7 / Linux 4 / macOS 3），唯一没有哈希的是 `ffmpeg@macos`（安装时返回 `HashRequired`）。**没有占位条目**：`libvips@macos`（404 的编造地址）与 `pandoc@macos`（`.pkg` 装不上）两条已删除，解释挪进本文档 1.3 与 3.4。见第 1.3 与 6.5 节 |
 | `crates/toolforge-process/` | 外部进程调用（执行、RPC、进程监管），是引擎被真正调用的下层 |
-| `scripts/devtools/verify-platform.mjs` | 真机运行时验收脚本（`scripts/devtools/run.mjs` 的第 5 个），**82 项检查**（【1】–【13】）；【6】验证"图片后端与引擎状态一致"、【7】验证任意角度旋转不静默取整、【8】验证抠图整条 ONNX 链路真的出透明背景、【9】验证电子书转换的降级与拦停、【10】验证图像描述的请求形状、【11】验证超分真的按倍数放大、【12】藏掉 libvips 目录后验证后端真的切到 ImageMagick（`finally` 里还原）、【13】把两个引擎的托管目录都藏掉后验证纯 Rust 兜底档接得住（产出无损 VP8L + 如实提示「只有无损模式」，`finally` 里逐个还原）；第 5.1 节的实测结论来自它，第 3.2 节的抠图实测数据来自【8】、中间档实测来自【12】、兜底档实测来自【13】 |
+| `scripts/devtools/verify-platform.mjs` | 真机运行时验收脚本（`scripts/devtools/run.mjs` 的第 5 个），**当前 172 项检查**（【1】–【18】）。本文档引用得最多的是这几条：【6】验证"图片后端与引擎状态一致"、【7】验证任意角度旋转不静默取整、【8】验证抠图整条 ONNX 链路真的出透明背景（并逐个已装模型核对**推理脚本实际用的输入尺寸与归一化**）、【9】验证电子书转换的降级与拦停、【10】验证图像描述的请求形状、【11】验证超分真的按倍数放大、【12】藏掉 libvips 目录后验证后端真的切到 ImageMagick（`finally` 里还原）、【13】把两个引擎的托管目录都藏掉后验证纯 Rust 兜底档接得住（产出无损 VP8L + 如实提示「只有无损模式」，`finally` 里逐个还原）、【14】验证 `video-to-gif` 内置插件（`${output.<端口>}` 解析 + 路径逃逸那两处修复）、【15】验证扫描件 PDF 的逐页 OCR、【16】逐个核对 32 个节点的"可用"与真实引擎/权重状态一致、【17】用 ffprobe 读回真实媒体属性（时长/帧数/编解码器/采样率/容器）、【18】验证压缩包节点真的产出**标准归档**（见 3.4）。历史注记里写的"82 项（【1】–【13】）"是当时的值 |
 | `scripts/devtools/mock-openai.mjs` | **假 OpenAI 兼容端点**，只服务于验收脚本：`verify-platform.mjs`【10】把应用的 AI 设置临时指向它（provider 选 `ollama` —— 本地提供方，因此不需要 API Key），跑一次 `ai.describe`，然后断言**我们自己可控的那部分**：恰好收到 1 次请求、请求里恰好 1 张图、以**内联 data URL** 发送（不是 multipart 也不是外链）、MIME 是 `image/jpeg`（说明本地确实重新编码过）、体积落在 1 KB ~ 200 KB 的合理区间（实测约 6.9 KB）、带系统提示词、用户提示词原样送达、`stream: false`，最后还验证描述真的流到了下游（净化 → 拼名 → 改名，产出 1 个文件且文件名里没有标点）。跑完会把**用户的 AI 设置恢复原状**。这个假端点**永远不会看到真实用户图片** —— 它是"不依赖 API Key 也能验证 AI 节点"的办法，见 `docs/SECURITY.md` |
 | `docs/ROADMAP.md` | `nodes.rs` 的 `not_implemented()` 错误提示所指向的实现进度文档（本文档未引用其内容，也不与其重复记录进度） |
 | `Cargo.toml`（根） | workspace 成员与依赖声明，见第 1.2 与 6.8 节 |

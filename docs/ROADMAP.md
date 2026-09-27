@@ -51,8 +51,9 @@
 > | IPC 命令 | **32 个**（`COMMAND_NAMES` 与生成的 `bindings.ts` 逐条对齐，由 `export_bindings` 守卫） |
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **7 个** |
-> | 引擎下载源 | `engine-sources.json` 共 **12 条**（5 个引擎 × 各平台），其中 **7 条**的 SHA-256 是真实下载后核对过的；其余 5 条 `sha256: null`，`install` 会对它们返回 `HashRequired` 而**不放行** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **161 项全通过**（【1】–【17】） |
+> | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
+> | 运行时测试总数 | `cargo test --workspace` **246 passed / 0 failed** |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **172 项全通过**（【1】–【18】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -811,28 +812,57 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   - `image.rotate` 的任意角度分支**不是降级到 ImageMagick**，而是直接 `return Err(engine_missing("imagemagick"))`（`nodes.rs:588`）。
 - 也就是说（**写这条时的结论**）：「纯 Rust 打底 → libvips 加速 → ImageMagick 兜底」这条链路**当时只有第一档存在**，后两档是声明而非实现。当时的处理意见是"这必须写进验收标准，否则会被误认为已经可用" —— 后来的做法不是写进验收标准，而是**直接把后两档实现出来**（见上面的状态更新）。
 
-### 3. `engine-sources.json` 的下载源哈希 ✅ 已回填 7 条（Windows / Linux）
+### 3. `engine-sources.json` 的下载源哈希 ✅ 已回填 13 条（Windows 7 / Linux 4 / macOS 3）
 
 - 原状：12 条来源的 `sha256` **全部为 `null`**，而 `EngineRegistry::install` 在缺哈希时**直接拒绝下载** —— 也就是说校验机制写好了，但**任何引擎都装不上**。
-- **现已回填 7 条**，且全部是**实际核对过**的（不是抄的）：
+- **现在共 14 条，其中 13 条是实际核对过的**（不是抄的）；唯一没有哈希的是 `ffmpeg@macos`：
 
   | 引擎 | 平台 | 版本 | 大小 | 哈希来源 |
   |---|---|---|---|---|
-  | `ffmpeg` | windows | 8.1.2 essentials | 104.6 MB | gyan.dev 随包发布的 `.sha256` 旁挂文件 |
+  | `ffmpeg` | windows | n8.1.3（BtbN autobuild-2026-09-26-13-03, win64-gpl） | 184 MB | 下载后自行计算（BtbN **不发布**校验和） |
+  | `ffmpeg` | linux | 同一个构建（linux64-gpl） | 150,325,156 B | 下载后自行计算 |
+  | `ffmpeg` | macos | 9.0.2（evermeet 版本直链） | 26,198,325 B | **`null`** —— 取不到字节，见下 |
   | `libvips` | windows | 8.18.6 (`build-win64-mxe`, x64-web) | 10.8 MB | 下载后自行计算 |
   | `imagemagick` | windows | 7.1.2-31 portable Q16 x64（`.7z`） | 11.7 MB | 下载后自行计算（**上游没有发布校验和**，release 里只有 SBOM 与 in-toto 证明，都不含产物摘要 —— 换版本必须重算） |
   | `pandoc` | windows | 3.11 | 39.8 MB | 下载后自行计算 |
   | `pandoc` | linux | 3.11 | 33.3 MB | 下载后自行计算 |
   | `python` | windows | 3.11.16 (python-build-standalone) | 46.0 MB | 下载后自行计算 |
   | `python` | linux | 3.11.16 (同上) | 46.6 MB | 下载后自行计算 |
+  | `python` | macos | 3.11.16 (同上, arm64) | 27,088,178 B | 下载后自行计算 + `tar -tzf` 核对清单（2036 项，确有 `python/bin/python3`） |
+  | `poppler` | windows | 26.09.0-0 | 41.7 MB | 下载后自行计算 |
+  | `7zip` | windows | 26.03（`.msi` + 管理安装） | 2,007,040 B | 下载后自行计算 |
+  | `7zip` | linux | 26.03（`7zz`） | 1,575,072 B | 下载后自行计算 |
+  | `7zip` | macos | 26.03（`7zz`） | 1,863,192 B | 下载后自行计算 |
 
-- **`imagemagick@windows` 是本轮新增的**（此前 `imagemagick` 声明了 `Download` 却没有来源，界面于是显示一个点下去必然失败的「一键下载」按钮 —— 那条提示语也一并修了）。三件事是**直接执行**验证的，不是推断：官方 Windows 便携包**只有 `.7z`**；**Windows 自带的 `tar`（bsdtar / libarchive）能读 7z**（`tar -xf` 退出码 0、`magick.exe -version` 打印 `ImageMagick 7.1.2-31 Q16 x64`），所以装它**不需要先装 7-Zip**；包内**没有顶层目录**（23 个条目直接在根），所以 `stripComponents` 是 **0** 而不是习惯上的 1。Linux / macOS **故意不写来源**（走 `apt` / `brew`）。
+- **`7zip` 三平台是本轮新增的，它推翻了一条长期存在的错误结论。** 历史注记写着"7zip 只能系统安装，因为官方只提供安装器、或需要先有 7-Zip 才能解压的 `.7z`（先有鸡还是先有蛋）"。**这个理由是可以被证伪的**：Windows 10 1803+ 自带的 `tar`（bsdtar）能读 7z —— 这一点在装 ImageMagick 时就已经被实测证明过（它的 Windows 便携包只有 `.7z`）。真正的原因只是那条 URL（`7z2408-extra.7z`）过期了，而上游早就发到 26.03。**一个错误的理由会让一个正确的结论永远不被复查**，所以这条留在文档里。
+  - 换到 `-extra` 也不行（第二个坑）：里面是精简版 `7za.exe`，**没有 RAR**，而 `archive.unpack` 的输入端口收 `.rar`。
+  - 最终：Windows 用 `.msi` 的**管理安装**（`archive: "msi"` → `msiexec /a <msi> /qn TARGETDIR=<dir>`，不写注册表、不装服务、不需要管理员权限，本机实测退出码 0），拿到**完整版** `Files/7-Zip/7z.exe` + `7z.dll`（`7z.exe i` 里 Rar1/2/3/5 都在，`7z a` 实测可用）；Linux / macOS 直接走上游的完整 `7z2603-linux-x64.tar.xz` / `7z2603-mac.tar.xz`（解压出来是 `7zz`，**不叫 `7z`**）。
+  - **端到端实测过两次**（应用内点击安装）：下载 → SHA-256 校验通过 → 解压 → 探测为 `installed`，路径 `…\engines\7zip\Files\7-Zip\7z.exe`，版本 `7-Zip 26.03 (x64)`。**第一次跑就抓到一个真缺陷**：探测把可执行文件认成了 **`7z.dll`**（引擎显示"已安装"、路径是个 DLL）—— 见下面的 3.1。
+  - **下载速度的一条环境记录**：本机开着加速器（steam++ / Watt Toolkit）时，`github.com` 被 hosts 指到 `127.0.0.1`（它在本地跑了一个 MITM 代理），应用侧的下载速度在 **0.02 ~ 2.4 MB/s** 之间波动、并且**失败过一次**（`client error (Connect) → operation timed out`，60 秒连接超时 ×2 次尝试）。同一个 URL 用 `Invoke-WebRequest` 只要 1 秒。**这是环境差异，不是代码缺陷**（应用用的是 reqwest + 系统证书；`curl` 因为自带 CA bundle 在这条链路上直接 TLS 失败）—— 但它意味着"下载失败"在本机是**正常会发生**的事，所以重试路径必须好使：失败信息里写清了三种常见原因与手动兜底，用户点第二次即可。
+
+### 3.1 探测把 `7z.dll` 当成了 7-Zip 本体（本轮发现并修复）
+
+- **症状**：引擎管理里 7-Zip 显示**已安装**，但路径是 `…\Files\7-Zip\7z.dll`，版本"未知"。也就是说 `archive.pack` / `archive.unpack` 拿到的"7-Zip"是一个 DLL —— 用起来必然失败，而**探测说它可用**。这类"探测通过、执行报别的错"的缺陷最难查。
+- **根因**：`managed_binary()` 的**递归回退**分支比较的是**文件主干名**（`file_stem`）。`7z.dll` 与 `7z.exe` 的主干都是 `7z`，而 `read_dir` 的顺序把 `7z.dll` 排在了前面。`MANAGED_LAYOUT` 那条路径用的是 `with_exe_suffix`（只认真文件 / 补 `.exe`），所以问题只出在回退分支 —— 而回退恰恰是"平台布局与 `MANAGED_LAYOUT` 不一致"时唯一的救生索（MSI 布局就在 `Files/7-Zip/` 下）。
+- **修法**：新增 `is_named_executable()`，要求**完整文件名**匹配（Windows 上裸名或 `名.exe`），非 Windows 平台还要求**可执行位**；主干名比较彻底删掉。
+- **回归测试**：`managed_binary_never_returns_a_dll`（只有 `7z.dll` / `7zFM.exe` 时必须找不到；补上真正的可执行文件后必须找到那一个）。**做过反证**：把主干名比较加回去，这条测试立刻红。
+- **顺带修掉的第二件事**：`probe_version_of()` 原来在"参数为空"时直接返回 `None`，于是 `7zip` 的版本**永远是"未知"**。而 7-Zip 的默认动作就是打印版本横幅并退出 0（`7-Zip 26.03 (x64) : …`）—— 空参数是**有含义**的取值，不是"没配"。这里刻意**不用** `7z i`：它会打印整张格式表，而 `probe_version` 只留尾部，版本横幅反而会被挤掉。
+- **运行时固化**：`verify-platform.mjs` 新增 **【18】**（11 项），见下。
+- **`ffmpeg@linux` 从滚动别名换成版本固定直链**：原来指向 `johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz`（永远等于"最新版"），所以哈希只能是 `null`，而 `null` 意味着安装被 `HashRequired` 拦住 —— Linux 用户实际只能走包管理器。现在与 Windows 用同一个 BtbN 构建，哈希已实测。
+- **`ffmpeg@macos` 仍是 `null`，这是唯一剩下的一条**：evermeet 的 `ffmpeg-9.0.2.zip` 从这台机器取不到字节（HEAD / GET 都试过；它的 `info` 接口是通的，所以不是站点整体不可达）。**拿不到字节就不填哈希** —— 抄一个哈希比不填更糟。安装时返回 `HashRequired`，用户可以显式勾选"允许安装没有校验值的来源"（对话框里本来就有这一项，带风险说明），或者 `brew install ffmpeg`。
+- **两条"占位条目"被删掉，解释挪进了文档**：`libvips@macos`（指向 `libvips/libvips` 的 release —— 上游**只发源码包**，实测 404，是**一条编出来的 URL**）与 `pandoc@macos`（`.pkg` 真的存在，但要用 `installer` 以 root 安装，不是可分发的归档；留着它的后果是 macOS 用户下完 39.8 MB 得到一句"没装上"）。**说明属于文档，不属于数据表** —— 而这条纪律现在由 `download_platforms_are_backed_by_real_sources`（双向核对 + 拒绝孤儿条目）和 `archive_kinds_are_known_and_msi_stays_on_windows` 守着。
+- **`imagemagick@windows`**（此前声明了 `Download` 却没有来源，界面于是显示一个点下去必然失败的「一键下载」按钮 —— 那条提示语也一并修了）。三件事是**直接执行**验证的，不是推断：官方 Windows 便携包**只有 `.7z`**；**Windows 自带的 `tar`（bsdtar / libarchive）能读 7z**（`tar -xf` 退出码 0、`magick.exe -version` 打印 `ImageMagick 7.1.2-31 Q16 x64`），所以装它**不需要先装 7-Zip**；包内**没有顶层目录**（23 个条目直接在根），所以 `stripComponents` 是 **0** 而不是习惯上的 1。Linux / macOS **故意不写来源**（走 `apt` / `brew`）。
   > ✅ **这条 ⚠️ 已解除（保留作历史）**：原文是"应用内的完整安装链路尚未复验"——`toolforge.exe` 被一个无关的第三方进程持有文件句柄，cargo 写不回链接产物（`link.exe` 1104），二进制重建不了、跑不了。句柄释放后重建并**真的装了一遍**：11.7 MB 下载 → SHA-256 校验通过 → 系统 `tar` 解开 `.7z` → `magick.exe` 落在 `…/engines/imagemagick/magick.exe`，**241.5 MB**，探测版本 `ImageMagick 7.1.2-31 Q16 x64`。上面那四点从"直接执行验证过的前提"升级为"整条链路端到端跑通"。顺带还拿到中间档的环境基线（见开放项 8）。
-- ⚠️ **一条环境事实，不是代码缺陷**：本次会话里**本机连不上 `www.gyan.dev`**（`curl` 直测 `Failed to connect ... after 21107 ms`），所以 **FFmpeg 的安装在本机没有完成过**，依赖它的 `video.*` / `audio.*` 节点在那台机器上不可用。`ffmpeg@windows` 这条来源的哈希取自上游**随包发布的 `.sha256` 文件**（比自己下载后计算更可信），但那只能证明"来源写对了"，**不能替代一次真实安装**。
+- ✅ **已解除的环境事实（保留作历史）**：这一段原来写着「本机连不上 `www.gyan.dev`，所以 FFmpeg 的安装在本机没有完成过，依赖它的 `video.*` / `audio.*` 节点在那台机器上不可用」。两件事都变了：① gyan.dev 那条来源被换成 BtbN 的 GitHub 地址（gyan.dev 实测只有 15~43 KB/s，**105 MB 根本下不完**，而客户端当时的总超时是 30 分钟），哈希因此从"上游旁挂文件"变成"自己下载后计算"；② **FFmpeg 已经在本机装成功**（n8.1.3，484 MB，`force` 安装），`video.*` / `audio.*` 节点已有真机基线。
 
 - **同时把所有可用 URL 改成版本固定直链**。原来 `ffmpeg` 用的是 `ffmpeg-release-essentials.zip`（滚动指向最新版）—— 那类 URL 上的哈希**必然失效**，表现为"昨天能装、今天全部失败"。`libvips` 的源仓库也从 `libvips/libvips` 改为 `libvips/build-win64-mxe`（前者的 release 里没有 Windows 资产，实测 404）。
-- **剩余未回填**：macOS 四条（ffmpeg / libvips / pandoc / python，无 macOS 环境核对）、`ffmpeg@linux`（上游 URL 是滚动别名）。这些条目 `sha256` 保持 `null`，`install` 会返回 `HashRequired` 而不是放行 —— 保守的默认值是刻意的。
-- 新增两条纪律测试：`every_declared_hash_is_a_wellformed_sha256`（长度/大小写/字符集）、`no_source_points_at_a_rolling_latest_alias`（禁止滚动别名配哈希）。
+- **剩余未回填：只剩 1 条**（`ffmpeg@macos`，见上）。原先列在这里的 `libvips@macos` / `pandoc@macos` 两条**不是"没核对"，而是根本不该存在**（一条是编出来的 404 地址、一条是装不上的 `.pkg`），已连同占位条目一起删除；`python@macos` 与 `ffmpeg@linux` 已实测回填。
+- 新增两条纪律测试：`every_declared_hash_is_a_wellformed_sha256`（长度/大小写/字符集）、`no_source_points_at_a_rolling_latest_alias`（禁止滚动别名配哈希）；本轮再加两条平台无关的守卫：`download_platforms_are_backed_by_real_sources`（声明与来源双向核对、拒绝孤儿条目）、`archive_kinds_are_known_and_msi_stays_on_windows`（`archive` 取值白名单 + URL 后缀一致 + `msi` 只在 Windows），以及针对上面那个真缺陷的 `managed_binary_never_returns_a_dll`。
+- **新增运行时验收【18】（11 项，`verify-platform.mjs`，总数 161 → 172）**：压缩包节点是否真的产出标准归档。它做的不是"再跑一次打包"，而是**独立实现交叉验证 + 反证**：
+  1. 解析出来的引擎路径必须是一个**真的可执行文件**（直接盯住上面那个 `7z.dll` 缺陷）；
+  2. `archive.pack` 打出来的必须是标准 zip（`PK\x03\x04`），并且**系统 tar**（libarchive）能解开它、解出来的字节与输入**逐字节相同** —— 自己打的包自己解，两边同时错还能对上；
+  3. 再用 `archive.unpack` 解一遍做闭环，同样逐字节比对；
+  4. **反证**：把一段普通文本当压缩包喂进去，必须**失败并给出可读原因**（实测 `7zip 执行失败（退出码 2）`），而不是"成功"地产出一个空目录。
 - 另一条实测教训：回填后有个单元测试**开始真的下载 104 MB 的 FFmpeg**（它原本假设"所有哈希都是 null"所以 `install` 会立刻返回 `HashRequired`）。现已改为用临时来源文件构造缺哈希场景，与真实数据解耦 —— **测试不该有联网副作用**。
 
 ### 4. 许可证确认有数据、无强制
