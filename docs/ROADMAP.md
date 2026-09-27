@@ -1235,6 +1235,68 @@ Tauri 的 IPC 有**两条通道**：
 
 **测试替身比被测代码更难收拾。** `Page.addScriptToEvaluateOnNewDocument` 注册的脚本会作用于**之后每一个新文档**；而我只记住了"最新那一份"的 id，忘了摘最早那份 —— 于是第一份假数据（把模型说成未安装）跟着跑到了收尾检查里，让"没有副作用"这条检查**假红**了一次。现在 `patchAndBoot()` 每次先摘上一份，收尾还会轮询确认新文档里确实没有注入物。
 
+### 3.17 `enginectl verify`：把"文件在 ≠ 文件能用"变成一条离线命令（本轮）
+
+§3.15 记了那次事故：0 字节的权重被当成"已就绪"。修完之后应用侧有两层防线（状态接口不再谎报、节点在推理前拦一道），但它们都是**运行时的兜底**。这一轮补的是**离线、可脚本化**的那一层 —— `scripts/enginectl.mjs verify`。
+
+- **它做什么**：不启动应用、不需要网络，逐个权重**算一遍 SHA-256** 并与 `engine.rs` 里预置的哈希比对；
+  0 字节 / 不足标称体积 60% 的按"不完整"处理（判据与 Rust 侧 `model_size_looks_complete()` 同一条）；
+  文件**不存在**只记"未下载"，**不算失败**（权重本来就是按需下载的）；预置哈希为 null 时只打印实际值并警告。
+  `--json` 给 CI 用，`--data-dir` 可指向另一台机器的数据目录。
+- **引擎侧不做哈希校验**（这一点必须说清）：`engine-sources.json` 里的 sha256 是**压缩包**的哈希，
+  而本地是解压后的目录，两者不可比。所以引擎只报"托管目录在不在、版本是多少、该平台有没有固定哈希"。
+
+**真机实测**（本机 Windows）：
+
+```text
+权重                  体积      预置哈希      实际哈希      结论
+u2netp                4.4 MB    309c8469258d  309c8469258d  ✓ 与预置哈希一致
+u2net                 —         8d10d2f3bb75  —             · 未下载（不算失败）
+birefnet-general      927.6 MB  58f621f00f5d  58f621f00f5d  ✓ 与预置哈希一致
+modnet-portrait       24.7 MB   07c308cf0fc7  07c308cf0fc7  ✓ 与预置哈希一致
+birefnet-lite         213.6 MB  5600024376f5  5600024376f5  ✓ 与预置哈希一致
+realesr-general-x4v3  4.6 MB    09b757accd74  09b757accd74  ✓ 与预置哈希一致
+realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希一致
+合计：9 个权重，0 个有问题。                       （退出码 0）
+```
+
+> ★ 这条输出顺带给出了一份**独立的证据**：§3.15 里被我截断又重下的那个 927 MB 权重，
+> 现在的哈希与预置值**逐字节一致** —— 恢复是完整的，不只是"文件大小差不多"。
+
+**失败路径也真机验过**（拿 18 MB 的 `realesrgan-anime6b` 开刀，验完删掉，机器状态复原）：
+
+| 情形 | 输出 | 退出码 |
+|---|---|---|
+| 0 字节 | `✗ 文件是 0 字节（0 B）` + 文件路径 | **1** |
+| 1 MB（明显截断） | `✗ 明显不完整（1.0 MB）` + "删掉这个文件后重新下载"的处理建议 | **1** |
+
+#### 顺带修掉的两处"开发脚本自己漂移"
+
+这个子命令一写出来就暴露了 `enginectl.mjs` 自己的两个问题，都属于本项目反复出现的那一类：
+
+1. ★ **JS 里手抄的 `ENGINE_BINARIES` 与 Rust 那份漂移了**：脚本头部还写着"与 registry.rs 保持一致"，
+   而 Rust 那边早已加了 `poppler`（`pdftoppm`），JS 这份没跟上 —— 于是 `probe` / `verify` 对 poppler 报的是
+   **"该引擎没有登记可执行文件名"**，而机器上它明明装好了（路径就在 `Library/bin/pdftoppm.exe`）。
+   现在**直接从 `registry.rs` 解析**（连同 `#[cfg(windows)]` 这类平台属性一起认），抄一份的机会就没有了。
+   同样地，JS 里的 `MANAGED_LAYOUT` 也被删了：改成**按候选文件名在托管目录里浅层查找** ——
+   7-Zip 的 `Files/7-Zip/7z.exe`、LibreOffice 的 `program/soffice.com`、Poppler 的 `Library/bin/`
+   这三种布局都能命中，而不用再维护第三张表。
+2. ★ **解析器少认一种写法就"静默输出错的清单"**：权重的字段在 `engine.rs` 里写作
+   `sha256: Some("…".into())`、`url: Some(format!("{REMBG_RELEASE}/x.onnx"))`，
+   而第一版正则只认裸字符串 `field: "…"` —— 结果**9 个权重的哈希全被读成 null**，
+   表格照样打得漂漂亮亮，结论却全是错的。现在三种写法都认、常量（`{REMBG_RELEASE}`）会自动代回，
+   并且加了一条守卫：**原文里明明写着 `Some(…)` 而脚本没抽出来 → 直接失败**，不再输出看着正常的错表。
+3. 另外 `probe` 现在会同时查**仓库 `engines/`** 与**应用数据目录 `engines/`**：此前只查前者，
+   于是在"应用里装好、仓库没装"的机器上（本机就是）它把所有引擎报成"未检测到" —— 又一份看着正常的错表。
+
+**当前的 `probe` 输出**（同一条命令，改动后的真实结果）：8 个引擎认成"应用托管"并带出版本
+（ffmpeg n8.1.3 / vips 8.18.6 / ImageMagick 7.1.2-31 / pandoc 3.11 / LibreOffice 26.2.6.3 /
+7-Zip 26.03 / Python 3.11.16 / poppler 26.09.0），calibre 与 tesseract 如实报"未检测到"。
+
+> 仍未实现的是 `clean`（清理陈旧下载/残件）。它涉及**删用户文件**，本轮的取舍是：
+> 先把"发现"做扎实（`verify` 能指出哪个文件坏了、坏在哪），**删除动作留给用户自己做** ——
+> §3.10 那套"删源文件"的边界条件就是前车之鉴。
+
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
 - `crates/toolforge-core/src/engine.rs` 里为每个引擎与模型都提供了 `license`、`license_note`、`requires_license_ack`，并且有测试在守护这些字段非空。
@@ -1401,7 +1463,7 @@ Tauri 的 IPC 有**两条通道**：
   > **剩下的一个**：`libreoffice`（约 420 MB，且只有系统安装模式）—— 它的 `doc.to-pdf` 至今没有真机基线。
   > **历史**（保留）：这一段原来写着"ffmpeg / pandoc / libreoffice / 7zip 四个必需引擎的逐个真机跑通仍未完成，且 FFmpeg 因 `www.gyan.dev` 不可达而未能完成安装" —— 那是环境问题不是代码缺陷，后来把来源换成 BtbN 的 GitHub 地址就解决了（见 §3）。
 - [ ] 🚧 **真实接通图片加速链路（libvips 与 ImageMagick 都已达成，图像域那两个节点仍缺）**：`libvips` 已由 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 真实调用并可在日志/节点输出里观测（`verify-platform.mjs`【6】在真机上验证），**中间档 ImageMagick 也已实测被挑中**（【12】）；仍缺的是 —— `image.enhance` / `image.strip-metadata` 不接外部后端（这是性能议题，声明侧已经不再谎称"装了会更快"）、**三档结果一致性没有测试**（见不一致 2 的更新）。
-- [ ] 🚧 `scripts/enginectl.mjs`：`list` / `install` ✅ 已有并实测；`verify` / `clean` 仍未实现
+- [x] ✅ `scripts/enginectl.mjs`：`list` / `install` / `probe` 已有并实测；**`verify` 本轮补上并真机验证**（见 §3.17）。仍未实现：`clean`
 - [ ] 🚧 离线 / 镜像源可配置（企业内网可用）
 
 **L2 WASM 运行时**
@@ -1450,7 +1512,9 @@ Tauri 的 IPC 有**两条通道**：
 10. **L3 取消可验证**：发起长耗时 Python 调用后取消，2 秒内 Python 子进程消失（进程列表可验证），且后续调用仍可正常执行（进程被正确重建）。
 11. **L3 进度完整**：插件上报 `currentItem` / `speed` / `etaSeconds` 时，前端能收到并显示（对应不一致 6g 的关闭）。
 12. **权限强制可验证**：仅授予 `fsRead` 的插件尝试写文件被拒绝；撤销授权后再次执行被拒绝；授予目录之外的文件访问被拒绝——三条均在前端可见具体原因，并都在审计日志中留痕。
-13. `scripts/enginectl.mjs` 的 `list` / `install` / `verify` 三个子命令在 Windows 与 Linux 上退出码为 0，且 `engines:list` / `engines:install` 两个 npm 脚本可用。
+13. `scripts/enginectl.mjs` 的 `list` / `install` / `verify` 三个子命令在 Windows 与 Linux 上退出码为 0，且 `engines:list` / `engines:install` / `engines:verify` 三个 npm 脚本可用。
+    > 进度：`verify` 已实现并在 **Windows** 真机实测（§3.17，含失败路径：0 字节与截断各返回退出码 1）；
+    > **Linux / macOS 仍未实测** —— 判据里那句"在 Windows 与 Linux 上"目前只兑现了一半。
 
 ---
 

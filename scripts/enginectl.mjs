@@ -32,13 +32,16 @@
  *   node scripts/enginectl.mjs probe ffmpeg         只探测 ffmpeg
  *   node scripts/enginectl.mjs install ffmpeg       下载并解压到 engines/ffmpeg/
  *   node scripts/enginectl.mjs install ffmpeg --keep-archive   保留下载的压缩包
+ *   node scripts/enginectl.mjs verify               校验**本地已有的权重文件**是否与
+ *                                                   预置 SHA-256 一致（离线，逐字节算）
+ *   node scripts/enginectl.mjs verify --json        同上，输出机器可读的 JSON
  *
  * 退出码：0 成功；1 失败（网络不可用、哈希不匹配、解压失败、参数错误等）。
  */
 
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { createWriteStream, existsSync } from 'node:fs';
+import { createWriteStream, existsSync, readdirSync, statSync } from 'node:fs';
 import { mkdir, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
@@ -53,6 +56,8 @@ const ROOT = path.resolve(HERE, '..');
 
 /** 引擎目录的唯一真相来源 */
 const ENGINE_CATALOG_RS = path.join(ROOT, 'crates', 'toolforge-core', 'src', 'engine.rs');
+/** 引擎可执行文件候选名的唯一真相来源（`pub const ENGINE_BINARIES`） */
+const ENGINE_REGISTRY_RS = path.join(ROOT, 'crates', 'toolforge-engines', 'src', 'registry.rs');
 /** 下载源表（Rust 侧 EngineSourceSpec 反序列化的就是它） */
 const ENGINE_SOURCES_JSON = path.join(ROOT, 'crates', 'toolforge-engines', 'engine-sources.json');
 /** 引擎安装目录，与 .gitignore 里的 `/engines/` 对应；Rust 侧 AppPaths::engines() 也是它 */
@@ -60,21 +65,56 @@ const ENGINES_DIR = path.join(ROOT, 'engines');
 /** 下载缓存（放在 engines/ 下，整个目录本来就不入库） */
 const DOWNLOAD_DIR = path.join(ENGINES_DIR, '.downloads');
 
-/** 与 registry.rs 的 ENGINE_BINARIES 保持一致（探测用） */
-const ENGINE_BINARIES = {
-  ffmpeg: ['ffmpeg'],
-  ffprobe: ['ffprobe'],
-  libvips: ['vips', 'vips.exe'],
-  imagemagick: ['magick', 'convert'],
-  pandoc: ['pandoc'],
-  libreoffice: ['soffice'],
-  '7zip': ['7z', '7za', '7zz'],
-  calibre: ['ebook-convert'],
-  tesseract: ['tesseract'],
-  python: ['python', 'python3', 'python3.11'],
-  'onnx-models': [],
-  'ai-provider': [],
-};
+/**
+ * 与 registry.rs 的 `ENGINE_BINARIES` **保持一致**（探测用）—— 直接从那份 Rust 源码解析。
+ *
+ * # 为什么是"解析"而不是"再抄一张表"（这里真的漂移过）
+ *
+ * 这张表原本在 JS 里手抄了一份，注释还写着"与 registry.rs 保持一致"。
+ * 结果是：Rust 那边加了 `poppler`（`pdftoppm`），JS 这份没跟上 ——
+ * 于是 `verify` / `probe` 对 poppler 报的是"该引擎是本脚本未登记的形态"，
+ * 而机器上它明明装好了。**声明与实现不一致**，这一次发生在开发脚本自己身上。
+ * 现在改成从 `registry.rs` 解析，抄一份的机会就没有了。
+ *
+ * 平台的 `#[cfg(windows)]` / `#[cfg(not(windows))]` 属性照旧生效：
+ * 例如 `imagemagick` 在 Windows 上只认 `magick`（`convert.exe` 是系统自带的卷转换工具）。
+ */
+async function loadEngineBinaries() {
+  let src;
+  try {
+    src = await readFile(ENGINE_REGISTRY_RS, 'utf8');
+  } catch (e) {
+    fail(`读不到引擎注册表源码：${ENGINE_REGISTRY_RS}`, '是不是不在仓库根目录下运行？');
+  }
+  const at = src.indexOf('pub const ENGINE_BINARIES');
+  if (at < 0) {
+    fail(
+      'registry.rs 里找不到 `pub const ENGINE_BINARIES`',
+      '本脚本靠解析它来探测引擎。若它被重命名，请同步更新 scripts/enginectl.mjs。',
+    );
+  }
+  const region = src.slice(at, src.indexOf('];', at));
+
+  const isWindows = process.platform === 'win32';
+  const table = {};
+  for (const m of region.matchAll(
+    /((?:#\[cfg\([^\]]*\)\]\s*)*)\("([a-z0-9-]+)",\s*&\[([^\]]*)\]\)/g,
+  )) {
+    const [, cfgs, id, names] = m;
+    // 认得了 `windows` / `not(windows)` 就够用：这张表目前只用这两种
+    if (/cfg\(\s*windows\s*\)/.test(cfgs) && !isWindows) continue;
+    if (/cfg\(\s*not\(\s*windows\s*\)\s*\)/.test(cfgs) && isWindows) continue;
+    table[id] = [...names.matchAll(/"([^"]*)"/g)].map((x) => x[1]);
+  }
+
+  if (Object.keys(table).length === 0) {
+    fail(
+      '未能从 registry.rs 解析出任何引擎可执行文件名',
+      'ENGINE_BINARIES 的写法变了？请更新 scripts/enginectl.mjs 里的 loadEngineBinaries()。',
+    );
+  }
+  return table;
+}
 
 /**
  * 必须排除的"同名误报"。
@@ -94,20 +134,16 @@ function isRejectedBinary(p) {
   return rejects.some((r) => base === r.toLowerCase());
 }
 
-/** 应用托管目录里的相对可执行路径（与 lib.rs 的 MANAGED_LAYOUT 一致） */
-const MANAGED_LAYOUT = {
-  ffmpeg: 'bin/ffmpeg',
-  libvips: 'bin/vips',
-  imagemagick: 'magick',
-  pandoc: 'pandoc',
-  libreoffice: 'program/soffice',
-  '7zip': '7z',
-  calibre: 'ebook-convert',
-  tesseract: 'tesseract',
-  python: 'python',
-};
-
-/** 与 lib.rs 的 version_args() 保持一致（拿版本用的参数） */
+/**
+ * 拿版本用的参数。
+ *
+ * ⚠️ 这张表**仍然是 JS 里的一份拷贝**（Rust 侧的 `version_args()` 是个 match 表达式，
+ * 解析它比解析一张常量表脆得多）。所以这里把代价写清楚：
+ * 表里没有的引擎会退化成 `--version`，拿到的东西不对时**只会显示"（无法取得版本）"**，
+ * **不会给出错误结论** —— 版本号在本脚本里只用于人眼确认，不参与任何判断。
+ * （此前 `MANAGED_LAYOUT` 与 `ENGINE_BINARIES` 两张表也是这么抄的，而后者真的漂移过，
+ *   所以现在已经改成从 Rust 解析，见 `loadEngineBinaries()`。）
+ */
 const VERSION_ARGS = {
   ffmpeg: ['-version'],
   libvips: ['--version'],
@@ -117,6 +153,7 @@ const VERSION_ARGS = {
   '7zip': [],
   calibre: ['--version'],
   tesseract: ['--version'],
+  poppler: ['-v'],
   python: ['--version'],
 };
 
@@ -171,10 +208,36 @@ function fail(msg, detail) {
 // ---------------------------------------------------------------------------
 
 /**
+ * 从 `engine.rs` 里抽出 `const NAME: &str = "…";`，用来还原 `Some(format!("{CONST}/x"))`。
+ *
+ * 权重的 URL 大量写成 `Some(format!("{REMBG_RELEASE}/u2netp.onnx"))` ——
+ * 不把常量代回去，输出里就只剩一个 `{REMBG_RELEASE}`，看着像坏数据。
+ */
+function loadStringConstants(src) {
+  const map = new Map();
+  for (const m of src.matchAll(/const\s+([A-Z0-9_]+)\s*:\s*&str\s*=\s*"([^"]*)"/g)) {
+    map.set(m[1], m[2]);
+  }
+  return map;
+}
+
+/**
  * 解析 `engine_catalog()` 里的 `EngineDescriptor { ... }` 块。
  *
  * 用"找块 + 括号配平 + 字段正则"而不是完整 Rust 解析器：这个文件是机器生成的
  * 风格固定，正则足够；一旦解析失败我们会明确报错，而不是静默返回空表。
+ *
+ * ⚠️ **字段有三种写法，少认一种就会静默出错**：
+ * ```rust
+ * id: "ffmpeg".into(),                                  // 裸字符串
+ * sha256: Some("309c…".into()),                         // Some("…".into())
+ * url: Some(format!("{REMBG_RELEASE}/u2netp.onnx")),    // Some(format!("…"))
+ * file_name: None,                                      // 没有值
+ * ```
+ * 第一版只认第一种，于是**每一个权重的 sha256 都被读成 null**，
+ * `verify` 把 9 个权重全报成"未回填哈希"—— 输出看着"正常"，结论却全是错的。
+ * 这就是本项目反复出现的"静默错误"，所以现在补了两道保险：
+ * 三种写法都认；以及下面的 `guardExtracted()`（原文里有值、我们没抽出来 → 直接失败）。
  */
 async function loadEngineCatalog() {
   let src;
@@ -183,6 +246,7 @@ async function loadEngineCatalog() {
   } catch (e) {
     fail(`读不到引擎目录源码：${ENGINE_CATALOG_RS}`, '是不是不在仓库根目录下运行？');
   }
+  const constants = loadStringConstants(src);
 
   const fnStart = src.indexOf('pub fn engine_catalog()');
   if (fnStart < 0) {
@@ -215,9 +279,33 @@ async function loadEngineCatalog() {
     fail('未能从 engine.rs 解析出任何引擎条目', '请检查 engine_catalog() 的写法是否变了。');
   }
 
+  /** 三种写法都认；抽不出来返回 null */
   const grab = (block, field) => {
-    const m = block.match(new RegExp(`${field}:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
-    return m ? m[1] : null;
+    const bare = block.match(new RegExp(`${field}:\\s*"((?:[^"\\\\]|\\\\.)*)"`));
+    const some = block.match(
+      new RegExp(`${field}:\\s*Some\\(\\s*(?:format!\\()?\\s*"((?:[^"\\\\]|\\\\.)*)"`),
+    );
+    const raw = bare?.[1] ?? some?.[1];
+    if (raw === undefined) return null;
+    // 把 `{CONST}` 代回真实值；代不出来的保留原样（一眼能看出是没解析成功）
+    return raw.replace(/\{([A-Z0-9_]+)\}/g, (whole, name) => constants.get(name) ?? whole).replace(/\\\\"/g, '"');
+  };
+  /**
+   * 抽完之后对账：**原文里明明有值，却没抽出来 → 立刻失败**。
+   *
+   * 宁可让脚本炸掉，也不要输出一份"看着正常、其实全错"的表 ——
+   * 第一版就是因为少认了 `Some(...)` 这种写法，把 9 个权重的哈希全报成"未回填"。
+   */
+  const guardExtracted = (block, field, value, where) => {
+    if (value !== null) return;
+    if (new RegExp(`${field}:\\s*Some\\(`).test(block)) {
+      fail(
+        // ⚠️ 这里**不能**出现反引号：整段字符串本身就在模板字符串里（踩过一次）
+        `解析 \`${field}\` 失败：${where} 里写着 \`${field}: Some(…)\`，但脚本没能抽出来`,
+        'engine.rs 的写法变了？请更新 scripts/enginectl.mjs 里的 grab()。\n' +
+          '（这条守卫存在的理由：静默输出一份错的清单比直接报错危险得多。）',
+      );
+    }
   };
   const grabNum = (block, field) => {
     const m = block.match(new RegExp(`${field}:\\s*(\\d+)`));
@@ -229,20 +317,143 @@ async function loadEngineCatalog() {
     return [...m[1].matchAll(/"([^"]*)"/g)].map((x) => x[1]);
   };
 
-  return blocks.map((b) => ({
-    id: grab(b, 'id'),
-    name: grab(b, 'name'),
-    description: grab(b, 'description'),
-    homepage: grab(b, 'homepage'),
-    license: grab(b, 'license'),
-    licenseNote: grab(b, 'license_note'),
-    approxSizeMb: grabNum(b, 'approx_size_mb'),
-    core: /core:\s*true/.test(b),
-    provides: grabList(b, 'provides') ?? [],
-    platforms: grabList(b, 'platforms') ?? [],
-    installModes: [...b.matchAll(/EngineInstallMode::(\w+)/g)].map((x) => x[1]),
-    requiresLicenseAck: /requires_license_ack:\s*true/.test(b),
-  }));
+  return blocks.map((b) => {
+    const id = grab(b, 'id');
+    const where = `引擎 \`${id}\``;
+    for (const f of ['id', 'name', 'homepage', 'license', 'license_note']) {
+      guardExtracted(b, f, grab(b, f), where);
+    }
+    return {
+      id,
+      name: grab(b, 'name'),
+      description: grab(b, 'description'),
+      homepage: grab(b, 'homepage'),
+      license: grab(b, 'license'),
+      licenseNote: grab(b, 'license_note'),
+      approxSizeMb: grabNum(b, 'approx_size_mb'),
+      core: /core:\s*true/.test(b),
+      provides: grabList(b, 'provides') ?? [],
+      platforms: grabList(b, 'platforms') ?? [],
+      installModes: [...b.matchAll(/EngineInstallMode::(\w+)/g)].map((x) => x[1]),
+      requiresLicenseAck: /requires_license_ack:\s*true/.test(b),
+      models: parseModels(b, grab, grabNum, grabList, guardExtracted),
+    };
+  });
+}
+
+/**
+ * 解析描述符里的 `models: vec![ EngineModel { ... } ]`。
+ *
+ * ⚠️ 不能用 `grabList` 那种"非贪婪匹配到第一个 `]`"的写法：模型块里还有
+ * `used_by: vec!["…"]` 这样的嵌套方括号，非贪婪会在**第一个** `]` 就收住。
+ * 所以这里自己做方括号配平（与上面解析 `EngineDescriptor` 用的是同一套办法）。
+ */
+function parseModels(descriptorBlock, grab, grabNum, grabList, guardExtracted) {
+  const at = descriptorBlock.search(/models:\s*vec!\[/);
+  if (at < 0) return [];
+  const open = descriptorBlock.indexOf('[', at);
+  let depth = 0;
+  let end = -1;
+  for (let i = open; i < descriptorBlock.length; i++) {
+    if (descriptorBlock[i] === '[') depth++;
+    else if (descriptorBlock[i] === ']') {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end < 0) return [];
+  const region = descriptorBlock.slice(open + 1, end);
+
+  const models = [];
+  let cursor = 0;
+  while (true) {
+    const head = region.indexOf('EngineModel {', cursor);
+    if (head < 0) break;
+    let d = 0;
+    let i = region.indexOf('{', head);
+    const start = i;
+    for (; i < region.length; i++) {
+      if (region[i] === '{') d++;
+      else if (region[i] === '}') {
+        d--;
+        if (d === 0) break;
+      }
+    }
+    const body = region.slice(start + 1, i);
+    cursor = i + 1;
+    const id = grab(body, 'id');
+    for (const f of ['id', 'name', 'license', 'url', 'sha256', 'file_name']) {
+      guardExtracted(body, f, grab(body, f), `权重 \`${id}\``);
+    }
+    models.push({
+      id,
+      name: grab(body, 'name'),
+      approxSizeMb: grabNum(body, 'approx_size_mb'),
+      license: grab(body, 'license'),
+      commercialUse: /commercial_use:\s*true/.test(body),
+      url: grab(body, 'url'),
+      sha256: grab(body, 'sha256'),
+      // `file_name` 是"落盘文件名"，与 id **经常对不上**（如 isnet-general → isnet-general-use.onnx）
+      fileName: grab(body, 'file_name') ?? `${id}.onnx`,
+      usedBy: grabList(body, 'used_by') ?? [],
+    });
+  }
+  return models;
+}
+
+/**
+ * 应用数据目录 —— 与 Rust 侧 `AppPaths::root()` 同一处。
+ *
+ * 权重不在仓库里（它们在用户数据目录下），所以 `verify` 必须知道它在哪；
+ * 用 `--data-dir` 可以覆盖，方便在另一台机器/CI 上校验一份拷贝。
+ */
+function defaultDataDir() {
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  switch (process.platform) {
+    case 'win32':
+      return path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'com.toolforge.desktop');
+    case 'darwin':
+      return path.join(home, 'Library', 'Application Support', 'com.toolforge.desktop');
+    default:
+      return path.join(process.env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'com.toolforge.desktop');
+  }
+}
+
+/**
+ * "这个权重文件看起来是完整的吗" —— 与 Rust 侧
+ * `toolforge_core::engine::model_size_looks_complete()` **同一条判据**：
+ * 0 字节、或不足标称体积 60% → 不完整。
+ *
+ * 为什么要在这里也判一次：`verify` 的价值就是**在推理之前**发现那种文件。
+ * 实测事故：一次中断的下载把 928 MB 的权重截成 0 字节，而 `Path::is_file()`
+ * 对它同样为真 —— 界面显示"已就绪"，直到跑任务时才炸出一句看不懂的错误。
+ * 判据刻意宽松（60%）：`approx_size_mb` 是"约"，把完好文件误判成损坏比漏判更糟。
+ */
+function sizeLooksComplete(actualBytes, approxSizeMb) {
+  if (actualBytes === 0) return false;
+  const approx = (approxSizeMb ?? 0) * 1024 * 1024;
+  if (approx === 0) return true;
+  return actualBytes >= (approx * 6) / 10;
+}
+
+/** 流式算文件的 SHA-256（900 MB 的权重不能一次读进内存） */
+async function hashFile(file) {
+  const { createReadStream } = await import('node:fs');
+  const hash = createHash('sha256');
+  let bytes = 0;
+  await new Promise((resolve, reject) => {
+    const rs = createReadStream(file, { highWaterMark: 1 << 22 });
+    rs.on('data', (c) => {
+      hash.update(c);
+      bytes += c.length;
+    });
+    rs.on('end', resolve);
+    rs.on('error', reject);
+  });
+  return { sha256: hash.digest('hex'), bytes };
 }
 
 /** 读取下载源表（`engine-sources.json`） */
@@ -360,6 +571,7 @@ function readVersion(binPath, engineId) {
 
 async function cmdProbe(onlyId) {
   const catalog = await loadEngineCatalog();
+  const binaries = await loadEngineBinaries();
   const targets = onlyId ? catalog.filter((e) => e.id === onlyId) : catalog;
   if (onlyId && targets.length === 0) {
     fail(`未知引擎 id：${onlyId}`, `可用 id：${catalog.map((e) => e.id).join(', ')}`);
@@ -367,13 +579,13 @@ async function cmdProbe(onlyId) {
 
   const rows = [];
   for (const e of targets) {
-    const bins = ENGINE_BINARIES[e.id];
+    const bins = binaries[e.id];
     if (bins === undefined) {
       rows.push([
         e.id,
         '无本地可执行文件',
         '',
-        '该引擎是本脚本未登记的形态（例如只有模型权重或只有远程服务），无需探测。',
+        '该引擎没有登记可执行文件名（例如只有模型权重或只有远程服务），无需探测。',
       ]);
       continue;
     }
@@ -382,15 +594,35 @@ async function cmdProbe(onlyId) {
       continue;
     }
 
-    // 第一站：应用托管目录（与 Rust 的探测顺序一致：托管目录 → PATH → 常见安装路径）
-    const managedRel = MANAGED_LAYOUT[e.id];
-    if (managedRel) {
-      const suffix = process.platform === 'win32' ? '.exe' : '';
-      const managed = path.join(ENGINES_DIR, e.id, `${managedRel}${suffix}`);
-      if (existsSync(managed)) {
-        rows.push([e.id, '已安装（应用管理）', readVersion(managed, e.id) ?? '', managed]);
-        continue;
+    // 第一站：应用托管目录（与 Rust 的探测顺序一致：托管目录 → PATH → 常见安装路径）。
+    // 按文件名在目录里找，而不是拿 MANAGED_LAYOUT 拼路径 —— 那张表在 JS 里也抄过一份，
+    // 而它同样漂移过（缺 poppler）。见 loadEngineBinaries() 的注释。
+    //
+    // 找**两个**根：仓库的 `engines/`（`enginectl install` 装的）与
+    // 应用数据目录的 `engines/`（应用里一键装的）。只找前者会在"应用装过、仓库没装"的
+    // 机器上把所有引擎报成"未检测到" —— 那是一条**看着正常、结论全错**的输出。
+    const roots = [
+      ['仓库', ENGINES_DIR],
+      ['应用', path.join(defaultDataDir(), 'engines')],
+    ];
+    let managed = null;
+    let managedRoot = null;
+    for (const [label, dir] of roots) {
+      const found = findManagedBinary(path.join(dir, e.id), bins);
+      if (found) {
+        managed = found;
+        managedRoot = label;
+        break;
       }
+    }
+    if (managed) {
+      rows.push([
+        e.id,
+        `已安装（${managedRoot}托管）`,
+        readVersion(managed, e.id) ?? '',
+        managed,
+      ]);
+      continue;
     }
 
     let found = null;
@@ -707,6 +939,259 @@ async function cmdInstall(engineId, opts) {
 }
 
 // ---------------------------------------------------------------------------
+// verify
+// ---------------------------------------------------------------------------
+
+/**
+ * 在托管目录里找一个可执行文件。
+ *
+ * **不用 `MANAGED_LAYOUT` 去拼路径**，而是按候选文件名在目录里**浅层递归查找**：
+ * 真实布局在不同平台/不同归档下并不一致 ——
+ * 7-Zip 的 MSI 把文件放在 `Files/7-Zip/7z.exe`，LibreOffice 的入口是 `program/soffice.com`
+ * （`soffice.exe` 是 GUI 启动器，跑 `--version` 会挂住），
+ * Python 的托管布局又是 `python.exe` 直接躺在根下。
+ * 把这几张表在 JS 里再抄一遍，就又多了一处会漂移的东西；
+ * 按名字找则天然跟着实际布局走。
+ */
+function findManagedBinary(dir, names, depth = 3) {
+  if (depth < 0 || !existsSync(dir)) return null;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const wanted = names.map((n) => n.toLowerCase());
+  const suffix = process.platform === 'win32' ? '.exe' : '';
+  // 先看本层（同层命中优先，避免舍近求远）
+  for (const e of entries) {
+    if (!e.isFile()) continue;
+    const base = e.name.toLowerCase();
+    const stem = suffix && base.endsWith(suffix) ? base.slice(0, -suffix.length) : base;
+    if (wanted.includes(stem) || wanted.includes(base)) {
+      const full = path.join(dir, e.name);
+      if (!isRejectedBinary(full)) return full;
+    }
+  }
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const found = findManagedBinary(path.join(dir, e.name), names, depth - 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * 校验**本地已有的模型权重**是不是和预置的 SHA-256 一致。
+ *
+ * # 为什么这个子命令值得存在
+ *
+ * 因为"文件在 ≠ 文件能用"，而且这**不是理论**：本仓库实测撞过一次 ——
+ * 一次被中断的下载把 928 MB 的 `birefnet-general` 截成了 **0 字节**，
+ * 而当时"装好了吗"的判据是 `Path::is_file()`，0 字节同样为真。于是界面显示「已就绪」、
+ * 节点把空文件交给 onnxruntime、用户看到的是「抠图脚本执行失败」，
+ * 真正的原因埋在 Python 的 stderr 里，跟"文件是空的"隔了三层。
+ *
+ * 应用侧现在有两层防线（状态接口不再谎报 + 节点在推理前拦一道），但它们都是
+ * **运行时的兜底**。这个子命令补的是**离线、可脚本化**的那一层：
+ * 不启动应用、不需要网络，逐字节算一遍哈希，并明确报出 0 字节 / 明显截断的文件。
+ *
+ * # 判据
+ *
+ * * 权重文件**不存在** → 记"未下载"，**不算失败**（权重本来就是按需下载的）；
+ * * 存在但 0 字节 / 不足标称体积 60% → **失败**（与 Rust 侧同一条判据）；
+ * * 存在且能算出哈希 → 与预置 `sha256` 比对，不一致 → **失败**；
+ * * 预置 `sha256` 为 null（还没回填）→ 只打印实际哈希，**不算失败**（但会警告）。
+ *
+ * 引擎那一侧**不做哈希校验**：`engine-sources.json` 里的 sha256 是**压缩包**的哈希，
+ * 而本地是解压后的目录，两者不可比。所以引擎只报"托管目录在不在、版本是多少"，
+ * 以及该平台有没有固定哈希（有 URL 没哈希 = 只能系统安装）。
+ */
+async function cmdVerify(opts) {
+  const catalog = await loadEngineCatalog();
+  const binaries = await loadEngineBinaries();
+  const sources = await loadSources();
+  const plat = platformKey();
+  const dataDir = opts.dataDir ?? defaultDataDir();
+
+  const byId = new Map();
+  for (const s of sources) {
+    if (!byId.has(s.id)) byId.set(s.id, {});
+    byId.get(s.id)[s.platform] = s;
+  }
+
+  // ---- 引擎：只报事实（托管目录 / 版本 / 是否有固定哈希）----
+  //
+  // 找**两个**托管根目录：仓库的 `engines/`（`enginectl install` 的结果）
+  // 与应用数据目录下的 `engines/`（应用里一键安装的结果）。
+  // 早先只找仓库那一个，于是本机 12 个引擎明明都装好了，这一列却全是 `—` ——
+  // 一份"看着正常、结论全错"的表。
+  const engineRows = [];
+  for (const e of catalog) {
+    const names = binaries[e.id] ?? [];
+    let managed = null;
+    let root = null;
+    if (names.length > 0) {
+      const candidates = [
+        ['仓库', path.join(ENGINES_DIR, e.id)],
+        ['应用', path.join(dataDir, 'engines', e.id)],
+      ];
+      for (const [label, dir] of candidates) {
+        const found = findManagedBinary(dir, names);
+        if (found) {
+          managed = found;
+          root = label;
+          break;
+        }
+      }
+    }
+    const src = byId.get(e.id)?.[plat];
+    engineRows.push({
+      id: e.id,
+      managed,
+      root,
+      version: managed ? (readVersion(managed, e.id) ?? null) : null,
+      pinnedHash: Boolean(src?.sha256),
+      hasSource: Boolean(src?.url),
+    });
+  }
+
+  // ---- 权重：**逐个算哈希**（这才是这个子命令的意义）----
+  const models = catalog.flatMap((e) => (e.models ?? []).map((m) => ({ ...m, engineId: e.id })));
+  const weightRows = [];
+  let failures = 0;
+
+  for (const m of models) {
+    const file = path.join(dataDir, 'models', m.id, m.fileName);
+    const row = {
+      id: m.id,
+      engineId: m.engineId,
+      path: file,
+      expected: m.sha256 ? String(m.sha256).replace(/^sha256:/i, '').toLowerCase() : null,
+      actual: null,
+      bytes: null,
+      verdict: 'missing',
+    };
+
+    if (!existsSync(file)) {
+      weightRows.push(row);
+      continue;
+    }
+
+    const size = statSync(file).size;
+    row.bytes = size;
+    if (!sizeLooksComplete(size, m.approxSizeMb)) {
+      row.verdict = size === 0 ? 'empty' : 'truncated';
+      failures += 1;
+      weightRows.push(row);
+      continue;
+    }
+
+    const { sha256, bytes } = await hashFile(file);
+    row.actual = sha256;
+    row.bytes = bytes;
+    if (!row.expected) {
+      row.verdict = 'unpinned';
+    } else if (row.expected === sha256) {
+      row.verdict = 'ok';
+    } else {
+      row.verdict = 'mismatch';
+      failures += 1;
+    }
+    weightRows.push(row);
+  }
+
+  // ---- 输出 ----
+  if (opts.json) {
+    console.log(
+      JSON.stringify(
+        {
+          platform: plat,
+          dataDir,
+          enginesDir: ENGINES_DIR,
+          engines: engineRows,
+          weights: weightRows,
+          failures,
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    info(`权重与引擎校验（离线，逐字节算哈希）`);
+    info(`  平台        ${plat}`);
+    info(`  数据目录    ${dataDir}`);
+    info(`  仓库引擎目录 ${path.relative(ROOT, ENGINES_DIR)}\n`);
+
+    const VERDICT = {
+      ok: '✓ 与预置哈希一致',
+      mismatch: '✗ 哈希不一致',
+      empty: '✗ 文件是 0 字节',
+      truncated: '✗ 明显不完整',
+      unpinned: '· 未回填哈希（只报实际值）',
+      missing: '· 未下载（不算失败）',
+    };
+    printTable(
+      ['权重', '体积', '预置哈希', '实际哈希', '结论'],
+      weightRows.map((r) => [
+        r.id,
+        r.bytes === null ? '—' : humanSize(r.bytes),
+        r.expected ? r.expected.slice(0, 12) : '（无）',
+        r.actual ? r.actual.slice(0, 12) : '—',
+        VERDICT[r.verdict],
+      ]),
+    );
+
+    info('\n引擎（托管目录 / 版本 / 该平台下载源是否有固定哈希）：');
+    printTable(
+      ['引擎', '托管安装', '版本', '下载源'],
+      engineRows.map((r) => [
+        r.id,
+        r.managed ? `${r.root}托管` : '—',
+        (r.version ?? '').slice(0, 46),
+        !r.hasSource ? '（该平台无来源）' : r.pinnedHash ? '已固定哈希' : '有 URL，哈希待回填',
+      ]),
+    );
+    const found = engineRows.filter((r) => r.managed).length;
+    info(
+      `\n  托管安装 ${found}/${engineRows.length} 个（` +
+        `仓库 ${path.relative(ROOT, ENGINES_DIR)}/ 与应用数据目录 engines/ 都查了）。` +
+        '\n  引擎侧**不做哈希校验**：来源表里的 sha256 是**压缩包**的哈希，' +
+        '而本地是解压后的目录，两者不可比。',
+    );
+
+    const broken = weightRows.filter((r) => ['mismatch', 'empty', 'truncated'].includes(r.verdict));
+    if (broken.length > 0) {
+      console.error('');
+      for (const r of broken) {
+        console.error(`❌ ${r.id}：${VERDICT[r.verdict]}（${humanSize(r.bytes)}）`);
+        console.error(`   文件：${r.path}`);
+        if (r.verdict !== 'empty' && r.verdict !== 'truncated') {
+          console.error(`   预置：${r.expected}\n   实际：${r.actual}`);
+        }
+        console.error(
+          '   处理：删掉这个文件后重新下载（应用里「设置 → 引擎管理 → 模型权重」，' +
+            '或让任务重新触发下载）—— 下载会重新做 SHA-256 校验。',
+        );
+      }
+    }
+
+    const unpinned = weightRows.filter((r) => r.verdict === 'unpinned');
+    if (unpinned.length > 0) {
+      warn(
+        `${unpinned.length} 个已有权重没有预置 sha256，无法判断是否被篡改/截断：\n` +
+          unpinned.map((r) => `   ${r.id}  实际 ${r.actual}`).join('\n') +
+          `\n   回填到 crates/toolforge-core/src/engine.rs 对应条目的 sha256 字段。`,
+      );
+    }
+
+    info(`\n合计：${weightRows.length} 个权重，${failures} 个有问题。`);
+  }
+
+  if (failures > 0) process.exitCode = 1;
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 
@@ -716,13 +1201,18 @@ const USAGE = `enginectl —— ToolForge 引擎开发辅助脚本
   node scripts/enginectl.mjs list                     打印引擎目录表
   node scripts/enginectl.mjs probe [id]               探测引擎是否已安装（默认全部）
   node scripts/enginectl.mjs install <id> [选项]      下载并解压到 engines/<id>/
+  node scripts/enginectl.mjs verify [选项]            校验本地权重与预置哈希是否一致
 
 install 选项：
   --keep-archive           保留下载的压缩包（默认下完即删）
   --idle-timeout <秒>      下载空闲超时，默认 60 秒（超过该时长没有新数据就中止）
   --help
 
-退出码：0 成功 / 1 失败（含网络不可用）
+verify 选项：
+  --json                   输出机器可读的 JSON（便于 CI 断言）
+  --data-dir <路径>        覆盖应用数据目录（默认按平台推断，与 Rust 侧 AppPaths 一致）
+
+退出码：0 成功 / 1 失败（含网络不可用、权重哈希不一致、权重文件为 0 字节）。
 `;
 
 async function main() {
@@ -748,6 +1238,15 @@ async function main() {
     case 'probe':
       await cmdProbe(argv[1]);
       break;
+    case 'verify': {
+      const idx = argv.indexOf('--data-dir');
+      const dataDir = idx >= 0 ? argv[idx + 1] : null;
+      if (idx >= 0 && (!dataDir || dataDir.startsWith('-'))) {
+        fail('--data-dir 需要一个路径', `收到的是：${argv[idx + 1] ?? '(空)'}`);
+      }
+      await cmdVerify({ json: argv.includes('--json'), dataDir });
+      break;
+    }
     case 'install': {
       const positional = argv.slice(1).filter((a) => !a.startsWith('-'));
       // --idle-timeout <秒>：网络慢或走代理时放宽
@@ -765,7 +1264,7 @@ async function main() {
       break;
     }
     default:
-      fail(`未知子命令：${cmd}`, '可用子命令：list / probe / install。用 --help 看完整用法。');
+      fail(`未知子命令：${cmd}`, '可用子命令：list / probe / install / verify。用 --help 看完整用法。');
   }
 }
 
