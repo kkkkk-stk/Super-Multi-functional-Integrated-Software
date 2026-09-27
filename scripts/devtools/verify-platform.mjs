@@ -6455,6 +6455,299 @@ runtime:
   }
 }
 
+// ============================================================================
+// 【34】三个图像后端的**结果一致性**
+// ============================================================================
+//
+// `image.crop` 的节点说明里写着这么一句话：
+//
+//   「裁剪矩形先算好再交给后端，所以三个后端切出来的**位置完全一致**。」
+//
+// 这句话此前**只有 libvips 那一档有证据**（【32】的像素断言都是在 libvips 下跑的），
+// 而"三档结果一致"恰恰是这句话的重点 —— 否则同一份流水线在不同机器上会切出
+// 不同的位置，而那是个极难复现的 bug（"我这儿是对的"）。
+//
+// 这一节把三档**真的各跑一遍**再逐像素比：
+//   ① libvips（本机装了就用它）→ ② 藏掉 libvips 只剩 ImageMagick → ③ 两个都藏掉、纯 Rust。
+//
+// 藏目录的做法抄【12】/【13】（`finally` 里必定还原，失败也还原）。
+//
+// ★ 关键的一条是**每档都要断言日志里的后端名**：如果改名没生效，三次跑的其实都是
+// libvips，那么"三档结果一致"就会**毫无意义地通过** —— 这正是本节最容易变成
+// 假检查的地方，所以它单列出来断言。
+c.section('【34】libvips / ImageMagick / 纯 Rust 三档切出来的位置是不是真的一样');
+{
+  const engines = await client.invoke('engines_probe_all');
+  const usable = (id) => {
+    const e = engines.find((x) => x.descriptor.id === id);
+    return e && (e.status.state === 'detected' || e.status.state === 'installed');
+  };
+
+  if (!usable('libvips') || !usable('imagemagick')) {
+    c.note(
+      `跳过：要验"三档一致"就得三档都跑得到，需要 libvips 与 imagemagick **同时装着**` +
+        `（当前 libvips=${usable('libvips')} imagemagick=${usable('imagemagick')}）`
+    );
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；在只装了一档的机器上这条永远是跳过');
+  } else {
+    const work = join(REPO_ROOT, '.tools', 'smoke', 'out-tier-consistency');
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+
+    const CROP_ID = 'com.verify.tier-crop';
+    const ROT_ID = 'com.verify.tier-rotate';
+
+    /** 单步插件的清单生成器 —— 参数写成字面量，省掉一整套 params 声明 */
+    const oneStep = (id, name, uses, withLines) => `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${id}
+  name: ${name}
+  version: 1.0.0
+  description: 仅用于验证三个图像后端的**结果一致性**。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 图片
+      type: file
+      accept: [".png"]
+      required: true
+  outputs:
+    - id: dst
+      label: 输出
+      type: file
+      accept: [".png"]
+      required: true
+  params: []
+runtime:
+  kind: pipeline
+  pipeline:
+    steps:
+      - id: s1
+        uses: ${uses}
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+${withLines}
+`;
+
+    const install = async (id, yaml) => {
+      const dir = join(work, id);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'plugin.yaml'), yaml, 'utf8');
+      const existing = await client.invoke('plugins_get', { pluginId: id }).catch(() => null);
+      if (existing) {
+        await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+        await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+      }
+      await client.invoke('plugins_install', {
+        req: {
+          source: { kind: 'directory', path: dir },
+          overwrite: true,
+          permissionsAcknowledged: true,
+          executableCodeAcknowledged: false,
+        },
+      });
+      await client.invoke('plugins_grant', {
+        req: {
+          pluginId: id,
+          granted: {
+            capabilities: [
+              { kind: 'fsRead', scope: { kind: 'input' } },
+              { kind: 'fsWrite', scope: { kind: 'output' } },
+            ],
+          },
+        },
+      });
+      await client.invoke('plugins_set_enabled', { pluginId: id, enabled: true });
+    };
+
+    const srcDir = join(work, 'in');
+    mkdirSync(srcDir, { recursive: true });
+    const srcFile = join(srcDir, 'quad.png');
+    writeFileSync(srcFile, makeQuadrantPng(96, 64));
+
+    /** 按引擎目录的改名来**强制**走某一档 */
+    const hide = (id) =>
+      renameSync(join(DATA_DIR, 'engines', id), join(DATA_DIR, 'engines', `${id}__hidden_by_tier`));
+    const unhide = (id) =>
+      renameSync(join(DATA_DIR, 'engines', `${id}__hidden_by_tier`), join(DATA_DIR, 'engines', id));
+
+    const run = async (pluginId, outName) => {
+      const outDir = join(work, outName);
+      rmSync(outDir, { recursive: true, force: true });
+      mkdirSync(outDir, { recursive: true });
+      const sub = await client.invoke('plugins_run', {
+        req: { pluginId, inputs: { src: [srcFile] }, params: {}, outputDir: outDir },
+      });
+      const job = await client.waitJob(sub.jobId, 200, 500);
+      const line =
+        (job.logs ?? []).map((l) => String(l.message)).find((m) => m.includes('后端 =')) ?? '';
+      const files = (job.outputs ?? []).filter((p) => p.toLowerCase().endsWith('.png'));
+      return { job, line, file: files[0] ?? null };
+    };
+
+    /**
+     * 逐像素比两份产出的**颜色**。
+     *
+     * ⚠️ 比的是 RGB 三元组，**不比通道数**：三个后端编出来的 PNG 色彩类型本来就不同
+     * （实测 libvips → colorType 2 / ImageMagick → colorType 3 调色板 / 纯 Rust → colorType 6），
+     * 那是**编码**差异，不是"切出来的位置不同"。这一节要钉的是后者。
+     * 顺带把看到的色彩类型打出来，免得读的人以为三者产出的字节应该一样。
+     */
+    const compare = (a, b) => {
+      const ia = decodePng(readFileSync(a));
+      const ib = decodePng(readFileSync(b));
+      if (!ia || !ib) return { same: false, why: '解码失败' };
+      if (ia.width !== ib.width || ia.height !== ib.height) {
+        return { same: false, why: `尺寸不同 ${ia.width}x${ia.height} vs ${ib.width}x${ib.height}` };
+      }
+      for (let y = 0; y < ia.height; y++) {
+        for (let x = 0; x < ia.width; x++) {
+          const pa = pixelAt(ia, x, y);
+          const pb = pixelAt(ib, x, y);
+          if (pa[0] !== pb[0] || pa[1] !== pb[1] || pa[2] !== pb[2]) {
+            return {
+              same: false,
+              why: `(${x},${y}) 处颜色不同：${quadrantName(pa)} vs ${quadrantName(pb)}`,
+            };
+          }
+        }
+      }
+      return { same: true, why: `${ia.width}x${ia.height} 颜色逐像素相同（色彩类型 ${ia.colorType} vs ${ib.colorType}）` };
+    };
+
+    const tierOf = (line) => {
+      if (line.includes('libvips')) return 'libvips';
+      if (line.includes('ImageMagick')) return 'imagemagick';
+      if (line.includes('纯 Rust')) return 'rust';
+      return '(未知)';
+    };
+
+    let hidVips = false;
+    let hidMagick = false;
+    try {
+      await install(CROP_ID, oneStep(CROP_ID, '三档裁剪（验证用）', 'image.crop',
+        '          mode: center\n          width: "32"\n          height: "16"'));
+      await install(ROT_ID, oneStep(ROT_ID, '三档旋转（验证用）', 'image.rotate',
+        '          angle: "90"'));
+
+      // ---- 第①档：libvips ----
+      const cropVips = await run(CROP_ID, 'crop-vips');
+      const rotVips = await run(ROT_ID, 'rot-vips');
+
+      // ---- 第②档：藏掉 libvips ----
+      hide('libvips');
+      hidVips = true;
+      await client.invoke('engines_probe_all');
+      const cropMagick = await run(CROP_ID, 'crop-magick');
+      const rotMagick = await run(ROT_ID, 'rot-magick');
+
+      // ---- 第③档：两个都藏掉 ----
+      hide('imagemagick');
+      hidMagick = true;
+      await client.invoke('engines_probe_all');
+      const cropRust = await run(CROP_ID, 'crop-rust');
+      const rotRust = await run(ROT_ID, 'rot-rust');
+
+      console.log(
+        `   裁剪三档：${tierOf(cropVips.line)} / ${tierOf(cropMagick.line)} / ${tierOf(cropRust.line)}`
+      );
+      console.log(
+        `   旋转三档：${tierOf(rotVips.line)} / ${tierOf(rotMagick.line)} / ${tierOf(rotRust.line)}`
+      );
+
+      // ★ 前提：三档**真的**各走了一次。改名没生效的话，下面的一致性断言毫无意义。
+      c.check(
+        tierOf(cropVips.line) === 'libvips' &&
+          tierOf(cropMagick.line) === 'imagemagick' &&
+          tierOf(cropRust.line) === 'rust',
+        '★ ① 裁剪真的分别走了 libvips / ImageMagick / 纯 Rust 三档（否则"三档一致"是假的）',
+        `${tierOf(cropVips.line)} / ${tierOf(cropMagick.line)} / ${tierOf(cropRust.line)}`
+      );
+      c.check(
+        tierOf(rotVips.line) === 'libvips' &&
+          tierOf(rotMagick.line) === 'imagemagick' &&
+          tierOf(rotRust.line) === 'rust',
+        '★ ①b 旋转也真的分别走了三档',
+        `${tierOf(rotVips.line)} / ${tierOf(rotMagick.line)} / ${tierOf(rotRust.line)}`
+      );
+
+      c.check(
+        [cropVips, cropMagick, cropRust, rotVips, rotMagick, rotRust].every(
+          (r) => r.job.status === 'succeeded' && r.file
+        ),
+        '② 六次运行全部成功并产出了 PNG',
+        [cropVips, cropMagick, cropRust, rotVips, rotMagick, rotRust]
+          .map((r) => r.job.status)
+          .join(' / ')
+      );
+
+      // ---- 一致性：同一档位的产出必须逐像素相同 ----
+      if (cropVips.file && cropMagick.file && cropRust.file) {
+        const a = compare(cropVips.file, cropMagick.file);
+        const b = compare(cropMagick.file, cropRust.file);
+        c.check(a.same, '★ ③ 裁剪：libvips 与 ImageMagick 切出来的**像素完全相同**', a.why);
+        c.check(b.same, '★ ③b 裁剪：ImageMagick 与纯 Rust 切出来的**像素完全相同**', b.why);
+      }
+      if (rotVips.file && rotMagick.file && rotRust.file) {
+        const a = compare(rotVips.file, rotMagick.file);
+        const b = compare(rotMagick.file, rotRust.file);
+        c.check(a.same, '★ ③c 旋转：libvips 与 ImageMagick 的产出**像素完全相同**', a.why);
+        c.check(b.same, '★ ③d 旋转：ImageMagick 与纯 Rust 的产出**像素完全相同**', b.why);
+      }
+
+      // ---- 反证：比对器本身要能发现"不一样" ----
+      // 拿两张**确实应该不同**的图去跑同一个比对器。否则"三档一致"可能只是
+      // 因为比对器永远返回 same（用同一个后端跑了三遍、或者比的是同一条路径）。
+      if (cropVips.file && cropRust.file) {
+        const wrong = compare(cropVips.file, rotVips.file);
+        c.check(
+          !wrong.same,
+          '★ ④ 反证：比对器对"确实不同的两张图"会报不同（不然上面几条一致断言是空的）',
+          wrong.why
+        );
+      }
+    } finally {
+      // 还原是**必须**的：留着改名会让这台机器后面每一个检查都走错档位。
+      // 两个都还原，且**失败也要还原** —— 所以逐个 try，不用一个大的。
+      if (hidMagick) {
+        try {
+          unhide('imagemagick');
+        } catch (e) {
+          c.check(false, '还原 imagemagick 失败 —— 请手动把 imagemagick__hidden_by_tier 改回 imagemagick', String(e.message));
+        }
+      }
+      if (hidVips) {
+        try {
+          unhide('libvips');
+        } catch (e) {
+          c.check(false, '还原 libvips 失败 —— 请手动把 libvips__hidden_by_tier 改回 libvips', String(e.message));
+        }
+      }
+      await client.invoke('engines_probe_all').catch(() => {});
+      const back = await client.invoke('engines_probe_all').catch(() => []);
+      const state = (id) => back.find((e) => e.descriptor.id === id)?.status?.state ?? '(读不到)';
+      c.check(
+        (state('libvips') === 'installed' || state('libvips') === 'detected') &&
+          (state('imagemagick') === 'installed' || state('imagemagick') === 'detected'),
+        '⑤ 两个引擎都已还原（否则这台机器后面的检查全会走错档位）',
+        `libvips=${state('libvips')} imagemagick=${state('imagemagick')}`
+      );
+      for (const id of [CROP_ID, ROT_ID]) {
+        await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+        await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+      }
+    }
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

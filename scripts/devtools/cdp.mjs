@@ -609,7 +609,14 @@ export function quadrantName(px) {
 }
 
 /**
- * 极简 PNG 解码器：只处理 **8 位、非隔行、colorType 2(RGB) 或 6(RGBA)**。
+ * 极简 PNG 解码器。支持：
+ *
+ * * **colorType 2（RGB）/ 6（RGBA）**，8 位；
+ * * **colorType 3（调色板）**，位深 1 / 2 / 4 / 8（可选 `tRNS` → 带 alpha）；
+ * * 非隔行（`interlace = 0`）。
+ *
+ * 其余（灰度、16 位、Adam7）**返回 `null` 而不是猜** —— 猜出来的像素会让
+ * 断言变成"看起来通过了"，那比不检查更糟。
  *
  * 为什么要自己写：要验证 `image.crop` 裁的是哪一块、`image.rotate` 转的是
  * 哪个方向、`image.enhance` 是不是真的动了像素，就得读**像素**。
@@ -620,13 +627,24 @@ export function quadrantName(px) {
  * 输出会用别的**（常见 Paeth）。只实现 None 的话，读自己造的输入永远对、
  * 读节点产出永远错 —— 那会是一条**方向性错误**的断言：越是成功的产出
  * 越会被判为失败（或者更糟：把错的值当成对的）。
+ *
+ * ⚠️ **调色板支持是被真实数据逼出来的**（`verify-platform.mjs`【34】）：
+ * 同一张 96×64 的四色图，三个后端编出来的 PNG **色彩类型各不相同** ——
+ * libvips 给 colorType 2、纯 Rust 给 colorType 6、**ImageMagick 给
+ * colorType 3 + 位深 2**（它发现只有 4 种颜色就转成了调色板）。
+ * 那时本解码器对 colorType 3 返回 null，于是"三档结果一致"这条断言
+ * 以"解码失败"收场 —— 而**像素其实是一致的**。也就是说：
+ * 拒绝读合法的编码会把"一致"误报成"不一致"。
  */
 export function decodePng(buf) {
   if (buf.length < 8 || buf.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') return null;
   let off = 8;
   let width = 0;
   let height = 0;
-  let channels = 0;
+  let bitDepth = 0;
+  let colorType = -1;
+  let palette = null; // PLTE
+  let paletteAlpha = null; // tRNS（只对调色板有意义）
   const idat = [];
   while (off + 8 <= buf.length) {
     const len = buf.readUInt32BE(off);
@@ -635,11 +653,13 @@ export function decodePng(buf) {
     if (type === 'IHDR') {
       width = data.readUInt32BE(0);
       height = data.readUInt32BE(4);
-      if (data[8] !== 8) return null; // 只支持 8 位
+      bitDepth = data[8];
+      colorType = data[9];
       if (data[12] !== 0) return null; // 不支持隔行
-      if (data[9] === 2) channels = 3;
-      else if (data[9] === 6) channels = 4;
-      else return null; // 调色板 / 灰度 / 16 位一律不处理（宁可返回 null，也不要瞎猜）
+    } else if (type === 'PLTE') {
+      palette = data;
+    } else if (type === 'tRNS') {
+      paletteAlpha = data;
     } else if (type === 'IDAT') {
       idat.push(data);
     } else if (type === 'IEND') {
@@ -647,21 +667,33 @@ export function decodePng(buf) {
     }
     off += 12 + len;
   }
-  if (!width || !height || !channels) return null;
+  if (!width || !height) return null;
+
+  const indexed = colorType === 3;
+  if (indexed) {
+    if (!palette || ![1, 2, 4, 8].includes(bitDepth)) return null;
+  } else if (bitDepth !== 8 || (colorType !== 2 && colorType !== 6)) {
+    return null;
+  }
 
   const raw = inflateSync(Buffer.concat(idat));
-  const stride = width * channels;
+  // 调色板图的行是按**位**打包的，所以步长与"每像素几字节"无关
+  const stride = indexed
+    ? Math.ceil((width * bitDepth) / 8)
+    : width * (colorType === 6 ? 4 : 3);
   if (raw.length < (stride + 1) * height) return null;
-  const out = Buffer.alloc(stride * height);
+  // 过滤器作用在**字节**上，所以左邻偏移是"每像素几字节"，位深 <8 时就是 1
+  const bpp = indexed ? 1 : stride / width;
+  const scan = Buffer.alloc(stride * height);
   let prev = Buffer.alloc(stride);
   for (let y = 0; y < height; y++) {
     const filter = raw[y * (stride + 1)];
     const src = raw.subarray(y * (stride + 1) + 1, y * (stride + 1) + 1 + stride);
-    const cur = out.subarray(y * stride, (y + 1) * stride);
+    const cur = scan.subarray(y * stride, (y + 1) * stride);
     for (let i = 0; i < stride; i++) {
-      const a = i >= channels ? cur[i - channels] : 0; // 左
+      const a = i >= bpp ? cur[i - bpp] : 0; // 左
       const b = prev[i]; // 上
-      const c = i >= channels ? prev[i - channels] : 0; // 左上
+      const c = i >= bpp ? prev[i - bpp] : 0; // 左上
       let v = src[i];
       if (filter === 1) v += a;
       else if (filter === 2) v += b;
@@ -672,7 +704,32 @@ export function decodePng(buf) {
     }
     prev = cur;
   }
-  return { width, height, channels, data: out };
+
+  if (!indexed) {
+    return { width, height, channels: colorType === 6 ? 4 : 3, data: scan, colorType };
+  }
+
+  // 调色板 → RGB（有 tRNS 就 → RGBA）
+  const channels = paletteAlpha ? 4 : 3;
+  const out = Buffer.alloc(width * height * channels);
+  const perByte = 8 / bitDepth;
+  const mask = (1 << bitDepth) - 1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const byte = scan[y * stride + Math.floor(x / perByte)];
+      // 高位的像素在左（PNG 规定）
+      const shift = 8 - bitDepth * ((x % perByte) + 1);
+      const idx = (byte >> shift) & mask;
+      const p = idx * 3;
+      if (p + 2 >= palette.length) return null; // 索引越界 = 文件坏了，不猜
+      const o = (y * width + x) * channels;
+      out[o] = palette[p];
+      out[o + 1] = palette[p + 1];
+      out[o + 2] = palette[p + 2];
+      if (channels === 4) out[o + 3] = idx < paletteAlpha.length ? paletteAlpha[idx] : 255;
+    }
+  }
+  return { width, height, channels, data: out, colorType };
 }
 
 function paeth(a, b, c) {
