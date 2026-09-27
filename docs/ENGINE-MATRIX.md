@@ -120,17 +120,19 @@ EngineModel {
 | `python` | Python 运行时 | L3 插件的执行环境（独立 3.11 运行时，与系统 Python 隔离）。 | `PSF-2.0` | 宽松许可；注意随包分发的第三方 wheel 各自的许可证。 | 约 150 MB | 应用按需下载 | `image.remove-background`<br>`ai.upscale` | Windows / macOS / Linux | 否 |
 | `onnx-models` | ONNX 模型包 | 抠图 / 超分 / 分割用的模型权重。**不随安装包分发，首次使用时下载**。 | `各模型不同（见下表）` | 代码许可与权重许可是两回事。U2Net 为 Apache-2.0 可商用；MODNet 权重为学术许可；BiRefNet 权重受训练集条款限制。 | 约 180 MB（引擎级估算） | 应用按需下载 | `image.remove-background`<br>`ai.upscale` | Windows / macOS / Linux | 是 |
 | `tesseract` | Tesseract OCR | 离线 OCR。中文识别质量一般，但完全免费且无需联网。 | `Apache-2.0` | 语言数据包（tessdata）另有许可，chi_sim 为 Apache-2.0。 | 约 60 MB | 仅探测系统已安装 | `doc.ocr` | Windows / macOS / Linux | 否 |
+| `poppler` | Poppler（PDF 栅格化） | 把 PDF 按页渲染成图片，是「扫描件 PDF 做 OCR」的前置步骤。单独装它不会让 OCR 更好，但没有它 `doc.ocr` 就只能吃图片。 | `GPL-2.0-or-later` | **GPL**：应用只调用它的命令行工具（`pdftoppm`）并原样转发用户的文件，不链接它的代码、不随应用分发。介意 GPL 的话不要装 —— 装 Tesseract + 自己把 PDF 页面存成图片走的是同一条 OCR 路径。 | 约 42 MB（26.09.0 压缩包实测 41.7 MB，解压后 120.7 MB） | 仅探测系统已安装；Windows 应用按需下载（macOS/Linux 走系统包管理器） | `doc.ocr` | Windows / macOS / Linux | 是 |
 | `ai-provider` | AI 服务提供方 | OpenAI 兼容接口的大模型服务，用于插件生成、图像描述等。 | `依服务商条款` | API Key 默认只存在内存里（重启要重填）。打开「记住 API Key」后会以**明文**另存到数据目录下的 `ai-key.txt` —— 系统钥匙串尚未接入。它不会随插件或日志外泄。 | 约 0 MB（无本地二进制） | 远程服务无本地二进制 | `ai.describe`<br>`doc.ocr` | Windows / macOS / Linux | 否 |
 
 ### 2.1 总表读法
 
 - **核心引擎共 3 个**：`ffmpeg`、`pandoc`、`7zip`。它们在名称后标注了「（核心引擎）」。缺失时应用**仍然能启动**，但依赖它们的节点不可用：`ffmpeg` 缺失 → 5 个 `video.*` 与 2 个 `audio.*` 节点不可用；`pandoc` 缺失 → `doc.convert` 不可用，并且 `ebook.convert` 失去唯一的纯文档转换后端；`7zip` 缺失 → `archive.pack` / `archive.unpack` 不可用。
 - **只有 `System` 一种安装方式的引擎共 4 个**：`libreoffice`（约 420 MB）、`calibre`（约 180 MB）、`tesseract`（约 60 MB）、`7zip`（约 5 MB）。这四个都只探测系统安装、不提供应用内下载。
+  > 📌 **`poppler` 不在这一组**：它是 `Download` + `System` 双模式（Windows 有一键下载，macOS/Linux 走系统包管理器）。它的 `MANAGED_LAYOUT` 是 `Library/bin/pdftoppm` —— 那两层目录不能省，因为 pdftoppm 是按**自己所在目录的相对位置**去找 `../share/poppler` 的数据文件的（`engine-sources.json` 里把这条写进了 note）。
 - **只有 `Download` 一种安装方式的引擎共 2 个**：`python`、`onnx-models`。
   > ⚠️ **这句原来接着写的是「二者不探测系统安装」—— 那是错的（本条已修正）。** `install_modes` 只决定「应用能不能替你下载」，**不决定探测范围**：`probe()` 的顺序是 ① 托管目录 → ② PATH → ③ 平台常见路径，对所有引擎一视同仁。所以系统里已有的 Python 会被探到，状态是 `Detected` / `source: System`。这恰恰是 `force` 标志与「另外安装应用托管版本」按钮存在的原因 —— **"探测到可用"不等于"满足这个节点的要求"**，系统 Python 3.14 显示可用却跑不了 `onnxruntime`（见 3.2、3.6）。`onnx-models` 是唯一的例外，它没有二进制，走下面那条虚拟引擎判据。
 - **只有 `Remote` 一种安装方式的引擎共 1 个**：`ai-provider`。体积记为 0 MB，因为它没有本地二进制。
-- **需要用户确认许可证（`requiresLicenseAck: true`）的引擎共 5 个**：`ffmpeg`、`pandoc`、`libreoffice`、`calibre`、`onnx-models`。UI 必须在用户点击「下载」之前就把许可证讲清楚（这是 `engine.rs` 中 `licenses` 字段刻意保留的原因）。
-- **全部 11 个引擎都声明支持三平台**：Windows / macOS / Linux。当前目录中没有平台受限的引擎。
+- **需要用户确认许可证（`requiresLicenseAck: true`）的引擎共 6 个**：`ffmpeg`、`pandoc`、`libreoffice`、`calibre`、`onnx-models`、`poppler`。UI 必须在用户点击「下载」之前就把许可证讲清楚（这是 `engine.rs` 中 `licenses` 字段刻意保留的原因）。
+- **全部 12 个引擎都声明支持三平台**：Windows / macOS / Linux。当前目录中没有平台受限的引擎。
 
 ---
 
@@ -225,16 +227,27 @@ EngineModel {
 
 - **主页**：https://github.com/tesseract-ocr/tesseract
 - **提供的节点（1 个）**：`doc.ocr`。
-- **缺失时会发生什么**：`doc.ocr` 的 `requiresEngines` 现在是**空数组**，`optionalEngines` 是 `["tesseract", "ai-provider"]`。因此 `tesseract` 缺失**不会**让节点失效。
-  > ✅ **这两处声明以前都写错了，现已改正**：`requiresEngines` 曾经是 `["python"]` —— 而 Tesseract 那条路**根本不碰 Python**（它只是 `ctx.engine("tesseract")` 起个 OCR 子进程），于是"只装了 Tesseract"的机器（恰恰是它最该能用的场景）反而被 UI 标灰；`optionalEngines` 里当时也没有 `ai-provider`，尽管 `tesseract` 缺失时它靠的正是配好的 AI 服务。两个方向现在都对上了，由 6.2 的双向测试守着。
-  > ✅ **这个节点现在真的有执行器了**（`nodes.rs::doc_ocr`），它的真实策略是**两条路**，各自诚实：
+- **缺失时会发生什么**：`doc.ocr` 的 `requiresEngines` 现在是**空数组**，`optionalEngines` 是 `["tesseract", "ai-provider", "poppler"]`。因此 `tesseract` 缺失**不会**让节点失效。
+  > ✅ **这几处声明以前都写错过，现已改正**：`requiresEngines` 曾经是 `["python"]` —— 而 Tesseract 那条路**根本不碰 Python**（它只是 `ctx.engine("tesseract")` 起个 OCR 子进程），于是"只装了 Tesseract"的机器（恰恰是它最该能用的场景）反而被 UI 标灰；`optionalEngines` 里当时也没有 `ai-provider`，尽管 `tesseract` 缺失时它靠的正是配好的 AI 服务；后来又漏了 `poppler`（PDF 栅格化）。三处现在都对上了，由 6.2 的双向测试守着。
+  > ✅ **这个节点现在真的有执行器了**（`nodes.rs::doc_ocr`），它的真实策略是**两条识别路径 + 一个前置步骤**，各自诚实：
   > - `engine` 参数为 `auto`（默认）或 `tesseract`：**装了 tesseract 就直接用它** —— 完全离线、不花钱、快，中文质量一般；
   > - 没装 tesseract（且 `engine` 为 `auto` 或 `ai`）：**改用多模态模型**，日志会明确写一句「本机没有 Tesseract，改用多模态模型识别（图片会上传给 AI 服务商）」。这条路要联网、按 token 计费，输出里 `backend` 是 `ai-vision`；
-  > - 两条都不可用时报错会把**两个选项都列出来**（装 tesseract / 配 AI），而不是只说一句"OCR 引擎缺失"。
-  > - ⚠️ **PDF 输入被明确拒绝**：PDF 得先按页栅格化成图片，这条链路没做（需要 pdfium / poppler），所以节点直接报错而不是产出一堆乱码。输入端口现在只声明 `image/*` —— 它此前还挂着 `.pdf`，属于同一处漂移的另一面（端口在承诺一个必然被拒绝的格式）。
-  > - ✅ **参数枚举与执行器已经逐字对齐**：节点目录里 `engine` 的枚举是 `auto` / `tesseract` / `ai`，与执行器读的分支一字不差。
+  > - 两条都不可用时报错会把**两个选项都列出来**（装 tesseract / 配 AI），而不是只说一句"OCR 引擎缺失"；
+  > - **前置**：输入是 PDF 时先按页栅格化，需要 `poppler`（见 3.3.1）。
+  > - ⚠️ **参数枚举与执行器已经逐字对齐**：节点目录里 `engine` 的枚举是 `auto` / `tesseract` / `ai`，与执行器读的分支一字不差。
   >   （历史：这里曾写着 `paddleocr` —— 执行器**没有**那条分支，用户选中它只会静默走到 `auto` 的行为；节点描述里「装了 PaddleOCR 时质量更高」也只是一句没有实现的文案，现已随枚举一起删掉并改写为"Tesseract 或多模态模型"。**参数名对了但取值对不上，比参数名写错更难发现**：界面照常显示、执行器照常运行，只有结果不符合预期。）
 - **许可证与分发注意点**：`Apache-2.0`。语言数据包（tessdata）另有许可，`chi_sim` 为 Apache-2.0。`requiresLicenseAck: false`。仅探测系统安装，不提供应用内下载。
+
+#### Poppler（`poppler`）—— PDF 栅格化
+
+- **主页**：https://poppler.freedesktop.org/
+- **提供的节点（1 个）**：`doc.ocr`（**只影响它能不能吃 PDF**，不影响 OCR 本身的可用性）。
+- **缺失时会发生什么**：给 `doc.ocr` 喂 PDF 会被**明确拒绝**，detail 里写清"这是一份 PDF，要先按页栅格化"并给出两条出路（装 Poppler / 自己把页面存成图片）。**不会**把 PDF 直接丢给 tesseract —— 后者只会回一句用户看不懂的话；也**不会**只识别第一页然后"成功"。
+  > 📌 **这一项以前是永久拒绝的**：ROADMAP §7 第 3 项写着"PDF 输入现在被明确拒绝（要按页转图片，需要 pdfium / poppler）。报错文案清楚，但功能确实没有"。现在补上了 —— 见下面那条实测。
+- **实现**（`nodes.rs::rasterize_pdf`）：`pdftoppm -png -r <dpi> <pdf> <prefix>`，产物落在**本次任务的 workspace** 里（不是系统临时目录 —— 后者在授权范围之外，`libreoffice_to_pdf` 在这上面踩过）。逐页处理不是优化而是必需：一页 200 DPI 的 A4 约 1654×2339 像素、11 MB RGB 数据，100 页一次性读进内存是 GB 级。多页结果用 `===== 第 N 页 =====` 分隔后拼成一份文本 —— **没有分隔标记的话，两页的文字会首尾相接**，用户看不出边界在哪。
+  > **实测**（真机，`verify-platform.mjs`【15】）：一份手写的 3 页 PDF（420×200 点）在 `pdfDpi: 100` 下渲染出 584×278 像素（预期 583×278±2），假 AI 端点收到 **3 次**请求（逐页而不是整篇），最终文本里 3 个页码分隔标记与 3 次请求的序号都在。**DPI 这个旋钮是有证据的，不是写着好看的。**
+- **许可证与分发注意点**：`GPL-2.0-or-later`，强 copyleft。应用**只调用它的命令行工具**（`pdftoppm`）并原样转发用户的文件，不链接它的代码、不随应用分发。`requiresLicenseAck: true`。Windows 提供一键下载（oschwartz10612/poppler-windows 的版本固定 tag），macOS / Linux 走系统包管理器。
+  > ⚠️ **解压层级不能改**：包的布局是 `poppler-26.09.0/Library/bin/*.exe|*.dll` + `Library/share/poppler/…`，而 pdftoppm 是按**自己所在目录的相对位置**去找 `../share/poppler` 的数据文件的。`stripComponents` 必须是 **1**（剥掉 `poppler-26.09.0/` 那一层），`binSubdir` 与 `MANAGED_LAYOUT` 都写 `Library/bin/pdftoppm`。剥 2 层会把数据目录挪走，表现是渲染时报"找不到数据目录"。
 
 ### 3.4 压缩包域
 
@@ -388,7 +401,7 @@ EngineModel {
 | `image.enhance` | 图像增强（**无引擎依赖**） | — | 🚧 **没有降级链，只有纯 Rust 一条路**：该节点的实现既不问后端、也不调用 libvips | 与"降级"无关：无论装了什么引擎，`image.enhance` 都走内置卷积 |
 | `image.strip-metadata` | 清除元数据（**无引擎依赖**） | — | 🚧 **同上一行：只有纯 Rust 实现**（重新编码即不保留 EXIF/IPTC/XMP），`pick_image_backend()` 没有被它调用，`optionalEngines` 也已清空 | 与"降级"无关：装不装引擎，行为都一样；对部分容器格式的元数据块清理可能不完整 |
 | `ebook.convert` | 电子书格式转换（可选：`calibre`、`pandoc`） | `calibre`（可选，非必需） | `calibre` 缺失 → `pandoc`（**只覆盖 EPUB / DOCX / FB2 / HTML / Markdown / RTF / ODT / TXT，且认不出的输入输出格式会被执行器在调用前拦下**）；`pandoc` 也缺失 → 没有任何可用后端 | **MOBI / AZW3 / LIT / PDF 输出能力完全丧失**；只剩 pandoc 覆盖的那些格式。两个后端都缺失时，节点虽不被判为不可用，但执行器会返回明确的 `EngineMissing`（detail 里列出 Calibre 与 Pandoc 各自的覆盖范围与体积），**不会静默产出空文件**（见 3.5） |
-| `doc.ocr` | 图片 / 扫描件转文字（**无必需引擎**：`tesseract` 与 `ai-provider` 都是可选） | `tesseract`（首选：离线、免费、快）或 `ai-provider`（多模态模型，要联网计费） | 缺 `tesseract` → 改用多模态模型（日志里写明图片会上传给 AI 服务商）；两条都没有 → 运行期报错，detail **把两个选项都列出来** | 与"降级"无关：节点在 UI 上**始终可用**（可用性只看必需引擎），真正的失败发生在运行期。**PDF 输入被明确拒绝**（要按页栅格化，这条链路没做），输入端口也不再声明 `.pdf`。历史：`requiresEngines` 曾是 `["python"]`，于是"只装 Tesseract"的机器被无谓标灰 —— 那个方向已修（见 3.3） |
+| `doc.ocr` | 图片 / **扫描件 PDF** 转文字（**无必需引擎**：`tesseract`、`ai-provider`、`poppler` 全是可选） | 识别：`tesseract`（首选：离线、免费、快）或 `ai-provider`（多模态模型，要联网计费）；PDF 输入另需 `poppler` 栅格化 | 缺 `tesseract` → 改用多模态模型（日志里写明图片会上传给 AI 服务商）；缺 `poppler` → PDF 输入被明确拒绝并给出两条出路；识别引擎都没有 → 运行期报错，detail **把两个选项都列出来** | 与"降级"无关：节点在 UI 上**始终可用**（可用性只看必需引擎），真正的失败发生在运行期。输入端口声明 `image/*` 与 `.pdf`（**PDF 已经真的能做了**，见 3.3.1）。历史：`requiresEngines` 曾是 `["python"]`，于是"只装 Tesseract"的机器被无谓标灰 —— 那个方向已修（见 3.3） |
 | `flow.branch` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
 | `flow.set-var` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
 | `flow.log` | 无（流程编排原语） | 无 | 不适用——永远可用 | 无 |
@@ -572,7 +585,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
      - 参数也已对齐实现：现在是 `model` / `mode`（`alpha` | `color`）/ `background` / `threshold` / `feather`。**旧的 `alphaMatting` 参数已被删除** —— 它从登记那天起就没有任何实现，是个**假参数**：用户在 UI 里勾上它，什么都不会发生。
   3. **`ebook.convert`** —— 本轮补上，Calibre 优先、Pandoc 兜底，并且**在调用 pandoc 之前**按能力表把关（pandoc 对认不出的输出扩展名会打印一句 warning、写一个 HTML 出来、**退出码仍为 0**，见 3.5）。
   4. **`ai.describe`** —— 本轮补上，走视觉模型；图片会先按 `maxSide`（默认 1024）缩小并转成 **JPEG q85** 再内联发送（视觉计费随像素增长，见 `docs/SECURITY.md`）。
-  5. **`doc.ocr`** —— 本轮补上，tesseract 优先、否则用视觉模型；**PDF 输入明确拒绝**（要先按页栅格化，这条链路没做）。
+  5. **`doc.ocr`** —— 本轮补上，tesseract 优先、否则用视觉模型；**PDF 输入现在也能做了**（装了 Poppler 就按页栅格化，见 3.3.1；没装则明确报错并给出两条出路）。
   6. **`ai.upscale`** —— 本轮补上，Real-ESRGAN + 分块推理（`py/upscale.py`，256 px 分块、16 px 重叠、只取中心贴回），并配了两个**动态输入尺寸**的权重。
 - **防回归测试**：`unimplemented_list_matches_actual_dispatch` 会**遍历真实分发表**，对名单里的每个节点断言它**确实**还落在 `not_implemented` 上（反方向也查）。名字不同但守同一件事的还有一条 `unimplemented_list_matches_the_dispatch_table`。它们守的失误形态是"实现完了却忘了从名单里删掉"（或反方向）—— 那种错会让用户看到与真实行为相反的提示，而**这个项目已经因此踩过一次坑**。
 - **`not_implemented()` 里曾经有一条 `debug_assert!`，已经删掉**：它的意图是抓"实现了却还挂在名单上"，但那件事已由上一条测试完整覆盖（跑真实分发、双向校验），而这个断言带来两个真问题：

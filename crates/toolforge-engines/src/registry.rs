@@ -55,6 +55,10 @@ pub const ENGINE_BINARIES: &[(&str, &[&str])] = &[
     ("7zip", &["7z", "7za", "7zz"]),
     ("calibre", &["ebook-convert"]),
     ("tesseract", &["tesseract"]),
+    // PDF 栅格化（`doc.ocr` 吃 PDF 时用）。只认 pdftoppm —— 包里还有
+    // pdftotext / pdfimages 等一堆工具，但"另一个 pdf*.exe 存在"不等于
+    // "能把 PDF 渲染成图片"，探测错工具会让节点在真正调用时才失败。
+    ("poppler", &["pdftoppm"]),
     ("python", &["python", "python3", "python3.11"]),
 ];
 

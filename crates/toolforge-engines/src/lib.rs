@@ -48,6 +48,11 @@ pub const MANAGED_LAYOUT: &[(&str, &str)] = &[
     ("7zip", "7z"),
     ("calibre", "ebook-convert"),
     ("tesseract", "tesseract"),
+    // Poppler 的 Windows 包把可执行文件与 DLL 放在 `Library/bin`，数据文件在
+    // `Library/share/poppler` —— 而 pdftoppm 是按**自己所在目录的相对位置**
+    // 去找数据文件的。所以这一层的写法与 engine-sources.json 的
+    // `binSubdir` 必须一致，两者改一个就得改另一个（见那里的 note）。
+    ("poppler", "Library/bin/pdftoppm"),
     ("python", "python"),
 ];
 
@@ -63,6 +68,9 @@ pub fn version_args(engine_id: &str) -> &'static [&'static str] {
         "7zip" => &[],
         "calibre" => &["--version"],
         "tesseract" => &["--version"],
+        // pdftoppm 把版本打到 **stderr**（`pdftoppm version 26.09.0`），
+        // 而且 `-v` 之后就退出，不会真的去渲染。
+        "poppler" => &["-v"],
         "python" => &["--version"],
         _ => &["--version"],
     }

@@ -121,5 +121,15 @@
     "stripComponents": 1,
     "binSubdir": "bin",
     "note": "**未核对**（无 macOS 环境验证资产名与哈希）。Intel Mac 请把 aarch64 换成 x86_64。"
+  },
+  {
+    "id": "poppler",
+    "platform": "windows",
+    "url": "https://github.com/oschwartz10612/poppler-windows/releases/download/v26.09.0-0/Release-26.09.0-0.zip",
+    "sha256": "7a6f256a0ddf7536182246a5733331bf4677cbcc34f4663774947ad34556c8d0",
+    "archive": "zip",
+    "stripComponents": 1,
+    "binSubdir": "Library/bin",
+    "note": "**为什么 stripComponents 是 1 而不是 2**：包里是 `poppler-26.09.0/Library/bin/*.exe|*.dll` + `poppler-26.09.0/Library/share/poppler/…`，而 pdftoppm 是按**可执行文件相对位置**去找 `../share/poppler` 的数据文件的。剥 2 层会把数据目录挪到 `poppler/`，二进制就找不到它了 —— 表现是渲染时报 `Couldn't find data directory`。剥 1 层保留 `Library/` 这一层，相对关系原封不动，所以 binSubdir 写成 `Library/bin`（MANAGED_LAYOUT 用同一个相对路径）。② 41.7 MB / 43,709,956 字节，sha256 是自己下载后算的：上游只有 GitHub release，**没有**发布校验和文件。③ 上游 tag 是版本固定的（v26.09.0-0），资产名里也带版本号 —— 别改成别的滚动别名。④ macOS / Linux 上请用系统包管理器（brew install poppler / apt install poppler-utils），没有配下载源。"
   }
 ]

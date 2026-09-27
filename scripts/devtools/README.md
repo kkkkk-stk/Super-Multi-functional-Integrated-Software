@@ -41,8 +41,8 @@ node scripts/devtools/inspect.mjs   # 单页体检
 node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
-node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（89 项）
-node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（50 项）
+node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（101 项）
+node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（58 项）
 ```
 
 `pnpm dev:cdp` 与 `pnpm verify:app` 是上面两条命令的简写。
@@ -129,7 +129,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 ### `verify-platform.mjs` —— 平台能力（**这一轮新增的主要内容**）
 
 `verify.mjs` 验的是**安全属性**，这个脚本验的是**平台声称能做到的事是不是真的做到了**。
-十四节，89 项：
+十五节，101 项：
 
 | 节 | 验什么 | 它抓到过什么 |
 |---|---|---|
@@ -147,6 +147,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 | 【12】 | 中间档（ImageMagick）是否真的被挑中 | 三层降级图的中间那一格**从来没有单独测过**（本机没装 ImageMagick） |
 | 【13】 | 兜底档（纯 Rust `image` crate）是否真的接得住 | 这一档是"零依赖、始终可用"的那条，**装了引擎的机器上永远走不到它** —— 也正因如此它最难被验到（此前文档只敢写"三档里有两档有证据"） |
 | 【14】 | 视频 → GIF（`video-to-gif`）是否真的跑得通 | **两个叠加的缺陷**：`${output.frame}` 根本解析不了（`build_io` 只给 `dst` 分配路径）；修掉之后又撞上"中间产物在输出目录、下游却用输入作用域去读"→ 路径逃逸拦截。这个内置插件从写出来那天起就没跑通过，而插件列表里它一直是"正常"的 |
+| 【15】 | 扫描件 PDF 的 OCR（Poppler 栅格化 + 逐页识别） | —— 这一节验的是**新做的能力**：3 页 PDF → 假端点收到 **3 次**请求（逐页而不是整篇）、渲染尺寸符合 `pdfDpi` 的预期（584×278 vs 583×278±2）、多页结果之间有 `===== 第 N 页 =====` 分隔 |
 
 **【12】与【13】的做法值得单说**：降级链的**后两档只能靠"临时把更优先的引擎藏起来"才测得到** ——
 libvips 只要在，`image.convert` 就永远走它，中间档与兜底档根本没有机会被执行。
@@ -228,13 +229,20 @@ L1（内置流水线）天天在跑，而 **L2（Extism WASM）与 L3（Python �
 
 ```
 .tools/smoke/
-├── in*/                 生成的测试 PNG / epub
+├── in*/                 生成的测试 PNG / PDF / epub
 ├── out-e2e/             e2e 的产出
 ├── out-verify-*/        verify 的产出
 ├── out-rembg-verify/    抠图的产出（带 alpha 的 PNG）
 ├── out-upscale-verify/  超分的产出
+├── out-pdf-ocr/         PDF OCR 的产出（逐页识别拼起来的 txt）
 └── inspect.png          inspect 的截图
 ```
 
-测试过程会**真的安装再卸载**一个测试插件（`com.toolforge.test.evil-traversal`），
-并往真实数据目录的审计日志里写记录 —— 这是刻意的：审计本身也要被验证。
+测试过程会**真的安装再卸载**一批测试插件（`com.toolforge.test.evil-traversal`、
+`...net-probe`、`...env-probe`、`...pdf-ocr` 等），并往真实数据目录的审计日志里写记录 ——
+这是刻意的：审计本身也要被验证。
+
+> 📌 **测试素材为什么是"造"出来的**：PNG 由 `cdp.mjs::makePng` 按像素写出来，
+> PDF 由 `makePdf` 手写字节（xref 偏移真算，不是编的）。一份几十 KB 的二进制素材
+> 一旦入库，就再也没人知道它是怎么来的、里面是什么 —— 而"3 页、每页写着
+> PAGE ONE/TWO/THREE"是**读一眼就知道**的。

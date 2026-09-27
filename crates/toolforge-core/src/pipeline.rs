@@ -904,15 +904,18 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "doc.ocr".into(),
         label: "OCR 文字识别".into(),
-        description: "从图片里提取文字。两条路径：装了 **Tesseract** 就用它（离线、免费、快，中文质量一般）；\
-                      没装则用**多模态模型**（中文/手写/复杂版式明显更强，但图片会上传给 AI 服务商并计费）。\
-                      **只支持图片** —— PDF 要先按页转图，那条链路还没做，所以 PDF 输入会被明确拒绝。".into(),
+        description: "从图片或**扫描件 PDF** 里提取文字。三条路径：装了 **Tesseract** 就用它\
+                      （离线、免费、快，中文质量一般）；没装则用**多模态模型**\
+                      （中文/手写/复杂版式明显更强，但图片会上传给 AI 服务商并计费）。\
+                      PDF 输入需要先按页栅格化 —— 装了 **Poppler** 会自动做这一步，\
+                      没装则明确报错而不是给你一堆乱码。".into(),
         category: NodeCategory::Document,
-        // 两个引擎都是**可选的**：有其一即可。放成 requires 会让"只装了 Tesseract"
+        // 三个引擎都是**可选的**：有其一即可。放成 requires 会让"只装了 Tesseract"
         // 的机器上这个节点被无谓地标灰 —— 而那正是它最该能用的场景。
         requires_engines: vec![],
-        optional_engines: vec![engine("tesseract"), engine("ai-provider")],
-        inputs: vec![in_file("src", "图片", &["image/*"])],
+        // poppler 只影响"能不能吃 PDF"，不影响"能不能 OCR"，所以同样是可选。
+        optional_engines: vec![engine("tesseract"), engine("ai-provider"), engine("poppler")],
+        inputs: vec![in_file("src", "图片或扫描件 PDF", &["image/*", ".pdf"])],
         outputs: vec![port("text", "识别文本", PortType::Text, false)],
         params: vec![
             // 枚举必须与执行器读的分支**逐字一致**。这里原来写着 `paddleocr`，
@@ -921,6 +924,10 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
             // 界面照常显示、执行器照常运行，只有结果不符合预期。
             enum_param("engine", "识别引擎", "auto", &["auto", "tesseract", "ai"]),
             param("lang", "语言（Tesseract 用，如 chi_sim+eng）", ParamType::Text, Some("chi_sim+eng".into()), false),
+            // PDF 专用：栅格化精度。200 DPI 是"正文小字还能认出来"与"别把一页渲染成
+            // 几十 MB"之间的常见折中；扫描件字特别小时可以调到 300~400。
+            range_param("pdfDpi", "PDF 栅格化精度（DPI）", ParamType::Int, 200.0, 72.0, 600.0),
+            range_param("pdfMaxPages", "PDF 最多处理页数（0 = 不限）", ParamType::Int, 0.0, 0.0, 500.0),
         ],
     });
 

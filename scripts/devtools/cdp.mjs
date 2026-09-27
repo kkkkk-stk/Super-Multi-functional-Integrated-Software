@@ -290,6 +290,78 @@ export function writeInputPng(name, width, height, seed = 0) {
   return p;
 }
 
+/**
+ * 生成一份**最小但合法**的多页 PDF（每页一个大号字）。
+ *
+ * ## 为什么要自己造
+ *
+ * `doc.ocr` 的 PDF 路径要有 PDF 才能验，而这个仓库里没有、也不该有二进制测试素材：
+ * 一份几十 KB 的 PDF 一旦入库就再也没人知道它是怎么来的。
+ * 手写的好处是**它是什么、有几页、每页写的是什么都一目了然**。
+ *
+ * 用到的 PDF 语法只有必需的那几样：catalog / pages 树 / page / Helvetica 字体 /
+ * 一个画一行字的 content stream。**xref 表的字节偏移是真算出来的**，不是编的 ——
+ * 少数阅读器会容忍坏掉的 xref（poppler 就会尝试重建），但"能容忍"不该被当成
+ * "可以写错"：那样测出来的通过说明不了任何事。
+ *
+ * @param {string[]} pageTexts 每页一行文字（ASCII；非 ASCII 需要嵌入字体，这里不做）
+ * @param {[number, number]} size 页面尺寸（点，1/72 英寸）
+ */
+export function makePdf(pageTexts, size = [420, 200]) {
+  const enc = (s) => Buffer.from(s, 'latin1');
+  const objects = [];
+
+  // 1: catalog, 2: pages, 3: font —— 固定编号，页对象从 4 开始，每页两个（page + contents）
+  const pageIds = pageTexts.map((_, i) => 4 + i * 2);
+  const contentIds = pageTexts.map((_, i) => 5 + i * 2);
+
+  objects[1] = enc(`<< /Type /Catalog /Pages 2 0 R >>`);
+  objects[2] = enc(
+    `<< /Type /Pages /Kids [${pageIds.map((id) => `${id} 0 R`).join(' ')}] /Count ${pageTexts.length} >>`
+  );
+  objects[3] = enc(`<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>`);
+
+  pageTexts.forEach((text, i) => {
+    const content = `BT /F1 36 Tf 24 80 Td (${text.replace(/[()\\]/g, (c) => `\\${c}`)}) Tj ET`;
+    objects[pageIds[i]] = enc(
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${size[0]} ${size[1]}] ` +
+        `/Resources << /Font << /F1 3 0 R >> >> /Contents ${contentIds[i]} 0 R >>`
+    );
+    objects[contentIds[i]] = enc(
+      `<< /Length ${Buffer.byteLength(content, 'latin1')} >>\nstream\n${content}\nendstream`
+    );
+  });
+
+  const total = objects.length; // 最大编号 + 1（对象从 1 开始编号）
+  let out = Buffer.from('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n', 'latin1');
+  const offsets = [];
+  for (let i = 1; i < total; i++) {
+    offsets[i] = out.length;
+    out = Buffer.concat([out, enc(`${i} 0 obj\n`), objects[i], enc('\nendobj\n')]);
+  }
+  const xrefStart = out.length;
+
+  let xref = `xref\n0 ${total}\n0000000000 65535 f \n`;
+  for (let i = 1; i < total; i++) {
+    xref += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+  out = Buffer.concat([
+    out,
+    enc(xref),
+    enc(`trailer\n<< /Size ${total} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF\n`),
+  ]);
+  return out;
+}
+
+/** 把测试用 PDF 写到 `<repo>/.tools/smoke/in/`，返回路径 */
+export function writeInputPdf(name, pageTexts, size) {
+  const dir = join(SMOKE_DIR, 'in');
+  mkdirSync(dir, { recursive: true });
+  const p = join(dir, name);
+  writeFileSync(p, makePdf(pageTexts, size));
+  return p;
+}
+
 /** 准备一个干净的输出目录，返回路径 */
 export function prepareOutDir(name) {
   const dir = join(SMOKE_DIR, name);

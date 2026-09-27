@@ -43,7 +43,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
 
-import { Checker, connect, makePng, REPO_ROOT, sleep, webpInfo } from './cdp.mjs';
+import { Checker, connect, makePng, REPO_ROOT, sleep, webpInfo, writeInputPdf } from './cdp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -1076,6 +1076,228 @@ c.section('【14】视频 → GIF（video-to-gif 内置插件）是否真的跑�
         '模板引用没有留下未解析的痕迹',
         ''
       );
+    }
+  }
+}
+
+// ============================================================================
+// 【15】扫描件 PDF 的 OCR：Poppler 栅格化 → 逐页识别 → 拼回一份文本
+// ============================================================================
+//
+// 这是 OCR 最常见的真实场景，而它此前是**明确拒绝**的（"需要 pdfium / poppler"）。
+// 这一节验三件事：
+//   1. PDF 真的被**逐页**栅格化了（假端点收到 N 次请求，而不是 1 次）；
+//   2. `pdfDpi` 这个参数真的生效（从假端点读回的 JPEG 尺寸反推像素数）；
+//   3. 多页结果被拼成一份文本，而且**页与页之间有分隔** ——
+//      没有分隔的话，两页的文字会首尾相接，用户根本看不出边界在哪。
+//
+// 仍然是"自己这一侧"的验证：假模型不回真文字，所以验不了"认得准不准"。
+c.section('【15】扫描件 PDF 的 OCR（Poppler 栅格化 + 逐页识别）');
+{
+  const engines = await client.invoke('engines_probe_all');
+  const usable = (e) => e && (e.status.state === 'detected' || e.status.state === 'installed');
+  const pop = engines.find((e) => e.descriptor.id === 'poppler');
+  const tess = engines.find((e) => e.descriptor.id === 'tesseract');
+
+  if (!usable(pop)) {
+    c.note('跳过：本机没有 Poppler（到「引擎管理」一键安装，约 42 MB，GPL）');
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    c.note(`poppler: ${pop.status.path}`);
+    if (usable(tess)) {
+      c.note('（本机也装了 Tesseract；下面用 engine=ai 走假端点，才能断言请求形状）');
+    }
+
+    const MOCK_PORT = 18125;
+    const mock = spawn(process.execPath, [join(HERE, 'mock-openai.mjs'), String(MOCK_PORT)], {
+      stdio: 'ignore',
+      detached: false,
+    });
+    await sleep(600);
+    const mockBase = `http://127.0.0.1:${MOCK_PORT}`;
+
+    const PLUGIN_ID = 'com.toolforge.test.pdf-ocr';
+    let restore = null;
+    try {
+      const before = await client.invoke('settings_get');
+      restore = before.ai;
+      await client.invoke('settings_patch', {
+        patch: {
+          ai: {
+            provider: 'ollama',
+            baseUrl: `${mockBase}/v1`,
+            model: 'mock-vision',
+            temperature: 0.2,
+            persistApiKey: false,
+          },
+        },
+      });
+
+      // ---- 装一个只用 doc.ocr 的临时插件 ----
+      const pdfOcrYaml = `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${PLUGIN_ID}
+  name: PDF OCR 测试插件
+  version: 1.0.0
+  description: 仅用于验证 doc.ocr 的 PDF 栅格化链路。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 扫描件 PDF
+      type: file
+      accept: [".pdf"]
+      required: true
+  outputs:
+    - id: dst
+      label: 识别文本
+      type: file
+      accept: [".txt"]
+      required: false
+  params:
+    - id: pdfDpi
+      label: 栅格化 DPI
+      type: int
+      default: { kind: int, value: 100 }
+      min: 72
+      max: 600
+      step: 1
+      required: false
+runtime:
+  kind: pipeline
+  pipeline:
+    onError: fail
+    timeoutMs: 300000
+    steps:
+      - id: ocr
+        uses: doc.ocr
+        label: 识别扫描件
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+          engine: ai
+          pdfDpi: "\${params.pdfDpi}"
+`;
+      const existing = await client.invoke('plugins_get', { pluginId: PLUGIN_ID }).catch(() => null);
+      if (existing) {
+        await client.invoke('plugins_uninstall', { pluginId: PLUGIN_ID }).catch(() => {});
+      }
+      await client.invoke('plugins_install', {
+        req: {
+          source: { kind: 'manifest', yaml: pdfOcrYaml },
+          overwrite: true,
+          permissionsAcknowledged: true,
+          executableCodeAcknowledged: false,
+        },
+      });
+      await client.invoke('plugins_grant', {
+        req: {
+          pluginId: PLUGIN_ID,
+          granted: {
+            capabilities: [
+              { kind: 'fsRead', scope: { kind: 'input' } },
+              { kind: 'fsWrite', scope: { kind: 'output' } },
+            ],
+          },
+        },
+      });
+      await client.invoke('plugins_set_enabled', { pluginId: PLUGIN_ID, enabled: true });
+
+      // ---- 造一份 3 页的 PDF ----
+      //
+      // 手写而不是塞一份二进制素材进仓库：它是什么、有几页、每页写什么都一目了然。
+      // 页面尺寸 420x200 点；100 DPI 下应当是 583x278 像素。
+      const PAGES = ['PAGE ONE', 'PAGE TWO', 'PAGE THREE'];
+      const PDF_W = 420;
+      const PDF_H = 200;
+      const DPI = 100;
+      const src = writeInputPdf('scan-3pages.pdf', PAGES, [PDF_W, PDF_H]);
+      c.check(existsSync(src) && statSync(src).size > 400, '造出一份 3 页 PDF', `${statSync(src).size} 字节`);
+
+      await fetch(`${mockBase}/__reset`);
+      const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-pdf-ocr');
+      rmSync(outDir, { recursive: true, force: true });
+      mkdirSync(outDir, { recursive: true });
+
+      const sub = await client.invoke('plugins_run', {
+        req: {
+          pluginId: PLUGIN_ID,
+          inputs: { src: [src] },
+          params: { pdfDpi: { kind: 'int', value: DPI } },
+          outputDir: outDir,
+        },
+      });
+      const job = await client.waitJob(sub.jobId, 240, 1000);
+      console.log(`   任务状态: ${job.status}`);
+      if (job.error) console.log(`   错误: ${job.error.code} — ${job.error.message}`);
+
+      c.check(job.status === 'succeeded', 'PDF → OCR 任务成功', job.status);
+
+      // ★ 核心断言一：逐页栅格化
+      const rec = await (await fetch(`${mockBase}/__received`)).json();
+      console.log(`   假端点收到 ${rec.length} 次请求：${rec.map((r) => `${r.imageWidth}x${r.imageHeight}`).join(', ')}`);
+      c.check(rec.length === PAGES.length, `逐页识别：收到 ${PAGES.length} 次请求（不是 1 次）`, String(rec.length));
+      c.check(
+        rec.every((r) => r.imageCount === 1 && r.dataUrlOk === true),
+        '每次请求都带 1 张内联图片',
+        ''
+      );
+
+      // ★ 核心断言二：pdfDpi 真的生效（从渲染出的像素尺寸反推）
+      const expectedW = Math.round((PDF_W / 72) * DPI);
+      const expectedH = Math.round((PDF_H / 72) * DPI);
+      const near = (a, b) => typeof a === 'number' && Math.abs(a - b) <= 2;
+      c.check(
+        rec.every((r) => near(r.imageWidth, expectedW) && near(r.imageHeight, expectedH)),
+        `渲染尺寸符合 ${DPI} DPI 的预期（${expectedW}x${expectedH}±2）`,
+        rec.map((r) => `${r.imageWidth}x${r.imageHeight}`).join(', ')
+      );
+
+      // ★ 核心断言三：多页结果拼接且有分隔
+      const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+      console.log(`   产出：${produced.join(', ') || '(空)'}`);
+      const txt = produced.find((f) => f.toLowerCase().endsWith('.txt'));
+      c.check(!!txt, '产出了一个 .txt', txt ?? produced.join(', '));
+
+      if (txt) {
+        const body = readFileSync(join(outDir, txt), 'utf8');
+        for (let i = 1; i <= PAGES.length; i++) {
+          c.check(
+            body.includes(`===== 第 ${i} 页 =====`),
+            `输出里有第 ${i} 页的分隔标记`,
+            ''
+          );
+        }
+        // 每一页都真的发出去过一次：假端点的回复里带序号
+        for (let i = 1; i <= PAGES.length; i++) {
+          c.check(
+            body.includes(`第 ${i} 次请求`),
+            `第 ${i} 页识别结果进了最终文本（按页序）`,
+            ''
+          );
+        }
+        c.note(`识别文本 ${body.length} 字符`);
+      }
+    } catch (e) {
+      c.check(false, 'PDF OCR 测试抛错', String(e.message).split('\n')[0]);
+    } finally {
+      await client.invoke('plugins_set_enabled', { pluginId: PLUGIN_ID, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: PLUGIN_ID }).catch(() => {});
+      if (restore) {
+        await client.invoke('settings_patch', { patch: { ai: restore } }).catch(() => {});
+        c.note('已还原原来的 AI 设置');
+      }
+      try {
+        mock.kill();
+      } catch {
+        /* 已经退出了 */
+      }
     }
   }
 }

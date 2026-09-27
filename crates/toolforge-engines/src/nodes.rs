@@ -2619,9 +2619,9 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// `doc.ocr`：把图片里的文字读出来。
+/// `doc.ocr`：把图片（或扫描件 PDF）里的文字读出来。
 ///
-/// ## 两条路径，各自诚实
+/// ## 两条识别路径，各自诚实
 ///
 /// * **tesseract**（装了就用）：完全离线、不花钱、快。中文识别质量一般。
 /// * **多模态模型**（没装 tesseract 时的兜底）：中文/手写/复杂版式明显更强，
@@ -2630,39 +2630,126 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// 默认策略是 `auto`：有 tesseract 就走它，没有就用 AI；**两条都不可用时
 /// 报错会把两个选项都说清楚**，而不是只说一句"OCR 引擎缺失"。
 ///
-/// ⚠️ 这个节点**只处理图片**。PDF 要先转图片（`doc.to-pdf` 是反过来的），
-/// 那条链路没做 —— 所以这里对 PDF 输入明确报错，而不是产出一堆乱码。
+/// ## PDF 输入（扫描件）
+///
+/// 这是 OCR 最常见的真实场景，所以这里支持它：装了 **Poppler** 就用
+/// `pdftoppm` 按页栅格化成 PNG（放进本次任务的 workspace），再逐页识别，
+/// 结果之间用 `===== 第 N 页 =====` 分隔。
+///
+/// **没装 Poppler 时明确报错**，而不是"只识别第一页"或者"产出一堆乱码"：
+/// 扫描件 PDF 直接丢给 tesseract 会得到一句
+/// `Error: page 1 was not found` 之类的话，用户完全不知道缺什么。
+///
+/// 为什么要按页而不是整篇：一页 200 DPI 的 A4 大约是 1654×2339 像素，
+/// 一页就是 11 MB 的 RGB 数据。100 页的 PDF 一次性读进内存是 1 GB 级别 ——
+/// 逐页处理是唯一可行的做法，而且逐页之后超时/取消的粒度也更细。
 async fn doc_ocr(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> ToolforgeResult<NodeOutput> {
     let src = resolve_path(ctx, "input", arg(args, "src")?)?;
     let dst = resolve_path(ctx, "output", arg(args, "dst")?)?;
     let lang = ctx.param_str("lang", "chi_sim+eng");
     let engine = ctx.param_str("engine", "auto");
 
-    let ext = file_ext(&src);
-    if ext == "pdf" {
-        return Err(ToolforgeError::invalid(
-            "doc.ocr 目前只支持图片，不支持 PDF",
-        )
-        .with_detail(
-            "PDF 要先按页转成图片再识别，这条链路还没做（需要 pdfium / poppler）。\n\
-             可以先用「文档 → 转 PDF」的反向流程，或把 PDF 页面另存为图片后重试。"
-                .to_string(),
-        ));
-    }
+    // ---- 先把"要识别的图片"定下来：PDF 要按页栅格化 ----
+    let page_images: Vec<PathBuf> = if file_ext(&src) == "pdf" {
+        rasterize_pdf(ctx, &src).await?
+    } else {
+        vec![src.clone()]
+    };
+    let multi = page_images.len() > 1;
 
     let want_tesseract = engine == "auto" || engine == "tesseract";
     let want_ai = engine == "auto" || engine == "ai";
+    let use_tesseract = want_tesseract && ctx.engines.is_available("tesseract").await;
 
-    if want_tesseract && ctx.engines.is_available("tesseract").await {
+    if !use_tesseract && !want_ai {
+        return Err(ocr_engine_missing());
+    }
+
+    // 输出目录：多页时逐页写进临时文件再拼接
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let scratch = if page_images.len() > 1 {
+        let dir = resolve_path(ctx, "work", "ocr-pages")?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ToolforgeError::io(format!("创建临时目录失败：{e}")))?;
+        Some(dir)
+    } else {
+        None
+    };
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut backend = String::new();
+
+    for (idx, page) in page_images.iter().enumerate() {
+        ctx.job.check()?;
+        if multi {
+            ctx.job.info(format!(
+                "识别第 {}/{} 页（共 {} 页）",
+                idx + 1,
+                page_images.len(),
+                page_images.len()
+            ));
+        }
+        let text_out = match &scratch {
+            Some(dir) => dir.join(format!("page-{}.txt", idx + 1)),
+            None => dst.clone(),
+        };
+        let (text, used) = ocr_one_image(ctx, page, &text_out, &lang, use_tesseract).await?;
+        backend = used;
+        chunks.push(text);
+    }
+
+    // 多页之间加分隔标记：**没有它，两页的文字会首尾相接**，
+    // 用户根本看不出"这一段其实是下一页的开头"。
+    let text = if chunks.len() > 1 {
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("===== 第 {} 页 =====\n{}", i + 1, t.trim_end()))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    } else {
+        chunks.first().cloned().unwrap_or_default().trim().to_string()
+    };
+
+    if multi || backend == "ai-vision" {
+        std::fs::write(&dst, &text)
+            .map_err(|e| ToolforgeError::io(format!("写入 {} 失败：{e}", dst.display())))?;
+    }
+
+    let mut out = NodeOutput::file(dst.display().to_string())
+        .with_value("text", text)
+        .with_value("backend", backend)
+        .with_value("pages", page_images.len().to_string());
+    if file_ext(&src) == "pdf" {
+        out = out.with_value("rasterizer", "poppler/pdftoppm".to_string());
+    }
+    Ok(out)
+}
+
+/// 只识别一张图片。
+///
+/// * **tesseract**：写到 `text_out`（tesseract 会把结尾的 `.txt` 去掉再补回来，
+///   所以传进来的路径就是最终文件），再读回来 —— 这样多页与单页走的是同一条路；
+/// * **多模态模型**：把图缩小后发给 AI，返回的文本由调用方负责落盘。
+async fn ocr_one_image(
+    ctx: &mut NodeCtx,
+    img: &Path,
+    text_out: &Path,
+    lang: &str,
+    use_tesseract: bool,
+) -> ToolforgeResult<(String, String)> {
+    if use_tesseract {
         let tesseract = ctx.engine("tesseract").await?;
         ctx.job.info(format!("使用 Tesseract OCR（语言 {lang}）"));
         let r = exec(
             ExecOptions::new(tesseract)
                 .args([
-                    src.display().to_string(),
-                    dst.display().to_string(),
+                    img.display().to_string(),
+                    text_out.display().to_string(),
                     "-l".into(),
-                    lang.clone(),
+                    lang.to_string(),
                 ])
                 .cancel(ctx.job.cancel.clone())
                 .timeout(Duration::from_secs(600))
@@ -2672,50 +2759,146 @@ async fn doc_ocr(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> Toolforg
         if !r.success() {
             return Err(r.into_error("tesseract"));
         }
-        let text = std::fs::read_to_string(&dst).unwrap_or_default();
-        return Ok(NodeOutput::file(dst.display().to_string())
-            .with_value("text", text.trim().to_string())
-            .with_value("backend", "tesseract".to_string()));
+        let text = std::fs::read_to_string(text_out).unwrap_or_default();
+        return Ok((text, "tesseract".to_string()));
     }
 
-    if want_ai {
-        let ai = require_ai(ctx, "doc.ocr")?;
-        ctx.job.info("本机没有 Tesseract，改用多模态模型识别（图片会上传给 AI 服务商）");
-        let img = decode_image(&src)?;
-        let jpeg = shrink_for_vision(&img, 2048)?;
-        let prompt = format!(
-            "请逐字提取这张图片里的所有文字，保持原有的换行与段落顺序。\
-             只输出文字本身，不要任何解释、标题或 Markdown 代码围栏。\
-             如果图里没有文字，只回答「（无文字）」。识别语言提示：{lang}"
-        );
-        let req = toolforge_core::ai::VisionRequest {
-            prompt,
-            system: None,
-            jpeg,
-        };
-        let text = ai.complete_with_image(req).await?;
-        let text = text.trim().to_string();
+    let ai = require_ai(ctx, "doc.ocr")?;
+    let decoded = decode_image(img)?;
+    let jpeg = shrink_for_vision(&decoded, 2048)?;
+    let prompt = format!(
+        "请逐字提取这张图片里的所有文字，保持原有的换行与段落顺序。\
+         只输出文字本身，不要任何解释、标题或 Markdown 代码围栏。\
+         如果图里没有文字，只回答「（无文字）」。识别语言提示：{lang}"
+    );
+    let req = toolforge_core::ai::VisionRequest {
+        prompt,
+        system: None,
+        jpeg,
+    };
+    let text = ai.complete_with_image(req).await?;
+    Ok((text.trim().to_string(), "ai-vision".to_string()))
+}
 
-        // 输出是文本文件 —— 调用方多半想把它喂给下一步（`text.replace` 等）
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(&dst, &text)
-            .map_err(|e| ToolforgeError::io(format!("写入 {} 失败：{e}", dst.display())))?;
-
-        return Ok(NodeOutput::file(dst.display().to_string())
-            .with_value("text", text)
-            .with_value("backend", "ai-vision".to_string()));
-    }
-
-    Err(ToolforgeError::engine_missing("tesseract").with_detail(
+/// 没装 tesseract、又不能用 AI 时的报错（两个选项都要说清楚）。
+fn ocr_engine_missing() -> ToolforgeError {
+    ToolforgeError::engine_missing("tesseract").with_detail(
         "OCR 需要二者之一：\n\
          * **Tesseract**（离线、免费、快，中文质量一般）—— 到官网装好后回到「引擎管理」重新探测；\
          它目前只提供安装器，所以没有做一键下载\n\
          * **多模态模型**（中文/手写明显更强，但要联网并计费）\
          —— 到「设置 → AI」配好，或把本节点的 `engine` 参数设为 `ai`"
             .to_string(),
-    ))
+    )
+}
+
+/// 把 PDF 按页栅格化成 PNG，返回**按页序排好**的图片路径。
+///
+/// # 为什么必须按页
+///
+/// 一页 200 DPI 的 A4 大约 1654×2339 像素、11 MB 的 RGB 数据。100 页的 PDF
+/// 一次性读进内存是 GB 级别。逐页处理是唯一可行的做法，顺带让超时与取消的
+/// 粒度也更细（`job.check()` 在每页之间）。
+///
+/// # 没装 Poppler 时
+///
+/// **明确报错**，而不是把 PDF 直接丢给 tesseract —— 后者只会回一句
+/// 不知道在说什么的话，用户完全不知道缺什么。
+async fn rasterize_pdf(ctx: &mut NodeCtx, src: &Path) -> ToolforgeResult<Vec<PathBuf>> {
+    let dpi = ctx.param_i64("pdfDpi", 200).clamp(72, 600);
+    let max_pages = ctx.param_i64("pdfMaxPages", 0);
+
+    if !ctx.engines.is_available("poppler").await {
+        return Err(ToolforgeError::engine_missing("poppler").with_detail(
+            "这是一份 PDF —— 扫描件要先按页栅格化成图片才能识别。\n\
+             到「设置 → 引擎管理」装 **Poppler**（约 42 MB，GPL，只用它的命令行工具），\
+             或者自己把 PDF 页面另存为图片后再用本节点。\n\
+             装不了 Poppler 也可以走另一条路：`doc.to-pdf` 的反向流程做不了，\
+             但 pdf 里的文字如果是可选的（不是扫描件），`doc.extract-text` 之类的\
+             文本层提取不需要栅格化。"
+                .to_string(),
+        ));
+    }
+
+    let pdftoppm = ctx.engine("poppler").await?;
+    // 栅格化产物落在**本次任务的 workspace** 里，不是系统临时目录 ——
+    // 前者是宿主分配给这个任务的授权范围，后者在授权范围之外（这条在
+    // `libreoffice_to_pdf` 上踩过：回退到 `std::env::temp_dir()` 等于在授权
+    // 范围外偷偷写文件）。
+    let dir = resolve_path(ctx, "work", "ocr-pages")?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ToolforgeError::io(format!("创建临时目录失败：{e}")))?;
+
+    let prefix = dir.join("page");
+    let mut args = vec![
+        "-png".to_string(),
+        "-r".to_string(),
+        dpi.to_string(),
+        src.display().to_string(),
+        prefix.display().to_string(),
+    ];
+    if max_pages > 0 {
+        // `-l` 要放在**输入文件之前**才是合法的 pdftoppm 用法；
+        // 这里重新拼一遍，保持参数顺序正确。
+        args = vec![
+            "-png".to_string(),
+            "-r".to_string(),
+            dpi.to_string(),
+            "-l".to_string(),
+            max_pages.to_string(),
+            src.display().to_string(),
+            prefix.display().to_string(),
+        ];
+    }
+
+    ctx.job
+        .info(format!("用 Poppler 按 {dpi} DPI 栅格化 PDF（逐页渲染）"));
+
+    let r = exec(
+        ExecOptions::new(pdftoppm)
+            .args(args)
+            .cancel(ctx.job.cancel.clone())
+            .timeout(Duration::from_secs(1800))
+            .quiet(true),
+    )
+    .await?;
+    if !r.success() {
+        return Err(r.into_error("pdftoppm").with_detail(
+            "PDF 可能是加密的、损坏的，或者根本不是 PDF。\
+             加密的 PDF 需要先去掉密码保护。"
+                .to_string(),
+        ));
+    }
+
+    // pdftoppm 的输出名形如 `page-1.png` / `page-01.png`（补零位数取决于总页数）。
+    // **必须按数字排**，不能按字典序 —— 虽然补零之后两者恰好一致，
+    // 但那是实现细节，靠它排序迟早会错。
+    let mut pages: Vec<(u64, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .map_err(|e| ToolforgeError::io(format!("读取临时目录失败：{e}")))?
+        .flatten()
+    {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("png") {
+            continue;
+        }
+        let n = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.rsplit('-').next())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        pages.push((n, p));
+    }
+    pages.sort_by_key(|(n, _)| *n);
+
+    if pages.is_empty() {
+        return Err(ToolforgeError::runtime(
+            "PDF 栅格化后没有得到任何页面（0 页的 PDF？）",
+        ));
+    }
+
+    Ok(pages.into_iter().map(|(_, p)| p).collect())
 }
 
 async fn ebook_convert(

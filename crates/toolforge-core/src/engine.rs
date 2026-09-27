@@ -563,6 +563,26 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             models: vec![],
         },
         EngineDescriptor {
+            id: "poppler".into(),
+            name: "Poppler（PDF 栅格化）".into(),
+            description: "把 PDF 按页渲染成图片，是「扫描件 PDF 做 OCR」的前置步骤。单独装它不会让 OCR 更好，\
+                          但没有它，`doc.ocr` 就只能吃图片、吃不了 PDF。".into(),
+            homepage: "https://poppler.freedesktop.org/".into(),
+            license: "GPL-2.0-or-later".into(),
+            license_note: "**GPL**：本应用只调用它的命令行工具（`pdftoppm`）并原样转发用户的文件，\
+                           不链接它的代码、不随应用分发。介意 GPL 的话不要装它 —— 装 Tesseract + 自己把\
+                           PDF 页面存成图片，走的是同一条 OCR 路径。".into(),
+            approx_size_mb: 42,
+            // 它不是"核心"：没有它应用照常工作，只是 doc.ocr 吃不了 PDF
+            core: false,
+            provides: vec!["doc.ocr".into()],
+            platforms: all_platforms(),
+            // Windows 有一键下载；macOS / Linux 走系统包管理（brew install poppler / apt install poppler-utils）
+            install_modes: vec![EngineInstallMode::Download, EngineInstallMode::System],
+            requires_license_ack: true,
+            models: vec![],
+        },
+        EngineDescriptor {
             id: "ai-provider".into(),
             name: "AI 服务提供方".into(),
             description: "OpenAI 兼容接口的大模型服务，用于插件生成、图像描述等。".into(),

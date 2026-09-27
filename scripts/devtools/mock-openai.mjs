@@ -28,6 +28,39 @@ const port = Number(process.argv[2] ?? 18123);
 /** 记录收到的请求摘要，供 /__received 查询 */
 const received = [];
 
+/**
+ * 从 JPEG 字节里读出宽高（扫 SOF 段）。
+ *
+ * 为什么这个 mock 要在意图片尺寸：`doc.ocr` 的 PDF 栅格化有一个 `pdfDpi`
+ * 参数，而"DPI 到底有没有生效"只能从**渲染出来的像素尺寸**看出来 ——
+ * A4 在 200 DPI 下是 1654×2339，在 100 DPI 下是 827×1169。
+ * 假端点拿到的是 base64 图片，顺手读一下 SOF 就能把这件事钉死，
+ * 否则那个参数就是个没人验过的旋钮。
+ */
+function jpegSize(buf) {
+  if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return null;
+  let i = 2;
+  while (i + 9 < buf.length) {
+    if (buf[i] !== 0xff) {
+      i++;
+      continue;
+    }
+    const marker = buf[i + 1];
+    // 无长度字段的标记：SOI / TEM / RSTn
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      i += 2;
+      continue;
+    }
+    const len = buf.readUInt16BE(i + 2);
+    // SOF0..SOF15，但要排掉 DHT(c4) / JPG(c8) / DAC(cc)
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return { height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
+    }
+    i += 2 + len;
+  }
+  return null;
+}
+
 const server = createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
@@ -79,8 +112,21 @@ const server = createServer((req, res) => {
     const dataUrlOk = firstUrl.startsWith('data:image/');
     const base64Len = dataUrlOk ? firstUrl.length - firstUrl.indexOf(',') - 1 : 0;
 
+    // 这一次是第几次请求（从 1 开始）。多页 OCR 靠它确认"每一页都单独发了一次"。
+    const seq = received.length + 1;
+
+    let size = null;
+    if (dataUrlOk) {
+      try {
+        size = jpegSize(Buffer.from(firstUrl.slice(firstUrl.indexOf(',') + 1), 'base64'));
+      } catch {
+        size = null;
+      }
+    }
+
     const summary = {
       at: new Date().toISOString(),
+      seq,
       model: parsed.model,
       messageCount: messages.length,
       hasSystem: messages.some((m) => m.role === 'system'),
@@ -89,19 +135,26 @@ const server = createServer((req, res) => {
       dataUrlOk,
       imageMime: dataUrlOk ? firstUrl.slice(5, firstUrl.indexOf(';')) : null,
       imageBase64Len: base64Len,
+      imageWidth: size?.width ?? null,
+      imageHeight: size?.height ?? null,
       temperature: parsed.temperature,
       stream: parsed.stream,
     };
     received.push(summary);
     console.log(
-      `[mock-openai] model=${summary.model} images=${summary.imageCount} ` +
-        `dataUrl=${summary.dataUrlOk} base64=${summary.imageBase64Len}B prompt=${JSON.stringify(summary.prompt).slice(0, 60)}`
+      `[mock-openai] #${seq} model=${summary.model} images=${summary.imageCount} ` +
+        `size=${summary.imageWidth}x${summary.imageHeight} ` +
+        `dataUrl=${summary.dataUrlOk} base64=${summary.imageBase64Len}B ` +
+        `prompt=${JSON.stringify(summary.prompt).slice(0, 40)}`
     );
 
     // 没图就当纯文本请求处理（文档转换等场景）——但本 mock 只服务视觉验证，
     // 所以明确回一个能看出是"没收到图"的回答，而不是编一个像样的描述。
+    // 回复里带上**序号与尺寸**：多页 OCR 的验证靠它们确认"每页各发了一次、
+    // 而且是按请求的 DPI 渲染的"。
     const reply = dataUrlOk
-      ? `一只红色的圆形物体（收到 ${imageParts.length} 张图，首图 ${Math.round(base64Len / 1024)} KB base64）`
+      ? `一只红色的圆形物体（第 ${seq} 次请求，收到 ${imageParts.length} 张图，` +
+        `首图 ${size ? `${size.width}x${size.height}` : '尺寸未知'} ${Math.round(base64Len / 1024)} KB base64）`
       : '（mock 没有收到图片）';
 
     res.writeHead(200, { 'content-type': 'application/json' });
