@@ -27,6 +27,7 @@
     "engines:list": "node scripts/enginectl.mjs list",
     "engines:install": "node scripts/enginectl.mjs install",
     "engines:verify": "node scripts/enginectl.mjs verify",
+    "engines:clean": "node scripts/enginectl.mjs clean",
     "icons": "node scripts/gen-icon.mjs && pnpm --filter @toolforge/desktop tauri icon ./assets/icon-source.png",
     "ensure-dist": "node scripts/ensure-dist.mjs",
     "check:encodings": "node scripts/check-encodings.mjs",

@@ -1192,6 +1192,136 @@ async function cmdVerify(opts) {
 }
 
 // ---------------------------------------------------------------------------
+// clean
+// ---------------------------------------------------------------------------
+
+/**
+ * 清理**已经证明坏掉**的权重文件，以及本脚本自己的下载临时文件。
+ *
+ * # 为什么默认是"只看不删"
+ *
+ * 这个子命令会**删用户的文件**。§3.10（「保留源文件」）与 §3.15（一次事故）都说明了
+ * 同一件事：删文件这件事，**默认值必须在安全的那一侧**。所以：
+ *
+ * * 不带 `--apply` 时**什么都不删**，只打印"如果加 --apply 会删哪些"；
+ * * 带 `--apply` 时，一个文件要被删掉必须**同时**满足两条：
+ *   ① 体积可疑（0 字节 / 不足标称体积 60%）—— 与 `verify` / Rust 侧同一条判据；
+ *   ② **算过哈希且与预置值不符**（0 字节与截断文件必然不符）。
+ *   只凭体积可疑**不删**：`approx_size_mb` 是"约"，误删一个完好权重比留着一个坏文件糟得多。
+ * * 没有预置哈希的权重**一律不删**（无法证明它坏了），只报告。
+ *
+ * 另外会清 `<仓库>/engines/.downloads/` 里 `install` 留下的压缩包 —— 那是本脚本自己的
+ * 临时目录，不是用户数据（`install` 默认下完即删，`--keep-archive` 才会留下）。
+ */
+async function cmdClean(opts) {
+  const catalog = await loadEngineCatalog();
+  const dataDir = opts.dataDir ?? defaultDataDir();
+  const models = catalog.flatMap((e) => (e.models ?? []).map((m) => ({ ...m, engineId: e.id })));
+
+  const candidates = []; // 权重
+  const skipped = []; // 体积可疑但证明不了坏的
+
+  for (const m of models) {
+    const file = path.join(dataDir, 'models', m.id, m.fileName);
+    if (!existsSync(file)) continue;
+    const size = statSync(file).size;
+    if (sizeLooksComplete(size, m.approxSizeMb)) continue;
+
+    const expected = m.sha256 ? String(m.sha256).replace(/^sha256:/i, '').toLowerCase() : null;
+    if (!expected) {
+      skipped.push({ id: m.id, path: file, bytes: size, why: '没有预置 SHA-256，无法证明它坏了' });
+      continue;
+    }
+    const { sha256 } = await hashFile(file);
+    if (sha256 === expected) {
+      skipped.push({
+        id: m.id,
+        path: file,
+        bytes: size,
+        why: `体积只有标称的 ${Math.round((size / ((m.approxSizeMb || 1) * 1024 * 1024)) * 100)}%，但哈希与预置值**一致**（说明标称体积不准），不删`,
+      });
+      continue;
+    }
+    candidates.push({
+      id: m.id,
+      path: file,
+      bytes: size,
+      why: size === 0 ? '文件是 0 字节' : '明显不完整',
+      expected,
+      actual: sha256,
+    });
+  }
+
+  // 本脚本自己的下载临时文件
+  const archives = existsSync(DOWNLOAD_DIR)
+    ? readdirSync(DOWNLOAD_DIR).map((n) => path.join(DOWNLOAD_DIR, n))
+    : [];
+
+  info('enginectl clean —— 只清**已经证明坏掉**的权重，以及本脚本自己的下载临时文件\n');
+  info(`  数据目录      ${dataDir}`);
+  info(`  下载临时目录  ${path.relative(ROOT, DOWNLOAD_DIR)}（${archives.length} 个文件）\n`);
+
+  if (candidates.length === 0 && archives.length === 0) {
+    info('✓ 没有需要清理的东西。');
+    return;
+  }
+
+  if (candidates.length > 0) {
+    printTable(
+      ['权重', '体积', '坏在哪', '预置哈希', '实际哈希'],
+      candidates.map((c) => [
+        c.id,
+        humanSize(c.bytes),
+        c.why,
+        c.expected.slice(0, 12),
+        c.actual.slice(0, 12),
+      ]),
+    );
+  }
+  if (archives.length > 0) {
+    info('\n下载临时文件：');
+    for (const a of archives) {
+      info(`  ${path.relative(ROOT, a)}  ${humanSize(statSync(a).size)}`);
+    }
+  }
+
+  if (skipped.length > 0) {
+    info('\n以下文件**体积可疑但证明不了坏**，因此不会删（请自行判断）：');
+    for (const s of skipped) info(`  ${s.id}  ${humanSize(s.bytes)}  —— ${s.why}`);
+  }
+
+  if (!opts.apply) {
+    info(
+      `\n以上**一个都没删**（默认只看不动）。要真的删掉它们：\n` +
+        `  node scripts/enginectl.mjs clean --apply\n` +
+        `删掉之后，下次用到该权重时会重新下载并做 SHA-256 校验。`,
+    );
+    return;
+  }
+
+  let removed = 0;
+  for (const c of candidates) {
+    try {
+      await rm(c.path, { force: true });
+      removed += 1;
+      info(`  已删除 ${c.path}`);
+    } catch (e) {
+      warn(`删除失败 ${c.path}：${e.message}`);
+    }
+  }
+  for (const a of archives) {
+    try {
+      await rm(a, { force: true });
+      removed += 1;
+      info(`  已删除 ${path.relative(ROOT, a)}`);
+    } catch (e) {
+      warn(`删除失败 ${a}：${e.message}`);
+    }
+  }
+  info(`\n共删除 ${removed} 个。下次用到这些权重时会重新下载（并做 SHA-256 校验）。`);
+}
+
+// ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
 
@@ -1202,6 +1332,7 @@ const USAGE = `enginectl —— ToolForge 引擎开发辅助脚本
   node scripts/enginectl.mjs probe [id]               探测引擎是否已安装（默认全部）
   node scripts/enginectl.mjs install <id> [选项]      下载并解压到 engines/<id>/
   node scripts/enginectl.mjs verify [选项]            校验本地权重与预置哈希是否一致
+  node scripts/enginectl.mjs clean [选项]             清理**已证明坏掉**的权重与下载临时文件
 
 install 选项：
   --keep-archive           保留下载的压缩包（默认下完即删）
@@ -1211,6 +1342,10 @@ install 选项：
 verify 选项：
   --json                   输出机器可读的 JSON（便于 CI 断言）
   --data-dir <路径>        覆盖应用数据目录（默认按平台推断，与 Rust 侧 AppPaths 一致）
+
+clean 选项：
+  --apply                  **真的删**（默认只看不动：只打印"会删哪些"）
+  --data-dir <路径>        同 verify
 
 退出码：0 成功 / 1 失败（含网络不可用、权重哈希不一致、权重文件为 0 字节）。
 `;
@@ -1247,6 +1382,15 @@ async function main() {
       await cmdVerify({ json: argv.includes('--json'), dataDir });
       break;
     }
+    case 'clean': {
+      const idx = argv.indexOf('--data-dir');
+      const dataDir = idx >= 0 ? argv[idx + 1] : null;
+      if (idx >= 0 && (!dataDir || dataDir.startsWith('-'))) {
+        fail('--data-dir 需要一个路径', `收到的是：${argv[idx + 1] ?? '(空)'}`);
+      }
+      await cmdClean({ apply: argv.includes('--apply'), dataDir });
+      break;
+    }
     case 'install': {
       const positional = argv.slice(1).filter((a) => !a.startsWith('-'));
       // --idle-timeout <秒>：网络慢或走代理时放宽
@@ -1264,7 +1408,10 @@ async function main() {
       break;
     }
     default:
-      fail(`未知子命令：${cmd}`, '可用子命令：list / probe / install / verify。用 --help 看完整用法。');
+      fail(
+        `未知子命令：${cmd}`,
+        '可用子命令：list / probe / install / verify / clean。用 --help 看完整用法。',
+      );
   }
 }
 

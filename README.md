@@ -371,7 +371,7 @@ Cargo 走系统证书库（Windows 上是 schannel），通常无需额外配置
 │
 ├── scripts/                     开发辅助脚本（非运行时依赖）
 │   ├── devtools/                ★ 真机验证（CDP 驱动真实 WebView）
-│   ├── enginectl.mjs            引擎目录 / 探测 / 按需下载 / **权重完整性校验**
+│   ├── enginectl.mjs            引擎目录 / 探测 / 按需下载 / 权重校验 / 清理（清理默认只看不删）
 │   ├── check-encodings.mjs      Windows 脚本编码守卫（`.ps1` 必须带 UTF-8 BOM）
 │   ├── gen-icon.mjs             生成图标（仓库不放二进制素材）
 │   └── ensure-dist.mjs          保证 cargo check 需要的前端产物存在
