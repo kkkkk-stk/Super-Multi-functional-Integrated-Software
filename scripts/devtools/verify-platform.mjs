@@ -2160,6 +2160,311 @@ runtime:
   }
 }
 
+// ============================================================================
+// 【18】压缩包：7-Zip 真的打包出**标准归档**、也真的解得开
+// ============================================================================
+//
+// 为什么这一节要在**运行时**验，而不是靠单元测试：
+//
+// * `7zip` 是三个核心引擎之一，而它的下载源长期是空的（文档里的理由是"官方只发安装器
+//   /需要先有 7-Zip 才能解压的 .7z"——**那个理由已经被证伪**，Windows 自带的 bsdtar
+//   读得懂 7z）。也就是说这条链路**从来没有在本机跑通过**，直到本轮。
+// * 它踩的两个坑都是"单元测试看不见、真跑才现形"的类型：
+//   ① 解压出来的可执行文件被**认成了 `7z.dll`**（旧实现比较文件主干名，`7z.dll`
+//      与 `7z.exe` 的主干都是 `7z`，而目录里 `7z.dll` 排在前面）—— 引擎显示"已安装"、
+//      路径却是个 DLL；② `MANAGED_LAYOUT` 写的是 `7z`，而 Windows 的 MSI 布局把文件
+//      放在 `Files/7-Zip/` 下 —— 探测靠**按文件名递归回退**才找得到。
+//   所以这里第 ① 条检查就是直接盯着"解析出来的路径必须是一个真的可执行文件"。
+// * 还有一条**独立实现**的交叉验证：7-Zip 打包出来的 zip 交给**系统 tar**（libarchive）
+//   去解。自己打的包自己解，两边同时错还能对上；换一套实现解，才算证明了
+//   "产出的是标准 zip 而不是只有 7-Zip 认得的私有格式"。
+c.section('【18】压缩包节点（7-Zip 打包 / 解压）是否真的产出标准归档');
+{
+  const engines = await client.invoke('engines_probe_all');
+  const z = engines.find((e) => e.descriptor.id === '7zip');
+  const zPath = z?.status?.path;
+  const zUsable = Boolean(z && (z.status.state === 'detected' || z.status.state === 'installed'));
+
+  if (!zUsable) {
+    c.note('跳过：本机没有可用的 7-Zip（到「引擎管理」一键安装；三平台都有下载源，Windows 约 2 MB）');
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    console.log(`   7-Zip: ${zPath}`);
+    console.log(`   版本: ${z.status.version ?? '(未知)'}`);
+
+    // ---- 检查 ①：解析出来的必须是**真的可执行文件**，不能是同名的 DLL ----
+    const base = (zPath ?? '').split(/[\\/]/).pop() ?? '';
+    c.check(
+      existsSync(zPath) && /^(7z|7za|7zz)(\.exe)?$/i.test(base),
+      '① 引擎路径指向真正的 7-Zip 可执行文件（不是 `7z.dll` 这类同名数据文件）',
+      `${zPath}（文件名 ${base}）`
+    );
+
+    const work = join(REPO_ROOT, '.tools', 'smoke', 'out-archive');
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+
+    // 造一个内容**可校验**的输入：随机字节 + 一个文本文件
+    // （随机字节是刻意的：全 0 或重复内容会让"解压后长度对了但内容是别的"这件事测不出来）
+    const payload = Buffer.concat([
+      Buffer.from('toolforge archive roundtrip\n', 'utf8'),
+      Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 37 + 11) % 251)),
+    ]);
+    const srcFile = join(work, 'payload.bin');
+    writeFileSync(srcFile, payload);
+
+    c.section('【18a】`archive.pack` 打包 → 用**系统 tar** 独立解开比对');
+    const PACK_ID = 'com.toolforge.test.archive-pack';
+    const packDir = join(work, 'pack-plugin');
+    mkdirSync(packDir, { recursive: true });
+    writeFileSync(
+      join(packDir, 'plugin.yaml'),
+      `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${PACK_ID}
+  name: 压缩测试插件
+  version: 1.0.0
+  description: 仅用于验证 archive.pack。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 待压缩文件
+      type: files
+      required: true
+  outputs:
+    - id: dst
+      label: 压缩包
+      type: file
+      accept: [".zip"]
+      required: true
+  params: []
+runtime:
+  kind: pipeline
+  pipeline:
+    onError: fail
+    timeoutMs: 300000
+    steps:
+      - id: zip
+        uses: archive.pack
+        label: 打包
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+          format: zip
+          level: "5"
+`,
+      'utf8'
+    );
+
+    /** 装插件 → 授权 → 启用（与【17】同一套流程，这里抽成函数免得抄三遍） */
+    const installTestPlugin = async (id, dir) => {
+      const existing = await client.invoke('plugins_get', { pluginId: id }).catch(() => null);
+      if (existing) {
+        await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+        await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+      }
+      await client.invoke('plugins_install', {
+        req: {
+          source: { kind: 'directory', path: dir },
+          overwrite: true,
+          permissionsAcknowledged: true,
+          executableCodeAcknowledged: false,
+        },
+      });
+      await client.invoke('plugins_grant', {
+        req: {
+          pluginId: id,
+          granted: {
+            capabilities: [
+              { kind: 'fsRead', scope: { kind: 'input' } },
+              { kind: 'fsWrite', scope: { kind: 'output' } },
+            ],
+          },
+        },
+      });
+      await client.invoke('plugins_set_enabled', { pluginId: id, enabled: true });
+    };
+    const removeTestPlugin = async (id) => {
+      await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+    };
+
+    try {
+      await installTestPlugin(PACK_ID, packDir);
+      const outDir = join(work, 'pack-out');
+      mkdirSync(outDir, { recursive: true });
+      const sub = await client.invoke('plugins_run', {
+        req: { pluginId: PACK_ID, inputs: { src: [srcFile] }, params: {}, outputDir: outDir },
+      });
+      const job = await client.waitJob(sub.jobId, 180, 1000);
+      console.log(`   打包任务: ${job.status}`);
+      if (job.error) console.log(`   错误: ${job.error.code} — ${job.error.message}`);
+      c.check(job.status === 'succeeded', 'archive.pack 成功', job.status);
+
+      const zipPath = (job.outputs ?? [])[0];
+      const magicOk =
+        Boolean(zipPath) &&
+        existsSync(zipPath) &&
+        readFileSync(zipPath).subarray(0, 4).toString('latin1') === 'PK\u0003\u0004';
+      c.check(
+        magicOk,
+        '产出是标准 zip（`PK\\x03\\x04` 文件头）',
+        `${zipPath ?? '(无产出)'}`
+      );
+
+      // ★ 独立实现交叉验证：用系统 tar（libarchive / GNU tar）解开 7-Zip 打的包
+      if (zipPath && existsSync(zipPath)) {
+        const unzipDir = join(work, 'tar-unzip');
+        mkdirSync(unzipDir, { recursive: true });
+        let tarOk = false;
+        let tarErr = '';
+        try {
+          execFileSync('tar', ['-xf', zipPath, '-C', unzipDir], { windowsHide: true });
+          tarOk = true;
+        } catch (e) {
+          tarErr = String(e.stderr ?? e.message).slice(0, 200);
+        }
+        c.check(tarOk, '系统 tar 能解开它（产出不是 7-Zip 私有格式）', tarErr);
+        const back = join(unzipDir, 'payload.bin');
+        const same =
+          tarOk && existsSync(back) && Buffer.compare(readFileSync(back), payload) === 0;
+        c.check(
+          same,
+          '独立实现解出来的字节与原始输入**逐字节相同**',
+          tarOk ? `${existsSync(back) ? readFileSync(back).length : 0} / ${payload.length} 字节` : tarErr
+        );
+
+        // ---- 【18b】再用我们自己的 archive.unpack 解一遍 ----
+        c.section('【18b】`archive.unpack` 解压 → 内容逐字节比对');
+        const UNPACK_ID = 'com.toolforge.test.archive-unpack';
+        const unpackDir = join(work, 'unpack-plugin');
+        mkdirSync(unpackDir, { recursive: true });
+        writeFileSync(
+          join(unpackDir, 'plugin.yaml'),
+          `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${UNPACK_ID}
+  name: 解压测试插件
+  version: 1.0.0
+  description: 仅用于验证 archive.unpack。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 压缩包
+      type: file
+      required: true
+  outputs:
+    - id: dst
+      label: 解压目录
+      type: directory
+      required: true
+  params: []
+runtime:
+  kind: pipeline
+  pipeline:
+    onError: fail
+    timeoutMs: 300000
+    steps:
+      - id: unpack
+        uses: archive.unpack
+        label: 解压
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+`,
+          'utf8'
+        );
+        await installTestPlugin(UNPACK_ID, unpackDir);
+        const uOut = join(work, 'unpack-out');
+        mkdirSync(uOut, { recursive: true });
+        const uSub = await client.invoke('plugins_run', {
+          req: { pluginId: UNPACK_ID, inputs: { src: [zipPath] }, params: {}, outputDir: uOut },
+        });
+        const uJob = await client.waitJob(uSub.jobId, 180, 1000);
+        console.log(`   解压任务: ${uJob.status}`);
+        if (uJob.error) console.log(`   错误: ${uJob.error.code} — ${uJob.error.message}`);
+        c.check(uJob.status === 'succeeded', 'archive.unpack 成功', uJob.status);
+
+        // 解压产物可能落在 output.dst 目录里，也可能被换名 —— 都在输出目录下递归找
+        const findByName = (dir, name) => {
+          const stack = [dir];
+          while (stack.length) {
+            const cur = stack.pop();
+            let entries = [];
+            try {
+              entries = readdirSync(cur, { withFileTypes: true });
+            } catch {
+              continue;
+            }
+            for (const e of entries) {
+              const p = join(cur, e.name);
+              if (e.isDirectory()) stack.push(p);
+              else if (e.name === name) return p;
+            }
+          }
+          return null;
+        };
+        const found = findByName(uOut, 'payload.bin');
+        c.check(Boolean(found), '解压目录里找得到 payload.bin', String(found));
+        c.check(
+          Boolean(found) && Buffer.compare(readFileSync(found), payload) === 0,
+          '解压出来的字节与原始输入**逐字节相同**（打包/解压闭环）',
+          found ? `${readFileSync(found).length} / ${payload.length} 字节` : '(未找到)'
+        );
+
+        // ---- 【18c】反证：不是压缩包时必须**失败**，不能假装成功 ----
+        c.section('【18c】反证：把普通文本当压缩包喂进去，必须报错而不是"成功"');
+        const notArchive = join(work, 'not-an-archive.zip');
+        writeFileSync(notArchive, '这不是压缩包，只是一段文本\n', 'utf8');
+        const badSub = await client.invoke('plugins_run', {
+          req: {
+            pluginId: UNPACK_ID,
+            inputs: { src: [notArchive] },
+            params: {},
+            outputDir: join(work, 'unpack-bad'),
+          },
+        });
+        const badJob = await client.waitJob(badSub.jobId, 120, 1000);
+        console.log(`   伪压缩包任务: ${badJob.status}${badJob.error ? ` — ${badJob.error.code}` : ''}`);
+        c.check(
+          badJob.status === 'failed',
+          '拒绝把非压缩包当压缩包（任务失败，不是"成功但产出空目录"）',
+          badJob.status
+        );
+        c.check(
+          Boolean(badJob.error?.message),
+          '失败时带得出可读原因（不是一句"失败了"）',
+          badJob.error?.message ?? '(无)'
+        );
+        await removeTestPlugin(UNPACK_ID);
+      }
+    } finally {
+      await removeTestPlugin(PACK_ID);
+      const left = await client.invoke('plugins_list');
+      const ids = (left?.plugins ?? left ?? []).map((p) => p.id);
+      c.check(
+        !ids.some((x) => /archive-(pack|unpack)/.test(String(x))),
+        '压缩测试插件已清理',
+        ids.filter((x) => /archive-(pack|unpack)/.test(String(x))).join(', ')
+      );
+    }
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

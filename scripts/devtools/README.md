@@ -41,7 +41,7 @@ node scripts/devtools/inspect.mjs   # 单页体检
 node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
-node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（161 项）
+node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（172 项）
 node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（70 项）
 ```
 
@@ -129,7 +129,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 ### `verify-platform.mjs` —— 平台能力（**这一轮新增的主要内容**）
 
 `verify.mjs` 验的是**安全属性**，这个脚本验的是**平台声称能做到的事是不是真的做到了**。
-十七节，161 项：
+十八节，172 项：
 
 | 节 | 验什么 | 它抓到过什么 |
 |---|---|---|
@@ -150,6 +150,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 | 【15】 | 扫描件 PDF 的 OCR（Poppler 栅格化 + 逐页识别） | —— 这一节验的是**新做的能力**：3 页 PDF → 假端点收到 **3 次**请求（逐页而不是整篇）、渲染尺寸符合 `pdfDpi` 的预期（584×278 vs 583×278±2）、多页结果之间有 `===== 第 N 页 =====` 分隔 |
 | 【16】 | 节点可用性判定说的是不是实话 | `ebook.convert` 在既没 Calibre 也没 Pandoc 的机器上显示"可用"（点下去才报 `EngineMissing`）；`ai.upscale` 在只下了**抠图**权重的机器上也显示可用。这一节逐个核对 32 个节点的"可用"与真实引擎/权重状态是否一致 —— 判据是**一致性**，不是硬编某台机器的状态 |
 | 【17】 | 音频 / 视频节点是否真的产出正确的媒体 | FFmpeg 装通之前这 7 个节点**一次都没被跑过**。真跑一遍抓到三个：`video.trim` 的切片长度是请求值的**两倍**（`-avoid_negative_ts make_zero` 干的，30 帧 vs 15 帧）、`video.transcode` 的容器参数是**装饰**（它叫 `container`，而扩展名由 `format` 决定）、`audio.normalize` 会**悄悄把 44.1kHz 重采样成 48kHz**。这一节用 ffprobe 读回真实属性（时长/帧数/编解码器/采样率/尺寸/容器）来断言，而不是只看"任务成功" |
+| 【18】 | 压缩包节点（7-Zip 打包 / 解压）是否真的产出**标准归档** | 7-Zip 是三个核心引擎之一，而它的下载源长期是空的（见 `docs/ROADMAP.md` §3），**这条链路从来没有在本机跑通过**。打通之后真跑一遍就现形两件事：① 解压出来的可执行文件被**认成了 `7z.dll`**（旧实现比较文件主干名，`7z.dll` 与 `7z.exe` 的主干都是 `7z`，而目录里 `7z.dll` 排在前面）—— 引擎显示"已安装"、路径却是个 DLL，`archive.*` 拿它去 exec 必然失败；② `MANAGED_LAYOUT` 写的是 `7z`，而 Windows 的 MSI 布局把文件放在 `Files/7-Zip/` 下，探测靠**按文件名递归回退**才找得到。这一节的检查 ① 直接盯着"解析出来的路径必须是一个真的可执行文件"，其余用**独立实现交叉验证**：7-Zip 打的 zip 交给**系统 tar**（libarchive）解，解出来的字节要与输入**逐字节相同**（自己打的包自己解，两边同时错还能对上）；再用 `archive.unpack` 解一遍做闭环；最后**反证** —— 把一段普通文本当压缩包喂进去，必须**失败并给出可读原因**，而不是"成功"地产出一个空目录 |
 
 **【12】与【13】的做法值得单说**：降级链的**后两档只能靠"临时把更优先的引擎藏起来"才测得到** ——
 libvips 只要在，`image.convert` 就永远走它，中间档与兜底档根本没有机会被执行。
