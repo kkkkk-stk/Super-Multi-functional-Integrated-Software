@@ -632,6 +632,128 @@ mod tests {
         assert!(r.stdout.contains("hello-toolforge"));
     }
 
+    /// 子进程往 **stderr 狂写**时不能把双方卡死（ROADMAP 里那条挂了很久的回归项）。
+    ///
+    /// # 这条测试防的是什么
+    ///
+    /// 管道缓冲区只有几十 KB。如果实现是"先读完 stdout 再读 stderr"（或者反过来），
+    /// 那么当子进程把另一个流写满之后，它会**阻塞在 write 上**，而我们正等着第一个流结束 ——
+    /// 两边互等，任务永远卡住，而且**没有任何错误信息**（这正是它难查的原因）。
+    /// 正确做法是两个流各交给一个任务同时读；源码里那句"避免管道缓冲区写满导致死锁"
+    /// 的注释说的就是它，但**此前没有任何测试**（文档里挂着 🚧）。
+    ///
+    /// # 怎么造这个场景（不依赖任何外部程序）
+    ///
+    /// 让**测试二进制自己**当那个"狂写的子进程"：带一个环境变量重新执行自己，
+    /// 只跑这一个测试（`--exact`），命中环境变量分支就往 stderr 写二十万行然后退出。
+    /// 好处是跨平台、不依赖 node/python/shell 的写法差异，也不会因为外部程序缺失而跳过 ——
+    /// **一条会自己跳过的"死锁测试"等于没有测试**。
+    ///
+    /// 二十万行 × 约 70 字节 ≈ 14 MB，远超任何管道缓冲；而 `quiet(true)` 让宿主只留尾部，
+    /// 顺便验证了"截断之后仍然能跑完"。
+    #[tokio::test]
+    async fn stderr_flood_does_not_deadlock() {
+        const FLOOD_ENV: &str = "TOOLFORGE_TEST_STDERR_FLOOD";
+        const FLOOD_LINES: usize = 200_000;
+
+        // ---- 子进程分支：狂写 stderr 后立刻退出 ----
+        if std::env::var(FLOOD_ENV).is_ok() {
+            flood_stderr(FLOOD_LINES);
+        }
+
+        let exe = std::env::current_exe().expect("测试二进制路径");
+        let started = std::time::Instant::now();
+        let r = exec(
+            ExecOptions::new(exe)
+                .args(flood_child_args())
+                .env(FLOOD_ENV, "1")
+                .quiet(true)
+                .timeout(Duration::from_secs(120)),
+        )
+        .await
+        .expect("执行自己时不该失败");
+
+        assert!(
+            !r.killed,
+            "子进程被超时杀掉了 —— 这就是死锁（跑了 {} ms）",
+            started.elapsed().as_millis()
+        );
+        assert!(r.success(), "exit={} stderr_tail={}", r.exit_code, r.stderr);
+        // 尾部里必须有完成标记：说明它是**写完了才退出的**，不是因为管道断了提前死
+        assert!(
+            r.stderr.contains("flood-complete"),
+            "stderr 尾部应保留最后一行（实际尾部：{}）",
+            r.stderr.chars().rev().take(200).collect::<String>()
+        );
+        assert!(
+            r.truncated,
+            "14 MB 的 stderr 必须被截断成尾部，否则内存会被吃光"
+        );
+    }
+
+    /// **反证上一条测试的前提**：顺序读法（先读完 stdout 再读 stderr）在这种子进程上**确实会死锁**。
+    ///
+    /// 少了这一条，上面那个"没卡住"可能只是因为**子进程根本没写满管道** ——
+    /// 那样它就成了一条永远绿的测试。这里用**不经过 `exec` 的裸 tokio** 复现死锁：
+    /// 只读 stdout、从不读 stderr，子进程写满 stderr 的管道缓冲后阻塞在 write 上，
+    /// 于是它永远不会关掉 stdout → 我们的读操作永远等不到 EOF。
+    ///
+    /// 断言写的是"**超时发生了**"：如果哪天有谁"顺手"把子进程改成写小一点，
+    /// 这条会立刻红，提醒他上一条测试已经失去意义。
+    #[tokio::test]
+    async fn naive_sequential_read_would_deadlock_on_the_same_child() {
+        const FLOOD_ENV: &str = "TOOLFORGE_TEST_STDERR_FLOOD";
+        if std::env::var(FLOOD_ENV).is_ok() {
+            flood_stderr(200_000);
+        }
+
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(flood_child_args())
+            .env(FLOOD_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn 自己");
+
+        let mut out = child.stdout.take().expect("stdout");
+        let drain_stdout_only = async {
+            use tokio::io::AsyncReadExt;
+            let mut sink = Vec::new();
+            let _ = out.read_to_end(&mut sink).await;
+        };
+        let hung = tokio::time::timeout(Duration::from_secs(5), drain_stdout_only)
+            .await
+            .is_err();
+
+        // 收尾：无论如何都把这个子进程杀掉，别留孤儿
+        let _ = child.kill().await;
+
+        assert!(
+            hung,
+            "顺序读法**没有**卡住 —— 说明子进程写的量不足以填满管道缓冲，\
+             上面那条 deadlock 测试已经失去意义（要么把行数调大，要么删掉它）"
+        );
+    }
+
+    /// 子进程分支用：往 stderr 写 `lines` 行冗余内容，最后留一个完成标记。
+    fn flood_stderr(lines: usize) -> ! {
+        let payload = "x".repeat(60);
+        for i in 0..lines {
+            eprintln!("flood-{i:07}-{payload}");
+        }
+        eprintln!("flood-complete");
+        std::process::exit(0);
+    }
+
+    /// 让"子进程"只跑狂写那一个测试：`--exact` + `--nocapture`。
+    fn flood_child_args() -> Vec<String> {
+        vec![
+            "--exact".to_string(),
+            "exec::tests::stderr_flood_does_not_deadlock".to_string(),
+            "--nocapture".to_string(),
+        ]
+    }
+
     #[tokio::test]
     async fn streaming_callback_receives_lines() {
         let lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
