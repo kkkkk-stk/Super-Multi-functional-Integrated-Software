@@ -2692,25 +2692,25 @@ c.section('【20】"一句话生成插件"闭环：草稿 → 审核 → 安装 
     console.log(`   运行时摘要：${gen.review?.runtimeSummary ?? '(无)'}`);
     console.log(`   能力清单：${(gen.review?.capabilities ?? []).join(' / ')}`);
 
-    // ---- 2) 把草稿写成目录、装上去、真跑 ----
-    // 这一步是**人在确认页上做的动作**的等价物：写盘 + plugins_install（不自动装）。
+    // ---- 2) 把草稿交给后端安装 —— **用 UI 真正走的那条路（bundle）** ----
+    //
+    // ⚠️ 这里刻意**不用** `kind: "directory"`：AI 工作室页面上点"安装"时，
+    // 前端把草稿打包成 `PluginSource::Bundle`（`plugin.yaml` 走 `yaml` 字段，
+    // 其余文件进 `files`）交给 `plugins_install`，由**后端**负责落盘。
+    // 那条路此前只有单元测试（`bundle_path_traversal_is_rejected` 之类），
+    // **没有任何运行时验证** —— 也就是说"用户在界面上点安装"这个动作，
+    // 从来没有被真的执行过一次。这里把它走通。
+    const bundleFiles = gen.draft.files
+      .filter((f) => f.path !== 'plugin.yaml')
+      .map((f) => ({ path: f.path, content: f.content, encoding: 'utf8' }));
+    const yamlText = gen.draft.files.find((f) => f.path === 'plugin.yaml')?.content ?? '';
     const draftDir = join(REPO_ROOT, '.tools', 'smoke', 'ai-draft');
     rmSync(draftDir, { recursive: true, force: true });
     mkdirSync(draftDir, { recursive: true });
-    for (const f of gen.draft.files) {
-      // 草稿里的路径来自模型，必须自己收敛：只允许写进草稿目录（防 `../` 之类的路径逃逸）
-      const target = join(draftDir, f.path);
-      if (!target.startsWith(draftDir)) {
-        c.check(false, '草稿文件路径必须落在草稿目录内', f.path);
-        continue;
-      }
-      mkdirSync(dirname(target), { recursive: true });
-      writeFileSync(target, f.content, 'utf8');
-    }
     await cleanupPlugin(DRAFT_ID);
     await client.invoke('plugins_install', {
       req: {
-        source: { kind: 'directory', path: draftDir },
+        source: { kind: 'bundle', yaml: yamlText, files: bundleFiles },
         overwrite: true,
         permissionsAcknowledged: true,
         executableCodeAcknowledged: false,
@@ -2729,7 +2729,7 @@ c.section('【20】"一句话生成插件"闭环：草稿 → 审核 → 安装 
     });
     await client.invoke('plugins_set_enabled', { pluginId: DRAFT_ID, enabled: true });
     const installed = await client.invoke('plugins_get', { pluginId: DRAFT_ID });
-    c.check(Boolean(installed), '⑤ 生成的插件能被安装（清单通过了装载校验）', DRAFT_ID);
+    c.check(Boolean(installed), '⑤ 生成的插件能被安装（走 UI 真正用的 bundle 路径：清单由后端落盘）', DRAFT_ID);
 
     const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-ai-draft');
     rmSync(outDir, { recursive: true, force: true });
@@ -2847,8 +2847,50 @@ c.section('【20】"一句话生成插件"闭环：草稿 → 审核 → 安装 
     } else {
       c.note('（审计队列为空，跳过"被拒草稿落审计"这条断言）');
     }
+    // ---- 6) 反证 C：Bundle 里的路径逃逸必须被后端拒绝 ----
+    //
+    // 单元测试里有 `bundle_path_traversal_is_rejected`，但**没有运行时证据**：
+    // 真正决定"用户点安装会不会写坏东西"的是 `plugins_install` 这条链路。
+    // 这里用一份**故意带 `../` 的 bundle** 走一遍，断言：① 被拒；② 什么都没留下。
+    const escapeTarget = join(REPO_ROOT, '.tools', 'smoke', 'escaped-by-bundle.txt');
+    rmSync(escapeTarget, { force: true });
+    let traversalRejected = false;
+    let traversalDetail = '';
+    try {
+      await client.invoke('plugins_install', {
+        req: {
+          source: {
+            kind: 'bundle',
+            yaml: yamlText.replace(DRAFT_ID, 'com.mock.traversal'),
+            files: [
+              { path: '../escaped-by-bundle.txt', content: 'escaped', encoding: 'utf8' },
+              { path: 'sub/../../escaped2.txt', content: 'escaped', encoding: 'utf8' },
+            ],
+          },
+          overwrite: true,
+          permissionsAcknowledged: true,
+          executableCodeAcknowledged: false,
+        },
+      });
+      traversalDetail = '竟然没有被拒绝';
+    } catch (e) {
+      traversalRejected = true;
+      // CDP 的异常文本很长（它会把对象整个摊开）。这里只把**错误码与消息**抠出来，
+      // 否则这一行日志读起来是一团 JSON。
+      const raw = String(e?.message ?? e);
+      const code = /"code"\s*:\s*"([A-Z_]+)"/.exec(raw)?.[1] ?? '';
+      const msg = /"message"\s*:\s*"([^"]{0,120})"/.exec(raw)?.[1] ?? raw.slice(0, 120);
+      traversalDetail = `${code}${code ? '：' : ''}${msg}`;
+    }
+    c.check(traversalRejected, '★ ⑯ Bundle 里的 `../` 路径逃逸被后端拒绝', traversalDetail);
+    c.check(!existsSync(escapeTarget), '⑰ 逃逸目标路径上什么都没被写出来', escapeTarget);
+    const leftover = await client
+      .invoke('plugins_get', { pluginId: 'com.mock.traversal' })
+      .catch(() => null);
+    c.check(!leftover, '⑱ 被拒的 bundle 没有留下半个插件', leftover ? '竟然装上了' : '干净');
   } finally {
     await cleanupPlugin(DRAFT_ID);
+    await cleanupPlugin('com.mock.traversal');
     if (restore) {
       await client.invoke('settings_patch', { patch: { ai: restore } }).catch(() => {});
     }

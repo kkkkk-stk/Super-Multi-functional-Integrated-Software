@@ -53,7 +53,7 @@
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
 > | 运行时测试总数 | `cargo test --workspace` **258 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **193 项全通过**（【1】–【20】） |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **196 项全通过**（【1】–【20】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -888,10 +888,11 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 
 - **原状**：`ai_generate` / `ai_review_draft` 有实现、有单元测试，但**从来没有人从"一句话"走到"装上一个能跑的插件"**。原因和 `doc.to-pdf` 是同一类：它需要一个**会按约定吐 YAML 的模型**，而真模型不可复现（同一个需求两次生成的插件不一样，还会偶发不合规）。于是产品最核心的那句话（README 第一段："你描述一下，它自己长出来"）**没有任何真机证据**。
 - **做法**：让 `mock-openai.mjs` 兼任"插件生成器" —— 请求里带 `[mock:draft]` / `[mock:broken]` / `[mock:malicious]` 分别回一份合规草稿 / 引用未声明端口的草稿 / 越权草稿。真模型"答得好不好"仍然不在验证范围内（与【10】的边界一致），但**我们这一侧**从此有证据。
-- **实测（【20】，15 项）**：草稿被解析成 `plugin.yaml` → 静态审核 `recommended: true, risk: low` → 写成目录 → `plugins_install` → 授权 → 启用 → 用一张真 PNG 跑一次 → 产出是**真的 WebP**（`RIFF/WEBP` 魔数），而且 **AI 写进 YAML 的参数真的生效**：`width: "400"` → 实测 **400×300**（这条断言很关键：它证明 AI 写的参数走进了节点参数解析，而不是"插件跑通了但参数被忽略"）。
-- **反证（两份坏草稿都必须被拦）**：
+- **实测（【20】，18 项）**：草稿被解析成 `plugin.yaml` → 静态审核 `recommended: true, risk: low` → **按前端真正走的那条路装上去**（`PluginSource::Bundle`：`plugin.yaml` 走 `yaml` 字段、其余文件进 `files`，由**后端**落盘 —— 这条路径此前只有单元测试，没有任何运行时证据，也就是说"用户在界面上点安装"这个动作**从来没被执行过一次**）→ 授权 → 启用 → 用一张真 PNG 跑一次 → 产出是**真的 WebP**（`RIFF/WEBP` 魔数），而且 **AI 写进 YAML 的参数真的生效**：`width: "400"` → 实测 **400×300**（这条断言很关键：它证明 AI 写的参数走进了节点参数解析，而不是"插件跑通了但参数被忽略"）。
+- **反证（三份坏输入都必须被拦）**：
   * **越权草稿**（`fsWrite` 用 `explicit` 作用域写系统 hosts + `exec`）：`recommended: false`、`riskLevel: critical`、点名 `HOST_PATH_WRITE` / `CRITICAL_CAPABILITY` / `HIGH_RISK_CAPABILITY`，并且**落审计**（`aiDraftRejected`）。注意前提：这份草稿是**语法完全合法的清单** —— 被拦的原因必须是"申请了高危能力"，而不是"YAML 写错了"。攻击者会写合法的 YAML。
   * **引用未声明端口的草稿**：见下，它是本轮**新加的一条校验**逼出来的。
+  * **带 `../` 的 bundle**：`plugins_install` 必须拒绝，且**逃逸目标路径上什么都不该留下**、被拒的 bundle 也不该留下半个插件（单元测试里有 `bundle_path_traversal_is_rejected`，但"用户点安装会不会写坏东西"取决于的是命令层这条链路）。
 - ★ **新校验：`TEMPLATE_UNKNOWN_OUTPUT_PORT`（以及 input / params 的同款）**。第一版"合规草稿"的中间步骤写了 `${output.resized}`，却没声明 `resized` 端口 —— 草稿**通过了审核、装得上**，直到真跑才报 `PLUGIN_INVALID: 模板变量 ${output.resized} 无法解析`。
   这条错误**完全可以在审核阶段看出来**：模板上下文里的 `output.*` 只包含**声明过的**端口（`toolforge-plugins/src/l1.rs` 就是这么填的）。而已有的 `validate_into` 只检查了 `${steps.*}`（存在性 + 前向引用），`${output.*}` / `${input.*}` / `${params.*}` **从来没被对过账**。
   现在 `PipelineDef::validate_template_refs()` 把这三类都对账，根名不认识（`${foo.bar}`）也报错。报成 `error` 而不是 `warning`：这类引用没有任何"也能跑"的情形，AI 生成流程正是靠 `validation.ok` 决定放不放行。
