@@ -41,7 +41,7 @@ node scripts/devtools/inspect.mjs   # 单页体检
 node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
-node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（267 项）
+node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（274 项）
 node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（70 项）
 ```
 
@@ -129,7 +129,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 ### `verify-platform.mjs` —— 平台能力（**这一轮新增的主要内容**）
 
 `verify.mjs` 验的是**安全属性**，这个脚本验的是**平台声称能做到的事是不是真的做到了**。
-二十五节，267 项：
+二十六节，274 项：
 
 | 节 | 验什么 | 它抓到过什么 |
 |---|---|---|
@@ -158,6 +158,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 | 【23】 | **`PLUGIN-SDK.md` 的节点表与真实节点目录是否对得上** | `PLUGIN-SDK.md` 是**插件作者的契约**，而"契约与实现漂移"在这个项目里已经造成过真实损失 —— 【22】发现的画布缺陷正是"代码没照文档写"；反过来"文档没跟上代码"同样会发生，而且更难发现（界面照常工作，只有照着文档写插件的人会踩坑）。做法：把文档里的节点表**按表头**解析（四张小节的列语义不一样：§3.1 那列是"从 `with` 读的参数"，其余是"参数 id（从 `io.params` 读）"—— 第一版按固定列下标取，把 §3.1 的行全判错了），逐行与 `pipeline_nodes` 对账引擎列与参数 id 集合，外加"目录里有但文档里没有"的节点。**第一次跑就对出四处漂移**：`doc.to-pdf` 还写着已删掉的 `format`；`doc.ocr` 漏了 `poppler` 与 `pdfDpi`/`pdfMaxPages`、正文还写着"PDF 输入会被明确拒绝"；`text.replace` / `name.build` 两个节点**根本没文档**（而 `batch-rename` / `ai-describe` 都靠它们）；`video.trim` 把说明塞进了参数列表。**反证**：临时把 `format` 加回那一格，检查立刻判红并点名到行号 |
 | 【24】 | **设置与 API Key 的落盘生命周期，以及密钥会不会顺着错误信息漏出去** | 两件事此前都没有被任何检查看过。① 生命周期逐条验：勾上「记住 API Key」→ `ai-key.txt` 真的写盘且内容一致；`settings.json` 里**没有**密钥（连 `apiKey` 这个键都没有）；`settings_get` 不回传明文、只回报 `hasKey`；关掉开关 → **磁盘上那份被删掉**（内存里仍可用）；清除 Key → 内存与磁盘都干净。② ★ **脱敏**：`redact()` 只认 `sk-` 前缀，而 Google 是 `AIza…`、Azure 是一串无前缀十六进制 —— 全不命中。最现实的泄漏渠道不是"我们把 Key 拼进错误信息"，是**对方把请求回显回来**（代理/网关/调试模式的后端会把 `Authorization` 头带进响应体，而那段响应体正是应用截下来给用户看的 `detail`）。所以新增 `redact_with(text, secret)`：**知道密钥就按字面量抹掉**，与它长得像不像 Key 无关。假端点里加了一条"话多的网关"路由，**把真实请求头回显**在 500 响应体里；断言三步走 —— ⑥b 回显正文**确实进了**错误文本（否则"里面没有密钥"可能只是因为整段响应体被丢掉了，那种通过是假的）、⑦ 文本里看不到密钥、⑦b 但留下可见的 `[REDACTED]` 标记。单元测试里还显式记下**旧行为会漏**（`assert!(redact(&echoed).contains(secret))`），所以这条运行时检查不是空过的。**重启行为单独验过**（不在套件里）：勾上开关写入 Key → 重启后仍然记得；开关关掉但磁盘有残留 → 重启时被主动清掉 |
 | 【25】 | **许可证确认是不是真的发生了，以及有没有留下记录** | 两件事必须分开验。① **确认真的发生了**：模型那一侧此前有个真缺陷 —— `model-panel.tsx` 对**不可商用**的权重自动发 `licenseAccepted: true`（`licenseAccepted: !m.commercialUse`），于是后端那道硬门永远走不到，用户从头到尾没看见任何确认，而**旁边的注释写的正是"需要用户显式点头"**。② **确认留下了记录**：原来那份确认只是一次布尔参数，装完就没痕迹（对合规审查拿不出证据链，用户每次重装还得再勾一次）。现在落盘到 `<data>/license-acks.json` + 一条 `LicenseAccepted` 审计事件，每条记 `{subject, license, fingerprint, acceptedAt}` —— **记的是许可证原文的指纹而不是"确认过这个 id"**：用户同意的是那一段文字，上游把条款收紧之后旧同意必须自动失效。断言：不带 `licenseAccepted` → `PERMISSION_DENIED` **且不留下任何记录**（被拒绝的尝试不能进证据链）；带了 → 记录含 16 位指纹/原文/可解析时间戳、目录接口如实报出 `licenseAcknowledged` 与时间、审计里有 `licenseAccepted`；**删掉记录文件立刻变回未确认**（证明每次重新读盘、不拿缓存撒谎）。⚠️ 前端那两个勾选框本身**没做点击穿透验证**（本机所有需要确认的引擎与权重都已装好，界面上不会出现"安装/下载"按钮），目前由 `tsc` + `vite` + 人工审阅覆盖 |
+| 【26】 | **能力清单（`capabilities/default.json`）说的和做的是不是一回事** | 它是**前端的权限边界**（决定一个被注入的脚本或将来插件自带的 UI 能直接对系统做什么），而这条边界此前**只有文档在描述**，文档还写错过一次：README 写着「`shell:allow-execute` 只放行一个用于"打开文件夹"的 `explorer`」，实际上**一条 shell 权限都没有**（真实边界比文档更紧，但文档仍是错的）。做法：从**页面上下文**里真的去调那些命令，并按错误文本分类 —— `not allowed. Permissions associated with this command` = ACL 拒绝、`forbidden path` = scope 拒绝、`invalid args` = 权限**在**（用"参数不对"当探针：证明权限存在，又不弹对话框、不写文件）。断言：`shell\|execute` / `shell\|open` / `opener\|open_path` / scope 外的 `fs:read_text_file` **都被拒**；**正向对照** —— scope **之内**的读真的能成（否则"什么都读不到"也会让上面几条全绿）；界面真正在用的 5 个命令权限都在（漏一条对应功能会**静默失效**）；静态读配置文件断言一条 `shell:` 都没有。顺带修掉 `system.ts` 里那个包着 `openPath` 的 `openWithDefaultApp()`（权限没给、从未被调用、一接上就静默失败），并让 `revealInExplorer` 的兜底直接报错而不是退回一个注定被拒的调用 |
 
 **【12】与【13】的做法值得单说**：降级链的**后两档只能靠"临时把更优先的引擎藏起来"才测得到** ——
 libvips 只要在，`image.convert` 就永远走它，中间档与兜底档根本没有机会被执行。

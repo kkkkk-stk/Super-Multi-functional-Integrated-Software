@@ -105,11 +105,25 @@ libvips（快、省内存） ──缺失──▶ ImageMagick（格式最全）
 > 所以大图也跑得动；`scale=2|3` 是"先按 4 倍推理再用 Lanczos 缩回去"（细节是模型真算出来的）。
 > 权重默认 `realesr-general-x4v3`（4.87 MB，输入尺寸动态）。**同样纯本地推理，不上传图片。**
 
-### 5. `tauri-plugin-shell` 对前端几乎是关闭的
+### 5. `tauri-plugin-shell` 对前端**完全关闭**
 
 前端（以及将来可能注入的插件 UI）如果能执行任意命令，前面所有的权限模型都是摆设。
-所有引擎调用都走 Rust 命令层 → `toolforge-process` → 子进程；
-capability 里 `shell:allow-execute` 只放行一个用于"打开文件夹"的 `explorer`。
+所有引擎调用都走 Rust 命令层 → `toolforge-process` → 子进程。
+
+**capability 里一条 `shell:` 权限都没有** —— 连"只放行 `explorer`"都没有。
+> ⚠️ **这句话在 2026 年这一轮之前写的是「`shell:allow-execute` 只放行一个用于"打开文件夹"的 `explorer`」—— 那是过期的**：现在的 `capabilities/default.json` 里**没有任何 shell 权限**，而"打开文件夹"走的是 `opener:reveal_item_in_dir`（见 `src/lib/system.ts` 的 `revealInExplorer`）。也就是说真实边界比文档写的**更紧**，但文档写了错话 —— 这一轮同时补上了运行时验证（`verify-platform.mjs`【26】从页面里真的去调 `shell|execute` 并断言被拒），**声明与行为从此对得上**。
+
+除了 shell，前端能直接调的东西就只剩这几样，逐条都有运行时断言：
+
+| 能力 | 谁在用 | 运行时验证 |
+| --- | --- | --- |
+| `opener:reveal_item_in_dir` | 「打开所在文件夹」（任务产出、引擎目录、插件目录） | ✅ 允许 |
+| `opener:open_url`（限 `http/https/mailto/tel`） | 「查看官方页面」等外链 | ✅ 允许 |
+| `dialog:open` / `dialog:save` | 选择文件 / 目录 / 保存位置 | ✅ 允许 |
+| `fs:read_text_file` 等（**受 scope 限制**） | 读取设置/插件清单等 | ✅ scope 内允许、**scope 外被拒** |
+| `shell:*` | —— | ❌ **被拒**（`shell.execute not allowed`） |
+| `opener:open_path` | —— | ❌ **被拒**（因此没有"用默认程序打开文件"这个功能） |
+
 
 ---
 

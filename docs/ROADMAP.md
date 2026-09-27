@@ -53,7 +53,7 @@
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
 > | 运行时测试总数 | `cargo test --workspace` **264 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **267 项全通过**（【1】–【25】） |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **274 项全通过**（【1】–【26】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -957,6 +957,20 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 - ★ **顺带发现并修掉一处"替用户点头"**：`model-panel.tsx` 原来对**不可商用**的权重写的是 `licenseAccepted: !m.commercialUse` —— 也就是**自动发 `true`**，于是后端那道门永远走不到，用户从头到尾没看见任何确认。而旁边的注释写的正是"不可商用的权重需要用户显式点头"。**注释与代码相反**，构建不会红、运行不报错，只是那份确认从来没发生过。现在：不可商用且未安装 → 必须勾选才能点「下载」；确认过就预先勾上。
 - **【25】（15 项）验的是后端契约**：不带 `licenseAccepted` → `PERMISSION_DENIED` **且不留下任何记录**（被拒绝的尝试不能进证据链）；带了 → 记录落盘（含指纹/原文/时间）+ `LicenseAccepted` 审计；`engines_catalog` / `models_list` 如实报出 `licenseAcknowledged` 与时间；删掉记录文件立刻变回未确认。
   > ⚠️ **这条边界要写清楚**：前端那两个勾选框本身**没有做点击穿透验证** —— 本机所有需要确认的引擎与权重都已安装，界面上不会出现"安装/下载"按钮，点不出一条真实路径。它目前由 `tsc` + `vite` + 人工审阅覆盖；要补上得有一台装有"未安装的不可商用权重"的机器。
+
+### 3.9 能力清单（capability）第一次被运行时对账；坏配置的恢复路径也验了
+
+- **为什么值得**：`capabilities/default.json` 是**前端的权限边界** —— 它决定一个被注入的脚本（或将来某个插件自带的 UI）能直接对系统做什么。而这条边界**从来只有文档在描述它**，文档还写错过一次：README 里写着「capability 里 `shell:allow-execute` 只放行一个用于"打开文件夹"的 `explorer`」，实际上**一条 shell 权限都没有**（真实边界比文档更紧，但文档仍然是错的）。
+- **【26】（7 项）的做法**：从**页面上下文**里真的去调那些命令，按错误文本分类 ——
+  `not allowed. Permissions associated with this command` = ACL 拒绝、`forbidden path` = scope 拒绝、`invalid args` = 权限**在**（用"参数不对"当探针：证明权限存在，又不弹对话框、不写文件）。
+  * 被拒的：`shell|execute`、`shell|open`、`opener|open_path`、以及 scope 外的 `fs:read_text_file`；
+  * **正向对照**：scope **之内**的读**真的能成** —— 少了这条，"什么都读不到"也能让上面几条全绿；
+  * 界面真正在用的 5 个命令（`reveal_item_in_dir` / `open_url` / `dialog|open` / `dialog|save` / `fs|write_text_file`）权限都在 —— capability 一旦被重新生成时漏掉某条，对应功能会**静默失效**（只弹一个 toast）；
+  * 静态对照：配置文件里一条 `shell:` 都没有（与运行时的 ① 互为印证）。
+- **顺带修掉一个"以为能用其实不能用"的 helper**：`src/lib/system.ts` 的 `openWithDefaultApp()` 包着 `openPath`，而 `opener:allow-open-path` 没有授予（②的运行时断言就是盯着它）。它**从未被任何界面调用过**，一旦有人接上就会静默失败。已删掉，并在文件头写清"将来要做这个功能，得先有意地加权限并配 scope"。同时 `revealInExplorer` 的兜底也从"退回 `openPath`"改成直接报错 —— 那条兜底只会把一个真实原因盖成另一个看不懂的 ACL 错误。
+- **顺带验了坏配置的恢复路径**（不在套件里，因为要重启应用）：`settings_store` 有单测覆盖 `load()` 的隔离逻辑，但"**应用启动路径**"这一层只有真重启才知道 —— 一个坏 JSON 让用户连界面都进不去的话，也就没有界面去修它。实机步骤：写入有辨识度的值（`accent=#123456`、`concurrency=7`）→ 重启确认真的读回 → 把 `settings.json` 写成一段坏 JSON → 重启 → 断言 **① 应用照常响应**、**② 坏文件被隔离成 `settings.broken.json` 且内容一字不差**、**③ 设置回到默认**（`accent=cyan`、`concurrency=8`）。验完还原备份并复查状态。
+
+
 
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 

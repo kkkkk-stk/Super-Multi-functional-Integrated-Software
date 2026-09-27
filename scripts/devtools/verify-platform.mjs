@@ -3910,6 +3910,125 @@ c.section('【25】许可证确认：硬门有效、并且留下可追溯的记�
   }
 }
 
+// ============================================================================
+// 【26】能力清单（capabilities/default.json）说的和做的是不是一回事
+// ============================================================================
+//
+// `capabilities/default.json` 是**前端的权限边界**：它决定一个被注入的脚本
+// （或者将来某个插件自带的 UI）能直接对系统做什么。而这条边界**从来没有被运行时
+// 试过** —— 只有文档在描述它，而文档已经错过一次：
+//
+//   README 里写着「capability 里 `shell:allow-execute` 只放行一个用于"打开文件夹"的
+//   `explorer`」—— 实际上**一条 shell 权限都没有**，"打开文件夹"走的是
+//   `opener:reveal_item_in_dir`。（真实边界比文档写的更紧，但文档仍然是错的。）
+//
+// 这一节从**页面上下文**里真的去调那些命令，并按错误文本分类：
+//
+//   * `not allowed. Permissions associated with this command` → **ACL 拒绝**
+//   * `forbidden path ... not allowed on the scope`            → **scope 拒绝**
+//   * `invalid args ...` / `missing ... key`                   → 权限**在**，只是参数不对
+//
+// "参数不对"恰好是我们要的探针：它证明权限存在，又不产生任何副作用
+// （弹不出对话框、写不了文件）。反过来，只有"允许"和"拒绝"两种结果的话，
+// 一个把权限全删光的配置也会让所有断言"通过"。
+c.section('【26】能力清单：前端能直接调什么，被拒的又是不是真的被拒');
+{
+  /** 从页面里调一个 Tauri 命令，把"拒绝"与"参数错误"分开 */
+  const probe = async (cmd, args) => {
+    const r = await client.evaluate(
+      `window.__TAURI_INTERNALS__.invoke(${JSON.stringify(cmd)}, ${JSON.stringify(args)})` +
+        `.then(v => ({ ok: true, text: String(v).slice(0, 60) }))` +
+        `.catch(e => ({ ok: false, text: (typeof e === 'string' ? e : JSON.stringify(e)).slice(0, 220) }))`
+    );
+    const t = String(r?.text ?? '');
+    const deniedByAcl = /not allowed\. Permissions associated with this command/.test(t);
+    const deniedByScope = /forbidden path/.test(t);
+    return { ok: Boolean(r?.ok), text: t, denied: deniedByAcl || deniedByScope, deniedByAcl, deniedByScope };
+  };
+
+  // ---- ① 必须被拒的：shell 与 scope 外的路径 ----
+  const shellExec = await probe('plugin:shell|execute', { program: 'cmd', args: ['/c', 'echo hi'] });
+  c.check(
+    shellExec.deniedByAcl,
+    '★ ① `plugin:shell|execute` 被 ACL 拒绝（前端拿不到任何 shell —— 这是整套权限模型的地基）',
+    shellExec.text.slice(0, 120)
+  );
+  const shellOpen = await probe('plugin:shell|open', { path: 'cmd' });
+  c.check(shellOpen.deniedByAcl, '①b `plugin:shell|open` 同样被拒', shellOpen.text.slice(0, 120));
+
+  const openPath = await probe('plugin:opener|open_path', {});
+  c.check(
+    openPath.deniedByAcl,
+    '★ ② `plugin:opener|open_path` 被拒（因此"用系统默认程序打开文件"当前做不到 —— 代码里那个包着它的 helper 已删掉）',
+    openPath.text.slice(0, 120)
+  );
+
+  const outside = await probe('plugin:fs|read_text_file', {
+    path: 'C:/Windows/System32/drivers/etc/hosts',
+  });
+  c.check(
+    outside.deniedByScope,
+    '★ ③ `fs:read_text_file` 读**scope 之外**的系统文件被拒（scope 生效，而不是"文件不存在"之类的巧合）',
+    outside.text.slice(0, 140)
+  );
+
+  // ---- ④ 正向对照：scope **之内**必须真的能读 ----
+  // 少了这条，"什么都读不到"也能让上面三条全绿。
+  const dataDir = (await client.invoke('app_paths'))?.entries?.find((e) => e.label === '数据目录')?.path;
+  const settingsPath = dataDir ? join(dataDir, 'settings.json') : null;
+  if (settingsPath && existsSync(settingsPath)) {
+    const inside = await probe('plugin:fs|read_text_file', {
+      path: settingsPath.replace(/\\/g, '/'),
+    });
+    c.check(
+      inside.ok,
+      '★ ④ 正向对照：读 scope **之内**的文件是允许的（否则"全都被拒"也会让上面几条通过）',
+      inside.ok ? `读到 ${inside.text.length} 字符的摘要` : inside.text.slice(0, 140)
+    );
+  } else {
+    c.note('（找不到数据目录里的 settings.json，跳过"scope 内可读"这条对照）');
+  }
+
+  // ---- ⑤ 前端界面真正在用的命令，权限必须**在** ----
+  //
+  // 这一组用"参数不对"当探针：它证明 ACL 放行，又不会真弹对话框、真写文件。
+  // capability 一旦被重新生成时漏掉某一条，对应的界面功能会**静默失效**
+  // （只弹一个 toast），所以这条要挡在 CI 一侧。
+  const uiNeeded = [
+    ['plugin:opener|reveal_item_in_dir', {}, '「打开所在文件夹」'],
+    ['plugin:opener|open_url', {}, '「查看官方页面」等外链'],
+    ['plugin:dialog|open', {}, '选择文件 / 目录'],
+    ['plugin:dialog|save', {}, '选择保存位置'],
+    ['plugin:fs|write_text_file', {}, '写文件（受 scope 限制）'],
+  ];
+  const missing = [];
+  for (const [cmd, args, what] of uiNeeded) {
+    const r = await probe(cmd, args);
+    if (r.denied) missing.push(`${cmd}（${what}）→ ${r.text.slice(0, 80)}`);
+  }
+  c.check(
+    missing.length === 0,
+    '★ ⑤ 界面真正在用的 5 个命令权限都在（否则对应功能会静默失效）',
+    missing.length ? missing.join('；') : '全部放行'
+  );
+
+  // ---- ⑥ 静态对照：capability 文件里**不该**再出现 shell ----
+  const capPath = join(REPO_ROOT, 'apps', 'desktop', 'src-tauri', 'capabilities', 'default.json');
+  if (existsSync(capPath)) {
+    const capText = readFileSync(capPath, 'utf8');
+    const shellPerms = [...capText.matchAll(/"([a-z-]+):(allow-[\w-]+|default)"/g)]
+      .map((m) => m[0])
+      .filter((s) => s.includes('"shell:'));
+    c.check(
+      shellPerms.length === 0,
+      '★ ⑥ 静态对照：capability 文件里没有任何 `shell:` 权限（与上面 ① 的运行时结果一致）',
+      shellPerms.length ? shellPerms.join(', ') : '一条都没有'
+    );
+  } else {
+    c.note(`（找不到 ${capPath}，跳过静态对照）`);
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

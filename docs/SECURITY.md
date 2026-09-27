@@ -733,7 +733,19 @@ Component::ParentDir => { if !out.pop() { out.push("..") } }
 
 ### 5.2 当前实际配置（与约束的偏差）
 
-`apps/desktop/src-tauri/capabilities/default.json` 是当前唯一的能力配置。它**总体上收得很紧**（只放行 `core:*` 的窗口/事件最小集合 + `log` / `dialog` / `opener` / `store` / `fs` / `shell`），值得记下来的正面事实：
+`apps/desktop/src-tauri/capabilities/default.json` 是当前唯一的能力配置。它**总体上收得很紧**（只放行 `core:*` 的窗口/事件最小集合 + `log` / `dialog` / `opener` / `store` / `fs`；**`shell` 零权限**），值得记下来的正面事实：
+
+> ✅ **这份"说的"与"做的"现在有运行时对账了（本轮新增）**：`verify-platform.mjs`【26】从**页面上下文**里真的去调那些命令，并按错误文本分类 ——
+> `not allowed. Permissions associated with this command` = ACL 拒绝、`forbidden path` = scope 拒绝、
+> `invalid args` = 权限**在**（参数不对，所以不会真弹对话框、真写文件）。
+> 断言共 7 条：① `shell|execute` 被拒 ①b `shell|open` 被拒 ② `opener|open_path` 被拒
+> ③ scope 外的 `fs:read_text_file` 被拒 ④ **正向对照**：scope 内的读**真的能成**（否则"全都被拒"也会让前三条通过）
+> ⑤ 界面真正在用的 5 个命令权限都在（`reveal_item_in_dir` / `open_url` / `dialog|open` / `dialog|save` / `fs|write_text_file`）
+> ⑥ 静态对照：capability 文件里一条 `shell:` 都没有。
+>
+> ⚠️ **文档曾经错过一次**：README 里写着「`shell:allow-execute` 只放行一个用于"打开文件夹"的 `explorer`」，而配置里**根本没有 shell 权限**（真实边界比文档更紧，但文档仍然写错了）。"打开文件夹"走的是 `opener:reveal_item_in_dir`。已改正。
+>
+> ⚠️ **同时修掉一个"以为能用其实不能用"的 helper**：`src/lib/system.ts` 里的 `openWithDefaultApp()` 包着 `openPath`，而 `opener:allow-open-path` **没有授予**（②的运行时断言就是盯着它）。那个函数**从未被任何界面调用过**，一旦有人接上就会静默失败 —— 已删掉，并在文件头写清"将来要做这个功能，得先有意地加权限并配 scope"。
 
 - `tauri.conf.json` 里 `app.withGlobalTauri: false`，所以页面里**没有** `window.__TAURI__` 全局对象；
 - CSP 很严：`default-src 'self'`、`script-src 'self'`、`frame-src 'none'`、`object-src 'none'`、`base-uri 'self'`、`form-action 'none'`、`connect-src 'self' ipc: http://ipc.localhost`，另有 `freezePrototype: true`。这显著降低了"前端被注入脚本后去调 IPC"的风险等级；
@@ -757,7 +769,8 @@ Component::ParentDir => { if !out.pop() { out.push("..") } }
 
 2. **前端直接持有文件系统文本读写能力**：`fs:default` + `fs:allow-read-text-file` + `fs:allow-write-text-file` + `fs:allow-exists`，scope 覆盖 `$DOWNLOAD/**`、`$DESKTOP/**`、`$DOCUMENT/**`、`$TEMP/**` 等。也就是说**前端不经过 Rust 命令层也能读写这些目录里的文本文件**。这与"前端只能通过 IPC 命令间接触发任务"的表述不完全一致（§9 第 12 项）。
 
-顺便指出：`apps/desktop/src-tauri/src/lib.rs` 的注释里写着「特别是 shell —— 它只被允许执行白名单 sidecar，前端拿不到任意命令执行」，这句**与上面的实际配置不符**（配置里是 `explorer`，不是 sidecar）。注释与配置应当对齐。
+顺便指出：`apps/desktop/src-tauri/src/lib.rs` 的注释里写着「特别是 shell —— 它只被允许执行白名单 sidecar，前端拿不到任意命令执行」，这句**曾经与配置不符**（配置里一度是 `explorer`）。
+> ✅ **现在两边都对得上了**：`lib.rs` 那段注释已经改写成「`shell` 插件被注册，但**没有授予任何 execute 权限**……但**零权限**意味着前端调不动它」，而配置里确实一条 `shell:` 都没有 —— 【26】的 ① / ⑥ 就是钉住这件事的（一个跑运行时、一个读配置文件）。
 
 ### 5.3 现状标注与落地验收条件
 
@@ -774,6 +787,10 @@ Component::ParentDir => { if !out.pop() { out.push("..") } }
 4. `fs` 能力逐条评估：前端确实需要直接读写文件的场景应收窄到最小目录，其余一律走 Rust 命令层；
 5. `AssetProtocol` 的 scope 与 `fs:scope` 保持一致且都指向用户目录，不得出现 `**` 根通配；
 6. 单测/CI 里加一条"配置断言"：解析 `capabilities/*.json`，若出现 `shell:allow-execute` 且 `args !== false`（或 allow 列表为空）则失败。
+   > ✅ **已落地（本轮）**：`verify-platform.mjs`【26】同时做了**两件事** ——
+   > **运行时**从页面里调 `plugin:shell|execute` / `plugin:shell|open` 并断言被 ACL 拒绝（`shell.execute not allowed. Permissions associated with this command: shell:allow-execute` 这种文本就是判据），
+   > **静态**读 `capabilities/default.json` 断言里面一条 `shell:` 都没有。
+   > 两条一起看才严密：只做静态的话，"插件没注册"与"权限没给"区分不开；只做运行时的话，一个被重新生成过的配置文件可能悄悄多回一条权限而没人发现。
 
 ### 5.4 两条与"具体收窄"有关的注意事项
 

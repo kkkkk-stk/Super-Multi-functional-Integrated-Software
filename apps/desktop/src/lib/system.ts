@@ -5,12 +5,29 @@
  * 而开发期经常需要那样调试。所有函数都做降级处理并给出 toast，
  * 不会让一个"打开目录"的失败把页面炸掉。
  *
- * 权限来源：`src-tauri/capabilities/default.json` 里有 `dialog:default` 与
- * `opener:default`。**前端拿不到任意 shell**（caps 里只白名单了一个 sidecar）。
+ * ## 权限来源（以 `src-tauri/capabilities/default.json` 为准，逐条有运行时断言）
+ *
+ * | 用到的命令 | 权限 | 验证 |
+ * |---|---|---|
+ * | `revealItemInDir` | `opener:default`（含 `allow-reveal-item-in-dir`） | ✅ 允许 |
+ * | `openUrl` | `opener:default`（含 `allow-open-url` + `allow-default-urls`） | ✅ 允许 |
+ * | 对话框 | `dialog:default` | ✅ 允许 |
+ * | `openPath` | **没有** `opener:allow-open-path` | ❌ **被拒** |
+ *
+ * ⚠️ 两点必须写清楚，否则很容易踩：
+ *
+ * 1. **前端拿不到任何 shell**。capability 里**一条 `shell:` 权限都没有**
+ *    （这里此前写的是"只白名单了一个 sidecar" —— 那是过期说法）。
+ *    `verify-platform.mjs`【26】从页面里真的去调 `plugin:shell|execute` 并断言被拒。
+ * 2. **`openPath` 是被 ACL 拒绝的**，所以"用系统默认程序打开文件"这件事当前**做不到**。
+ *    原来这里有个 `openWithDefaultApp()` 包着它 —— 它从来没有被任何界面调用过，
+ *    而一旦有人接上就会**静默失败**（只弹一个 toast）。已删掉；将来真要做这个功能，
+ *    得先**有意地**在 capability 里加 `opener:allow-open-path` 并配 scope，
+ *    而不是让一个函数以为它能用。
  */
 
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { openPath, openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
 
 /** 是否运行在 Tauri 运行时里 */
@@ -92,23 +109,12 @@ export async function revealInExplorer(path: string): Promise<void> {
   if (!path) return;
   try {
     await revealItemInDir(path);
-  } catch {
-    // 有些平台 / 路径（例如不存在的输出目录）不支持 reveal，退回"直接打开"
-    try {
-      await openPath(path);
-    } catch (e) {
-      toast.error("无法打开该位置", { description: `${path}\n${errorText(e)}` });
-    }
-  }
-}
-
-/** 用系统默认程序打开文件或目录 */
-export async function openWithDefaultApp(path: string): Promise<void> {
-  if (!path) return;
-  try {
-    await openPath(path);
   } catch (e) {
-    toast.error("无法打开", { description: `${path}\n${errorText(e)}` });
+    // 有些平台 / 路径（例如不存在的输出目录）不支持 reveal。
+    // ⚠️ 这里**不能**退回 `openPath`：capability 里没有 `opener:allow-open-path`，
+    // 那样只会拿到一个 ACL 拒绝、把一个真实原因盖成另一个看不懂的错误。
+    // （正文里解释过：`openPath` 现在是不可用的，见文件头。）
+    toast.error("无法定位该位置", { description: `${path}\n${errorText(e)}` });
   }
 }
 
