@@ -607,7 +607,11 @@ permissions:
 ### 3.5 哪些节点会产出可供 `${steps.x.y}` 引用的值
 
 这一步在 `nodes.rs` 里是显式写明的（很多节点用 `NodeOutput::file()`，它**只登记产出文件、
-不产出可引用的值**）：
+不产出可引用的值**）。**32 个节点里 20 个产出值、12 个不产出**，下表两段分别是这两组 ——
+分段是刻意的：把"没有值"的节点**点名列出**，比只写一句"其它都没有"更不容易骗人
+（`image.remove-background` 当初就是被那句"其它都没有"盖住的）。
+
+**产出值的（20 个）**
 
 | 节点 | 可引用的 key |
 |---|---|
@@ -615,28 +619,46 @@ permissions:
 | `image.resize` | `width`、`height`、`backend` |
 | `image.crop` | `width`、`height`、`backend` |
 | `image.rotate` | `backend` |
+| `image.convert` | `path`、`backend` |
+| `image.remove-background` | `path`、`model`（实际用的权重）、`backend`（恒为 `onnx-python`）、`inputSize`（喂给模型的尺寸，如 `320x320`）、`normalize`（`imagenet` 或 `pm1`）、`coveragePercent`（前景占比百分比） |
 | `ai.upscale` | `path`、`model`、`backend`（恒为 `onnx-python`）、`width`、`height` |
 | `ai.describe` | `text`（模型给的描述）、`model`（实际使用的模型名） |
-| `doc.ocr` | `text`（识别出的文字）、`backend`（`tesseract` 或 `ai-vision`） |
+| `doc.ocr` | `text`（识别出的文字）、`backend`（`tesseract` 或 `ai-vision`）、`pages`（实际识别了几页）、`rasterizer`（**只在走 PDF 栅格化那条路时才有**，值为 `poppler/pdftoppm`） |
 | `ebook.convert` | `backend`（`calibre` 或 `pandoc`） |
+| `video.transcode` | `path` |
 | `fs.copy`、`fs.move` | `path` |
-| `image.convert` | `path`、`backend` |
 | `fs.mkdir` | `path` |
 | `archive.unpack` | `path` |
+| `text.replace` | `text`（替换后的全文） |
+| `name.build` | `value`（拼好的文件名，**不含目录**） |
+| `flow.log` | `message`（原样回显的消息） |
 | `flow.set-var` | `value` |
-| 其它（如 `video.thumbnail`、`video.transcode`、`image.remove-background`） | **没有可引用的值** —— 只能通过 `${output.<portId>}` 传路径 |
+| `flow.branch` | `active`（条件求值结果，`true` / `false`） |
 
-> ⚠️ **这张表是本轮新发现的又一处漂移，请把它当"可能过期"看待。**
-> 它此前写着 `image.rotate` 会产出 `width` / `height` —— 而实现里
-> `image_rotate` 只 `with_value("backend", …)`，一个宽高都没有。
-> 写 `when: ${steps.rot.width} > 100` 的人会得到一条"模板变量无法解析"的报错，
-> 而文档说它存在。**根因是这张表没有任何机械对账**：【23】只核对了
-> 3.2 的节点表（名字 / 参数 / 引擎），没核对 3.5 的"产出值"表 ——
-> 因为节点注册表里根本没有"我会产出哪些值"这个字段，它只存在于
-> `NodeOutput::with_value(...)` 的调用点里。
-> 补齐那条对账需要给 `NodeDescriptor` 加一个 `values` 字段（会牵动
-> specta 绑定、前后端类型与 UI），因此**留作待办**（见 ROADMAP）。
-> 在那之前，判断某个节点产出什么，以 `nodes.rs` 的返回值为准。
+**不产出任何值的（12 个）** —— 只能用 `${output.<portId>}` 传路径：
+
+`fs.delete`、`image.enhance`、`image.strip-metadata`、`video.extract-audio`、`video.thumbnail`、
+`video.trim`、`video.compress`、`audio.convert`、`audio.normalize`、`doc.convert`、
+`doc.to-pdf`、`archive.pack`
+
+> ✅ **这张表现在有机械对账了**（`verify-platform.mjs`【35】）：它把本表与
+> `nodes.rs` 里真正的 `with_value(…)` / `NodeOutput::value(…)` / `values.insert(…)`
+> 调用点逐行比对，**三个方向都查**（文档缺值、文档多值、文档说没有其实有）。
+>
+> 它此前确实是坏的，而且坏得比 §3.23 记的那一处更严重 —— 见下面这段历史：
+>
+> > ⚠️ **这张表此前没有任何机械对账**：【23】只核对了 3.2 的节点表
+> > （名字 / 参数 / 引擎），没核对 3.5 的"产出值"表 —— 因为节点注册表里根本没有
+> > "我会产出哪些值"这个字段，它只存在于 `NodeOutput::with_value(...)` 的调用点里。
+> > 结果是**三类漂移同时存在**（【35】第一次跑就全报出来了）：
+> > ① `image.rotate` 写着会产出 `width` / `height`，实际只产出 `backend`（用户照写会得到
+> > "模板变量无法解析"）；② `doc.ocr` 的 `pages` / `rasterizer` **没写**；
+> > ③ **`image.remove-background` 被归进了"没有可引用的值"那一行，而它其实产出 6 个值**
+> > —— 其中 `coveragePercent`（前景占比）是**流程内可判断"模型到底找没找到东西"的唯一手段**
+> > （例如 `when: ${steps.bg.coveragePercent} < 5` 走"没找到主体"的分支），
+> > 而文档告诉插件作者这件事做不到。`video.transcode` 的 `path` 同样漏了。
+>
+> **在那之前，判断某个节点产出什么，以 `nodes.rs` 的返回值为准。**
 
 **`backend` 是什么**：`image.convert` / `image.resize` / `image.crop` / `image.rotate` 会报出**实际使用的图像后端**，取值为 `"libvips"` / `"imagemagick"` / `"rust"`。它让"到底走没走 libvips"这件事变成流程内可判断的事实，例如后续步骤可以写 `when: ${steps.conv.backend} == rust` 来做"纯 Rust 路径下的补偿处理"。`image.enhance` 与 `image.strip-metadata` **不产出这个值**（它们不参与三层降级）；`ebook.convert` / `doc.ocr` / `ai.upscale` 也各有自己的 `backend` 值，含义见上表 —— 名字一样，但**取值域不一样**，别拿一个节点的取值去判断另一个节点。
 

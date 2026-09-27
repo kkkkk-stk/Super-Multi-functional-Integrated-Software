@@ -41,7 +41,7 @@ node scripts/devtools/inspect.mjs   # 单页体检
 node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
-node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（401 项）
+node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（408 项）
 node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（70 项）
 ```
 
@@ -166,7 +166,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 ### `verify-platform.mjs` —— 平台能力（**这一轮新增的主要内容**）
 
 `verify.mjs` 验的是**安全属性**，这个脚本验的是**平台声称能做到的事是不是真的做到了**。
-三十四节（外加一条【0】前置自检），401 项：
+三十五节（外加一条【0】前置自检），408 项：
 
 | 节 | 验什么 | 它抓到过什么 |
 |---|---|---|
@@ -206,6 +206,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 | 【32】 | **`image.crop` / `image.rotate` 按像素验**（最后两个从没被执行过的节点） | 起点是一次**全仓库反查**："32 个节点里还剩哪几个从来没被真的跑过一次？" 答案剩这两个 —— `image.crop` 只出现在节点声明、注释和一句错误文案里；`image.rotate` 唯一一次出现在检查脚本里，是【7】里的一句 `c.check(true, '能力边界已记录')`，**一条永远为真的假检查**（而【7】标题写着"任意角度旋转…"却只跑了 `image-convert`）。现在用四象限纯色素材按**像素**验：中心裁剪的落点是手算的（产出右下角必须是"右下/白"，**这同时是"什么都不做"的反证**）、自定义偏移用"同样尺寸但四角全白"证明偏移真的生效、90° 断言宽高互换而方向刻意不写死（改用"90° 与 270° 产出必须不同"）、180°/水平/垂直镜像定向断言、任意角度按实际后端断言"要么真变形、要么 `ENGINE_MISSING`"。同一轮还发现 `autoOrient` 是个**存在很久的装饰品参数**（声明里有、界面默认打开、`nodes.rs` 一行都没读），已按三个后端统一实现并用尺寸验证开关的两个位置。详见 `docs/ROADMAP.md` §3.23 |
 | 【33】 | **`fs.delete` / `archive.unpack` / `fs.move`：声明与行为是否终于一致** | 这一节的起点是**新写的一条静态自省单测**（`declared_node_params_are_actually_read_by_their_executor`，把 `nodes.rs` 读进测试、对着分发表扫每个执行器真正读了哪些参数键，再与 `builtin_nodes()` 双向对账）。第一次跑就报了三条，全是真的：① **`fs.delete.toTrash`** —— 默认 `true`、标签写着「移到回收站而非永久删除」，而执行器一行都没读它，一直硬删：**界面在替一个不存在的安全网做承诺**；② `archive.unpack.keepStructure` —— 默认 `true`、界面上有开关，执行器硬编码 `7z x`，关掉毫无效果；③ `fs.move.overwrite` —— **反向**：执行器一直在读它，但节点从来没声明过，用户看不见也关不掉。三条都已修（撤掉假参数 / 真的实现 `x`↔`e` / 补上声明），本节 14 条检查把声明层与行为层都验一遍：`overwrite=false` 遇到已存在的目标**必须失败**且错误点名它、`overwrite=true` 照常覆盖、默认解压保留两层目录而 `keepStructure=false` 必须平铺。详见 `docs/ROADMAP.md` §3.24 |
 | 【34】 | **三个图像后端的「结果一致性」** | `image.crop` 的说明里写着「裁剪矩形先算好再交给后端，所以三个后端切出来的**位置完全一致**」，而这句话此前**只有 libvips 那一档有证据**（【32】的像素断言全是在装了 libvips 的机器上跑的）。这一节把三档**真的各跑一遍**：① libvips → ② 把 `engines/libvips` 临时改名、只剩 ImageMagick → ③ 两个都改名、只剩纯 Rust（改名与还原抄【12】/【13】，`finally` 必定还原并断言两个引擎都回到 `installed`）。★ 关键的一条是**每档都要断言日志里的后端名** —— 改名一旦没生效，三次跑的都是 libvips，"三档一致"就会毫无意义地通过；另加一条**比对器反证**（拿裁剪产出与旋转产出比，必须报不同）。实测三档完全一致：裁剪都是 32×16、左上 `TL` 右下 `BR`；旋转都是 64×96、左上 `BL` 右下 `TR`（顺带证实 `vips rot d90` / `magick -rotate 90` / `image::rotate90()` 三个实现的方向也一致）。**途中撞到**：首次运行四条全红报"解码失败"，而像素其实一致 —— 三个后端编出的 PNG **色彩类型各不相同**（libvips→2 RGB、纯 Rust→6 RGBA、ImageMagick→3 调色板位深 2），而解码器当时对调色板返回 null。已给 `cdp.mjs::decodePng` 补上调色板支持（位深 1/2/4/8 + `tRNS`），并把比对改成比颜色三元组而非字节。详见 `docs/ROADMAP.md` §3.25 |
+| 【35】 | **`PLUGIN-SDK.md` §3.5「产出值」表与 `nodes.rs` 的实际调用点** | 这是**最后一张没有机械对账的公开契约**：【23】核对 §3.1–§3.4 的节点表（名字/参数/引擎），而 §3.5「哪些节点会产出可供 `${steps.x.y}` 引用的值」一直没人管 —— 因为 `NodeDescriptor` 里根本没有"我会产出哪些值"这个字段，那些值只存在于 `NodeOutput::with_value(…)` 的调用点里。它漂了很久，而且**四个方向同时漂**：`image.rotate` 多写了 `width`/`height`；`doc.ocr` 少了 `pages`/`rasterizer`；`video.transcode` 少了 `path`；**`text.replace`/`name.build`/`flow.log`/`flow.branch` 四个节点整个没被文档提到**；最要命的是 **`image.remove-background` 被归进"没有可引用的值"那一行，而它实际产出 6 个值** —— 其中 `coveragePercent` 是流程内判断"模型到底找没找到主体"的唯一手段，文档却告诉作者这件事做不到。现在文档按"**产出值的 20 个**"与"**不产出任何值的 12 个**"两段点名列出（不再用一句"其它都没有"笼统带过），本节 7 条检查把源码扫描与两段文档**四个方向**对上：文档缺值、文档编造值、有值却没行、以及**每个节点都必须被覆盖**。解析器自带三条自检（分发表 ≥30、两段都认出、`out.values.insert` 这种只有 `image.probe` 用的写法也要认）。★ 做过**四处独立篡改的证伪矩阵**（删真值 / 编假值 / 漏节点 / 把有值节点塞进无值清单），四处都如期变红。详见 `docs/ROADMAP.md` §3.26 |
 
 **【27】为什么把删除规则抽成纯函数**：上面那几条边界条件**每一条都是数据丢失风险**，
 而用真机穷举它们的代价太高（要造出"产出路径恰好等于输入路径"的插件、要造出多输入端口、
