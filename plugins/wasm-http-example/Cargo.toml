@@ -1,0 +1,28 @@
+[package]
+name = "toolforge-plugin-http-fetch"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "ToolForge L2 示例插件：抓取网页元信息（演示 net 白名单）"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# 与 `plugins/wasm-example` 保持同一版本：Extism PDK 的 ABI 与宿主里的
+# `extism` crate（1.30）配套，升 PDK 之前先确认宿主侧能装载。
+extism-pdk = "1.4.1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
+
+# 这个 crate 是**独立**的：它不在根 workspace 里（插件要单独编译到 wasm32，
+# 混进宿主 workspace 会让 `cargo build` 试图按宿主的目标三元组编译它）。
+[workspace]

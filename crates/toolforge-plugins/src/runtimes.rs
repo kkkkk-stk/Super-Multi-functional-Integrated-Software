@@ -193,7 +193,10 @@ impl PluginRunner {
                             "wasmBytes": bytes.len(),
                             "memoryLimitMb": wasm.memory_limit_mb,
                             "hostFunctions": wasm.allow_host_functions,
-                            "allowedHosts": wasm::allowed_hosts_from(&effective),
+                            // `unwrap_or_default()` 而不是原样给 `Option`：
+                            // 空数组读作"什么都没放行"（fail-closed），比 `null` 清楚。
+                            // 排查"插件联网被拒"时，这一条就是第一个要看的地方。
+                            "allowedHosts": wasm::allowed_hosts_from(&effective).unwrap_or_default(),
                         })),
                 );
                 RunningPlugin::Wasm(p)

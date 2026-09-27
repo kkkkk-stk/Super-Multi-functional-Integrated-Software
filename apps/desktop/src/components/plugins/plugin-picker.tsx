@@ -98,9 +98,12 @@ export function useDefaultPlugin(
   React.useEffect(() => {
     if (value && snapshot.plugins.some((p) => p.id === value)) return;
     const candidates = snapshot.plugins.filter((p) => (filter ? filter(p) : true));
-    // 优先挑"已启用 + 权限齐全"的，避免用户一进来就撞到"未授权"的墙
+    // 优先挑"已启用 + 权限齐全"的，避免用户一进来就撞到"未授权"的墙。
+    // 注意这里**只是排序偏好**，不是可用性判定：部分授权的插件仍然可以选
+    // （缺的能力在运行期才拦，见 `PluginStore::set_enabled` 的文档）。
     const preferred =
       candidates.find((p) => p.enabled && !p.hasPendingPermissions && p.grantedCount > 0) ??
+      candidates.find((p) => p.enabled && p.grantedCount > 0) ??
       candidates.find((p) => p.enabled) ??
       candidates[0];
     setValue(preferred ? preferred.id : null);

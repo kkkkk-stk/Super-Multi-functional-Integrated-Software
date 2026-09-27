@@ -138,6 +138,71 @@ impl Capability {
     pub fn fingerprint(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| format!("{self:?}"))
     }
+
+    /// 传给**插件**的能力标签（camelCase，与清单里写的 `kind:` 逐字一致）。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 插件载荷里的 `capabilities` 曾经是 `format!("{c:?}")` —— 也就是 Rust 的
+    /// **Debug 输出**：`FsRead { scope: Input }`。而文档（`PLUGIN-SDK.md`
+    /// 与两个 L2 示例的注释）写的都是 `["fsRead", "fsWrite"]`。
+    ///
+    /// 后果和参数那个缺陷是同一类：`plugins/python-example/main.py` 里
+    /// `if "fsRead" not in caps: raise ...` 永远成立，于是这个示例插件
+    /// **必然报"没有 fsRead 能力"**，而用户明明授权了。L2 的两个示例只是把标签
+    /// 打进日志，所以没暴露 —— 又一次"只有真跑才会发现"。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Capability::FsRead { .. } => "fsRead",
+            Capability::FsWrite { .. } => "fsWrite",
+            Capability::Net { .. } => "net",
+            Capability::Exec => "exec",
+            Capability::Env { .. } => "env",
+            Capability::Ai => "ai",
+            Capability::Gpu => "gpu",
+        }
+    }
+
+    /// 一条 `net.hosts` 条目里是不是带了**端口**。
+    ///
+    /// # 为什么这是一条错误而不是风格建议
+    ///
+    /// L2 沙箱把这份名单原样交给 Extism 的 `allowed_hosts`，而 Extism 的判定是
+    /// （见 `extism-1.30.0/src/pdk.rs`）：
+    ///
+    /// ```text
+    /// let host_str = url.host_str().unwrap_or_default();   // ← 只有主机名，没有端口
+    /// allowed_hosts.iter().any(|p| glob::Pattern::new(p).matches(host_str))
+    /// ```
+    ///
+    /// 于是 `api.example.com:443` 去匹配 `api.example.com` —— 永远不中。
+    /// 作者以为自己写得更严格，实际得到的是一个**确定连不上网**的插件，
+    /// 而且在运行时只会看到 `HTTP request to … is not allowed`，
+    /// 那句报错指不到清单上那个冒号。
+    ///
+    /// 所以：安装前就报错，并在 `runtimes/wasm.rs::normalize_host_pattern`
+    /// 里再兜一层（剥端口），保证已装好的插件不至于神秘失败。
+    ///
+    /// 判定刻意保守：IPv6 的 `[::1]` 不算带端口（方括号里的冒号不是分隔符），
+    /// 冒号后面不是纯数字的（`a:b`）也放过 —— 不猜。
+    pub fn net_host_has_port(host: &str) -> bool {
+        let host = host.trim();
+        if let Some(close) = host.rfind(']') {
+            // IPv6 字面量：`[::1]:8080` 才算带端口
+            let rest = &host[close + 1..];
+            return rest
+                .strip_prefix(':')
+                .is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+        }
+        match host.rsplit_once(':') {
+            Some((head, port)) => {
+                !head.is_empty()
+                    && !port.is_empty()
+                    && port.chars().all(|c| c.is_ascii_digit())
+            }
+            None => false,
+        }
+    }
 }
 
 /// 风险等级
@@ -420,6 +485,8 @@ pub struct PathResolver {
     output_root: Option<PathBuf>,
     plugin_data_root: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
+    /// 额外的**只读**根，见 [`PathResolver::with_read_root`]
+    extra_read_roots: Vec<PathBuf>,
 }
 
 impl PathResolver {
@@ -429,6 +496,7 @@ impl PathResolver {
             output_root: None,
             plugin_data_root: None,
             workspace_root: None,
+            extra_read_roots: Vec::new(),
         }
     }
 
@@ -446,6 +514,27 @@ impl PathResolver {
     }
     pub fn with_workspace(mut self, p: impl Into<PathBuf>) -> Self {
         self.workspace_root = Some(p.into());
+        self
+    }
+
+    /// 追加一个**只读**根：`PathScope::Input` 的解析额外允许落在这里。
+    ///
+    /// # 为什么多步流水线必须要有它
+    ///
+    /// 流水线各步骤之间传递的中间产物**落在输出目录里**（宿主为每个输出端口
+    /// 分配的目标路径都在 `output_root` 下），而下游步骤是通过 `src` 端口读它的，
+    /// 于是 `nodes.rs::resolve_path` 用 `Input` 作用域去解析 —— 撞上
+    /// "路径逃逸被拦截"，整条流水线在第二步就断了。
+    ///
+    /// 内置的 `video-to-gif` 就是这么断的：`video.thumbnail` 抽帧到
+    /// `${output.frame}`，紧接着 `image.probe` 想读它 → `PERMISSION_DENIED`。
+    /// （它此前还卡在更早的一个缺陷上 —— `${output.frame}` 根本解析不了，
+    /// 所以这个第二层问题一直没露头。两个缺陷叠在一起，只修一个还是跑不通。）
+    ///
+    /// 收窄之处：**只对读放开**。写仍然必须落在该作用域自己的根里 ——
+    /// 否则一个只声明 `fsWrite { output }` 的插件就能往输入目录里写东西。
+    pub fn with_read_root(mut self, p: impl Into<PathBuf>) -> Self {
+        self.extra_read_roots.push(p.into());
         self
     }
 
@@ -512,7 +601,16 @@ impl PathResolver {
             normalize_lexically(&root_norm.join(given))
         };
 
-        if !candidate.starts_with(&root_norm) {
+        // 读操作额外接受"只读根"（典型是输出目录：流水线的中间产物落在那里，
+        // 下游步骤却要用输入端口去读它 —— 见 `with_read_root` 的文档）
+        let allowed = candidate.starts_with(&root_norm)
+            || (matches!(scope, PathScope::Input)
+                && self
+                    .extra_read_roots
+                    .iter()
+                    .any(|r| candidate.starts_with(normalize_lexically(r))));
+
+        if !allowed {
             return Err(ToolforgeError::denied(format!(
                 "路径逃逸被拦截：{rel} 解析后落在授权目录之外"
             ))
@@ -617,6 +715,53 @@ mod tests {
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         // 根**之外**的绝对路径必须被拦
         let err = r.resolve(&PathScope::Input, "C:\\Windows\\System32").unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+    }
+
+    /// 多步流水线的中间产物在输出目录里，下游步骤却用 `src`（Input 作用域）读它。
+    ///
+    /// 这条是内置 `video-to-gif` 实测出来的：抽帧写到 `${output.frame}`，
+    /// 紧接着 `image.probe` 读同一个文件 → 以前直接 `PERMISSION_DENIED`
+    /// 「路径逃逸被拦截」，整条流水线在第二步断掉。
+    #[test]
+    fn read_root_lets_a_pipeline_read_its_own_intermediate() {
+        let r = PathResolver::new()
+            .with_input("/srv/input")
+            .with_output("/srv/output")
+            .with_read_root("/srv/output");
+
+        // 用 Input 作用域读输出目录里的中间产物：放行
+        assert_eq!(
+            r.resolve(&PathScope::Input, "/srv/output/frame.png").unwrap(),
+            Path::new("/srv/output/frame.png")
+        );
+
+        // 但**写**不受这条影响：输出目录之外的写仍然必须走 Output 作用域，
+        // 而 Input 作用域里没有输出根（这里只是恰好同名，换成别的目录就不行了）
+        let r2 = PathResolver::new()
+            .with_input("/srv/input")
+            .with_output("/srv/out2")
+            .with_read_root("/srv/out2");
+        assert!(
+            r2.resolve(&PathScope::Input, "/srv/out2/a.png").is_ok(),
+            "只读根对读生效"
+        );
+        // 只读根不会让**别的**目录变得可读
+        let err = r2.resolve(&PathScope::Input, "/srv/output/a.png").unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+    }
+
+    /// 只读根**只**影响 Input 作用域：它不能把输出根变成"随便读"。
+    #[test]
+    fn read_root_does_not_widen_output_writes() {
+        let r = PathResolver::new()
+            .with_input("/srv/input")
+            .with_output("/srv/output")
+            .with_read_root("/srv/input"); // 故意把输入目录登记成可读根
+        // 读输入目录本来就允许
+        assert!(r.resolve(&PathScope::Input, "/srv/input/a.png").is_ok());
+        // 往输入目录"写"仍然被拒（Output 作用域的根是 /srv/output）
+        let err = r.resolve(&PathScope::Output, "/srv/input/a.png").unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
     }
 

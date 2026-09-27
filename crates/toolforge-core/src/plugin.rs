@@ -254,6 +254,48 @@ impl ParamValue {
             _ => None,
         }
     }
+
+    /// 转成**插件看得懂**的裸 JSON 值。
+    ///
+    /// # 为什么不能直接把 `ParamValue` 序列化给插件（这是一个真实的 ABI 缺陷）
+    ///
+    /// `ParamValue` 的 serde 表示是 `{"kind": "int", "value": 5}` —— 那是为了让
+    /// specta 导出成 TS 可判别联合、前端做表单绑定不用 `any`。它是**宿主与前端的
+    /// 内部约定**，不是插件 ABI。
+    ///
+    /// 但 L2/L3 的载荷曾经直接 `json!(req.params)`，于是插件收到的是
+    /// `{"count": {"kind":"int","value":5}}`。后果是两个示例插件同时挂掉，
+    /// 而且报错各不相同：
+    ///
+    /// * L2（Rust）：`invalid type: map, expected a string` —— 反序列化就失败了；
+    /// * L3（Python）：`无法把 {'kind': 'int', 'value': 5} 解释为整数`。
+    ///
+    /// 两份**互相独立**的实现、两种语言，同时因为同一个形状挂掉，而
+    /// `docs/PLUGIN-SDK.md` 与两个插件的文档注释里写的都是
+    /// `"params": { "format": "webp" }` —— 也就是说，**文档是对的，实现是错的**。
+    /// 这类"文档与实现不一致，而两者都自洽"的缺陷，只有真跑一次才会暴露。
+    ///
+    /// 所以：给插件的一律是裸值（`"stats"` / `5` / `true` / `["a","b"]`）。
+    pub fn to_plain_json(&self) -> serde_json::Value {
+        match self {
+            ParamValue::Str(s) => serde_json::Value::String(s.clone()),
+            ParamValue::Int(i) => serde_json::json!(i),
+            ParamValue::Float(f) => serde_json::json!(f),
+            ParamValue::Bool(b) => serde_json::json!(b),
+            ParamValue::List(l) => serde_json::json!(l),
+        }
+    }
+}
+
+/// 把参数表转成插件载荷里的 `params` 对象（裸值，见 [`ParamValue::to_plain_json`]）。
+pub fn params_to_plain_json(
+    params: &std::collections::HashMap<String, ParamValue>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(params.len());
+    for (k, v) in params {
+        map.insert(k.clone(), v.to_plain_json());
+    }
+    serde_json::Value::Object(map)
 }
 
 // ============================================================================
@@ -529,6 +571,26 @@ impl PluginManifest {
                     format!("插件申请直接写宿主机路径：{glob}"),
                 ));
             }
+            // `net` 的 hosts 不能带端口。
+            //
+            // 这是**必然失效**而不是"风格问题"：L2 沙箱把这份名单交给 Extism，
+            // 而 Extism 用 `url.host_str()` 匹配 —— 端口根本不参与比较，
+            // 所以 `api.example.com:443` 永远匹配不上 `api.example.com`。
+            // 报成错误是因为它没有任何"也能跑"的情形：作者以为写得更严格，
+            // 实际得到的是一个完全连不上网的插件（详见 SECURITY.md §9）。
+            if let crate::permission::Capability::Net { hosts } = cap {
+                for h in hosts {
+                    if crate::permission::Capability::net_host_has_port(h) {
+                        issues.push(ValidationIssue::error(
+                            "NET_HOST_WITH_PORT",
+                            format!(
+                                "net.hosts 里的 `{h}` 带了端口：沙箱只按主机名匹配，\
+                                 端口不参与比较，这条白名单永远匹配不上"
+                            ),
+                        ));
+                    }
+                }
+            }
         }
 
         ValidationReport::from_issues(issues)
@@ -571,11 +633,39 @@ impl PluginManifest {
                         ));
                     }
                 }
-                // L2 的能力边界提醒：如果插件声明了 fs/net 却选了 WASM 运行时，几乎肯定是设计错了
-                if !self.permissions.is_empty() {
+                // L2 的能力边界提醒。
+                //
+                // ⚠️ 这里曾经把 `net` 也算进"多余声明"，原话是
+                // 「WASM 运行时无法访问文件系统与网络」。**那句话对网络是错的**：
+                // Extism 内置了 `http_request` 宿主函数，只要声明了 `net` 且用户授权，
+                // 沙箱就能发请求（见 `runtimes/wasm.rs::allowed_hosts_from`）。
+                // 把 `net` 说成多余，会引导作者删掉一个**必须**声明的东西 ——
+                // 删掉的后果不是"少一条警告"，而是插件跑起来必然报
+                // 「HTTP request to … is not allowed」。
+                //
+                // 反过来，fs / exec / env 对 L2 确实不可达（关掉 WASI 后连 open 都没有），
+                // 所以只对这几项给出警告。
+                let unreachable: Vec<&str> = self
+                    .permissions
+                    .capabilities
+                    .iter()
+                    .filter_map(|c| match c {
+                        crate::permission::Capability::FsRead { .. } => Some("fsRead"),
+                        crate::permission::Capability::FsWrite { .. } => Some("fsWrite"),
+                        crate::permission::Capability::Exec => Some("exec"),
+                        crate::permission::Capability::Env { .. } => Some("env"),
+                        // `net` 是可达的（Extism 的 http_request，受 allowed_hosts 约束）；
+                        // `ai` / `gpu` 由宿主侧决定，与沙箱无关，不在这里下结论。
+                        _ => None,
+                    })
+                    .collect();
+                if !unreachable.is_empty() {
                     issues.push(ValidationIssue::warning(
                         "WASM_WITH_PERMISSIONS",
-                        "WASM 运行时无法访问文件系统与网络，声明 fs/net 权限通常是多余或设计错误",
+                        format!(
+                            "WASM 运行时访问不到这些能力，声明它们通常是设计错误：{}",
+                            unreachable.join("、")
+                        ),
                     ));
                 }
             }
@@ -879,6 +969,55 @@ pub enum FileEncoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // 给插件的参数载荷 —— 这一组钉的是一个**只有真跑才会发现的 ABI 缺陷**
+    // ========================================================================
+
+    /// `ParamValue` 自己的 serde 形状是 `{kind, value}`（给前端做可判别联合用的）。
+    /// 插件**不能**收到那个形状：它一收到就解析失败。
+    ///
+    /// 这个缺陷曾经同时打挂两个语言不同、互相独立的示例插件：
+    /// L2 报 `invalid type: map, expected a string`，
+    /// L3 报 `无法把 {'kind': 'int', 'value': 5} 解释为整数`。
+    #[test]
+    fn plugin_params_are_plain_values_not_tagged_enums() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("mode".to_string(), ParamValue::Str("stats".into()));
+        params.insert("count".to_string(), ParamValue::Int(5));
+        params.insert("ratio".to_string(), ParamValue::Float(1.5));
+        params.insert("flag".to_string(), ParamValue::Bool(true));
+        params.insert("tags".to_string(), ParamValue::List(vec!["a".into(), "b".into()]));
+
+        let json = params_to_plain_json(&params);
+
+        // 裸值：不是对象、不是 {kind,value}
+        assert_eq!(json["mode"], serde_json::json!("stats"));
+        assert_eq!(json["count"], serde_json::json!(5));
+        assert_eq!(json["ratio"], serde_json::json!(1.5));
+        assert_eq!(json["flag"], serde_json::json!(true));
+        assert_eq!(json["tags"], serde_json::json!(["a", "b"]));
+
+        // 反证：拿"直接序列化 ParamValue"的结果去比对，必须**不相等**。
+        // 没有这一条，上面那几行在一个"根本没做转换"的实现上也可能通过
+        // —— 只要 ParamValue 的 serde 恰好长成裸值。
+        let leaked = serde_json::to_value(ParamValue::Int(5)).unwrap();
+        assert_ne!(
+            leaked,
+            serde_json::json!(5),
+            "ParamValue 的 serde 形状若变成裸值，这条测试的前提就不成立了"
+        );
+        assert_eq!(leaked["kind"], serde_json::json!("int"));
+    }
+
+    #[test]
+    fn empty_params_map_is_an_empty_object_not_null() {
+        // `null` 会让插件的 `params.get("x")` 直接抛异常；
+        // 空对象才是"这次没有参数"的正确表示
+        let json = params_to_plain_json(&std::collections::HashMap::new());
+        assert!(json.is_object());
+        assert_eq!(json.as_object().unwrap().len(), 0);
+    }
 
     const MINIMAL_L1: &str = r#"
 apiVersion: toolforge/v1

@@ -49,8 +49,9 @@ io:
 runtime:
   kind: wasm
   wasm:
-    # 相对插件目录的产物路径；用 `cargo build --target wasm32-wasip1 --release`
-    # 后把 target/wasm32-wasip1/release/*.wasm 复制过来（见同目录 README 注释）
+    # 相对插件目录的产物路径。**必须**用 `--target wasm32-unknown-unknown` 构建：
+    # `wasm32-wasip1` 的 std 会无条件导入 WASI，而宿主关掉了 WASI，装了也跑不起来
+    # （见 src/lib.rs 顶部注释里的完整说明）。
     path: plugin.wasm
     entry: run
     memoryLimitMb: 64

@@ -700,10 +700,15 @@ fn submit_plugin_run(
     app: &Arc<AppState>,
     req: RunPluginRequest,
 ) -> ToolforgeResult<RunPluginResponse> {
-    // 这一步会校验：已安装 / 已启用 / 校验通过 / 权限齐全
+    // 这一步会校验：已安装 / 已启用 / 校验通过
     let record = app.plugins.runnable(&req.plugin_id)?;
     // 哈希校验：与安装时不一致就直接拒绝并禁用
     app.plugins.quarantine_if_changed(&req.plugin_id)?;
+
+    // 声明了但没授权的能力**不阻塞运行**（部分授权是允许的），但必须提前说一句：
+    // 用户点下去却撞上 PERMISSION_DENIED 时，至少日志里已经有原因。
+    // 这条曾经是硬阻塞，见 `PluginStore::set_enabled` 的文档。
+    let ungranted = app.plugins.ungranted_declared(&req.plugin_id);
 
     // 把多文件输入展开成单文件批次（目录会先展开成里面的文件）
     let batches = expand_batches(&req.inputs)?;
@@ -728,6 +733,11 @@ fn submit_plugin_run(
     let engines = app.engines.clone();
     let paths = app.paths.clone();
     let plugin_id = req.plugin_id.clone();
+    // 审计日志句柄：**应用那一个**（`<data>/audit`），不是从插件目录反推出来的。
+    // 内置插件在 `<仓库>/plugins/builtin/` 下，反推会写到 `<仓库>/plugins/audit/`
+    // —— 既污染工作树，又让 L1 与 L2/L3 的审计分家。真机跑 video-to-gif 时冒出来的
+    // `plugins/audit/` 就是这么来的。
+    let audit = app.plugins.audit().clone();
     // 在锁外克隆一份句柄：`AiClient` 在 `RwLock` 里，持锁跨 await 会饿死设置保存
     let vision: Option<Arc<dyn toolforge_core::ai::VisionClient>> = app
         .ai
@@ -739,6 +749,14 @@ fn submit_plugin_run(
         let workspace = paths.job_workspace(ctx.id.as_str());
         std::fs::create_dir_all(&workspace).ok();
 
+        if !ungranted.is_empty() {
+            ctx.warn(format!(
+                "该插件有 {} 项声明的能力尚未授权，用到时会被拒绝并记入安全审计：{}",
+                ungranted.len(),
+                ungranted.join("、")
+            ));
+        }
+
         let mut produced_all: Vec<String> = Vec::new();
         let total = batches.len().max(1);
 
@@ -746,7 +764,8 @@ fn submit_plugin_run(
             // 取消检查放在批次边界 —— 这是"取消秒级生效"的关键
             ctx.check()?;
 
-            let (input_root, outputs) = build_io(inputs, &output_dir, &req.params)?;
+            let (input_root, outputs) =
+                build_io(inputs, &output_dir, &req.params, &record.manifest.io.outputs)?;
             let label = inputs
                 .values()
                 .find_map(|v| v.first())
@@ -763,18 +782,26 @@ fn submit_plugin_run(
             let call_req = PluginCallRequest {
                 payload: serde_json::json!({
                     "input": inputs,
-                    "params": req.params,
+                    // ⚠️ `params` 必须是**裸值**，不能直接把 `ParamValue` 序列化过去。
+                    // 它的 serde 形状是 `{kind, value}`（那是给前端做表单绑定用的
+                    // 可判别联合），插件收到那个形状会直接解析失败 —— 两个语言不同、
+                    // 互相独立的示例插件都栽在这里，详见 `ParamValue::to_plain_json`。
+                    "params": toolforge_core::plugin::params_to_plain_json(&req.params),
                     "paths": {
                         "input": input_root.display().to_string(),
                         "output": output_dir.display().to_string(),
                         "data": paths.plugin_data(&plugin_id).display().to_string(),
                         "work": workspace.display().to_string(),
                     },
+                    // ⚠️ 用 `label()` 而**不是** `format!("{c:?}")`。
+                    // Debug 输出会把 `fsRead` 写成 `FsRead { scope: Input }`，
+                    // 而插件（以及文档）认的是 camelCase 标签 —— 照 Debug 输出走，
+                    // 插件里 `if "fsRead" in caps` 永远为假。
                     "capabilities": record
                         .effective()
                         .capabilities
                         .iter()
-                        .map(|c| format!("{c:?}"))
+                        .map(|c| c.label())
                         .collect::<Vec<_>>(),
                 }),
                 input_root: input_root.clone(),
@@ -803,9 +830,17 @@ fn submit_plugin_run(
                         // 其余节点完全不受影响。
                         vision: vision.clone(),
                     };
-                    let result =
-                        toolforge_plugins::l1::run_pipeline(&record, &pipeline_req, engines.clone(), &ctx)
-                            .await?;
+                    // 审计日志用**应用那一个**，不要从插件目录反推 ——
+                    // 内置插件在 `<仓库>/plugins/builtin/` 下，反推会写到
+                    // `<仓库>/plugins/audit/`（污染工作树，且与 L2/L3 的审计分家）。
+                    let result = toolforge_plugins::l1::run_pipeline(
+                        &record,
+                        &pipeline_req,
+                        engines.clone(),
+                        &audit,
+                        &ctx,
+                    )
+                    .await?;
                     report_steps(&ctx, &result.steps);
                     for w in &result.warnings {
                         ctx.warn(w.clone());
@@ -823,12 +858,13 @@ fn submit_plugin_run(
                     let value = runner.call(&record, &call_req, &ctx).await?;
                     // 插件返回值可能很大，只在 debug 级别留一份摘要，方便排查
                     ctx.log(LogLevel::Debug, format!("插件返回：{}", summarize(&value)));
-                    let produced = extract_outputs(&value);
-                    if produced.is_empty() {
-                        outputs.values().cloned().collect()
-                    } else {
-                        produced
-                    }
+                    interpret_plugin_response(
+                        &record,
+                        &value,
+                        &output_dir,
+                        &ctx,
+                        &outputs,
+                    )?
                 }
             };
 
@@ -1164,7 +1200,10 @@ fn build_io(
     inputs: &HashMap<String, Vec<String>>,
     output_dir: &std::path::Path,
     params: &HashMap<String, ParamValue>,
+    declared_outputs: &[toolforge_core::plugin::IoPort],
 ) -> ToolforgeResult<(PathBuf, HashMap<String, String>)> {
+    use toolforge_core::plugin::PortType;
+
     let mut input_root: Option<PathBuf> = None;
     for paths in inputs.values() {
         for p in paths {
@@ -1181,24 +1220,83 @@ fn build_io(
         }
     }
 
-    // 输出名：<源文件名主干>.<params.format 或原扩展名>
-    let ext = params
+    let mut outputs = HashMap::new();
+    let Some(src) = inputs.values().find_map(|v| v.first()) else {
+        return Ok((
+            input_root.unwrap_or_else(|| output_dir.to_path_buf()),
+            outputs,
+        ));
+    };
+
+    let stem = PathBuf::from(src)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".into());
+    let original_ext = PathBuf::from(src)
+        .extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "out".into());
+    // `params.format` 优先：这是"转换类"插件的传统写法（`image-convert` 就靠它）
+    let format_ext = params
         .get("format")
         .and_then(|v| v.as_str())
         .map(|s| s.trim_start_matches('.').to_string());
 
-    let mut outputs = HashMap::new();
-    let first_input = inputs.values().find_map(|v| v.first());
-    if let Some(src) = first_input {
-        let stem = PathBuf::from(src)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "output".into());
-        let original_ext = PathBuf::from(src)
-            .extension()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "out".into());
-        let name = format!("{stem}.{}", ext.unwrap_or(original_ext));
+    // ---- 逐条为清单里声明的输出端口分配路径 ----
+    //
+    // # 这里此前只分配了 `dst`
+    //
+    // 原来只有一行 `outputs.insert("dst", <stem>.<ext>)`。后果是**任何声明了
+    // 第二个输出端口的插件都是坏的**：`${output.frame}` 之类的模板变量根本
+    // 解析不了，插件在第一步就报 `模板变量 ${output.frame} 无法解析`。
+    // 内置的 `video-to-gif` 就是这么坏的 —— 它从写出来那天起就没跑通过，
+    // 而单元测试、`cargo check`、插件列表全都显示"正常"。
+    //
+    // 命名规则（`ext` 的优先级：`params.format` → 端口 `accept` 里的扩展名 → 源扩展名）：
+    //
+    // | 端口 | 类型 | 文件名 |
+    // |---|---|---|
+    // | `dst` | file | `<主干>.<ext>` —— 与历史行为一致，不动 |
+    // | 其它 | file | `<主干>.<端口id>.<ext>` —— 加上端口 id，避免多端口撞名 |
+    // | `dst` | directory | `<主干>`（目录不带扩展名） |
+    // | 其它 | directory | `<主干>.<端口id>` |
+    for port in declared_outputs {
+        // text / json / number… 不是路径，宿主不为它分配文件
+        if !matches!(
+            port.ty,
+            PortType::File | PortType::Files | PortType::Directory | PortType::Any
+        ) {
+            continue;
+        }
+        let is_dir = port.ty == PortType::Directory;
+        let declared_ext = port
+            .accept
+            .iter()
+            .find_map(|a| a.strip_prefix('.').map(|s| s.to_string()))
+            .or_else(|| {
+                port.accept
+                    .iter()
+                    .find_map(|a| a.rsplit_once('/').map(|(_, e)| e.to_string()))
+            });
+        let ext = format_ext
+            .clone()
+            .filter(|_| port.id == "dst")
+            .or(declared_ext)
+            .unwrap_or_else(|| original_ext.clone());
+
+        let name = match (is_dir, port.id.as_str()) {
+            (true, "dst") => stem.clone(),
+            (true, other) => format!("{stem}.{other}"),
+            (false, "dst") => format!("{stem}.{ext}"),
+            (false, other) => format!("{stem}.{other}.{ext}"),
+        };
+        outputs.insert(port.id.clone(), output_dir.join(name).display().to_string());
+    }
+
+    // 清单没声明任何文件类输出端口 → 保持历史行为，给一个 `dst`。
+    // （大多数内置插件的 `io.outputs` 就是空的，靠 `${dst}` 走通。）
+    if outputs.is_empty() {
+        let name = format!("{stem}.{}", format_ext.unwrap_or(original_ext));
         outputs.insert("dst".to_string(), output_dir.join(name).display().to_string());
     }
 
@@ -1254,6 +1352,9 @@ fn summarize(v: &serde_json::Value) -> String {
 /// 从插件返回值里提取产出文件。
 ///
 /// 约定：返回值是对象且带 `outputs` 数组（也可以是 `output` 单值）。
+///
+/// ⚠️ 这是**旧**的数组形态，只保留给"插件直接返回一个文件路径列表"的老写法。
+/// 现在的完整约定见 [`interpret_plugin_response`]。
 fn extract_outputs(v: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(arr) = v.get("outputs").and_then(|x| x.as_array()) {
@@ -1267,6 +1368,149 @@ fn extract_outputs(v: &serde_json::Value) -> Vec<String> {
         out.push(s.to_string());
     }
     out
+}
+
+/// 解读 L2/L3 插件的返回值，产出"这个插件这次真的产出了什么"。
+///
+/// # 这个函数补的是一条真实存在的断链
+///
+/// L2/L3 的返回信封在文档里是这么写的：
+///
+/// ```json
+/// { "outputs": { "swatch": "D:/out/色卡.png" }, "values": { "count": 5 } }
+/// ```
+///
+/// 但在它存在之前，宿主只认 `outputs` 是**数组**的写法（[`extract_outputs`]）。
+/// 对象形态于是被静默忽略，落到 `build_io` 算出来的那个输出路径上 ——
+/// 而那个文件**从来没有人写过**。任务于是"成功"，产出列表里挂着一个不存在的文件：
+/// 用户点开是空的、点"在文件夹里显示"会失败。这是最糟的一类缺陷
+/// （静默地少干活，还报告成功），而它只在 L2/L3 上发生，L1 走的是另一条路。
+///
+/// 现在的规则：
+///
+/// 1. `{"error": "…"}` → 交给上层（其实 `wasm.rs` 已经先拦了一道）；
+/// 2. `outputs` 是**对象** → 逐条对照清单里声明的输出端口：
+///    * 端口类型是文件/目录 → 当成一个**路径**：必须真实存在，且必须在输出根之内。
+///      越界 → `PERMISSION_DENIED` + 审计（插件不能凭空"宣称"产出了系统目录里的文件）；
+///      不存在 → 记一条 **warning** 并**不**计入产出（宁可少报，也不能报一个假路径）；
+///    * 其它类型（text / json / number / boolean）→ 当成**值**，写进任务日志（info）。
+///      不写日志的话，一个"输出一段 JSON"的插件跑完，用户什么都看不到；
+/// 3. `outputs` 是数组（老写法）→ 走 [`extract_outputs`]，并给一条建议改写法。
+///
+/// `values` 里的键值同样写到任务日志 —— 那是 `${steps.<id>.<键>}` 引用得到的东西，
+/// 用户至少该看得见。
+fn interpret_plugin_response(
+    record: &toolforge_plugins::PluginRecord,
+    value: &serde_json::Value,
+    output_root: &std::path::Path,
+    ctx: &toolforge_core::queue::JobCtx,
+    fallback_outputs: &HashMap<String, String>,
+) -> ToolforgeResult<Vec<String>> {
+    use toolforge_core::plugin::PortType;
+
+    // 端口 id -> 类型
+    let ports: HashMap<&str, PortType> =
+        record.manifest.io.outputs.iter().map(|p| (p.id.as_str(), p.ty)).collect();
+
+    let mut produced: Vec<String> = Vec::new();
+
+    let outputs_value = value.get("outputs");
+    let mut saw_object_outputs = false;
+
+    if let Some(map) = outputs_value.and_then(|o| o.as_object()) {
+        saw_object_outputs = true;
+        for (port_id, raw) in map {
+            let Some(text) = raw.as_str() else {
+                // 非字符串（数字/布尔/对象）当成值处理，不当路径
+                ctx.info(format!("输出端口 `{port_id}`：{}", summarize(raw)));
+                continue;
+            };
+            let is_file_port = matches!(
+                ports.get(port_id.as_str()),
+                Some(PortType::File | PortType::Files | PortType::Directory | PortType::Any) | None
+            );
+
+            if !is_file_port {
+                ctx.info(format!("输出端口 `{port_id}`：{text}"));
+                continue;
+            }
+
+            let p = std::path::Path::new(text);
+            // 先做词法收敛再比较：`D:\out\..\..\Windows` 这类写法必须被认出来
+            let norm = toolforge_core::permission::normalize_lexically(p);
+            let rooted = toolforge_core::permission::normalize_lexically(output_root);
+            if !norm.starts_with(&rooted) {
+                return Err(ToolforgeError::denied(format!(
+                    "插件声明的产出 `{text}` 不在输出目录之内"
+                ))
+                .with_subject(record.id())
+                .with_detail(format!(
+                    "输出目录：{}\n\
+                     插件返回值里的路径必须落在这个目录里。宿主不会把一个插件\
+                     「宣称」的任意路径当成产出 —— 那会让输出列表变成一份可被伪造的清单。",
+                    output_root.display()
+                )));
+            }
+            if !p.exists() {
+                ctx.warn(format!(
+                    "插件把 `{text}` 报成输出端口 `{port_id}` 的产出，但这个文件不存在，已忽略"
+                ));
+                continue;
+            }
+            produced.push(text.to_string());
+        }
+    }
+
+    // `values` / `outputs` 里的**非路径**结果必须让用户看得见。
+    // 否则"输出一段文本/JSON"的插件跑完，界面上什么都不显示。
+    if let Some(values) = value.get("values").and_then(|v| v.as_object()) {
+        for (k, v) in values {
+            ctx.info(format!("插件结果 · {k} = {}", summarize(v)));
+        }
+    }
+
+    if produced.is_empty() {
+        if saw_object_outputs {
+            // 对象形态但一个文件都没落地：**不要**回退到宿主算出来的路径 ——
+            // 那个文件没人写过，报出去就是假产出。
+            let declared: Vec<&str> = record
+                .manifest
+                .io
+                .outputs
+                .iter()
+                .filter(|p| matches!(p.ty, PortType::File | PortType::Files | PortType::Directory))
+                .map(|p| p.id.as_str())
+                .collect();
+            if !declared.is_empty() {
+                ctx.warn(format!(
+                    "插件返回的 outputs 里没有任何真实存在的文件（声明的文件类输出端口：{}）",
+                    declared.join("、")
+                ));
+            }
+        } else if let Some(arr) = outputs_value.and_then(|o| o.as_array()) {
+            let _ = arr;
+            produced = extract_outputs(value);
+        }
+    }
+
+    if produced.is_empty() && outputs_value.is_none() {
+        // 插件根本没提 outputs —— 老写法/自由写法。
+        // 这里保留旧的兜底，但**只**在宿主算出来的那个路径确实存在时才报它。
+        let existing: Vec<String> = fallback_outputs
+            .values()
+            .filter(|p| std::path::Path::new(p.as_str()).exists())
+            .cloned()
+            .collect();
+        if existing.is_empty() && !fallback_outputs.is_empty() {
+            ctx.warn(
+                "插件没有返回 outputs，宿主也没有在输出目录里看到预期文件 —— \
+                 请检查插件是否把产物写到了路径 `paths.output` 下",
+            );
+        }
+        produced = existing;
+    }
+
+    Ok(produced)
 }
 
 /// 让 `Arc<AppState>` 能在命令签名里使用

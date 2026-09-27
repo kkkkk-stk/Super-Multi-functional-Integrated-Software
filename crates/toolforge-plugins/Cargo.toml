@@ -28,6 +28,7 @@ semver = { workspace = true }
 specta = { workspace = true }
 
 extism = { workspace = true }
+wasmparser = { workspace = true }
 base64 = "0.22"
 
 [dev-dependencies]

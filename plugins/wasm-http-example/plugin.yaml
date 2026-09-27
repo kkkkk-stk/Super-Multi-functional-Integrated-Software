@@ -1,0 +1,79 @@
+# ToolForge L2 插件（Extism WASM 沙箱）—— **联网**示例
+#
+# 与 `plugins/wasm-example` 的区别只有一个：这一个申请 `net`，用来演示
+# L2 的网络能力**是真的被强制的**。
+#
+# ── 先读这一段：L2 的网到底是怎么开的 ─────────────────────────────────
+# Extism 内置了 `http_request` 宿主函数，所以 WASM 沙箱**能**发 HTTP ——
+# 但它只能发给宿主放行过的主机：
+#
+#   清单里声明的 hosts  ∩  用户在授权面板上勾的 hosts  →  Extism 的 allowed_hosts
+#
+# 两边取交集（`PermissionSet::effective()`），少一个都不给。所以：
+#
+#   * **没勾 `net`** → 白名单是空的 → 任何请求都被沙箱自己拒绝，
+#     报 `HTTP request to <url> is not allowed`；
+#   * 勾了 `net`（`hosts: []` 表示任意主机）→ 请求才发得出去。
+#
+# ── 关于 `hosts` 的写法（一个真实的坑）────────────────────────────────
+# **只能写主机名，不能写端口。** Extism 用 `url.host_str()` 去匹配，端口根本
+# 不参与比较，所以 `api.example.com:443` 这种写法永远匹配不上、插件必然失败。
+# 校验器会以 `NET_HOST_WITH_PORT` 直接拒绝这种清单，不让它拖到运行时才神秘报错。
+# 支持 glob：`*.example.com` 是合法的。
+#
+# ── 为什么 hosts 是空列表 ─────────────────────────────────────────────
+# 这是一个"抓任意网址元信息"的工具，作者无法预知用户会填什么域名，所以只能
+# 申请任意主机 —— 这会以**高风险**出现在授权面板上（红色），这是对的：
+# 任意主机意味着插件可以把内容发到任何地方。真实插件应当尽量改成白名单。
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.example.http-fetch
+  name: 网页元信息抓取（WASM 联网示例）
+  version: 0.1.0
+  description: 抓取一个网址，提取标题、meta 描述与响应信息，返回 JSON。演示 L2 的 net 能力与主机白名单如何被强制执行。
+  author: ToolForge
+  license: MIT
+  icon: globe
+  category: text
+  tags: [示例, WASM, 联网, HTTP]
+
+permissions:
+  capabilities:
+    # 空列表 = 任意主机。等价于授权面板上的「访问网络（任意主机，无限制）」
+    - kind: net
+      hosts: []
+
+io:
+  inputs:
+    - id: url
+      label: 网址
+      type: text
+      description: 例如 https://example.com 。必须是 http:// 或 https:// 开头。
+      required: true
+  outputs:
+    - id: result
+      label: 页面信息（JSON）
+      type: json
+      required: false
+      description: 形如 {"url":"…","status":200,"title":"…","description":"…"} 的 JSON 字符串。
+  params: []
+
+runtime:
+  kind: wasm
+  wasm:
+    # 用 `cargo build --target wasm32-unknown-unknown --release` 生成后复制过来，
+    # 完整命令见同目录 src/lib.rs 的模块文档。
+    # （**不能**用 wasm32-wasip1：它的 std 必然导入 WASI，而宿主关掉了 WASI。）
+    path: plugin.wasm
+    entry: run
+    # 响应体最多 512 KB（插件自己也截断了），64 MB 给解析留足余量
+    memoryLimitMb: 64
+    # 网络调用要算上 DNS + TLS 握手，10 秒对"抓一个页面"是合理的上界。
+    # 注意这个值是**燃料**上限（见 runtimes/wasm.rs），不是墙钟超时：
+    # 沙箱里的等待时间不烧燃料，所以真正卡住网络时靠的是宿主自身的 http 超时。
+    timeoutMs: 10000
+    # 宿主函数白名单只管 log / kv。`http_request` 是 Extism **内置**的，
+    # 不在这份名单里，也**不需要**在这里声明。
+    allowHostFunctions: ["log"]

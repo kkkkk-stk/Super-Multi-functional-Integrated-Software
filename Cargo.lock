@@ -6436,6 +6436,7 @@ dependencies = [
  "toolforge-process",
  "tracing",
  "walkdir",
+ "wasmparser 0.245.1",
 ]
 
 [[package]]

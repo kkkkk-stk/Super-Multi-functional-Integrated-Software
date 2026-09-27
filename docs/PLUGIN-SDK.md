@@ -668,11 +668,27 @@ L2 跑在 Extism + Wasmtime 上，宿主**关闭了 WASI**。这意味着插件�
 内存：`memoryLimitMb` 换算成 64 KiB 页并夹在 16 页（1 MiB）到 65536 页（4 GiB）之间。
 超限报 `PLUGIN_RUNTIME`。
 
-### 4.3 从 Rust 编译到 `wasm32-wasip1`
+### 4.3 从 Rust 编译到 `wasm32-unknown-unknown`
+
+> ⚠️ **目标三元组必须是 `wasm32-unknown-unknown`，不能用 `wasm32-wasip1`。**
+>
+> 这一条曾经写错，代价是一个"编译成功、产物也在、但装进沙箱必然失败"的示例插件。
+> 原因很隐蔽：**Rust 的 wasip1 版 std 在启动时会无条件读环境变量**（`std::rt::init`
+> 调 `environ_get`），所以任何用 std 写出来的 wasip1 模块都会导入
+> `wasi_snapshot_preview1`；而宿主刻意关掉了 WASI（`with_wasi(false)`，这是
+> "插件没有文件系统"这条保证的实现手段），于是 wasmtime 实例化时报：
+>
+> ```text
+> unknown import: `wasi_snapshot_preview1::environ_get` has not been defined
+> ```
+>
+> 宿主现在会在**装载前**读一遍模块的导入段，遇到 WASI 导入直接给出
+> "请改用 `wasm32-unknown-unknown` 重新构建"的提示（见
+> `runtimes/wasm.rs::inspect_imports`），但正确做法当然是一开始就选对目标。
 
 ```powershell
 # 1) 装目标（只需一次）
-rustup target add wasm32-wasip1
+rustup target add wasm32-unknown-unknown
 
 # 2) 建工程：Cargo.toml 里 crate-type 必须是 cdylib
 #    [lib]
@@ -682,19 +698,30 @@ rustup target add wasm32-wasip1
 #    anyhow = "1"
 #    serde = { version = "1", features = ["derive"] }
 #    serde_json = "1"
+#
+#    [profile.release]
+#    panic = "abort"     # wasm32-unknown-unknown 不支持展开
 
 # 3) 编译
-cargo build --target wasm32-wasip1 --release
+cargo build --target wasm32-unknown-unknown --release
 
 # 4) 把产物复制成清单里 wasm.path 指定的名字
-Copy-Item .\target\wasm32-wasip1\release\<crate_name>.wasm .\plugin.wasm
+Copy-Item .\target\wasm32-unknown-unknown\release\<crate_name>.wasm .\plugin.wasm
 ```
 
 > ⚠️ 如果插件工程放在仓库的 `plugins/` 下，**必须在它自己的 `Cargo.toml` 里加一行
 > `[workspace]`**，否则 cargo 会去找仓库根的 workspace 并报
 > "current package believes it's in a workspace when it's not"。
 
-完整可运行例子：`plugins/wasm-example/`（`plugin.yaml` + `Cargo.toml` + `src/lib.rs`）。
+> 💡 想在**宿主机**上跑这个 crate 的纯函数单元测试（`cargo test`），需要把
+> `#[plugin_fn]` 的入口用 `#[cfg(target_arch = "wasm32")]` 门起来：PDK 的
+> `info!` / `http::request` 引用了 `extism:host/env` 的导入，在宿主机三元组上
+> 链接会报 `LNK2019: 无法解析的外部符号 get_log_level`。
+> 两个示例插件（`plugins/wasm-example`、`plugins/wasm-http-example`）都这么做。
+
+完整可运行例子：
+* `plugins/wasm-example/` —— 纯计算（文本统计 / slugify）；
+* `plugins/wasm-http-example/` —— 联网（`net` 白名单 + Extism 的 `http_request`）。
 
 ### 4.4 Extism PDK 用法
 
@@ -707,13 +734,17 @@ struct RunRequest {
     /// 输入端口 id -> **路径/值列表**（即使只有一个值也是数组）
     #[serde(default)]
     input: std::collections::BTreeMap<String, Vec<String>>,
-    /// 参数 id -> 值
+    /// 参数 id -> **裸值**（`"stats"` / `5` / `true`）。
+    ///
+    /// ⚠️ 用 `serde_json::Value` 而不是 `String`：宿主给的是**原始 JSON 类型**，
+    /// 声明成 `String` 会让整个反序列化失败（`invalid type: map, expected a string`
+    /// —— 这是本项目真实踩过的坑）。
     #[serde(default)]
-    params: std::collections::BTreeMap<String, String>,
+    params: std::collections::BTreeMap<String, serde_json::Value>,
     /// 逻辑作用域 -> 真实根目录
     #[serde(default)]
     paths: std::collections::BTreeMap<String, String>,
-    /// 本次调用实际生效的能力标签
+    /// 本次调用实际生效的能力标签（camelCase，与清单里的 `kind:` 一致）
     #[serde(default)]
     capabilities: Vec<String>,
 }
@@ -730,10 +761,54 @@ pub fn run(input: Json<RunRequest>) -> FnResult<Json<serde_json::Value>> {
 要点：
 
 - **输入**：宿主把 `PluginCallRequest::payload` 序列化成 JSON 字节传进来
-  （字段见上面结构体，与 `runtimes.rs` 的文档一致）。
+  （字段见上面结构体，与 `runtimes.rs` 的文档一致）。注意 `params` 的值是
+  **裸值**（`"stats"` / `5` / `true` / `["a"]`），不是 `{kind, value}` ——
+  后者是宿主与前端的内部约定，插件**不会**收到那个形状。
+  `capabilities` 是 camelCase 标签（`["fsRead","fsWrite","net"]`），
+  与清单里 `kind:` 写的一致。
 - **返回**：**必须是 JSON**。宿主先按 JSON 解析，解析不了才宽容地退化成裸字符串。
-- **错误**：返回 `FnResult` 的 `Err`（`anyhow!` 的错误会带上 return code），
-  宿主会把它变成 `PLUGIN_RUNTIME` 错误。
+
+#### 返回信封（宿主真正认的三个字段）
+
+```jsonc
+{
+  // ① 输出端口 id -> 值。文件类端口给**路径**（必须真实存在、且必须落在
+  //    输出目录之内，否则整次调用被判 PERMISSION_DENIED 并记审计）；
+  //    其它类型（text/json/number/boolean）给值，会写进任务日志。
+  "outputs": { "swatch": "D:\\out\\色卡.png", "palette": "[{\"hex\":\"#1a2b3c\"}]" },
+
+  // ② 结构化结果，会逐个写进任务日志。也是 `${steps.<步骤id>.<键>}` 引用得到的东西。
+  "values": { "count": 5, "dominant": "#1a2b3c" },
+
+  // ③ 报错。**这是 L2 唯一可靠的报错通道**，见下。
+  "error": "请求 … 失败：HTTP request to … is not allowed"
+}
+```
+
+> ⚠️ **L2 报错不要靠返回 `Err`。**
+>
+> Extism 1.30 只在**输出已被设置**时才读取插件设置的错误消息
+> （`plugin.rs`: `if output_res.is_ok() && self.extism_error_is_set()`），
+> 而 Extism PDK 的 `#[plugin_fn]` 在 `Err` 分支上只调 `error_set`、
+> **不**设置输出内存 —— 于是 `output_res` 是 `Err`，你写的报错文案被丢掉，
+> 用户看到的是一句 wasm 回溯：
+>
+> ```text
+> WASM 插件执行失败：error while executing at wasm backtrace:
+>  0: 0x8bd7 - <unknown>!<wasm function 92>
+> ```
+>
+> 所以 L2 插件请用 `{"error": "…"}` 报错（宿主会把它变成任务的失败原因），
+> 并**同时**用 `warn!` 打一条日志。`plugins/wasm-http-example` 里的 `fail()`
+> 就是这么写的，可以直接抄。
+>
+> L3（Python）不受影响：它的 JSON-RPC 错误帧本来就能带出 `message`，
+> 宿主会照实呈现（`{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"…"}}`）。
+
+> ⚠️ **`outputs` 写对象，不要写数组。** 数组是宿主早期只认的形态，仍然兼容，
+> 但它无法表达"哪个端口产出了哪个文件"，而且宿主不会去核对数组里的路径是否
+> 真的存在。对象形态下，宿主会逐条对照 `io.outputs` 声明的端口类型处理。
+
 - **日志**：用 `extism_pdk` 的 `info!` 等宏；它们走 **Extism 内置的
   `extism_log_*` 导入**，宿主把日志回调接到了 `tracing`。
   所以**即使不申请 `log` 宿主函数也能打日志** —— 见下一节。
@@ -1050,7 +1125,10 @@ runtime:
 | `PLUGIN_CAPABILITY_VIOLATION` | 插件用了未声明或未授权的能力 | **这是安全事件**：补声明后让用户重新授权，或去掉该行为 |
 | `INTEGRITY_CHECK_FAILED` | 插件目录在安装后被改动过 | 重新安装插件；不要手工改已安装的插件文件 |
 | L2：`WASM 模块里没有导出函数 \`run\`` | `wasm.entry` 与 `#[plugin_fn]` 的函数名不一致 | 让两者一致 |
-| L2：`WASM 模块编译失败` | 目标不是 `wasm32-wasip1`，或用了 Extism 不支持的导入 | 用 `--target wasm32-wasip1` 重新编译 |
+| L2：`WASM 模块编译失败` | 文件不是合法 wasm，或用了 Extism 不支持的指令 | 用 `--target wasm32-unknown-unknown` 重新编译 |
+| L2：`这个 WASM 模块引用了 WASI（例如 \`wasi_snapshot_preview1::environ_get\`）` | 模块是用 `wasm32-wasip1` 构建的（wasip1 的 std 必然导入 WASI），而宿主关掉了 WASI | 用 `--target wasm32-unknown-unknown` 重新构建。**这是必然失败，不是环境问题** |
+| L2：`模块导入了宿主没有提供的函数` | 模块导入了 `extism:host/user` 下的自定义宿主函数 | v0.1 不注入任何自定义宿主函数；日志用 `info!`（内置），KV 推迟到 v0.2 |
+| L2：`HTTP request to … is not allowed` | 没授权 `net`，或请求的主机不在白名单里 | 检查两处：清单 `net.hosts` **不能带端口**（沙箱只按主机名匹配），用户也在授权面板勾了 `net` |
 | L2：`传给 WASM 插件的载荷 N MB 超过 16 MB 上限` | 想用 WASM 处理大文件 | 换 L1 或 L3 —— 这是设计边界，不是 bug |
 | L3：`插件启动了但永远不响应` | stdout 没 flush，或 `print()` 污染了协议流 | 每写一帧都 `flush()`；日志一律写 stderr |
 | L3：`尚未调用 initialize`（`-32004`） | `initialize` 抛异常/超时了 | 看 stderr；`initialize` 里不要做重活 |
@@ -1068,7 +1146,7 @@ runtime:
 6. 节点的可调参数 id 与节点读取的键名一致（例如 `format`、`quality`、`width`）。
 7. `with` 的值全是字符串；`${steps.x.y}` 只引用更早的步骤。
 8. 输出端口多于一个时，**不要**用 `${dst}`，改用 `${output.<portId>}`。
-9. L2：`allowHostFunctions` 只写 `log`；不声明任何 `fs`/`net` 权限。
+9. L2：`allowHostFunctions` 只写 `log`；`wasm32-unknown-unknown` 目标；`net` 的 `hosts` **不带端口**。fs/exec/env 对 WASM 不可达，不要声明。
 10. L3：`requirements` 不带 URL/VCS/本地路径；每条帧写完都 flush；日志走 stderr。
 11. 用 `PluginManifest::validate()` 自查一遍（宿主装载前也会跑它）。
 

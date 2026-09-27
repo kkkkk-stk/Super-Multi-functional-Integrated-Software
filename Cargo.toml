@@ -80,6 +80,12 @@ image = { version = "0.25", default-features = false }
 
 # ---------- 插件运行时 ----------
 extism = "1.30"
+# 与 wasmtime 共享的 wasm 二进制解析器。加它是**直接**依赖而不是白捡：
+# L2 装载前要能读懂模块的 import 段，才能把
+# "unknown import: `wasi_snapshot_preview1::environ_get` has not been defined"
+# 这种没人看得懂的报错，换成"你的构建目标选错了"。
+# 版本跟 Cargo.lock 里 wasmtime 拉进来的那个一致（0.245），不额外引入新版本。
+wasmparser = "0.245"
 
 [profile.release]
 codegen-units = 1

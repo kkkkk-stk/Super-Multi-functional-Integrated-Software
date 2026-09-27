@@ -123,8 +123,10 @@ function ToolCard({
   active: boolean;
   onSelect: () => void;
 }) {
-  const runnable =
-    plugin.enabled && plugin.grantedCount > 0 && !plugin.hasPendingPermissions;
+  // "能不能跑"不再要求权限齐全：部分授权的插件照样可以跑，
+  // 缺的那几项在运行期才会拦（并记审计）。见 `PluginStore::set_enabled` 的文档。
+  // 但"一项都没授权"仍然算不可用 —— 那种状态下插件做什么都会被拒。
+  const runnable = plugin.enabled && plugin.grantedCount > 0;
 
   return (
     <button

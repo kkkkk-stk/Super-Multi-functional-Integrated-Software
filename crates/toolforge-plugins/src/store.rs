@@ -308,10 +308,49 @@ impl PluginStore {
         self.records.get(id).map(|r| r.clone())
     }
 
+    /// 清单里声明了、但用户还没授权的能力（人类可读描述）。
+    ///
+    /// **这是提示，不是阻塞**。见 [`PluginStore::set_enabled`] 里那段说明：
+    /// 部分授权是允许的，缺的能力在**运行期**被拦下来并记审计。
+    /// 这个方法只服务于"运行前先告诉用户一句"。
+    pub fn ungranted_declared(&self, id: &str) -> Vec<String> {
+        let Some(rec) = self.records.get(id) else {
+            return Vec::new();
+        };
+        rec.manifest
+            .permissions
+            .capabilities
+            .iter()
+            .filter(|c| {
+                !rec
+                    .state
+                    .granted
+                    .capabilities
+                    .iter()
+                    .any(|g| g.fingerprint() == c.fingerprint())
+            })
+            .map(|c| c.describe())
+            .collect()
+    }
+
     /// 判断插件当前**能否真正执行**。
     ///
     /// 一次报出**全部**阻塞原因，而不是撞到第一个就返回 —— 用户需要一次就知道
-    /// "它被禁用了，而且还有 2 项能力没授权"，而不是修一个再发现下一个。
+    /// "它被禁用了，而且清单校验还没过"，而不是修一个再发现下一个。
+    ///
+    /// ⚠️ **"还有 N 项能力未授权"不再是阻塞**（2026-09 改）。
+    /// 原来它是阻塞项，理由是"没授权就跑，运行时必然越权"。但那条推理有个漏洞：
+    /// 运行期的能力裁决本来就会拒绝未授权的动作，所以真正需要的不是"提前拦住
+    /// 整个插件"，而是"拦住那一个动作"。把它当阻塞项带来两个更糟的后果：
+    ///
+    /// 1. **授权面板上的承诺变成了空话**：面板写着"没勾的能力，插件在运行时
+    ///    一旦尝试使用就会被拦截"，而实际上你根本没机会让它跑起来；
+    /// 2. **逼出习惯性全选**：一个插件只要有一项你不想要的权限（比如它申请了
+    ///    任意主机的 `net`，而你只想用它做本地文件处理），你就只能整包放弃。
+    ///    这恰好是"最小授权"最想避免的行为。
+    ///
+    /// 现在缺哪些能力由 [`PluginStore::ungranted_declared`] 报给用户，
+    /// 真正的拒绝发生在动作那一刻（`CapabilityGuard` / Extism 主机白名单）。
     pub fn runnable(&self, id: &str) -> ToolforgeResult<PluginRecord> {
         let rec = self
             .records
@@ -331,25 +370,6 @@ impl PluginStore {
             blockers.push("插件已被禁用（在插件详情页点「启用」）".to_string());
         }
 
-        let missing: Vec<String> = rec
-            .manifest
-            .permissions
-            .capabilities
-            .iter()
-            .filter(|c| {
-                !rec
-                    .state
-                    .granted
-                    .capabilities
-                    .iter()
-                    .any(|g| g.fingerprint() == c.fingerprint())
-            })
-            .map(|c| c.describe())
-            .collect();
-        if !missing.is_empty() {
-            blockers.push(format!("还有 {} 项能力未授权", missing.len()));
-        }
-
         if blockers.is_empty() {
             return Ok(rec);
         }
@@ -362,11 +382,6 @@ impl PluginStore {
         };
 
         let mut detail: Vec<String> = blockers.iter().map(|b| format!("· {b}")).collect();
-        if !missing.is_empty() {
-            detail.push(String::new());
-            detail.push("待授权的能力：".to_string());
-            detail.extend(missing.iter().map(|m| format!("  - {m}")));
-        }
         if !rec.validation.ok {
             detail.push(String::new());
             detail.push("校验问题：".to_string());
@@ -389,6 +404,35 @@ impl PluginStore {
 
     // ---------------- 变更 ----------------
 
+    /// 启用 / 禁用插件。
+    ///
+    /// # ⚠️ 这里**曾经**要求"清单声明的每一项都已授权"（`runnable_or_grant_all`）
+    ///
+    /// 那条门在 2026-09 被去掉了，理由是它把安全模型里"声明 ∩ 授权"的交集
+    /// 变成了一个**恒等式**：
+    ///
+    /// ```text
+    /// 启用要求：已授权 ⊇ 声明
+    /// set_granted 又只接受声明里有的（多余的丢弃）⇒ 已授权 ⊆ 声明
+    /// ⇒ 已授权 == 声明 ⇒ 运行期的"交集"永远是声明本身
+    /// ```
+    ///
+    /// 也就是说：`PermissionSet::effective()`、`allowed_hosts_from()`、
+    /// `CapabilityGuard` 里那套"少一个都不给"的逻辑，在真实链路上从来没有
+    /// 被走到过 —— 因为任何"给少了"的状态都不允许启用。它是**装饰**，
+    /// 而装饰会让人相信一件没发生的事。
+    ///
+    /// 更实际的代价是逼出**习惯性全选**：插件只要申请了一项你不想要的权限
+    /// （最典型的是"任意主机 net"），你就只能整包放弃它。这与"最小授权"背道而驰。
+    ///
+    /// 现在的模型是一条直线，没有中间门：
+    ///
+    /// * **装**：校验 + 内容哈希落盘；
+    /// * **启用**：你说了算（一个都不授权也能启用）；
+    /// * **用**：那一刻如果碰了没授权的动作 → 拒绝 + 记审计。
+    ///
+    /// 「不提供一键全部允许」这条设计**没有变**：面板仍然默认全不勾、仍然没有全选按钮，
+    /// 变的只是"少勾几项"不再等于"这个插件永远用不了"。
     pub fn set_enabled(&self, id: &str, enabled: bool) -> ToolforgeResult<PluginSummary> {
         let (dir, mut state) = {
             let rec = self
@@ -397,10 +441,6 @@ impl PluginStore {
                 .ok_or_else(|| ToolforgeError::not_found(format!("插件 {id} 未安装")))?;
             (rec.dir.clone(), rec.state.clone())
         };
-        // 要启用就得先把权限补齐，否则运行时必然越权
-        if enabled {
-            self.runnable_or_grant_all(id)?;
-        }
         state.enabled = enabled;
         self.save_state(&dir, &state)?;
 
@@ -411,19 +451,6 @@ impl PluginStore {
             plugin_id: id.to_string(),
         });
         Ok(self.records.get(id).unwrap().summary())
-    }
-
-    fn runnable_or_grant_all(&self, id: &str) -> ToolforgeResult<()> {
-        let rec = self.records.get(id).unwrap();
-        let declared = rec.manifest.permissions.clone();
-        let eff = PermissionSet::effective(&declared, &rec.state.granted);
-        if eff.capabilities.len() == declared.capabilities.len() {
-            return Ok(());
-        }
-        Err(ToolforgeError::denied(
-            "启用前必须先逐条确认该插件申请的权限",
-        )
-        .with_detail("这是刻意设计：我们不提供「一键全部允许」。"))
     }
 
     /// 更新授权集合。
@@ -1065,22 +1092,35 @@ runtime:
         assert!(report.summary.has_pending_permissions);
         assert!(report.content_hash.starts_with("sha256:"));
 
-        // 未授权时不能运行；且错误里必须明确指出缺哪些能力
+        // 未授权时**能**启用（部分授权是允许的），但缺哪些能力必须一次说清 ——
+        // 这是提示，不再是阻塞。真正的拒绝发生在动作那一刻。
+        let missing = s.ungranted_declared("com.test.demo");
+        assert_eq!(missing.len(), 1, "应当报出 1 项未授权能力：{missing:?}");
+        assert!(
+            missing[0].contains("读文件"),
+            "未授权能力的描述必须是人类可读的：{:?}",
+            missing[0]
+        );
+        // 启用后仍然不可运行，因为它是禁用状态（这条阻塞项与权限无关）
         let err = s.runnable("com.test.demo").unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         assert!(
-            err.detail.as_deref().unwrap_or("").contains("读文件"),
-            "错误详情必须列出缺失的能力：{:?}",
+            err.detail.as_deref().unwrap_or("").contains("禁用"),
+            "必须告诉用户它还被禁用着：{:?}",
             err.detail
         );
-        // 同时也要告诉用户"它还被禁用着" —— 一次报全，别让他修一个发现一个
-        assert!(err.detail.as_deref().unwrap_or("").contains("禁用"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 启用不再要求"全部授权"。
+    ///
+    /// 这条测试是**有意反转**旧行为的：原来叫 `cannot_enable_without_granting_first`，
+    /// 断言"直接启用应当被拒绝"。旧行为把 `声明 ∩ 授权` 变成了恒等式
+    /// （见 `set_enabled` 的文档），于是运行期那套能力裁决从来没被走到过。
+    /// 现在改成"零授权也能启用，缺的能力在运行期被拦"。
     #[test]
-    fn cannot_enable_without_granting_first() {
+    fn enabling_does_not_require_granting_everything() {
         let root = std::env::temp_dir().join("tf-store-test-2");
         let _ = std::fs::remove_dir_all(&root);
         let s = store(&root);
@@ -1092,11 +1132,23 @@ runtime:
         )
         .unwrap();
 
-        // 直接启用应当被拒绝 —— 没有"一键全部允许"
-        let err = s.set_enabled("com.test.demo", true).unwrap_err();
-        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        // 一个都没授权也能启用
+        let summary = s.set_enabled("com.test.demo", true).unwrap();
+        assert!(summary.enabled, "零授权也应当允许启用");
+        assert_eq!(summary.granted_count, 0);
+        assert!(summary.has_pending_permissions, "但仍然要如实标出未授权项");
+        assert!(s.runnable("com.test.demo").is_ok(), "启用后即可运行");
 
-        // 授权后可以启用
+        // 生效权限 = 声明 ∩ 已授权 = 空集。运行期看到的就是这个空集，
+        // 于是任何一次受控动作都会被 `CapabilityGuard` 拒绝。
+        let rec = s.record("com.test.demo").unwrap();
+        assert!(
+            rec.effective().capabilities.is_empty(),
+            "零授权时生效权限必须是空集：{:?}",
+            rec.effective()
+        );
+
+        // 授权之后交集才有内容 —— 这一步才是真正"给了权限"
         s.set_granted(
             "com.test.demo",
             PermissionSet::from_iter_caps([Capability::FsRead {
@@ -1104,9 +1156,46 @@ runtime:
             }]),
         )
         .unwrap();
-        let summary = s.set_enabled("com.test.demo", true).unwrap();
-        assert!(summary.enabled);
-        assert!(s.runnable("com.test.demo").is_ok());
+        let rec = s.record("com.test.demo").unwrap();
+        assert_eq!(rec.effective().capabilities.len(), 1);
+        assert!(s.ungranted_declared("com.test.demo").is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 授权可以被**事后收回**，而插件仍然是启用状态 ——
+    /// 这时"声明 ∩ 授权"才是一个真子集，也是运行期真正会用到交集的那种状态。
+    #[test]
+    fn revoking_a_grant_leaves_the_plugin_enabled_but_restricted() {
+        let root = std::env::temp_dir().join("tf-store-test-revoke");
+        let _ = std::fs::remove_dir_all(&root);
+        let s = store(&root);
+        s.install(
+            PluginSource::Manifest {
+                yaml: L1_YAML.into(),
+            },
+            false,
+        )
+        .unwrap();
+        s.set_granted(
+            "com.test.demo",
+            PermissionSet::from_iter_caps([Capability::FsRead {
+                scope: PathScope::Input,
+            }]),
+        )
+        .unwrap();
+        s.set_enabled("com.test.demo", true).unwrap();
+
+        // 收回全部授权
+        s.set_granted("com.test.demo", PermissionSet::empty()).unwrap();
+
+        let rec = s.record("com.test.demo").unwrap();
+        assert!(rec.state.enabled, "收回授权不该顺手把插件禁用掉");
+        assert!(
+            rec.effective().capabilities.is_empty(),
+            "收回后生效权限必须为空"
+        );
+        assert_eq!(s.ungranted_declared("com.test.demo").len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

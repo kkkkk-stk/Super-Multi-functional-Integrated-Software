@@ -135,10 +135,25 @@ pub struct PipelineRunResult {
 }
 
 /// 执行一条 L1 流水线。
+///
+/// `audit` 必须是**应用那一个**审计日志（`PluginStore::audit()`）。
+///
+/// 这里曾经是从插件目录**反推**出来的：`record.dir.parent().parent().join("audit")`，
+/// 注释写着"插件目录是 `<data>/plugins/<id>`，审计目录是 `<data>/audit`"。
+/// 那个假设对**用户插件**成立，对**内置插件**不成立 —— 内置插件的目录是
+/// `<仓库>/plugins/builtin/<id>`，于是审计被写到 `<仓库>/plugins/audit/`：
+///
+/// * 位置不对（不在应用数据目录里，用户与「设置 → 审计」看到的是两个地方）；
+/// * **污染工作树**（`git status` 里冒出一个 `plugins/audit/`）；
+/// * 审计链**裂成两半**：L2/L3 走 `PluginRunner` 注入的 AuditLog（位置正确），
+///   L1 走这个反推（位置错误）。事后取证时"同一个事件在哪个文件里"取决于运行时。
+///
+/// 真机跑 `video-to-gif` 触发路径逃逸拦截时，`plugins/audit/` 就是这么冒出来的。
 pub async fn run_pipeline(
     record: &PluginRecord,
     req: &PipelineRunRequest,
     engines: Arc<EngineRegistry>,
+    audit: &crate::audit::AuditLog,
     job: &JobCtx,
 ) -> ToolforgeResult<PipelineRunResult> {
     let PluginRuntime::Pipeline { pipeline } = &record.manifest.runtime else {
@@ -154,7 +169,11 @@ pub async fn run_pipeline(
         .with_input(&req.input_root)
         .with_output(&req.output_root)
         .with_plugin_data(&req.plugin_data_root)
-        .with_workspace(&req.workspace_root);
+        .with_workspace(&req.workspace_root)
+        // 中间产物落在**输出**目录里，而下游步骤是用 `src` 端口（Input 作用域）去读它的。
+        // 不把输出目录登记成只读根，多步流水线就会在第二步报"路径逃逸被拦截" ——
+        // 内置 `video-to-gif` 实测到的就是这个（见 `PathResolver::with_read_root`）。
+        .with_read_root(&req.output_root);
 
     // 申请了 fs 能力才能碰对应作用域；没申请就直接拒绝，而不是跑到一半才失败
     if pipeline_uses_fs(pipeline, "src")
@@ -164,7 +183,7 @@ pub async fn run_pipeline(
             .any(|c| matches!(c, toolforge_core::permission::Capability::FsRead { .. }))
     {
         crate::audit::record_violation(
-            &record_dir_audit(record),
+            audit,
             record.id(),
             "流水线读取输入文件，但未声明 fsRead 能力",
         );
@@ -415,13 +434,12 @@ pub async fn run_pipeline(
                 // 越权记录绝不能跟着消失 —— 那正是攻击者最希望发生的事。
                 match err.code {
                     ErrorCode::PluginCapabilityViolation => crate::audit::record_violation(
-                        &record_dir_audit(record),
+                        audit,
                         record.id(),
                         &format!("步骤 `{}`：{}", step.id, err.message),
                     ),
                     ErrorCode::PermissionDenied => {
-                        let log = record_dir_audit(record);
-                        log.record(
+                        audit.record(
                             crate::audit::AuditEvent::new(
                                 crate::audit::AuditEventKind::PathEscapeBlocked,
                                 format!(
@@ -481,6 +499,13 @@ pub async fn run_pipeline(
 }
 
 /// 给审计日志用的轻量构造（执行器不持有 AuditLog 实例，用插件目录旁的 audit 目录）。
+///
+/// ⚠️ **已废弃，不要再调用**。它按"插件目录是 `<data>/plugins/<id>`"反推审计目录，
+/// 而内置插件的目录是 `<仓库>/plugins/builtin/<id>` —— 于是审计被写到
+/// `<仓库>/plugins/audit/`，污染工作树，并且让 L1 与 L2/L3 的审计落在两个地方。
+/// `run_pipeline` 现在接一个 `audit: &AuditLog` 参数（应用那一个）。
+/// 留着不删是为了让"曾经这么错过"这件事留在代码里可查。
+#[allow(dead_code)]
 fn record_dir_audit(record: &PluginRecord) -> crate::audit::AuditLog {
     // 插件目录是 `<data>/plugins/<id>`，审计目录是 `<data>/audit`
     let audit_dir = record

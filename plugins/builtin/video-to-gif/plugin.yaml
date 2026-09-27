@@ -48,11 +48,17 @@ io:
     - id: frame
       label: 中间抽帧（PNG）
       type: file
+      # ⚠️ `accept` 在**输出**端口上的含义是"这个端口产出什么格式"，
+      # 宿主据此决定给它的目标文件取什么扩展名。这里必须是 .png：
+      # 下一步 `video.thumbnail` 让 ffmpeg 按扩展名决定封装格式，写成 .mp4
+      # 会得到一个"单帧 mp4"，后面 `image.convert` 就读不动了。
+      accept: [".png"]
       required: false
       description: 中间产物；若不需要保留可让宿主只取 dst。
     - id: dst
       label: 输出 GIF
       type: file
+      accept: [".gif"]
       required: false
   params:
     # id 叫 `at`：video.thumbnail 的执行器读的就是它

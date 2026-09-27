@@ -23,7 +23,13 @@
  * | `ai` / `gpu` | low |
  */
 
-import type { Capability, PathScope, PermissionSet, RiskLevel } from "@/types/domain";
+import type {
+  Capability,
+  PathScope,
+  PermissionSet,
+  RiskLevel,
+  RuntimeKind,
+} from "@/types/domain";
 
 /**
  * 取出能力数组。
@@ -67,6 +73,21 @@ export function isSandboxedScope(scope: PathScope): boolean {
   return scope.kind !== "explicit";
 }
 
+/** 「这项能力在运行时到底管不管」的结论 */
+export type EnforcementLevel =
+  /** 运行时真的按它拦 —— 面板上打勾是有意义的 */
+  | "enforced"
+  /** 只有一部分被强制（例如 L2 的 net 拦主机、L3 的 net 只有默认断网） */
+  | "partial"
+  /** 授权了也不生效（宿主没有调用点，或者根本没有注入通道） */
+  | "inert";
+
+export interface EnforcementInfo {
+  level: EnforcementLevel;
+  /** 面向用户的说明。`enforced` 时说明"强制到了什么程度" */
+  note: string | null;
+}
+
 /**
  * 这项能力在**运行时**到底有没有被强制。
  *
@@ -76,47 +97,97 @@ export function isSandboxedScope(scope: PathScope): boolean {
  *
  * | 能力 | 运行时状态 |
  * |---|---|
- * | `fsRead` / `fsWrite` | ✅ **强制**。`nodes.rs::resolve_path()` 对每一次文件访问先过 `CapabilityGuard::check()`，拒绝时返回 `PluginCapabilityViolation` 并记审计 |
- * | `net` | ⚠️ **部分**。L3 的默认断网由 `SpawnSpec::deny_network` 承担（清空 + 代理指向 `127.0.0.1:1`）；但 `hosts` 白名单**没有运行时校验**，它只影响授权界面的文案 |
+ * | `fsRead` / `fsWrite` | ✅ **强制**。每一次文件访问先过 `CapabilityGuard::check()`，拒绝时返回 `PluginCapabilityViolation` 并记审计 |
+ * | `net` | ⚠️ **分层**。L2：Extism 的 `allowed_hosts` 由**声明 ∩ 授权**翻译而来，越界请求被沙箱自己拒绝（见 `runtimes/wasm.rs::allowed_hosts_from`）—— **真拦**；L3：只有"清空环境 + 代理指向 `127.0.0.1:1`"这一层默认断网，`hosts` 白名单没有运行时校验，插件可以直接用 `socket` 绕过代理 |
  * | `exec` | ❌ **未强制**。`CapabilityGuard` 有 `Spawn` 分支，但没有调用点；L3 插件可以直接 `subprocess` 起进程 |
  * | `env` | ❌ **未强制，而且授权了也不会生效**。L3 进程被 `env_clear()`，一个环境变量都读不到 —— 白名单没有注入通道 |
  * | `ai` / `gpu` | ❌ **未强制**（`CapabilityRequest` 里连对应变体都还没有） |
  *
  * 这不是"实现得还不够"的借口，而是**界面不能骗人**：用户勾了"读取环境变量"
  * 却什么都没发生、勾了"启动进程"以为被管住了，都是误导。
- * `docs/SECURITY.md` §9 逐条记录了这些缺口，并把"在 UI 说明"列为处理方向 ——
- * 这个函数就是那一步。
+ * `docs/SECURITY.md` §9 逐条记录了这些缺口。
  *
- * 返回 `null` 表示"已完全强制"，不需要额外提示。
+ * ## 为什么要传 `runtimeKind`
+ *
+ * 同一个能力在 L2 与 L3 下的强制程度**不一样**，而这里曾经只有一个文案：
+ *
+ * > 「宿主目前不代插件发 HTTP，也没有运行时校验下面这份主机白名单」
+ *
+ * 这句话在 2026-09 之前对**所有**运行时都是真的，之后对 L2 变成了**假的**
+ * （L2 的主机白名单已经真的交给沙箱了）。一条过期的免责声明看起来"更安全"，
+ * 实际后果是相反的：它会劝作者删掉一份**必须**声明的 `net`，
+ * 而删掉之后插件必然报 `HTTP request to … is not allowed`。
+ *
+ * 所以：**不知道运行时就不下结论**（返回 `null`，界面不显示那一行），
+ * 而不是拿一句可能过期的话去蒙。
  */
-export function capabilityEnforcementNote(cap: Capability): string | null {
+export function capabilityEnforcement(
+  cap: Capability,
+  runtimeKind?: RuntimeKind,
+): EnforcementInfo {
   switch (cap.kind) {
     case "fsRead":
     case "fsWrite":
-      return null;
-    case "net":
-      return cap.hosts.length > 0
-        ? "宿主目前不代插件发 HTTP，也没有运行时校验下面这份主机白名单 —— 它只影响这张授权界面上的说明。"
-        : "宿主目前不代插件发 HTTP。L3 插件的默认断网由进程环境强制，与这次授权无关。";
+      return { level: "enforced", note: null };
+
+    case "net": {
+      if (runtimeKind === "wasm") {
+        // L2：白名单真的进了沙箱
+        return {
+          level: "enforced",
+          note:
+            cap.hosts.length > 0
+              ? "这份主机白名单会被交给 WASM 沙箱（Extism 的 allowedHosts），越界的请求会被沙箱自己拒绝。只有主机名参与匹配，端口不参与。"
+              : "空列表 = 任意主机，沙箱会放行所有请求。",
+        };
+      }
+      if (runtimeKind === "python") {
+        return {
+          level: "partial",
+          note: cap.hosts.length > 0
+            ? "L3 的默认断网（代理指向 127.0.0.1:1）由进程环境承担，但下面这份主机白名单没有运行时校验 —— 插件可以直接用 socket 绕过代理。"
+            : "L3 的默认断网由进程环境承担，与这次授权无关；蓄意的插件可以用 socket 绕过。",
+        };
+      }
+      // 运行时未知（或 L1 内置流水线）：不下结论
+      return { level: "partial", note: null };
+    }
+
     case "exec":
-      // 注意别在这里重复"宿主尚未在运行时强制这一项" —— 那句话由面板统一加前缀，
-      // 各分支只写**具体到什么程度**。写重复了界面就会读成
-      // "宿主尚未…。宿主尚未…：…"，很蠢。
-      return "L3 插件可以直接启动子进程。授权它等于确认你知道这件事。";
+      return {
+        level: "inert",
+        note: "L3 插件可以直接启动子进程。授权它等于确认你知道这件事。",
+      };
+
     case "env":
-      return "宿主尚未实现环境变量注入 —— L3 插件进程的环境被清空，所以即使授权，插件也读不到任何变量。";
+      return {
+        level: "inert",
+        note: "宿主尚未实现环境变量注入 —— L3 插件进程的环境被清空，所以即使授权，插件也读不到任何变量。",
+      };
+
     case "ai":
-      return "宿主尚未实现按能力裁决 AI 调用：内置节点走的是宿主自己的 AI 客户端，与这次授权无关。";
+      return {
+        level: "inert",
+        note: "宿主尚未实现按能力裁决 AI 调用：内置节点走的是宿主自己的 AI 客户端，与这次授权无关。",
+      };
+
     case "gpu":
-      return "宿主没有针对 GPU 的任何限制手段。";
+      return { level: "inert", note: "宿主没有针对 GPU 的任何限制手段。" };
+
     default:
-      return null;
+      return { level: "inert", note: null };
   }
 }
 
-/** 上面的机器可读版本：`false` 表示"声明了但运行时并不按它拦"。 */
-export function isCapabilityEnforced(cap: Capability): boolean {
-  return cap.kind === "fsRead" || cap.kind === "fsWrite";
+/** 上面的兼容包装：返回"未强制"的说明，已完全强制时返回 `null`（不传运行时） */
+export function capabilityEnforcementNote(cap: Capability): string | null {
+  const info = capabilityEnforcement(cap);
+  return info.level === "enforced" ? null : info.note;
+}
+
+/** 上面的机器可读版本：`false` 表示"声明了但运行时并不完全按它拦" */
+export function isCapabilityEnforced(cap: Capability, runtimeKind?: RuntimeKind): boolean {
+  return capabilityEnforcement(cap, runtimeKind).level === "enforced";
 }
 
 export function describeCapability(cap: Capability): string {

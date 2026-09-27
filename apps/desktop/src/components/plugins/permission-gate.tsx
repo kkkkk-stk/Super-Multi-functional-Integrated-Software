@@ -6,6 +6,7 @@ import {
   Info,
   Network,
   ShieldAlert,
+  ShieldCheck,
   Terminal,
 } from "lucide-react";
 import * as React from "react";
@@ -14,7 +15,7 @@ import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Separator } from "@/components/ui/separator";
 import {
-  capabilityEnforcementNote,
+  capabilityEnforcement,
   capabilityFingerprint,
   capabilityRisk,
   capabilityWarning,
@@ -139,7 +140,9 @@ export function PermissionGate({
         <AnimatePresence initial={false}>
           {ordered.map((cap) => {
             const risk = capabilityRisk(cap);
-            const enforcementNote = capabilityEnforcementNote(cap);
+            // 强制程度与运行时有关：同一个 `net` 在 L2（真的交给沙箱）与
+            // L3（只有默认断网）下不是一回事，所以要把运行时传进去。
+            const enforcement = capabilityEnforcement(cap, runtimeKind);
             const key = capabilityFingerprint(cap);
             const checked = selected.has(key);
             const wasGranted = granted?.has(key) ?? false;
@@ -191,13 +194,36 @@ export function PermissionGate({
                     {/* 授权界面的义务：说清"这一项宿主到底管不管"。
                         打勾给人的暗示是"宿主会按这个勾拦住"，而 exec / env / ai / gpu
                         目前根本没有运行时调用点（详见 SECURITY.md §9）——
-                        不说的话，用户会以为自己刚刚做了一次有意义的安全决策。 */}
-                    {enforcementNote && (
-                      <p className="mt-1 flex items-start gap-1.5 text-[11px] text-risk-medium">
-                        <Info className="mt-0.5 h-3 w-3 shrink-0" />
+                        不说的话，用户会以为自己刚刚做了一次有意义的安全决策。
+
+                        反过来，**已经强制的能力也要说**：`fsRead/fsWrite` 与
+                        L2 的 `net` 是真的会拦的，只标"没强制"会让用户以为这套
+                        授权全是摆设。两句话都有价值，都写。 */}
+                    {enforcement.note && (
+                      <p
+                        className={cn(
+                          "mt-1 flex items-start gap-1.5 text-[11px]",
+                          enforcement.level === "enforced"
+                            ? "text-muted-foreground"
+                            : "text-risk-medium",
+                        )}
+                      >
+                        {enforcement.level === "enforced" ? (
+                          <ShieldCheck className="mt-0.5 h-3 w-3 shrink-0" />
+                        ) : (
+                          <Info className="mt-0.5 h-3 w-3 shrink-0" />
+                        )}
                         <span>
-                          <span className="font-medium">宿主尚未在运行时强制这一项。</span>
-                          {enforcementNote}
+                          {enforcement.level === "enforced" && (
+                            <span className="font-medium">宿主会按这一项拦。 </span>
+                          )}
+                          {enforcement.level === "partial" && (
+                            <span className="font-medium">宿主只强制了一部分。 </span>
+                          )}
+                          {enforcement.level === "inert" && (
+                            <span className="font-medium">宿主尚未在运行时强制这一项。 </span>
+                          )}
+                          {enforcement.note}
                         </span>
                       </p>
                     )}
