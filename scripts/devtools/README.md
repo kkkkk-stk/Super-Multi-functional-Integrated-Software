@@ -41,11 +41,41 @@ node scripts/devtools/inspect.mjs   # 单页体检
 node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
-node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（274 项）
+node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（293 项）
 node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（70 项）
 ```
 
 `pnpm dev:cdp` 与 `pnpm verify:app` 是上面两条命令的简写。
+
+### Windows 上的两个坑（都实测过，都会让"验证还没开始就失败"）
+
+**① `.ps1` 必须带 UTF-8 BOM。**
+Windows 自带的 PowerShell 5.1 在没有 BOM 时按 **ANSI/GBK** 解码脚本文件。注释里的中文是多字节序列，
+其中某些字节会被当成 GBK 的**后继字节**，把它后面紧邻的那个 ASCII 字符**吞掉** ——
+而 GBK 的后继字节范围 `0x40–0x7E` **正好包含 `}`**。于是括号配对崩掉，
+脚本连**解析**都过不去（报 `Unexpected token '}'`，指的却是一个完全正确的行）。
+PowerShell 7 默认按 UTF-8 读，所以这个问题**只在"用系统自带 PowerShell 跑"时出现** ——
+而这正是 Windows 用户的默认情况。
+`scripts/devtools/dev-with-cdp.ps1` 现在带 BOM（`.gitattributes` 另有 `*.ps1 text eol=crlf`）。
+判据很好复现：`[System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$errs)`
+在没有 BOM 时报 1–2 个 `Unexpected token '}'`，加上就是 0 个。
+
+**② 编译产物可能被"不属于本应用"的进程抓住。**
+`cargo build` 报 `failed to remove file ...toolforge.exe ... os error 32` 时，
+先别怀疑自己的进程没退干净 —— 用 **Restart Manager** 查一下到底是谁拿着句柄：
+
+```powershell
+# 读 .tools/probe/target/debug/toolforge.exe 的真实占用者（不是靠猜）
+# 关键 API：RmStartSession → RmRegisterResources → RmGetList
+```
+
+本机实测的占用者是一个**带反作弊的游戏客户端**（`DeltaForceClient-Win64-Shipping.exe`，
+`RmCritical` 类型）—— 它抓着一个跟它毫无关系的 debug exe 不放，重启应用、
+等上半小时都没用。这种情况下 `dev-with-cdp.ps1` 会**改用 `.tools\probe\target-app` 编译**
+（并打一条警告），而不是让人对着一个 os error 32 干等。
+> 顺带一件事：清 WebView2 进程时**只杀本应用的**。`msedgewebview2.exe` 是共享的运行时宿主，
+> Windows 自己的 `SearchHost.exe` 也在用它；认法是 WebView2 把宿主程序名写在
+> `--webview-exe-name=` 里。脚本现在按这个字段过滤（实测能精确挑出本应用的 5 个进程）。
 
 ---
 
@@ -129,7 +159,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 ### `verify-platform.mjs` —— 平台能力（**这一轮新增的主要内容**）
 
 `verify.mjs` 验的是**安全属性**，这个脚本验的是**平台声称能做到的事是不是真的做到了**。
-二十六节，274 项：
+二十七节，293 项：
 
 | 节 | 验什么 | 它抓到过什么 |
 |---|---|---|
@@ -159,6 +189,13 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 | 【24】 | **设置与 API Key 的落盘生命周期，以及密钥会不会顺着错误信息漏出去** | 两件事此前都没有被任何检查看过。① 生命周期逐条验：勾上「记住 API Key」→ `ai-key.txt` 真的写盘且内容一致；`settings.json` 里**没有**密钥（连 `apiKey` 这个键都没有）；`settings_get` 不回传明文、只回报 `hasKey`；关掉开关 → **磁盘上那份被删掉**（内存里仍可用）；清除 Key → 内存与磁盘都干净。② ★ **脱敏**：`redact()` 只认 `sk-` 前缀，而 Google 是 `AIza…`、Azure 是一串无前缀十六进制 —— 全不命中。最现实的泄漏渠道不是"我们把 Key 拼进错误信息"，是**对方把请求回显回来**（代理/网关/调试模式的后端会把 `Authorization` 头带进响应体，而那段响应体正是应用截下来给用户看的 `detail`）。所以新增 `redact_with(text, secret)`：**知道密钥就按字面量抹掉**，与它长得像不像 Key 无关。假端点里加了一条"话多的网关"路由，**把真实请求头回显**在 500 响应体里；断言三步走 —— ⑥b 回显正文**确实进了**错误文本（否则"里面没有密钥"可能只是因为整段响应体被丢掉了，那种通过是假的）、⑦ 文本里看不到密钥、⑦b 但留下可见的 `[REDACTED]` 标记。单元测试里还显式记下**旧行为会漏**（`assert!(redact(&echoed).contains(secret))`），所以这条运行时检查不是空过的。**重启行为单独验过**（不在套件里）：勾上开关写入 Key → 重启后仍然记得；开关关掉但磁盘有残留 → 重启时被主动清掉 |
 | 【25】 | **许可证确认是不是真的发生了，以及有没有留下记录** | 两件事必须分开验。① **确认真的发生了**：模型那一侧此前有个真缺陷 —— `model-panel.tsx` 对**不可商用**的权重自动发 `licenseAccepted: true`（`licenseAccepted: !m.commercialUse`），于是后端那道硬门永远走不到，用户从头到尾没看见任何确认，而**旁边的注释写的正是"需要用户显式点头"**。② **确认留下了记录**：原来那份确认只是一次布尔参数，装完就没痕迹（对合规审查拿不出证据链，用户每次重装还得再勾一次）。现在落盘到 `<data>/license-acks.json` + 一条 `LicenseAccepted` 审计事件，每条记 `{subject, license, fingerprint, acceptedAt}` —— **记的是许可证原文的指纹而不是"确认过这个 id"**：用户同意的是那一段文字，上游把条款收紧之后旧同意必须自动失效。断言：不带 `licenseAccepted` → `PERMISSION_DENIED` **且不留下任何记录**（被拒绝的尝试不能进证据链）；带了 → 记录含 16 位指纹/原文/可解析时间戳、目录接口如实报出 `licenseAcknowledged` 与时间、审计里有 `licenseAccepted`；**删掉记录文件立刻变回未确认**（证明每次重新读盘、不拿缓存撒谎）。⚠️ 前端那两个勾选框本身**没做点击穿透验证**（本机所有需要确认的引擎与权重都已装好，界面上不会出现"安装/下载"按钮），目前由 `tsc` + `vite` + 人工审阅覆盖 |
 | 【26】 | **能力清单（`capabilities/default.json`）说的和做的是不是一回事** | 它是**前端的权限边界**（决定一个被注入的脚本或将来插件自带的 UI 能直接对系统做什么），而这条边界此前**只有文档在描述**，文档还写错过一次：README 写着「`shell:allow-execute` 只放行一个用于"打开文件夹"的 `explorer`」，实际上**一条 shell 权限都没有**（真实边界比文档更紧，但文档仍是错的）。做法：从**页面上下文**里真的去调那些命令，并按错误文本分类 —— `not allowed. Permissions associated with this command` = ACL 拒绝、`forbidden path` = scope 拒绝、`invalid args` = 权限**在**（用"参数不对"当探针：证明权限存在，又不弹对话框、不写文件）。断言：`shell\|execute` / `shell\|open` / `opener\|open_path` / scope 外的 `fs:read_text_file` **都被拒**；**正向对照** —— scope **之内**的读真的能成（否则"什么都读不到"也会让上面几条全绿）；界面真正在用的 5 个命令权限都在（漏一条对应功能会**静默失效**）；静态读配置文件断言一条 `shell:` 都没有。顺带修掉 `system.ts` 里那个包着 `openPath` 的 `openWithDefaultApp()`（权限没给、从未被调用、一接上就静默失败），并让 `revealInExplorer` 的兜底直接报错而不是退回一个注定被拒的调用 |
+| 【27】 | **「保留源文件」这个设置到底有没有生效**（删用户文件的那条路） | 它此前是**完全惰性的**：`Settings::keep_original` 声明了、能改、能落盘，但**没有任何代码读它**；而界面在三个地方把它当成真事（设置页开关、批量页下拉框、运行面板那句"当前设置：批量处理时不会保留源文件"）。用户以为源文件会被删掉，实际一个都不会动 —— 又是一次**声明与行为不一致**，`cargo check` 全绿、界面不报错。补上之后这一节逐条钉边界：① 开关打开 → 源文件在、产出照常；② 关掉 → 源文件**真的没了**、产出完好、日志写明了删掉谁；③a/③b/③c/③d **删用户文件时最容易出事的几条路**；④ 失败的任务**不删**（源文件是用户唯一还能重试的东西）。★ ③ 原本是一条**空洞断言** —— 它只查「源文件还在」，而任务**失败**时源文件当然还在（失败原因完全可能是清单写错、引擎缺失）。现在拆成互补的四条：**③a** 钉住拒绝的**理由**（插件写回自己的输入路径必须报 `PERMISSION_DENIED`，见 `nodes.rs::resolve_path`）；**③b** 用一个 **L3 直通插件**（只校验 PNG 头、把**输入路径本身**报成产出、一个字节都不写）真正走到 `产出 == 输入路径`，断言产出还在；**③c** 同一任务日志里**没有**删除记录；**③d 正向对照** —— 同一个插件、同一份输入、同一个设置，只把产出换成输出目录里的一份副本，源文件就**必须**被删掉。少了 ③d，"日志里没有删除记录"这类**只断言"没发生"**的检查天生可疑：删除机制整体坏掉时它同样会绿 |
+
+**【27】为什么把删除规则抽成纯函数**：上面那几条边界条件**每一条都是数据丢失风险**，
+而用真机穷举它们的代价太高（要造出"产出路径恰好等于输入路径"的插件、要造出多输入端口、
+要让输入文件在中途被搬走……）。所以规则落在 `commands.rs` 的 `sources_to_delete()` 上，
+配 5 条单元测试逐条钉住；真机只负责验证**调用点**（什么时候调用、调用之后日志说了什么）。
+反过来也一样：【12】/【13】那种"只能靠真机才能走到的分支"，单测替代不了。
 
 **【12】与【13】的做法值得单说**：降级链的**后两档只能靠"临时把更优先的引擎藏起来"才测得到** ——
 libvips 只要在，`image.convert` 就永远走它，中间档与兜底档根本没有机会被执行。

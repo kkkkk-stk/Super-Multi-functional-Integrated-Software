@@ -4029,6 +4029,449 @@ c.section('【26】能力清单：前端能直接调什么，被拒的又是不�
   }
 }
 
+// ============================================================================
+// 【27】「保留源文件」这个设置到底有没有生效
+// ============================================================================
+//
+// 它此前是**完全惰性的**：`Settings::keep_original` 声明了、能改、能落盘，但
+// **没有任何代码读它**。而界面在三个地方把它当成真事 ——
+//
+//   1. 设置页的开关「批量处理时保留源文件」；
+//   2. 批量页的下拉框（保留 / 不保留）；
+//   3. 运行面板上那句「当前设置：批量处理时不会保留源文件。」
+//
+// 也就是说：用户以为源文件会被删掉（或者被保留），实际上一个都不会动。
+// 这与画布那次是同一类问题 —— **声明与行为不一致**，构建不会红、界面不报错。
+//
+// 现在真的照它做，规则刻意保守（见 `commands.rs` 里那段注释）：只在批次**成功之后**删、
+// 只删这一次真正用到的输入、**输出路径与输入路径相同就跳过**、每个删除都写进任务日志。
+// 这一节把四条规则逐条验一遍。
+//
+// ⚠️ ③ 那一条曾经是**空洞的断言**（只查"源文件还在"，而失败时它当然还在），
+// 现在拆成两条互补的：③a 钉住拒绝的**理由**（权限），③b 用一个直通插件
+// 真正走到「产出 == 输入路径」那一步。细节见各自的注释。
+c.section('【27】「保留源文件」这个设置是不是真的生效');
+{
+  const CONVERT = 'com.toolforge.builtin.image-convert';
+  const work = join(REPO_ROOT, '.tools', 'smoke', 'out-keep');
+  // ⚠️ 两个临时插件的 id 都声明在**这一层**：`finally` 里要卸载它们，
+  // 放在 `try` 里面会变成一个 ReferenceError（真踩过：收尾阶段崩掉，
+  // 前面几十条检查的结果连同汇总一起没了）。
+  const IN_PLACE_ID = 'com.verify.inplace';
+  const PASS_ID = 'com.verify.passthrough';
+
+  const before = await client.invoke('settings_get');
+  const runConvert = async (src, outDir, params = {}) => {
+    const sub = await client.invoke('plugins_run', {
+      req: { pluginId: CONVERT, inputs: { src: [src] }, params, outputDir: outDir },
+    });
+    return client.waitJob(sub.jobId, 180, 1000);
+  };
+
+  try {
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+
+    // ---- ① 默认（保留）→ 源文件必须还在 ----
+    await client.invoke('settings_patch', { patch: { keepOriginal: true } });
+    const keepSrc = join(work, 'keep-in.png');
+    writeFileSync(keepSrc, makePng(120, 90, 11));
+    const keepOut = join(work, 'out-keep');
+    mkdirSync(keepOut, { recursive: true });
+    const keepJob = await runConvert(keepSrc, keepOut, { format: { kind: 'str', value: 'webp' } });
+    c.check(keepJob.status === 'succeeded', '① 前置：转换任务成功', keepJob.status);
+    c.check(existsSync(keepSrc), '★ ① 「保留源文件」打开时源文件还在（默认值就是这一侧）', keepSrc);
+    c.check(
+      readdirSync(keepOut).some((f) => f.endsWith('.webp')),
+      '①b 产出照常生成',
+      readdirSync(keepOut).join(', ')
+    );
+
+    // ---- ② 关掉 → 源文件必须真的被删掉，而产出绝不能被牵连 ----
+    await client.invoke('settings_patch', { patch: { keepOriginal: false } });
+    const dropSrc = join(work, 'drop-in.png');
+    writeFileSync(dropSrc, makePng(120, 90, 12));
+    const dropOut = join(work, 'out-drop');
+    mkdirSync(dropOut, { recursive: true });
+    const dropJob = await runConvert(dropSrc, dropOut, { format: { kind: 'str', value: 'webp' } });
+    c.check(dropJob.status === 'succeeded', '② 前置：转换任务成功', dropJob.status);
+    c.check(
+      !existsSync(dropSrc),
+      '★ ② 「不保留源文件」时源文件**真的被删掉了**（此前这个开关一点作用都没有）',
+      dropSrc
+    );
+    const dropped = readdirSync(dropOut);
+    c.check(
+      dropped.some((f) => f.endsWith('.webp')) && dropped.every((f) => existsSync(join(dropOut, f))),
+      '②b 产出完好无损（删的只能是源文件）',
+      dropped.join(', ')
+    );
+    const dropLogs = (dropJob.logs ?? []).map((l) => String(l.message)).join('\n');
+    c.check(
+      dropLogs.includes('已按设置删除源文件'),
+      '②c 任务日志里写明了删掉了谁（不是悄悄删）',
+      (dropLogs.match(/已按设置删除源文件：\S+/) ?? ['(没找到)'])[0]
+    );
+
+    // ---- ③a 插件**写不回**自己的输入路径 ----
+    //
+    // 这一条此前的断言是**空洞的**，必须写下来免得下次又退回去：原脚本只检查了
+    // 「源文件还在」。可任务**失败**时源文件当然还在 —— 失败的原因完全可能是
+    // 清单写错、引擎缺失、甚至参数不合法，检查照样是绿的。
+    //
+    // 真正要钉住的性质是**拒绝的理由**：节点的写操作按 `output` 角色解析路径
+    // （见 `nodes.rs::resolve_path`），输入路径落在收敛边界之外，必须报
+    // `PERMISSION_DENIED`。所以这里连错误码一起断言。
+    const dir = join(work, 'inplace');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'plugin.yaml'),
+      `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${IN_PLACE_ID}
+  name: 就地处理验证插件
+  version: 1.0.0
+  description: 输出路径与输入路径相同，用来验证"删源文件"不会把产出删掉。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: input }
+io:
+  inputs:
+    - id: src
+      label: 图片
+      type: file
+      accept: [".png"]
+      required: true
+  outputs:
+    - id: dst
+      label: 就地输出
+      type: file
+      accept: [".png"]
+      required: true
+  params: []
+runtime:
+  kind: pipeline
+  pipeline:
+    onError: fail
+    steps:
+      - id: touch
+        uses: image.convert
+        with:
+          src: "\${src}"
+          dst: "\${src}"
+          format: png
+`,
+      'utf8'
+    );
+    const existing = await client.invoke('plugins_get', { pluginId: IN_PLACE_ID }).catch(() => null);
+    if (existing) {
+      await client.invoke('plugins_set_enabled', { pluginId: IN_PLACE_ID, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: IN_PLACE_ID }).catch(() => {});
+    }
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'directory', path: dir },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: false,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: IN_PLACE_ID,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'input' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: IN_PLACE_ID, enabled: true });
+
+    const inPlaceSrc = join(work, 'inplace-src.png');
+    writeFileSync(inPlaceSrc, makePng(100, 80, 13));
+    const inPlaceOut = join(work, 'out-inplace');
+    mkdirSync(inPlaceOut, { recursive: true });
+    const sub = await client.invoke('plugins_run', {
+      req: {
+        pluginId: IN_PLACE_ID,
+        inputs: { src: [inPlaceSrc] },
+        params: {},
+        outputDir: inPlaceOut,
+      },
+    });
+    const inPlaceJob = await client.waitJob(sub.jobId, 180, 1000);
+    console.log(
+      `   就地处理任务：${inPlaceJob.status}${inPlaceJob.error ? ` — ${inPlaceJob.error.code}` : ''}`
+    );
+    c.check(
+      inPlaceJob.status === 'failed',
+      '③a 前置：写回自己输入路径的插件被拒绝（引擎不允许就地覆盖输入）',
+      inPlaceJob.status
+    );
+    c.check(
+      inPlaceJob.error?.code === 'PERMISSION_DENIED',
+      '★ ③a 拒绝的理由是权限 —— 而不是碰巧因为别的原因失败（这条以前是空洞的断言）',
+      inPlaceJob.error?.code ?? '(没有错误码)'
+    );
+    c.check(existsSync(inPlaceSrc), '③a-b 被拒绝之后源文件原封不动', inPlaceSrc);
+
+    // ---- ③b 真能走到「产出 == 输入路径」的情形：插件把输入本身报成产出 ----
+    //
+    // ③a 证明了插件**写不回**输入路径，所以"就地编辑"这条路上其实到不了删除那一步。
+    // 但「产出里出现的路径绝不删」这条规则仍然必须成立，而且有真实场景：
+    // 一个**直通插件**（发现文件已经满足要求，于是原样把输入报成产出）。
+    // 这时 `produced` 与 `src` 是同一个路径，删"源文件"等于删掉刚生成的结果。
+    //
+    // 构造要点：宿主只接受**输出目录之内**的产出（见 `interpret_plugin_response`），
+    // 所以把输入文件放进输出目录里，路径才合法。
+    const passDir = join(work, 'passthrough');
+    rmSync(passDir, { recursive: true, force: true });
+    mkdirSync(passDir, { recursive: true });
+    writeFileSync(
+      join(passDir, 'plugin.yaml'),
+      `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${PASS_ID}
+  name: 直通验证插件
+  version: 1.0.0
+  description: 不写任何文件，把输入路径本身报成产出（"已经满足要求"的直通）。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 图片
+      type: file
+      accept: [".png"]
+      required: true
+  outputs:
+    - id: dst
+      label: 产出
+      type: file
+      accept: [".png"]
+      required: false
+  params:
+    - id: mode
+      label: 模式
+      type: text
+      description: pair = 把输入本身报成产出（不写文件）；copy = 真写一份副本到输出目录。
+      default: { kind: str, value: pair }
+      required: false
+runtime:
+  kind: python
+  python:
+    entry: main.py
+    pythonVersion: "3.11"
+    requirements: []
+    timeoutMs: 60000
+    workers: 1
+    allowNetwork: false
+`,
+      'utf8'
+    );
+    // 直通探针：只校验 PNG 头，然后**原样**把输入路径报成产出 —— 一个字节都不写。
+    // （Python 源码嵌在 JS 模板字符串里，所以不能出现反引号）
+    writeFileSync(
+      join(passDir, 'main.py'),
+      `"""直通探针：pair 模式不写文件、把输入路径本身报成产出；copy 模式真写一份副本。"""
+import json
+import os
+import sys
+
+PNG_SIG = b"\\x89PNG\\r\\n\\x1a\\n"
+
+
+def _write(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\\n")
+    sys.stdout.flush()
+
+
+def handle_initialize(params):
+    return {"ok": True}
+
+
+def handle_run(params):
+    src = ((params.get("input") or {}).get("src") or [None])[0]
+    if not src:
+        raise ValueError("缺少输入端口 src")
+    with open(src, "rb") as fh:
+        head = fh.read(len(PNG_SIG))
+    if head != PNG_SIG:
+        raise ValueError("输入不是 PNG")
+    mode = (params.get("params") or {}).get("mode") or "pair"
+    if mode == "copy":
+        out_root = os.path.normpath((params.get("paths") or {}).get("output") or os.path.dirname(src))
+        out = os.path.normpath(os.path.join(out_root, "passthrough-copy.png"))
+        if not out.startswith(out_root + os.sep):
+            raise ValueError("拒绝写出输出目录之外")
+        with open(src, "rb") as a, open(out, "wb") as b:
+            b.write(a.read())
+        return {"outputs": {"dst": out}, "values": {"mode": mode}}
+    return {"outputs": {"dst": src}, "values": {"mode": mode}}
+
+
+def handle_shutdown(params):
+    return {"ok": True}
+
+
+HANDLERS = {"initialize": handle_initialize, "run": handle_run, "shutdown": handle_shutdown}
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        handler = HANDLERS.get(msg.get("method"))
+        if handler is None:
+            continue
+        try:
+            result = handler(msg.get("params") or {})
+            _write({"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
+        except Exception as exc:  # noqa: BLE001
+            _write({"jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32000, "message": str(exc)}})
+
+
+main()
+`,
+      'utf8'
+    );
+    const passExisting = await client.invoke('plugins_get', { pluginId: PASS_ID }).catch(() => null);
+    if (passExisting) {
+      await client.invoke('plugins_set_enabled', { pluginId: PASS_ID, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: PASS_ID }).catch(() => {});
+    }
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'directory', path: passDir },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: true,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: PASS_ID,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'output' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: PASS_ID, enabled: true });
+
+    // 「不保留源文件」必须**明确**处在关闭状态，否则这条检查会变成 ② 的复读机
+    await client.invoke('settings_patch', { patch: { keepOriginal: false } });
+    const passOut = join(work, 'passthrough-src');
+    mkdirSync(passOut, { recursive: true });
+    const passFile = join(passOut, 'same.png');
+    writeFileSync(passFile, makePng(96, 72, 14));
+    const passSub = await client.invoke('plugins_run', {
+      req: {
+        pluginId: PASS_ID,
+        inputs: { src: [passFile] },
+        params: {},
+        outputDir: passOut,
+      },
+    });
+    const passJob = await client.waitJob(passSub.jobId, 180, 1000);
+    console.log(
+      `   直通任务：${passJob.status}${passJob.error ? ` — ${passJob.error.code}` : ''}；产出=${JSON.stringify(passJob.outputs ?? [])}`
+    );
+    c.check(passJob.status === 'succeeded', '③b 前置：直通任务成功', passJob.status);
+    c.check(
+      Array.isArray(passJob.outputs) && passJob.outputs.includes(passFile),
+      '③b-b 宿主确实把输入路径登记成了产出（不然这条检查测的是别的东西）',
+      JSON.stringify(passJob.outputs ?? [])
+    );
+    c.check(
+      existsSync(passFile),
+      '★ ③b 产出 == 输入路径时**产出没有被当成源文件删掉**（"删源文件"的安全阀）',
+      passFile
+    );
+    const passLogs = (passJob.logs ?? []).map((l) => String(l.message)).join('\n');
+    c.check(
+      !passLogs.includes('已按设置删除源文件'),
+      '★ ③c 任务日志里没有"已按设置删除源文件" —— 说明是**认出来了**，不是碰巧没删',
+      passLogs.includes('已按设置删除源文件') ? '日志里出现了删除记录' : '没有删除记录'
+    );
+
+    // ---- ③d 正向对照：同一个插件、同一份输入，只把产出换个路径 ----
+    //
+    // ③c 断言的是"日志里**没有**删除记录"。一条只断言"没发生"的检查天生可疑：
+    // 删除机制整体坏掉、或者这一步根本没执行，它同样会绿。
+    //
+    // 所以补这条对照：**同一个插件、同一份输入、同一个设置**，只把要报的产出
+    // 从"输入路径本身"换成"输出目录里的一份副本"。这时输入不是产出了，
+    // 源文件就**必须**被删掉。两条一起看，才能区分"认出来了"与"根本没跑"。
+    const ctlFile = join(passOut, 'control.png');
+    writeFileSync(ctlFile, makePng(96, 72, 15));
+    const ctlSub = await client.invoke('plugins_run', {
+      req: {
+        pluginId: PASS_ID,
+        inputs: { src: [ctlFile] },
+        params: { mode: { kind: 'str', value: 'copy' } },
+        outputDir: passOut,
+      },
+    });
+    const ctlJob = await client.waitJob(ctlSub.jobId, 180, 1000);
+    const ctlCopy = join(passOut, 'passthrough-copy.png');
+    console.log(
+      `   对照任务：${ctlJob.status}${ctlJob.error ? ` — ${ctlJob.error.code}` : ''}；产出=${JSON.stringify(ctlJob.outputs ?? [])}`
+    );
+    c.check(ctlJob.status === 'succeeded', '③d 前置：对照任务成功', ctlJob.status);
+    c.check(existsSync(ctlCopy), '③d-b 副本产出确实写出来了', ctlCopy);
+    c.check(
+      !existsSync(ctlFile),
+      '★ ③d 正向对照：产出换成副本之后，源文件**真的被删了** —— 证明上面 ③b/③c 不是"因为删除机制压根没跑"',
+      ctlFile
+    );
+
+    // ---- ④ 失败的任务**不删**源文件 ----
+    //
+    // 源文件是用户唯一还能重试的东西。失败还删它，等于把一次失败变成一次数据丢失。
+    const badSrc = join(work, 'bad-in.png');
+    writeFileSync(badSrc, Buffer.from('这不是一张 PNG，只是普通文本', 'utf8'));
+    const badOut = join(work, 'out-bad');
+    mkdirSync(badOut, { recursive: true });
+    const badJob = await runConvert(badSrc, badOut, { format: { kind: 'str', value: 'webp' } });
+    console.log(`   坏输入任务：${badJob.status}${badJob.error ? ` — ${badJob.error.code}` : ''}`);
+    c.check(badJob.status === 'failed', '④ 前置：坏输入确实让任务失败', badJob.status);
+    c.check(
+      existsSync(badSrc),
+      '★ ④ 任务失败时**不删**源文件（失败还删，等于把一次失败变成一次数据丢失）',
+      badSrc
+    );
+  } finally {
+    // 收尾：恢复原设置、卸载临时插件
+    await client
+      .invoke('settings_patch', { patch: { keepOriginal: before.keepOriginal } })
+      .catch(() => {});
+    await client.invoke('plugins_set_enabled', { pluginId: IN_PLACE_ID, enabled: false }).catch(() => {});
+    await client.invoke('plugins_uninstall', { pluginId: IN_PLACE_ID }).catch(() => {});
+    await client.invoke('plugins_set_enabled', { pluginId: PASS_ID, enabled: false }).catch(() => {});
+    await client.invoke('plugins_uninstall', { pluginId: PASS_ID }).catch(() => {});
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

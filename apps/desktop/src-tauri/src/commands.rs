@@ -764,6 +764,9 @@ fn submit_plugin_run(
     // —— 既污染工作树，又让 L1 与 L2/L3 的审计分家。真机跑 video-to-gif 时冒出来的
     // `plugins/audit/` 就是这么来的。
     let audit = app.plugins.audit().clone();
+    // 「保留源文件」这个设置在**运行时**才有意义，所以在这里读一次快照带进任务
+    // （不要在任务体里持锁读设置：那会把设置保存饿死，见上面 vision 的注释）
+    let keep_original = app.settings.read().keep_original;
     // 在锁外克隆一份句柄：`AiClient` 在 `RwLock` 里，持锁跨 await 会饿死设置保存
     let vision: Option<Arc<dyn toolforge_core::ai::VisionClient>> = app
         .ai
@@ -895,6 +898,20 @@ fn submit_plugin_run(
             };
 
             produced_all.extend(produced);
+
+            // ---- 「不保留源文件」到底删哪些 ----
+            //
+            // 规则抽成纯函数 `sources_to_delete()`，因为"删用户文件"这件事的边界条件
+            // （就地处理、产出与输入同路径、文件已经被搬走）用真机跑很难穷举，
+            // 而它们**每一条都是数据丢失风险**。纯函数可以逐条钉单测。
+            if !keep_original {
+                for path in sources_to_delete(&inputs, &produced_all, keep_original) {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => ctx.info(format!("已按设置删除源文件：{}", path.display())),
+                        Err(e) => ctx.warn(format!("删除源文件失败（{}）：{e}", path.display())),
+                    }
+                }
+            }
         }
 
         ctx.progress_now(toolforge_core::job::JobProgress::ratio(
@@ -1288,6 +1305,54 @@ pub async fn ai_review_draft(
 // 内部辅助
 // ============================================================================
 
+/// 按「保留源文件」设置算出**这一次成功之后应当删掉哪些输入文件**。
+///
+/// # 为什么是纯函数
+///
+/// 这个设置在 2026 年这一轮之前是**完全惰性的**：`Settings::keep_original` 声明了、
+/// 能改、能落盘，但**没有任何代码读它**。而界面在三个地方把它当成真事 ——
+/// 设置页的开关、批量页的下拉框、以及运行面板上那句
+/// 「当前设置：批量处理时不保留源文件。」用户以为源文件会被删掉，实际一个都不会动。
+///
+/// 现在真的照它做。而"删用户文件"的每一条边界条件都是**数据丢失风险**，
+/// 所以规则抽成这个纯函数、逐条钉单测：
+///
+/// | 情形 | 处理 | 为什么 |
+/// |---|---|---|
+/// | `keep_original == true` | 一个都不删 | 默认值就在安全的那一侧 |
+/// | 输入文件已经不存在 | 跳过 | 就地改名（`fs.move`）之后旧路径本来就没有了，`remove_file` 只会报"文件不存在" |
+/// | 输入路径**出现在产出里** | 跳过 | 产出与输入同路径时，删"源文件"等于删掉刚生成的结果 |
+/// | 其余 | 删 | 这才是用户勾掉「保留源文件」时想要的效果 |
+///
+/// ⚠️ 调用点还额外保证了一件事（纯函数管不了）：**只有批次成功之后才会走到这里**。
+/// 失败或取消时源文件必须留着 —— 那是用户唯一还能重试的东西。
+fn sources_to_delete(
+    inputs: &HashMap<String, Vec<String>>,
+    produced: &[String],
+    keep_original: bool,
+) -> Vec<PathBuf> {
+    if keep_original {
+        return Vec::new();
+    }
+    let produced_set: std::collections::HashSet<&std::path::Path> = produced
+        .iter()
+        .map(|p| std::path::Path::new(p.as_str()))
+        .collect();
+
+    let mut out = Vec::new();
+    for path in inputs.values().flatten() {
+        let src = std::path::Path::new(path);
+        if !src.exists() {
+            continue;
+        }
+        if produced_set.contains(src) {
+            continue;
+        }
+        out.push(src.to_path_buf());
+    }
+    out
+}
+
 /// 记下一次许可证确认：落盘 + 写审计。
 ///
 /// **调用点必须放在硬门之后**（见两处调用点的注释）—— 被拒绝的尝试不该留下记录，
@@ -1658,3 +1723,137 @@ fn interpret_plugin_response(
 
 /// 让 `Arc<AppState>` 能在命令签名里使用
 pub type SharedState = Arc<AppState>;
+
+#[cfg(test)]
+mod tests {
+    use super::sources_to_delete;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    /// 建一个本次测试专属的临时目录。
+    ///
+    /// 不用 `tempfile`：这个 crate 目前没有 dev-dependencies，为四条边界条件
+    /// 拉一棵依赖树不划算。目录名带进程号 + 纳秒时间戳，避免并行测试互相踩。
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "toolforge-keep-original-{}-{nanos}-{tag}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &Path) {
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    fn inputs_of(paths: &[&Path]) -> HashMap<String, Vec<String>> {
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "src".to_string(),
+            paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        );
+        inputs
+    }
+
+    #[test]
+    fn keep_original_deletes_nothing() {
+        // 默认值就在安全的那一侧：开关打开时，**一个文件都不许删**。
+        // 这条如果坏了，用户勾上「保留源文件」反而丢文件 —— 最坏的一种回归。
+        let dir = scratch("keep");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        touch(&a);
+        touch(&b);
+
+        let inputs = inputs_of(&[&a, &b]);
+        let out = sources_to_delete(&inputs, &[], true);
+        assert!(out.is_empty(), "keep_original=true 时不该删任何东西，实际 {out:?}");
+        assert!(a.exists() && b.exists(), "源文件必须原地还在");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn produced_paths_are_never_deleted() {
+        // 产出与输入同路径（就地处理：重编码、覆盖写、`fs.move` 回到原目录……）。
+        // 这时删「源文件」等于删掉**刚刚生成的结果**。
+        let dir = scratch("produced");
+        let src = dir.join("photo.png");
+        let other = dir.join("other.png");
+        touch(&src);
+        touch(&other);
+
+        let inputs = inputs_of(&[&src, &other]);
+        let produced = vec![src.to_string_lossy().into_owned()];
+        let out = sources_to_delete(&inputs, &produced, false);
+
+        assert_eq!(out, vec![other.clone()], "同路径的产出必须被跳过，其余的照删");
+        assert!(src.exists(), "产出文件被删掉了 —— 这是数据丢失");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_inputs_are_skipped_instead_of_erroring() {
+        // 输入已经被上游节点改名/移动过（`fs.move` 之后旧路径本来就不存在）。
+        // 这里不能报错，否则一次成功的批次会因为「删不掉一个不存在的文件」被算成失败。
+        let dir = scratch("missing");
+        let gone = dir.join("gone.txt");
+        let alive = dir.join("alive.txt");
+        touch(&alive);
+
+        let inputs = inputs_of(&[&gone, &alive]);
+        let out = sources_to_delete(&inputs, &[], false);
+        assert_eq!(out, vec![alive.clone()]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn default_setting_deletes_every_existing_input() {
+        // 用户主动把「保留源文件」关掉时，才是真的想删 —— 这才是开关的另一半语义。
+        let dir = scratch("delete");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        touch(&a);
+        touch(&b);
+
+        let inputs = inputs_of(&[&a, &b]);
+        let mut out = sources_to_delete(&inputs, &[], false);
+        out.sort();
+        let mut expected = vec![a.clone(), b.clone()];
+        expected.sort();
+        assert_eq!(out, expected);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inputs_from_every_port_are_considered() {
+        // 插件可以有多个输入端口（见 `PluginIo`），一个端口都不许漏 ——
+        // 漏掉的那个端口的源文件会被静默留下，用户以为删干净了。
+        let dir = scratch("ports");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        touch(&a);
+        touch(&b);
+
+        let mut inputs: HashMap<String, Vec<String>> = HashMap::new();
+        inputs.insert("src".into(), vec![a.to_string_lossy().into_owned()]);
+        inputs.insert("ref".into(), vec![b.to_string_lossy().into_owned()]);
+
+        let mut out = sources_to_delete(&inputs, &[], false);
+        out.sort();
+        assert_eq!(out.len(), 2, "两个输入端口的文件都该进删除列表，实际 {out:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

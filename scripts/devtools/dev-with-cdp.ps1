@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     带 WebView2 远程调试端口启动 ToolForge 开发模式。
 
@@ -26,6 +26,20 @@
 .NOTES
     重启时如果报 `failed to remove file ...toolforge.exe ... os error 32`，
     说明上一个进程还没释放文件锁。本脚本会等到 exe 可写为止才启动。
+
+    ⚠️ 本文件是**带 UTF-8 BOM** 的（`.gitattributes` 另外声明了 `*.ps1 eol=crlf`）。
+    两个都不是洁癖，是实测出来的必需品：
+      * **没有 BOM** 时，Windows PowerShell 5.1（Windows 自带的那个）会按 **ANSI/GBK**
+        解码这个文件。注释里的中文是多字节序列，其中某些字节会被当成 GBK 的**后继字节**，
+        把它后面紧邻的那个 ASCII 字符**吞掉** —— 而 GBK 的后继字节范围 0x40–0x7E
+        **正好包含 `}`**。于是括号配对崩掉，脚本连**解析**都过不去
+        （报 `Unexpected token '}'`，指的却是一个完全正确的行）。PowerShell 7 默认按
+        UTF-8 读，所以这个问题只在"用系统自带 PowerShell 跑"时出现 —— 而这正是
+        Windows 用户的默认情况。
+      * **行尾用 CRLF** 是给老版本 PowerShell 的解析器留的余地（见 `.gitattributes`）。
+
+    亲测：去掉 BOM，`[Parser]::ParseFile()` 立刻报 1–2 个 `Unexpected token '}'`；
+    加回去就是 0 个。
 #>
 [CmdletBinding()]
 param(
@@ -41,17 +55,41 @@ $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 # cargo 紧接着替换二进制时会报 os error 32。
 if (-not $NoStop) {
     for ($i = 0; $i -lt 20; $i++) {
-        $procs = Get-Process -Name toolforge, msedgewebview2 -ErrorAction SilentlyContinue
+        # ⚠️ 只杀**本应用**的 WebView2，不要 `Get-Process msedgewebview2` 一把撸。
+        # `msedgewebview2.exe` 是共享的运行时宿主：Windows 自己的 SearchHost 也在用它，
+        # 无差别 kill 会把开始菜单的 WebView 一起干掉（能恢复，但不是我们该做的事）。
+        # 认法：WebView2 会把自己的宿主程序名写在 `--webview-exe-name=` 里。
+        $procs = @()
+        $procs += Get-Process -Name toolforge -ErrorAction SilentlyContinue
+        $procs += Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like '*--webview-exe-name=toolforge.exe*' } |
+            ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }
+        $procs = $procs | Where-Object { $_ }
         if (-not $procs) { break }
         $procs | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Milliseconds 700
     }
+
     $exe = Join-Path $repoRoot '.tools\probe\target\debug\toolforge.exe'
+    $locked = $false
     if (Test-Path $exe) {
+        $locked = $true
         for ($i = 0; $i -lt 20; $i++) {
-            try { [System.IO.File]::OpenWrite($exe).Close(); break }
+            try { [System.IO.File]::OpenWrite($exe).Close(); $locked = $false; break }
             catch { Start-Sleep -Milliseconds 500 }
         }
+    }
+
+    # 锁可能**根本不属于我们**。
+    #
+    # 实测：本机有个带反作弊的游戏进程（`DeltaForceClient-Win64-Shipping.exe`，
+    # 用 Restart Manager 查出来的）会抓住仓库里新写出来的 exe 不放，于是
+    # `cargo build` 报 `failed to remove file ...toolforge.exe`。
+    # 重启应用没有用 —— 句柄不在我们手里。这种情况下改用一个独立编译目录继续，
+    # 而不是让人对着一个 os error 32 干等。
+    if ($locked) {
+        Write-Warning "$exe 被本应用之外的进程占用（见脚本注释）；改用 .tools\probe\target-app 编译"
+        $env:CARGO_TARGET_DIR = Join-Path $repoRoot '.tools\probe\target-app'
     }
 }
 
@@ -67,6 +105,7 @@ if (Test-Path (Join-Path $repoRoot '.tools\rust\rustup')) {
     $env:CARGO_HOME = Join-Path $repoRoot '.tools\rust\cargo'
 }
 # 复用 devtools 的 target 缓存，避免 tauri dev 触发一次全量重建
+# （除非上面检测到 exe 被外部进程占用，那时已经换成 target-app）
 $sharedTarget = Join-Path $repoRoot '.tools\probe\target'
 if ((Test-Path $sharedTarget) -and -not $env:CARGO_TARGET_DIR) {
     $env:CARGO_TARGET_DIR = $sharedTarget
