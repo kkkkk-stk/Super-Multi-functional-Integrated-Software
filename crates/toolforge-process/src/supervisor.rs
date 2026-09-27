@@ -179,9 +179,9 @@ impl ChildSupervisor {
         crate::hide_console(&mut cmd);
         crate::detach_process_group(&mut cmd);
 
-        let mut child = cmd.spawn().map_err(|e| {
-            ToolforgeError::runtime(format!("无法启动插件进程 `{name}`：{e}"))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ToolforgeError::runtime(format!("无法启动插件进程 `{name}`：{e}")))?;
 
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -211,11 +211,8 @@ impl ChildSupervisor {
                             }
                             let notification = match RpcMessage::parse_line(&line) {
                                 Ok(RpcMessage::Response(resp)) => {
-                                    let key = resp
-                                        .id
-                                        .as_ref()
-                                        .map(|v| v.to_string())
-                                        .unwrap_or_default();
+                                    let key =
+                                        resp.id.as_ref().map(|v| v.to_string()).unwrap_or_default();
                                     let waiter = pending.lock().await.remove(&key);
                                     match waiter {
                                         Some(tx) => {
@@ -365,8 +362,15 @@ impl ChildSupervisor {
     }
 
     /// 调用插件方法。
-    pub async fn call(&mut self, method: &str, params: Value, timeout: Duration) -> ToolforgeResult<Value> {
-        self.call_raw(method, params, timeout).await.map_err(|e| self.decorate(e))
+    pub async fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> ToolforgeResult<Value> {
+        self.call_raw(method, params, timeout)
+            .await
+            .map_err(|e| self.decorate(e))
     }
 
     /// 发通知（不需要回复）

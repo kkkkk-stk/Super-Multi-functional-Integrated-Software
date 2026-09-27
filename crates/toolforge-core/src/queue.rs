@@ -166,9 +166,7 @@ impl JobCtx {
             job.log(entry.level, entry.message.clone());
             e.job = job;
         }
-        let _ = self
-            .tx
-            .send(AppEvent::job_log(self.id.to_string(), entry));
+        let _ = self.tx.send(AppEvent::job_log(self.id.to_string(), entry));
     }
 
     pub fn info(&self, m: impl Into<String>) {
@@ -294,9 +292,7 @@ impl JobQueue {
         self.order.lock().push(id.to_string());
         self.prune();
 
-        let _ = self.tx.send(AppEvent::JobUpdated {
-            job: Box::new(job),
-        });
+        let _ = self.tx.send(AppEvent::JobUpdated { job: Box::new(job) });
 
         JobCtx::new(id, cancel, self.tx.clone(), self.entries.clone())
     }
@@ -409,7 +405,10 @@ impl JobQueue {
                 .entries
                 .get(id)
                 .ok_or_else(|| ToolforgeError::not_found(format!("任务 {id} 不存在")))?;
-            (entry.job.status.is_terminal(), entry.job.status == JobStatus::Queued)
+            (
+                entry.job.status.is_terminal(),
+                entry.job.status == JobStatus::Queued,
+            )
         };
 
         if terminal {
@@ -425,7 +424,14 @@ impl JobQueue {
 
         // 排队中的任务没有 runner 在跑，直接落终态
         if was_queued {
-            finish(&self.entries, &self.tx, id, JobStatus::Cancelled, None, vec![]);
+            finish(
+                &self.entries,
+                &self.tx,
+                id,
+                JobStatus::Cancelled,
+                None,
+                vec![],
+            );
         }
 
         self.get(id)
@@ -529,9 +535,7 @@ fn transition(entries: &EntryMap, tx: &broadcast::Sender<AppEvent>, id: &str, ne
         let mut job = e.job.clone();
         if job.transition(next) {
             e.job = job.clone();
-            let _ = tx.send(AppEvent::JobUpdated {
-                job: Box::new(job),
-            });
+            let _ = tx.send(AppEvent::JobUpdated { job: Box::new(job) });
         }
     }
 }
@@ -571,9 +575,7 @@ fn finish(
         (job, title, err_msg)
     };
 
-    let _ = tx.send(AppEvent::JobUpdated {
-        job: Box::new(job),
-    });
+    let _ = tx.send(AppEvent::JobUpdated { job: Box::new(job) });
     let _ = tx.send(AppEvent::JobFinished {
         job_id: id.to_string(),
         status,

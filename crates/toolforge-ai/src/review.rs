@@ -201,9 +201,9 @@ pub fn review_draft(draft: &AiDraft) -> SecurityReview {
             });
             // WASM 做不了文件处理，这是最常见的"AI 生成错误"
             if manifest.io.inputs.iter().any(|p| {
-                p.accept
-                    .iter()
-                    .any(|a| a.starts_with("image/") || a.starts_with("video/") || a.starts_with("audio/"))
+                p.accept.iter().any(|a| {
+                    a.starts_with("image/") || a.starts_with("video/") || a.starts_with("audio/")
+                })
             }) {
                 findings.push(ReviewFinding {
                     severity: RiskLevel::High,
@@ -232,7 +232,8 @@ pub fn review_draft(draft: &AiDraft) -> SecurityReview {
                 findings.push(ReviewFinding {
                     severity: RiskLevel::High,
                     code: "NET_DECLARED_BUT_DISABLED".into(),
-                    message: "清单声明了网络能力，但 python.allowNetwork 为 false，两者不一致".into(),
+                    message: "清单声明了网络能力，但 python.allowNetwork 为 false，两者不一致"
+                        .into(),
                     evidence: Some("runtime.python.allowNetwork".into()),
                 });
             }
@@ -268,8 +269,10 @@ pub fn review_draft(draft: &AiDraft) -> SecurityReview {
         .files
         .iter()
         .filter(|f| {
-            matches!(f.language.as_str(), "python" | "py" | "javascript" | "js" | "sh" | "bash")
-                || f.path.ends_with(".py")
+            matches!(
+                f.language.as_str(),
+                "python" | "py" | "javascript" | "js" | "sh" | "bash"
+            ) || f.path.ends_with(".py")
         })
         .collect();
 
@@ -336,7 +339,11 @@ fn scan_code(f: &DraftFile, manifest: &PluginManifest, out: &mut Vec<ReviewFindi
         ("eval(", CapabilityNeed::Code, "动态求值代码"),
         ("exec(", CapabilityNeed::Code, "动态执行代码"),
         ("__import__", CapabilityNeed::Code, "动态导入模块"),
-        ("socket", CapabilityNeed::Net, "原始套接字（可绕过代理环境变量）"),
+        (
+            "socket",
+            CapabilityNeed::Net,
+            "原始套接字（可绕过代理环境变量）",
+        ),
         ("requests.", CapabilityNeed::Net, "发起 HTTP 请求"),
         ("urllib", CapabilityNeed::Net, "发起 HTTP 请求"),
         ("httpx", CapabilityNeed::Net, "发起 HTTP 请求"),
@@ -356,14 +363,16 @@ fn scan_code(f: &DraftFile, manifest: &PluginManifest, out: &mut Vec<ReviewFindi
         let declared = match need {
             CapabilityNeed::Exec => manifest.permissions.wants_exec(),
             CapabilityNeed::Net => manifest.permissions.wants_network(),
-            CapabilityNeed::Fs => !manifest.permissions.capabilities.is_empty()
-                && manifest.permissions.capabilities.iter().any(|c| {
-                    matches!(
-                        c,
-                        toolforge_core::permission::Capability::FsRead { .. }
-                            | toolforge_core::permission::Capability::FsWrite { .. }
-                    )
-                }),
+            CapabilityNeed::Fs => {
+                !manifest.permissions.capabilities.is_empty()
+                    && manifest.permissions.capabilities.iter().any(|c| {
+                        matches!(
+                            c,
+                            toolforge_core::permission::Capability::FsRead { .. }
+                                | toolforge_core::permission::Capability::FsWrite { .. }
+                        )
+                    })
+            }
             // 动态代码执行没有任何能力声明能覆盖它 —— 永远是危险的
             CapabilityNeed::Code => false,
         };
@@ -518,10 +527,7 @@ runtime:
         let bad = GOOD_L1.replace("image.resize", "image.magic");
         let r = review_draft(&draft_with(&bad));
         assert!(!r.recommended);
-        assert!(r
-            .findings
-            .iter()
-            .any(|f| f.code == "STEP_UNKNOWN_NODE"));
+        assert!(r.findings.iter().any(|f| f.code == "STEP_UNKNOWN_NODE"));
     }
 
     #[test]
@@ -676,10 +682,7 @@ runtime:
             language: "python".into(),
         });
         let r = review_draft(&d);
-        assert!(r
-            .findings
-            .iter()
-            .any(|f| f.code == "CODE_WITH_L1_RUNTIME"));
+        assert!(r.findings.iter().any(|f| f.code == "CODE_WITH_L1_RUNTIME"));
         assert!(!r.recommended);
     }
 

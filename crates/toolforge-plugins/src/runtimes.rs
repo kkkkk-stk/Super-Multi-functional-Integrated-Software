@@ -53,7 +53,7 @@ use toolforge_core::queue::JobCtx;
 
 use toolforge_engines::EngineRegistry;
 
-use crate::audit::{AuditLog, AuditEvent, AuditEventKind};
+use crate::audit::{AuditEvent, AuditEventKind, AuditLog};
 use crate::store::PluginRecord;
 
 /// 一次插件调用的输入（L2/L3 共用）
@@ -328,9 +328,7 @@ impl PluginRunner {
         let result = instance.call(req, job).await;
 
         // 无论成功失败都放回去（Python 进程可能还活着，复用比重启便宜）
-        self.loaded
-            .lock()
-            .insert(record.id().to_string(), instance);
+        self.loaded.lock().insert(record.id().to_string(), instance);
 
         result
     }
@@ -359,7 +357,11 @@ mod tests {
         let dir = std::env::temp_dir().join("tf-runner-tests");
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
         let engines = Arc::new(EngineRegistry::new(AppPaths::new(&dir)).with_events(tx));
-        let runner = PluginRunner::new(engines, AppPaths::new(&dir), AuditLog::from_dir(dir.join("audit")));
+        let runner = PluginRunner::new(
+            engines,
+            AppPaths::new(&dir),
+            AuditLog::from_dir(dir.join("audit")),
+        );
         runner.unload("com.nope").await;
         assert!(!runner.is_loaded("com.nope"));
         runner.unload_all().await;

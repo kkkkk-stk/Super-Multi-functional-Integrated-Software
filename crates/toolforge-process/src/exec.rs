@@ -129,7 +129,9 @@ fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".into();
     }
-    if s.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '\'')) {
+    if s.chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '\''))
+    {
         format!("\"{}\"", s.replace('"', "\\\""))
     } else {
         s.to_string()
@@ -277,7 +279,11 @@ pub fn resolve_program(program: &Path) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     let exts: Vec<String> = if cfg!(windows) {
         match std::env::var("PATHEXT") {
-            Ok(v) => v.split(';').filter(|s| !s.is_empty()).map(|s| s.to_lowercase()).collect(),
+            Ok(v) => v
+                .split(';')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_lowercase())
+                .collect(),
             // PATH 里没有 PATHEXT（少见但可能）时用一个够用的集合
             Err(_) => vec![".exe".into(), ".cmd".into(), ".bat".into(), ".com".into()],
         }
@@ -375,11 +381,8 @@ where
     crate::detach_process_group(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| {
-        ToolforgeError::engine_failed(
-            "process",
-            format!("无法启动 {program_display}：{e}"),
-        )
-        .with_detail(format!("完整命令：{}", opts.display_command()))
+        ToolforgeError::engine_failed("process", format!("无法启动 {program_display}：{e}"))
+            .with_detail(format!("完整命令：{}", opts.display_command()))
     })?;
 
     let stdout = child.stdout.take();
@@ -577,7 +580,11 @@ pub async fn probe_version(program: &Path, args: &[&str]) -> Option<String> {
     } else {
         r.stdout
     };
-    let first = text.lines().find(|l| !l.trim().is_empty())?.trim().to_string();
+    let first = text
+        .lines()
+        .find(|l| !l.trim().is_empty())?
+        .trim()
+        .to_string();
     Some(truncate(&first, 200))
 }
 
@@ -639,7 +646,9 @@ mod tests {
 
     #[tokio::test]
     async fn missing_program_is_engine_missing() {
-        let err = exec(ExecOptions::new("/definitely/not/here/xyz")).await.unwrap_err();
+        let err = exec(ExecOptions::new("/definitely/not/here/xyz"))
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::EngineMissing);
     }
 
@@ -663,7 +672,11 @@ mod tests {
 
         let resolved = resolve_program(Path::new(name))
             .unwrap_or_else(|| panic!("`{name}` 应当能从 PATH 解析出来"));
-        assert!(resolved.is_absolute(), "解析结果应当是绝对路径：{}", resolved.display());
+        assert!(
+            resolved.is_absolute(),
+            "解析结果应当是绝对路径：{}",
+            resolved.display()
+        );
         assert!(resolved.is_file());
 
         // 关键：解析出来的路径**不是**原来那个裸名字
@@ -676,13 +689,17 @@ mod tests {
     fn windows_adds_pathext_suffix() {
         let r = resolve_program(Path::new("cmd")).expect("cmd 应当被解析到");
         assert_eq!(
-            r.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref(),
+            r.extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .as_deref(),
             Some("exe")
         );
         // 已经带后缀时不该补成 `cmd.exe.exe`
         let r2 = resolve_program(Path::new("cmd.exe")).expect("cmd.exe 应当被解析到");
         assert_eq!(
-            r2.file_name().map(|s| s.to_string_lossy().to_lowercase()).as_deref(),
+            r2.file_name()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .as_deref(),
             Some("cmd.exe")
         );
     }
@@ -728,9 +745,13 @@ mod tests {
     #[tokio::test]
     async fn quiet_still_keeps_output() {
         #[cfg(windows)]
-        let opts = ExecOptions::new("cmd").args(["/C", "echo quiet-keeps-output"]).quiet(true);
+        let opts = ExecOptions::new("cmd")
+            .args(["/C", "echo quiet-keeps-output"])
+            .quiet(true);
         #[cfg(not(windows))]
-        let opts = ExecOptions::new("sh").args(["-c", "echo quiet-keeps-output"]).quiet(true);
+        let opts = ExecOptions::new("sh")
+            .args(["-c", "echo quiet-keeps-output"])
+            .quiet(true);
 
         let r = exec(opts).await.unwrap();
         assert!(r.success(), "exit={} stderr={}", r.exit_code, r.stderr);
@@ -820,7 +841,9 @@ mod tests {
 
     #[test]
     fn display_command_quotes_paths_with_spaces() {
-        let o = ExecOptions::new("C:\\Program Files\\FFmpeg\\ffmpeg.exe").arg("-i").arg("a b.mp4");
+        let o = ExecOptions::new("C:\\Program Files\\FFmpeg\\ffmpeg.exe")
+            .arg("-i")
+            .arg("a b.mp4");
         let d = o.display_command();
         assert!(d.contains("\"C:\\Program Files\\FFmpeg\\ffmpeg.exe\""));
         assert!(d.contains("\"a b.mp4\""));
@@ -849,7 +872,11 @@ mod tests {
         let (s, _) = b.finish();
         assert!(s.contains("line-19999-"), "尾部必须保留");
         assert!(!s.contains("line-0-"), "头部应当被丢掉");
-        assert!(s.len() <= KEEP_TAIL + 4096, "长度应当只受尾部上限约束：{}", s.len());
+        assert!(
+            s.len() <= KEEP_TAIL + 4096,
+            "长度应当只受尾部上限约束：{}",
+            s.len()
+        );
     }
 
     /// 回归：**没有丢掉头部时不许出现"已省略"提示**。

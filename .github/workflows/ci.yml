@@ -92,6 +92,13 @@ jobs:
         # 那它就必须能红。本地同款命令：`pnpm check:clippy`。
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: cargo fmt --check
+        # 与上一步同理：文档的「附 A」里一直写着这条检查点"无输出"，
+        # 而实测有 **271 处 diff / 30 个文件**、CI 又从不检查它 —— 于是它长期是假的声明。
+        # 现在整仓已经用 `cargo fmt --all` 重排过，这一步就是让"零格式差异"这句话
+        # **真的能失败**。本地同款命令：`pnpm check:fmt`。
+        run: cargo fmt --all --check
+
   # ==========================================================================
   # 前端侧：类型检查 + 构建
   # 单独一个 job，这样前端挂了不会掩盖 Rust 的问题（反之亦然）

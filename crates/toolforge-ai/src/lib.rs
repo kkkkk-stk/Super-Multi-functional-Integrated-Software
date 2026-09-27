@@ -250,12 +250,10 @@ pub fn parse_model_output(raw: &str) -> ToolforgeResult<Vec<DraftFile>> {
             } else {
                 // 结束代码块
                 let lang = current_lang.take().unwrap_or_default();
-                let path = current_path.take().unwrap_or_else(|| {
-                    match lang.as_str() {
-                        "yaml" | "yml" => "plugin.yaml".to_string(),
-                        "python" | "py" => "main.py".to_string(),
-                        other => format!("file.{other}"),
-                    }
+                let path = current_path.take().unwrap_or_else(|| match lang.as_str() {
+                    "yaml" | "yml" => "plugin.yaml".to_string(),
+                    "python" | "py" => "main.py".to_string(),
+                    other => format!("file.{other}"),
                 });
                 if !buf.trim().is_empty() {
                     files.push(DraftFile {
@@ -283,27 +281,26 @@ pub fn parse_model_output(raw: &str) -> ToolforgeResult<Vec<DraftFile>> {
                 language: "yaml".into(),
             }]);
         }
-        return Err(ToolforgeError::new(
-            ErrorCode::AiRejected,
-            "模型输出里没有找到任何代码块",
-        )
-        .with_detail("期望形如 ```yaml ... ``` 的块。"));
+        return Err(
+            ToolforgeError::new(ErrorCode::AiRejected, "模型输出里没有找到任何代码块")
+                .with_detail("期望形如 ```yaml ... ``` 的块。"),
+        );
     }
 
     // plugin.yaml 必须存在
     if !files.iter().any(|f| f.path == "plugin.yaml") {
-        return Err(ToolforgeError::new(
-            ErrorCode::AiRejected,
-            "模型输出里没有 `plugin.yaml`",
-        )
-        .with_detail(format!(
-            "实际产出的文件：{}",
-            files
-                .iter()
-                .map(|f| f.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+        return Err(
+            ToolforgeError::new(ErrorCode::AiRejected, "模型输出里没有 `plugin.yaml`").with_detail(
+                format!(
+                    "实际产出的文件：{}",
+                    files
+                        .iter()
+                        .map(|f| f.path.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+        );
     }
 
     Ok(files)

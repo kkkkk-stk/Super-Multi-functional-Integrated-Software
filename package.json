@@ -32,8 +32,9 @@
     "check:encodings": "node scripts/check-encodings.mjs",
     "check:rust": "node scripts/ensure-dist.mjs && cargo check --workspace --all-targets",
     "check:clippy": "cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "check:fmt": "cargo fmt --all --check",
     "check:web": "pnpm typecheck && pnpm build",
-    "check:all": "pnpm check:encodings && pnpm check:rust && pnpm check:clippy && pnpm check:web"
+    "check:all": "pnpm check:encodings && pnpm check:rust && pnpm check:clippy && pnpm check:fmt && pnpm check:web"
   },
   "devDependencies": {
     "typescript": "5.9.3"

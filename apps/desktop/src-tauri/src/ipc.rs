@@ -22,12 +22,12 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+use toolforge_ai::review::SecurityReview;
+use toolforge_ai::AiDraft;
 use toolforge_core::engine::{EngineDescriptor, EngineStatus};
 use toolforge_core::job::{Job, JobFilter, JobStatus};
 use toolforge_core::permission::{Capability, PermissionSet};
 use toolforge_core::plugin::{ParamValue, PluginSource, PluginSummary, ValidationReport};
-use toolforge_ai::review::SecurityReview;
-use toolforge_ai::AiDraft;
 
 // ============================================================================
 // 应用 / 设置

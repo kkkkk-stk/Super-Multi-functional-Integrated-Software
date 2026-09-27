@@ -248,7 +248,11 @@ impl PipelineDef {
     ///
     /// 报成 `error` 而不是 `warning`：这类引用没有任何"也能跑"的情形，
     /// 它必然在执行第一步时失败。AI 生成流程正是靠 `validation.ok` 决定要不要放行的。
-    pub fn validate_template_refs(&self, io: &crate::plugin::PluginIo, issues: &mut Vec<ValidationIssue>) {
+    pub fn validate_template_refs(
+        &self,
+        io: &crate::plugin::PluginIo,
+        issues: &mut Vec<ValidationIssue>,
+    ) {
         let input_ids: Vec<&str> = io.inputs.iter().map(|p| p.id.as_str()).collect();
         let output_ids: Vec<&str> = io.outputs.iter().map(|p| p.id.as_str()).collect();
         let param_ids: Vec<&str> = io.params.iter().map(|p| p.id.as_str()).collect();
@@ -400,7 +404,8 @@ impl PipelineDef {
         // 一次性把"本流水线用到的节点各声明了哪些参数"收集起来
         // （收集 `String` 而不是 `&str`：`builtin_nodes()` 每次返回的是**新建的**描述符，
         //   借它的字段会立刻悬空）
-        let mut node_param_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut node_param_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for step in &self.steps {
             for node in builtin_nodes() {
                 if node.name == step.uses {
@@ -549,12 +554,10 @@ pub fn render_template(template: &str, ctx: &TemplateContext) -> ToolforgeResult
             if let Some(rel_end) = template[i + 2..].find('}') {
                 let name = template[i + 2..i + 2 + rel_end].trim();
                 let value = ctx.get(name).ok_or_else(|| {
-                    ToolforgeError::plugin_invalid(format!(
-                        "模板变量 `${{{name}}}` 无法解析"
-                    ))
-                    .with_detail(
-                        "可用的变量：input.* / output.* / params.* / steps.* / env.*（白名单）",
-                    )
+                    ToolforgeError::plugin_invalid(format!("模板变量 `${{{name}}}` 无法解析"))
+                        .with_detail(
+                            "可用的变量：input.* / output.* / params.* / steps.* / env.*（白名单）",
+                        )
                 })?;
                 out.push_str(value);
                 i = i + 2 + rel_end + 1;
@@ -853,7 +856,6 @@ pub const UNIMPLEMENTED_NODES: &[&str] = &[
 // 逐批调用流水线、上报「处理 3/12」、在批次边界检查取消。
 // 所以清单里从来不需要写循环，也不需要这个节点。
 
-
 /// 某个节点的执行器是否已实现
 pub fn is_implemented(node: &str) -> bool {
     !UNIMPLEMENTED_NODES.contains(&node)
@@ -883,7 +885,13 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         optional_engines: vec![],
         inputs: vec![in_file("src", "源文件", &[])],
         outputs: vec![out_file("dst", "目标文件")],
-        params: vec![param("overwrite", "覆盖已存在文件", ParamType::Bool, Some(true.into()), false)],
+        params: vec![param(
+            "overwrite",
+            "覆盖已存在文件",
+            ParamType::Bool,
+            Some(true.into()),
+            false,
+        )],
     });
     n.push(NodeDescriptor {
         name: "fs.move".into(),
@@ -905,7 +913,13 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         optional_engines: vec![],
         inputs: vec![],
         outputs: vec![port("dst", "目录", PortType::Directory, false)],
-        params: vec![param("path", "目录路径（相对输出目录）", ParamType::Text, None, true)],
+        params: vec![param(
+            "path",
+            "目录路径（相对输出目录）",
+            ParamType::Text,
+            None,
+            true,
+        )],
     });
     n.push(NodeDescriptor {
         name: "fs.delete".into(),
@@ -916,7 +930,12 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         optional_engines: vec![],
         inputs: vec![in_file("src", "待删除", &[])],
         outputs: vec![],
-        params: param_many(&[("toTrash", "移到回收站而非永久删除", ParamType::Bool, Some(true.into()))]),
+        params: param_many(&[(
+            "toTrash",
+            "移到回收站而非永久删除",
+            ParamType::Bool,
+            Some(true.into()),
+        )]),
     });
 
     // ---------------- 图片 ----------------
@@ -973,7 +992,8 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         name: "image.crop".into(),
         label: "裁剪 / 缩略图".into(),
         description: "按坐标裁剪，或按目标尺寸做中心裁剪（cover）。\
-                      裁剪矩形先算好再交给后端，所以三个后端切出来的**位置完全一致**。".into(),
+                      裁剪矩形先算好再交给后端，所以三个后端切出来的**位置完全一致**。"
+            .into(),
         category: NodeCategory::Image,
         requires_engines: vec![],
         optional_engines: vec![engine("libvips"), engine("imagemagick")],
@@ -983,8 +1003,22 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
             enum_param("mode", "裁剪模式", "center", &["center", "custom", "smart"]),
             range_param("width", "宽度", ParamType::Int, 512.0, 1.0, 100_000.0),
             range_param("height", "高度", ParamType::Int, 512.0, 1.0, 100_000.0),
-            range_param("x", "左上角 X（mode=custom 时生效）", ParamType::Int, 0.0, 0.0, 100_000.0),
-            range_param("y", "左上角 Y（mode=custom 时生效）", ParamType::Int, 0.0, 0.0, 100_000.0),
+            range_param(
+                "x",
+                "左上角 X（mode=custom 时生效）",
+                ParamType::Int,
+                0.0,
+                0.0,
+                100_000.0,
+            ),
+            range_param(
+                "y",
+                "左上角 Y（mode=custom 时生效）",
+                ParamType::Int,
+                0.0,
+                0.0,
+                100_000.0,
+            ),
         ],
     });
     n.push(NodeDescriptor {
@@ -992,7 +1026,8 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         label: "旋转 / 翻转".into(),
         description: "任意角度旋转、水平/垂直镜像。\
                       90° 整数倍三个后端都能做；**任意角度必须有 libvips 或 ImageMagick**\
-                      （纯 Rust 需要重采样，装不了就是明确的报错，不会静默取整）。".into(),
+                      （纯 Rust 需要重采样，装不了就是明确的报错，不会静默取整）。"
+            .into(),
         category: NodeCategory::Image,
         requires_engines: vec![],
         optional_engines: vec![engine("libvips"), engine("imagemagick")],
@@ -1000,9 +1035,27 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         outputs: vec![out_file("dst", "输出图片")],
         params: vec![
             param("angle", "角度", ParamType::Float, Some(90.0.into()), false),
-            param("flipH", "水平镜像", ParamType::Bool, Some(false.into()), false),
-            param("flipV", "垂直镜像", ParamType::Bool, Some(false.into()), false),
-            param("autoOrient", "按 EXIF 自动校正方向", ParamType::Bool, Some(true.into()), false),
+            param(
+                "flipH",
+                "水平镜像",
+                ParamType::Bool,
+                Some(false.into()),
+                false,
+            ),
+            param(
+                "flipV",
+                "垂直镜像",
+                ParamType::Bool,
+                Some(false.into()),
+                false,
+            ),
+            param(
+                "autoOrient",
+                "按 EXIF 自动校正方向",
+                ParamType::Bool,
+                Some(true.into()),
+                false,
+            ),
         ],
     });
     n.push(NodeDescriptor {
@@ -1028,7 +1081,8 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         name: "image.strip-metadata".into(),
         label: "清除元数据".into(),
         description: "去掉 EXIF / IPTC / XMP。分享图片前用来抹除 GPS 位置等隐私信息。\
-                      **只有纯 Rust 实现**：解码再重新编码，天然不会保留任何元数据块。".into(),
+                      **只有纯 Rust 实现**：解码再重新编码，天然不会保留任何元数据块。"
+            .into(),
         category: NodeCategory::Image,
         requires_engines: vec![],
         // 同 `image.enhance`：外部后端没有接入，不要靠 optional_engines 制造期待
@@ -1043,7 +1097,8 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         description: "AI 抠图（U²-Net / ISNet）。**权重与运行时都不随安装包分发**：\
                       先在「模型权重」里下载一个（u2netp 只要 4.4 MB），\
                       首次运行时会自动准备一个独立 Python 环境装 onnxruntime（约 30 MB）。\
-                      之后每张图是本地推理，不联网、不上传图片。".into(),
+                      之后每张图是本地推理，不联网、不上传图片。"
+            .into(),
         category: NodeCategory::Image,
         // onnx-models 是虚拟引擎（权重的宿主），python 是推理运行时。
         // 两个都是**必需**的：少任何一个这个节点都跑不起来，所以不能放进 optional。
@@ -1071,9 +1126,29 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
                 ],
             ),
             enum_param("mode", "输出方式", "alpha", &["alpha", "color"]),
-            param("background", "替换背景色（mode=color 时生效，如 #FFFFFF）", ParamType::Color, Some("#FFFFFF".into()), false),
-            range_param("threshold", "蒙版阈值（0 = 不卡，越大越干净但可能啃掉边缘）", ParamType::Int, 0.0, 0.0, 99.0),
-            range_param("feather", "边缘羽化强度（0 = 不羽化）", ParamType::Int, 0.0, 0.0, 50.0),
+            param(
+                "background",
+                "替换背景色（mode=color 时生效，如 #FFFFFF）",
+                ParamType::Color,
+                Some("#FFFFFF".into()),
+                false,
+            ),
+            range_param(
+                "threshold",
+                "蒙版阈值（0 = 不卡，越大越干净但可能啃掉边缘）",
+                ParamType::Int,
+                0.0,
+                0.0,
+                99.0,
+            ),
+            range_param(
+                "feather",
+                "边缘羽化强度（0 = 不羽化）",
+                ParamType::Int,
+                0.0,
+                0.0,
+                50.0,
+            ),
         ],
     });
 
@@ -1100,12 +1175,44 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
             // 现在统一到 `format`：它与 `image.convert` / `video.extract-audio` /
             // `audio.convert` 的命名一致，插件清单里声明一个同名参数就能把扩展名
             // 传下去，节点自己不必再读它。
-            enum_param("format", "容器格式", "mp4", &["mp4", "mkv", "webm", "mov", "avi"]),
-            enum_param("vcodec", "视频编码", "libx264", &["libx264", "libx265", "libvpx-vp9", "av1", "copy"]),
-            enum_param("acodec", "音频编码", "aac", &["aac", "libopus", "libmp3lame", "copy", "none"]),
-            range_param("crf", "质量 CRF（越小越好）", ParamType::Int, 23.0, 0.0, 51.0),
-            enum_param("preset", "编码速度", "medium", &["ultrafast", "fast", "medium", "slow", "veryslow"]),
-            enum_param("hwaccel", "硬件加速", "none", &["none", "auto", "nvenc", "qsv", "amf", "videotoolbox"]),
+            enum_param(
+                "format",
+                "容器格式",
+                "mp4",
+                &["mp4", "mkv", "webm", "mov", "avi"],
+            ),
+            enum_param(
+                "vcodec",
+                "视频编码",
+                "libx264",
+                &["libx264", "libx265", "libvpx-vp9", "av1", "copy"],
+            ),
+            enum_param(
+                "acodec",
+                "音频编码",
+                "aac",
+                &["aac", "libopus", "libmp3lame", "copy", "none"],
+            ),
+            range_param(
+                "crf",
+                "质量 CRF（越小越好）",
+                ParamType::Int,
+                23.0,
+                0.0,
+                51.0,
+            ),
+            enum_param(
+                "preset",
+                "编码速度",
+                "medium",
+                &["ultrafast", "fast", "medium", "slow", "veryslow"],
+            ),
+            enum_param(
+                "hwaccel",
+                "硬件加速",
+                "none",
+                &["none", "auto", "nvenc", "qsv", "amf", "videotoolbox"],
+            ),
         ],
     });
     n.push(NodeDescriptor {
@@ -1118,7 +1225,12 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         inputs: vec![in_file("src", "视频", &["video/*"])],
         outputs: vec![out_file("dst", "音频文件")],
         params: vec![
-            enum_param("format", "输出格式", "mp3", &["mp3", "aac", "flac", "wav", "opus", "m4a"]),
+            enum_param(
+                "format",
+                "输出格式",
+                "mp3",
+                &["mp3", "aac", "flac", "wav", "opus", "m4a"],
+            ),
             range_param("bitrate", "码率 kbps", ParamType::Int, 192.0, 32.0, 512.0),
         ],
     });
@@ -1132,7 +1244,13 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         inputs: vec![in_file("src", "视频", &["video/*"])],
         outputs: vec![out_file("dst", "封面图")],
         params: vec![
-            param("at", "时间点（如 00:00:03 / 3.5）", ParamType::Text, Some("00:00:01".into()), false),
+            param(
+                "at",
+                "时间点（如 00:00:03 / 3.5）",
+                ParamType::Text,
+                Some("00:00:01".into()),
+                false,
+            ),
             range_param("width", "宽度", ParamType::Int, 1280.0, 16.0, 7680.0),
             enum_param("format", "图片格式", "jpg", &["jpg", "png", "webp"]),
         ],
@@ -1147,9 +1265,27 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         inputs: vec![in_file("src", "视频", &["video/*"])],
         outputs: vec![out_file("dst", "输出视频")],
         params: vec![
-            param("start", "起点", ParamType::Text, Some("00:00:00".into()), true),
-            param("duration", "时长（留空 = 到结尾）", ParamType::Text, None, false),
-            param("reencode", "强制重编码（精确切割）", ParamType::Bool, Some(false.into()), false),
+            param(
+                "start",
+                "起点",
+                ParamType::Text,
+                Some("00:00:00".into()),
+                true,
+            ),
+            param(
+                "duration",
+                "时长（留空 = 到结尾）",
+                ParamType::Text,
+                None,
+                false,
+            ),
+            param(
+                "reencode",
+                "强制重编码（精确切割）",
+                ParamType::Bool,
+                Some(false.into()),
+                false,
+            ),
         ],
     });
     n.push(NodeDescriptor {
@@ -1162,7 +1298,13 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         inputs: vec![in_file("src", "视频", &["video/*"])],
         outputs: vec![out_file("dst", "压缩后视频")],
         params: vec![
-            param("targetSizeMb", "目标体积 (MB)", ParamType::Float, Some(10.0.into()), true),
+            param(
+                "targetSizeMb",
+                "目标体积 (MB)",
+                ParamType::Float,
+                Some(10.0.into()),
+                true,
+            ),
             range_param("maxWidth", "最大宽度", ParamType::Int, 1920.0, 64.0, 7680.0),
         ],
     });
@@ -1178,9 +1320,21 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         inputs: vec![in_file("src", "音频", &["audio/*"])],
         outputs: vec![out_file("dst", "输出音频")],
         params: vec![
-            enum_param("format", "目标格式", "mp3", &["mp3", "aac", "flac", "wav", "opus", "ogg", "m4a"]),
+            enum_param(
+                "format",
+                "目标格式",
+                "mp3",
+                &["mp3", "aac", "flac", "wav", "opus", "ogg", "m4a"],
+            ),
             range_param("bitrate", "码率 kbps", ParamType::Int, 192.0, 32.0, 512.0),
-            range_param("sampleRate", "采样率", ParamType::Int, 44100.0, 8000.0, 192_000.0),
+            range_param(
+                "sampleRate",
+                "采样率",
+                ParamType::Int,
+                44100.0,
+                8000.0,
+                192_000.0,
+            ),
         ],
     });
     n.push(NodeDescriptor {
@@ -1208,28 +1362,74 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
     n.push(NodeDescriptor {
         name: "doc.convert".into(),
         label: "文档格式转换".into(),
-        description: "Pandoc 支持的任意格式互转（Markdown / HTML / DOCX / EPUB / LaTeX / ODT ...）。".into(),
+        description:
+            "Pandoc 支持的任意格式互转（Markdown / HTML / DOCX / EPUB / LaTeX / ODT ...）。".into(),
         category: NodeCategory::Document,
         requires_engines: vec![engine("pandoc")],
         optional_engines: vec![],
-        inputs: vec![in_file("src", "文档", &[".md", ".html", ".docx", ".epub", ".tex", ".rst", ".odt", ".txt"])],
+        inputs: vec![in_file(
+            "src",
+            "文档",
+            &[
+                ".md", ".html", ".docx", ".epub", ".tex", ".rst", ".odt", ".txt",
+            ],
+        )],
         outputs: vec![out_file("dst", "输出文档")],
         params: vec![
-            enum_param("to", "目标格式", "pdf_engine", &["md", "html", "docx", "epub", "pdf_engine", "rst", "latex", "odt"]),
-            param("standalone", "生成独立文档（带模板）", ParamType::Bool, Some(true.into()), false),
-            param("toc", "生成目录", ParamType::Bool, Some(false.into()), false),
-            param("extraArgs", "额外 pandoc 参数", ParamType::Text, Some("".into()), false),
+            enum_param(
+                "to",
+                "目标格式",
+                "pdf_engine",
+                &[
+                    "md",
+                    "html",
+                    "docx",
+                    "epub",
+                    "pdf_engine",
+                    "rst",
+                    "latex",
+                    "odt",
+                ],
+            ),
+            param(
+                "standalone",
+                "生成独立文档（带模板）",
+                ParamType::Bool,
+                Some(true.into()),
+                false,
+            ),
+            param(
+                "toc",
+                "生成目录",
+                ParamType::Bool,
+                Some(false.into()),
+                false,
+            ),
+            param(
+                "extraArgs",
+                "额外 pandoc 参数",
+                ParamType::Text,
+                Some("".into()),
+                false,
+            ),
         ],
     });
     n.push(NodeDescriptor {
         name: "doc.to-pdf".into(),
         label: "转 PDF（Office）".into(),
         description: "用 LibreOffice headless 把 Word / Excel / PPT 转 PDF。\
-                      首次调用会启动常驻 listener（冷启动 2~5 秒），之后复用进程。".into(),
+                      首次调用会启动常驻 listener（冷启动 2~5 秒），之后复用进程。"
+            .into(),
         category: NodeCategory::Document,
         requires_engines: vec![engine("libreoffice")],
         optional_engines: vec![],
-        inputs: vec![in_file("src", "Office 文档", &[".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp"])],
+        inputs: vec![in_file(
+            "src",
+            "Office 文档",
+            &[
+                ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
+            ],
+        )],
         outputs: vec![out_file("dst", "PDF")],
         // ⚠️ 这里原来还有一个 `format` 参数（pdf / pdf-a / html / txt），**执行器从来没读过它** ——
         // `libreoffice_to_pdf` 里写死的是 `--convert-to pdf`。也就是说它是个纯装饰的参数，
@@ -1247,13 +1447,18 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
                       （离线、免费、快，中文质量一般）；没装则用**多模态模型**\
                       （中文/手写/复杂版式明显更强，但图片会上传给 AI 服务商并计费）。\
                       PDF 输入需要先按页栅格化 —— 装了 **Poppler** 会自动做这一步，\
-                      没装则明确报错而不是给你一堆乱码。".into(),
+                      没装则明确报错而不是给你一堆乱码。"
+            .into(),
         category: NodeCategory::Document,
         // 三个引擎都是**可选的**：有其一即可。放成 requires 会让"只装了 Tesseract"
         // 的机器上这个节点被无谓地标灰 —— 而那正是它最该能用的场景。
         requires_engines: vec![],
         // poppler 只影响"能不能吃 PDF"，不影响"能不能 OCR"，所以同样是可选。
-        optional_engines: vec![engine("tesseract"), engine("ai-provider"), engine("poppler")],
+        optional_engines: vec![
+            engine("tesseract"),
+            engine("ai-provider"),
+            engine("poppler"),
+        ],
         inputs: vec![in_file("src", "图片或扫描件 PDF", &["image/*", ".pdf"])],
         outputs: vec![port("text", "识别文本", PortType::Text, false)],
         params: vec![
@@ -1262,11 +1467,31 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
             // 参数名对了但取值对不上，是比"参数名写错"更难发现的一类漂移：
             // 界面照常显示、执行器照常运行，只有结果不符合预期。
             enum_param("engine", "识别引擎", "auto", &["auto", "tesseract", "ai"]),
-            param("lang", "语言（Tesseract 用，如 chi_sim+eng）", ParamType::Text, Some("chi_sim+eng".into()), false),
+            param(
+                "lang",
+                "语言（Tesseract 用，如 chi_sim+eng）",
+                ParamType::Text,
+                Some("chi_sim+eng".into()),
+                false,
+            ),
             // PDF 专用：栅格化精度。200 DPI 是"正文小字还能认出来"与"别把一页渲染成
             // 几十 MB"之间的常见折中；扫描件字特别小时可以调到 300~400。
-            range_param("pdfDpi", "PDF 栅格化精度（DPI）", ParamType::Int, 200.0, 72.0, 600.0),
-            range_param("pdfMaxPages", "PDF 最多处理页数（0 = 不限）", ParamType::Int, 0.0, 0.0, 500.0),
+            range_param(
+                "pdfDpi",
+                "PDF 栅格化精度（DPI）",
+                ParamType::Int,
+                200.0,
+                72.0,
+                600.0,
+            ),
+            range_param(
+                "pdfMaxPages",
+                "PDF 最多处理页数（0 = 不限）",
+                ParamType::Int,
+                0.0,
+                0.0,
+                500.0,
+            ),
         ],
     });
 
@@ -1281,23 +1506,45 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         inputs: vec![port("src", "输入文件/目录", PortType::Files, true)],
         outputs: vec![out_file("dst", "压缩包")],
         params: vec![
-            enum_param("format", "格式", "zip", &["zip", "7z", "tar", "tar.gz", "tar.xz"]),
+            enum_param(
+                "format",
+                "格式",
+                "zip",
+                &["zip", "7z", "tar", "tar.gz", "tar.xz"],
+            ),
             range_param("level", "压缩级别 0-9", ParamType::Int, 5.0, 0.0, 9.0),
-            param("password", "密码（留空 = 不加密）", ParamType::Text, Some("".into()), false),
+            param(
+                "password",
+                "密码（留空 = 不加密）",
+                ParamType::Text,
+                Some("".into()),
+                false,
+            ),
         ],
     });
     n.push(NodeDescriptor {
         name: "archive.unpack".into(),
         label: "解压".into(),
-        description: "自动识别格式解压。**内置 Zip Slip 防护**：拒绝解出到目标目录之外的条目。".into(),
+        description: "自动识别格式解压。**内置 Zip Slip 防护**：拒绝解出到目标目录之外的条目。"
+            .into(),
         category: NodeCategory::Archive,
         requires_engines: vec![engine("7zip")],
         optional_engines: vec![],
-        inputs: vec![in_file("src", "压缩包", &[".zip", ".7z", ".rar", ".tar", ".gz", ".xz", ".bz2"])],
+        inputs: vec![in_file(
+            "src",
+            "压缩包",
+            &[".zip", ".7z", ".rar", ".tar", ".gz", ".xz", ".bz2"],
+        )],
         outputs: vec![port("dst", "输出目录", PortType::Directory, false)],
         params: vec![
             param("password", "密码", ParamType::Text, Some("".into()), false),
-            param("keepStructure", "保留目录结构", ParamType::Bool, Some(true.into()), false),
+            param(
+                "keepStructure",
+                "保留目录结构",
+                ParamType::Bool,
+                Some(true.into()),
+                false,
+            ),
         ],
     });
 
@@ -1329,7 +1576,8 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         description: "用 Real-ESRGAN 放大图片，比传统插值保留更多细节。\
                       **模型原生是 4 倍**；选 2/3 倍时会先用 4 倍推理再缩回去\
                       （细节是模型真算出来的，比原图直接插值好得多）。\
-                      分块推理，所以大图也跑得动。需要下载权重（最小的只有 4.9 MB）。".into(),
+                      分块推理，所以大图也跑得动。需要下载权重（最小的只有 4.9 MB）。"
+            .into(),
         category: NodeCategory::Ai,
         requires_engines: vec![engine("python"), engine("onnx-models")],
         optional_engines: vec![],
@@ -1350,8 +1598,22 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
                 ],
             ),
             range_param("scale", "放大倍数", ParamType::Int, 4.0, 2.0, 4.0),
-            range_param("tile", "分块边长（px）", ParamType::Int, 256.0, 32.0, 2048.0),
-            range_param("overlap", "分块重叠（px）", ParamType::Int, 16.0, 0.0, 128.0),
+            range_param(
+                "tile",
+                "分块边长（px）",
+                ParamType::Int,
+                256.0,
+                32.0,
+                2048.0,
+            ),
+            range_param(
+                "overlap",
+                "分块重叠（px）",
+                ParamType::Int,
+                16.0,
+                0.0,
+                128.0,
+            ),
         ],
     });
     n.push(NodeDescriptor {
@@ -1386,19 +1648,56 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         name: "text.replace".into(),
         label: "文本替换".into(),
         description: "对字符串做查找替换，支持正则与大小写控制。\
-                      纯计算、不碰文件，输出可被 `${steps.<id>.text}` 引用。".into(),
+                      纯计算、不碰文件，输出可被 `${steps.<id>.text}` 引用。"
+            .into(),
         category: NodeCategory::Text,
         requires_engines: vec![],
         optional_engines: vec![],
         inputs: vec![],
         outputs: vec![port("text", "结果", PortType::Text, false)],
         params: vec![
-            param("input", "输入文本（通常写 ${src.stem}）", ParamType::Text, None, true),
-            param("pattern", "查找内容（正则或字面量）", ParamType::Text, None, true),
-            param("replacement", "替换为", ParamType::Text, Some("".into()), false),
-            param("useRegex", "按正则解释 pattern", ParamType::Bool, Some(true.into()), false),
-            param("caseSensitive", "区分大小写", ParamType::Bool, Some(true.into()), false),
-            param("all", "替换全部（关掉只替换第一个）", ParamType::Bool, Some(true.into()), false),
+            param(
+                "input",
+                "输入文本（通常写 ${src.stem}）",
+                ParamType::Text,
+                None,
+                true,
+            ),
+            param(
+                "pattern",
+                "查找内容（正则或字面量）",
+                ParamType::Text,
+                None,
+                true,
+            ),
+            param(
+                "replacement",
+                "替换为",
+                ParamType::Text,
+                Some("".into()),
+                false,
+            ),
+            param(
+                "useRegex",
+                "按正则解释 pattern",
+                ParamType::Bool,
+                Some(true.into()),
+                false,
+            ),
+            param(
+                "caseSensitive",
+                "区分大小写",
+                ParamType::Bool,
+                Some(true.into()),
+                false,
+            ),
+            param(
+                "all",
+                "替换全部（关掉只替换第一个）",
+                ParamType::Bool,
+                Some(true.into()),
+                false,
+            ),
         ],
     });
     n.push(NodeDescriptor {
@@ -1406,23 +1705,71 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         label: "拼装文件名".into(),
         description: "把主干、扩展名、前缀、后缀、序号拼成一个**文件名**（不含目录）。\
                       纯计算。把它接到 `fs.move` 的 `dst` 上即可完成重命名 —— \
-                      因为输出的是相对路径，宿主会把它解析到输出目录内。".into(),
+                      因为输出的是相对路径，宿主会把它解析到输出目录内。"
+            .into(),
         category: NodeCategory::Text,
         requires_engines: vec![],
         optional_engines: vec![],
         inputs: vec![],
         outputs: vec![port("value", "文件名", PortType::Text, false)],
         params: vec![
-            param("stem", "主干（通常写 ${src.stem}）", ParamType::Text, None, true),
-            param("ext", "扩展名（含点，通常写 ${src.ext}）", ParamType::Text, Some("".into()), false),
+            param(
+                "stem",
+                "主干（通常写 ${src.stem}）",
+                ParamType::Text,
+                None,
+                true,
+            ),
+            param(
+                "ext",
+                "扩展名（含点，通常写 ${src.ext}）",
+                ParamType::Text,
+                Some("".into()),
+                false,
+            ),
             param("prefix", "前缀", ParamType::Text, Some("".into()), false),
-            param("suffix", "后缀（插在扩展名之前）", ParamType::Text, Some("".into()), false),
-            param("index", "序号（0 = 不追加；可写 ${batch.index}）", ParamType::Int, Some(0i64.into()), false),
-            param("indexPad", "序号补零位数", ParamType::Int, Some(3i64.into()), false),
-            param("indexSeparator", "序号与主体的分隔符", ParamType::Text, Some("-".into()), false),
+            param(
+                "suffix",
+                "后缀（插在扩展名之前）",
+                ParamType::Text,
+                Some("".into()),
+                false,
+            ),
+            param(
+                "index",
+                "序号（0 = 不追加；可写 ${batch.index}）",
+                ParamType::Int,
+                Some(0i64.into()),
+                false,
+            ),
+            param(
+                "indexPad",
+                "序号补零位数",
+                ParamType::Int,
+                Some(3i64.into()),
+                false,
+            ),
+            param(
+                "indexSeparator",
+                "序号与主体的分隔符",
+                ParamType::Text,
+                Some("-".into()),
+                false,
+            ),
             enum_param("indexPosition", "序号位置", "suffix", &["suffix", "prefix"]),
-            enum_param("case", "大小写", "keep", &["keep", "lower", "upper", "title"]),
-            param("separator", "把空格等替换成该字符（留空 = 不动）", ParamType::Text, Some("".into()), false),
+            enum_param(
+                "case",
+                "大小写",
+                "keep",
+                &["keep", "lower", "upper", "title"],
+            ),
+            param(
+                "separator",
+                "把空格等替换成该字符（留空 = 不动）",
+                ParamType::Text,
+                Some("".into()),
+                false,
+            ),
         ],
     });
 
@@ -1439,7 +1786,13 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
             port("true", "成立", PortType::Any, false),
             port("false", "不成立", PortType::Any, false),
         ],
-        params: vec![param("condition", "条件表达式", ParamType::Text, None, true)],
+        params: vec![param(
+            "condition",
+            "条件表达式",
+            ParamType::Text,
+            None,
+            true,
+        )],
     });
     n.push(NodeDescriptor {
         name: "flow.set-var".into(),
@@ -1515,7 +1868,11 @@ pub fn find_node(name: &str) -> Option<NodeDescriptor> {
 pub fn engines_referenced() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for node in builtin_nodes() {
-        for e in node.requires_engines.iter().chain(node.optional_engines.iter()) {
+        for e in node
+            .requires_engines
+            .iter()
+            .chain(node.optional_engines.iter())
+        {
             if !out.contains(e) {
                 out.push(e.clone());
             }
@@ -1599,7 +1956,12 @@ mod tests {
             // enum 参数必须有 options
             for p in &n.params {
                 if p.ty == ParamType::Enum {
-                    assert!(!p.options.is_empty(), "{} 的 {} 是 enum 但没 options", n.name, p.id);
+                    assert!(
+                        !p.options.is_empty(),
+                        "{} 的 {} 是 enum 但没 options",
+                        n.name,
+                        p.id
+                    );
                 }
             }
         }
@@ -1635,10 +1997,7 @@ mod tests {
     #[test]
     fn template_extraction() {
         let vars = extract_vars("${src} -> ${params.width}px, ${steps.probe.width}");
-        assert_eq!(
-            vars,
-            vec!["src", "params.width", "steps.probe.width"]
-        );
+        assert_eq!(vars, vec!["src", "params.width", "steps.probe.width"]);
     }
 
     #[test]
@@ -1665,7 +2024,10 @@ mod tests {
         assert!(out.is_err());
         let mut ctx2 = TemplateContext::new();
         ctx2.insert("x", "值");
-        assert_eq!(render_template("中文 ${x} 尾", &ctx2).unwrap(), "中文 值 尾");
+        assert_eq!(
+            render_template("中文 ${x} 尾", &ctx2).unwrap(),
+            "中文 值 尾"
+        );
     }
 
     #[test]
@@ -1759,7 +2121,9 @@ mod tests {
                 .map(|(id, val)| PipelineStep {
                     id: (*id).into(),
                     uses: "image.convert".into(),
-                    with: [("src".to_string(), (*val).to_string())].into_iter().collect(),
+                    with: [("src".to_string(), (*val).to_string())]
+                        .into_iter()
+                        .collect(),
                     label: None,
                     when: None,
                     on_error: None,
@@ -1782,7 +2146,9 @@ mod tests {
         let mut issues = Vec::new();
         p.validate_template_refs(&io_with(&["src"], &["dst"], &[]), &mut issues);
         assert!(
-            issues.iter().any(|i| i.code == "TEMPLATE_UNKNOWN_OUTPUT_PORT"),
+            issues
+                .iter()
+                .any(|i| i.code == "TEMPLATE_UNKNOWN_OUTPUT_PORT"),
             "引用了未声明的输出端口必须报错，实际：{issues:?}"
         );
         // 报错信息要能直接告诉作者"你有哪些端口可用"，否则他只能猜
@@ -1791,7 +2157,10 @@ mod tests {
             .find(|i| i.code == "TEMPLATE_UNKNOWN_OUTPUT_PORT")
             .map(|i| i.message.clone())
             .unwrap_or_default();
-        assert!(msg.contains("resized") && msg.contains("dst"), "信息里要同时出现错的和对的：{msg}");
+        assert!(
+            msg.contains("resized") && msg.contains("dst"),
+            "信息里要同时出现错的和对的：{msg}"
+        );
     }
 
     #[test]
@@ -1879,11 +2248,21 @@ runtime:
         let manifest: crate::plugin::PluginManifest = serde_yaml::from_str(text).unwrap();
         let report = manifest.validate();
         assert!(
-            report.issues.iter().any(|i| i.code == "TEMPLATE_UNKNOWN_OUTPUT_PORT"),
+            report
+                .issues
+                .iter()
+                .any(|i| i.code == "TEMPLATE_UNKNOWN_OUTPUT_PORT"),
             "`validate()` 必须报出未声明的输出端口，实际：{:?}",
-            report.issues.iter().map(|i| i.code.clone()).collect::<Vec<_>>()
+            report
+                .issues
+                .iter()
+                .map(|i| i.code.clone())
+                .collect::<Vec<_>>()
         );
-        assert!(!report.ok, "有 error 级问题时 report.ok 必须是 false（AI 流程靠它放行）");
+        assert!(
+            !report.ok,
+            "有 error 级问题时 report.ok 必须是 false（AI 流程靠它放行）"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1929,7 +2308,11 @@ runtime:
             .filter(|i| i.code == "PARAM_NEVER_USED")
             .map(|i| i.path.clone().unwrap_or_default())
             .collect();
-        assert_eq!(flagged, vec!["io.params[0]".to_string()], "装饰品参数必须被点名：{issues:?}");
+        assert_eq!(
+            flagged,
+            vec!["io.params[0]".to_string()],
+            "装饰品参数必须被点名：{issues:?}"
+        );
         assert!(
             issues[0].message.contains('`') && issues[0].message.contains("format"),
             "信息里要点出是哪个参数：{}",
@@ -1937,12 +2320,17 @@ runtime:
         );
         // 报 warning 而不是 error：参数没人读不会让任务失败，不该拦住安装
         assert!(
-            !issues.iter().any(|i| i.severity == crate::plugin::Severity::Error),
+            !issues
+                .iter()
+                .any(|i| i.severity == crate::plugin::Severity::Error),
             "不该升级成 error：{issues:?}"
         );
         // 报错信息必须直接告诉作者三条通道长什么样，否则他只知道"有问题"、不知道怎么改
         let msg = &issues[0].message;
-        assert!(msg.contains("with") && msg.contains("${params.format}"), "信息要可操作：{msg}");
+        assert!(
+            msg.contains("with") && msg.contains("${params.format}"),
+            "信息要可操作：{msg}"
+        );
     }
 
     /// 通道 ①：`with` 里有**同名键**（字面量直接透传）。
@@ -1951,7 +2339,10 @@ runtime:
         let p = pipeline_with("image.convert", &[("quality", "80")]);
         let mut issues = Vec::new();
         p.validate_param_reachability(&io_with(&[], &[], &["quality"]), &mut issues);
-        assert!(issues.is_empty(), "同名 with 键就是一条通道，不该报：{issues:?}");
+        assert!(
+            issues.is_empty(),
+            "同名 with 键就是一条通道，不该报：{issues:?}"
+        );
     }
 
     /// 通道 ②：`with` 的**值**里引用了它 —— 而且**键名可以不一样**。
@@ -1964,7 +2355,10 @@ runtime:
         let p = pipeline_with("name.build", &[("index", "${params.indexMode}")]);
         let mut issues = Vec::new();
         p.validate_param_reachability(&io_with(&[], &[], &["indexMode"]), &mut issues);
-        assert!(issues.is_empty(), "模板注入（键名不同）也是通道，不该报：{issues:?}");
+        assert!(
+            issues.is_empty(),
+            "模板注入（键名不同）也是通道，不该报：{issues:?}"
+        );
     }
 
     /// 通道 ③：`with` 里**什么都不写**，但节点自己声明了同名参数。
@@ -1977,8 +2371,14 @@ runtime:
         // `image.convert` 的节点描述符里声明了 format / quality
         let p = pipeline_with("image.convert", &[("src", "${src}")]);
         let mut issues = Vec::new();
-        p.validate_param_reachability(&io_with(&["src"], &["dst"], &["format", "quality"]), &mut issues);
-        assert!(issues.is_empty(), "节点按名读取也是通道，不该报：{issues:?}");
+        p.validate_param_reachability(
+            &io_with(&["src"], &["dst"], &["format", "quality"]),
+            &mut issues,
+        );
+        assert!(
+            issues.is_empty(),
+            "节点按名读取也是通道，不该报：{issues:?}"
+        );
     }
 
     /// 没有参数时不做任何事（也别去建那张节点参数表）。
@@ -2036,12 +2436,20 @@ runtime:
         assert!(
             report.issues.iter().any(|i| i.code == "PARAM_NEVER_USED"),
             "`validate()` 必须报出装饰品参数，实际：{:?}",
-            report.issues.iter().map(|i| i.code.clone()).collect::<Vec<_>>()
+            report
+                .issues
+                .iter()
+                .map(|i| i.code.clone())
+                .collect::<Vec<_>>()
         );
         assert!(
             report.ok,
             "装饰品参数是 warning，不该让插件装不上：{:?}",
-            report.issues.iter().map(|i| i.code.clone()).collect::<Vec<_>>()
+            report
+                .issues
+                .iter()
+                .map(|i| i.code.clone())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2072,9 +2480,7 @@ runtime:
             let bad: Vec<&str> = report
                 .issues
                 .iter()
-                .filter(|i| {
-                    i.code.starts_with("TEMPLATE_") || i.code == "PARAM_NEVER_USED"
-                })
+                .filter(|i| i.code.starts_with("TEMPLATE_") || i.code == "PARAM_NEVER_USED")
                 .map(|i| i.code.as_str())
                 .collect();
             assert!(
@@ -2084,16 +2490,17 @@ runtime:
                 report
                     .issues
                     .iter()
-                    .filter(|i| {
-                        i.code.starts_with("TEMPLATE_") || i.code == "PARAM_NEVER_USED"
-                    })
+                    .filter(|i| { i.code.starts_with("TEMPLATE_") || i.code == "PARAM_NEVER_USED" })
                     .map(|i| i.message.clone())
                     .collect::<Vec<_>>()
                     .join("\n")
             );
             checked += 1;
         }
-        assert!(checked >= 4, "只检查到 {checked} 个内置插件，路径是不是变了？");
+        assert!(
+            checked >= 4,
+            "只检查到 {checked} 个内置插件，路径是不是变了？"
+        );
     }
 
     #[test]

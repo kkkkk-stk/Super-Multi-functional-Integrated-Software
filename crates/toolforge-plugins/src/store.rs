@@ -322,8 +322,7 @@ impl PluginStore {
             .capabilities
             .iter()
             .filter(|c| {
-                !rec
-                    .state
+                !rec.state
                     .granted
                     .capabilities
                     .iter()
@@ -607,9 +606,7 @@ impl PluginStore {
         if manifest.runtime.requires_artifact() {
             let has_artifact = files.iter().any(|f| match &manifest.runtime {
                 toolforge_core::plugin::PluginRuntime::Wasm { wasm } => f.path == wasm.path,
-                toolforge_core::plugin::PluginRuntime::Python { python } => {
-                    f.path == python.entry
-                }
+                toolforge_core::plugin::PluginRuntime::Python { python } => f.path == python.entry,
                 _ => false,
             });
             if !has_artifact {
@@ -689,10 +686,12 @@ impl PluginStore {
         let hash = content_hash(dir)?;
 
         // 权限差异检测：与已装旧版本比，新版本是否扩权了
-        let previous = self
-            .records
-            .get(&id)
-            .map(|r| (r.manifest.permissions.clone(), r.manifest.metadata.version.clone()));
+        let previous = self.records.get(&id).map(|r| {
+            (
+                r.manifest.permissions.clone(),
+                r.manifest.metadata.version.clone(),
+            )
+        });
 
         let (added, removed) = match &previous {
             Some((old_caps, _)) => diff_capabilities(old_caps, &manifest.permissions),
@@ -808,9 +807,8 @@ impl PluginStore {
         std::fs::remove_dir_all(&dir)
             .map_err(|e| ToolforgeError::io(format!("删除插件目录失败：{e}")))?;
         self.records.remove(id);
-        self.audit.record(
-            AuditEvent::new(AuditEventKind::Uninstalled, "卸载插件").subject(id),
-        );
+        self.audit
+            .record(AuditEvent::new(AuditEventKind::Uninstalled, "卸载插件").subject(id));
         let _ = self.tx.send(AppEvent::PluginChanged {
             plugin_id: id.to_string(),
         });
@@ -960,8 +958,7 @@ fn decode_bundle_file(f: &BundleFile) -> ToolforgeResult<Vec<u8>> {
 }
 
 fn copy_dir_contents(from: &Path, to: &Path) -> ToolforgeResult<()> {
-    std::fs::create_dir_all(to)
-        .map_err(|e| ToolforgeError::io(format!("创建目录失败：{e}")))?;
+    std::fs::create_dir_all(to).map_err(|e| ToolforgeError::io(format!("创建目录失败：{e}")))?;
     for entry in walkdir::WalkDir::new(from)
         .max_depth(6)
         .into_iter()
@@ -1088,7 +1085,10 @@ runtime:
 
         // 这是安全模型的地基：装完不等于能用
         assert!(!report.summary.enabled, "安装后必须处于禁用状态");
-        assert_eq!(report.summary.granted_count, 0, "安装后不应有任何已授权能力");
+        assert_eq!(
+            report.summary.granted_count, 0,
+            "安装后不应有任何已授权能力"
+        );
         assert!(report.summary.has_pending_permissions);
         assert!(report.content_hash.starts_with("sha256:"));
 
@@ -1187,7 +1187,8 @@ runtime:
         s.set_enabled("com.test.demo", true).unwrap();
 
         // 收回全部授权
-        s.set_granted("com.test.demo", PermissionSet::empty()).unwrap();
+        s.set_granted("com.test.demo", PermissionSet::empty())
+            .unwrap();
 
         let rec = s.record("com.test.demo").unwrap();
         assert!(rec.state.enabled, "收回授权不该顺手把插件禁用掉");
@@ -1226,7 +1227,10 @@ runtime:
             )
             .unwrap();
         assert_eq!(summary.granted_count, 1, "未声明的 Exec 必须被丢弃");
-        assert_eq!(summary.risk_level, toolforge_core::permission::RiskLevel::Low);
+        assert_eq!(
+            summary.risk_level,
+            toolforge_core::permission::RiskLevel::Low
+        );
 
         // 并且记了审计
         let log = s.audit().tail(10);
@@ -1311,14 +1315,14 @@ runtime:
             "    - kind: fsRead\n      scope: { kind: input }\n    - kind: exec",
         );
         let report = s
-            .install(
-                PluginSource::Manifest { yaml: escalated },
-                true,
-            )
+            .install(PluginSource::Manifest { yaml: escalated }, true)
             .unwrap();
 
         assert!(
-            report.added_capabilities.iter().any(|c| c.contains("启动外部进程")),
+            report
+                .added_capabilities
+                .iter()
+                .any(|c| c.contains("启动外部进程")),
             "必须报出新增的高危能力：{:?}",
             report.added_capabilities
         );
@@ -1366,11 +1370,7 @@ runtime:
 
         // 关键：磁盘上不能留下任何痕迹
         let dir = s.paths().plugin_dir("com.test.demo");
-        assert!(
-            !dir.exists(),
-            "被拒绝的安装不该留下目录：{}",
-            dir.display()
-        );
+        assert!(!dir.exists(), "被拒绝的安装不该留下目录：{}", dir.display());
 
         let _ = std::fs::remove_dir_all(&root);
     }

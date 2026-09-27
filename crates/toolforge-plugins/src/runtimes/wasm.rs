@@ -182,7 +182,9 @@ fn record_import(out: &mut WasmImports, module: &str, field: &str) {
 /// 剥端口在语义上是**放宽**（`a.com:443` 只允许 443，剥掉后允许任意端口）。
 /// 之所以接受，是因为 Extism 压根无法表达"只允许 443"，拒绝执行反而会让一个
 /// 意图正确的插件变成完全不可用。校验器已经把这个取舍摆到明面上了。
-pub fn allowed_hosts_from(granted: &toolforge_core::permission::PermissionSet) -> Option<Vec<String>> {
+pub fn allowed_hosts_from(
+    granted: &toolforge_core::permission::PermissionSet,
+) -> Option<Vec<String>> {
     use toolforge_core::permission::Capability;
     let mut hosts: Vec<String> = Vec::new();
     for cap in &granted.capabilities {
@@ -388,14 +390,13 @@ impl WasmPlugin {
                 input.len() / 1024 / 1024,
                 MAX_INPUT_BYTES / 1024 / 1024
             ))
-            .with_detail(
-                "WASM 插件适合处理小数据。大文件请走 L1 内置节点或 L3 Python 插件。",
-            ));
+            .with_detail("WASM 插件适合处理小数据。大文件请走 L1 内置节点或 L3 Python 插件。"));
         }
 
         let started = std::time::Instant::now();
         let mut plugin = extism::Plugin::new_from_compiled(&self.compiled).map_err(|e| {
-            ToolforgeError::runtime(format!("创建 WASM 实例失败：{e}")).with_subject(&self.plugin_id)
+            ToolforgeError::runtime(format!("创建 WASM 实例失败：{e}"))
+                .with_subject(&self.plugin_id)
         })?;
 
         let out: Vec<u8> = plugin
@@ -417,9 +418,9 @@ impl WasmPlugin {
         let value = serde_json::from_slice(&out).or_else(|_| {
             // 插件直接返回了裸字符串（没包成 JSON）—— 宽容处理，
             // 因为这是新手最常见的写法，为它报错体验太差。
-            String::from_utf8(out)
-                .map(Value::String)
-                .map_err(|e| ToolforgeError::runtime(format!("WASM 返回值既不是 JSON 也不是 UTF-8 文本：{e}")))
+            String::from_utf8(out).map(Value::String).map_err(|e| {
+                ToolforgeError::runtime(format!("WASM 返回值既不是 JSON 也不是 UTF-8 文本：{e}"))
+            })
         })?;
 
         // ---- `{"error": "…"}` 约定：插件报错的**唯一**可靠通道 ----
@@ -464,10 +465,7 @@ impl WasmPlugin {
         if oom {
             return ToolforgeError::new(
                 ErrorCode::PluginRuntime,
-                format!(
-                    "WASM 插件超出内存上限（{} MB）",
-                    self.def.memory_limit_mb
-                ),
+                format!("WASM 插件超出内存上限（{} MB）", self.def.memory_limit_mb),
             )
             .with_subject(&self.plugin_id);
         }
@@ -485,7 +483,8 @@ impl WasmPlugin {
         } else {
             ""
         };
-        ToolforgeError::runtime(format!("WASM 插件执行失败：{chain}{hint}")).with_subject(&self.plugin_id)
+        ToolforgeError::runtime(format!("WASM 插件执行失败：{chain}{hint}"))
+            .with_subject(&self.plugin_id)
     }
 }
 
@@ -612,9 +611,14 @@ mod tests {
             timeout_ms: 1000,
             allow_host_functions: vec!["log".into()],
         };
-        let err = WasmPlugin::load(&wasm, &def, "test".into(), &toolforge_core::permission::PermissionSet::empty())
-            .err()
-            .expect("引用 WASI 的模块必须被拒绝");
+        let err = WasmPlugin::load(
+            &wasm,
+            &def,
+            "test".into(),
+            &toolforge_core::permission::PermissionSet::empty(),
+        )
+        .err()
+        .expect("引用 WASI 的模块必须被拒绝");
         assert_eq!(err.code, ErrorCode::PluginInvalid);
         let detail = err.detail.unwrap_or_default();
         assert!(detail.contains("wasm32-unknown-unknown"), "{detail}");
@@ -628,7 +632,10 @@ mod tests {
             ("extism:host/env", "log_info"),
         ]);
         let got = inspect_imports(&wasm).expect("应当能解析");
-        assert_eq!(got.custom_host_functions, vec!["my_secret_helper".to_string()]);
+        assert_eq!(
+            got.custom_host_functions,
+            vec!["my_secret_helper".to_string()]
+        );
 
         let def = WasmRuntimeDef {
             path: "p.wasm".into(),
@@ -638,9 +645,14 @@ mod tests {
             // 清单里声明了 log，但模块导入的是别的
             allow_host_functions: vec!["log".into()],
         };
-        let err = WasmPlugin::load(&wasm, &def, "test".into(), &toolforge_core::permission::PermissionSet::empty())
-            .err()
-            .expect("未声明的自定义宿主函数必须被拒绝");
+        let err = WasmPlugin::load(
+            &wasm,
+            &def,
+            "test".into(),
+            &toolforge_core::permission::PermissionSet::empty(),
+        )
+        .err()
+        .expect("未声明的自定义宿主函数必须被拒绝");
         assert_eq!(err.code, ErrorCode::PluginInvalid);
         assert!(
             err.message.contains("my_secret_helper"),
@@ -665,8 +677,14 @@ mod tests {
     /// 所以带端口的白名单必须被规整掉，否则永远匹配不上。
     #[test]
     fn host_patterns_lose_their_port() {
-        assert_eq!(normalize_host_pattern("api.example.com:443"), "api.example.com");
-        assert_eq!(normalize_host_pattern("*.example.com:8080"), "*.example.com");
+        assert_eq!(
+            normalize_host_pattern("api.example.com:443"),
+            "api.example.com"
+        );
+        assert_eq!(
+            normalize_host_pattern("*.example.com:8080"),
+            "*.example.com"
+        );
         assert_eq!(normalize_host_pattern("[::1]:8080"), "[::1]");
         // 本来就对的写法不能被改坏
         assert_eq!(normalize_host_pattern("example.com"), "example.com");

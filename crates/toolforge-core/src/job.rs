@@ -76,7 +76,11 @@ impl JobStatus {
 /// `{ kind: "pluginRun", plugin_id: string }` —— 前端按 `pluginId` 取值就拿到
 /// `undefined`。生成绑定后请务必核对 `bindings.ts` 里的字段名。
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum JobKind {
     /// 单文件/多文件格式转换
     Convert,
@@ -407,10 +411,12 @@ mod tests {
         }
         assert_eq!(j.logs.len(), Job::LOG_TAIL_LIMIT);
         // 保留的是最新的
-        assert!(j.logs.last().unwrap().message.contains(&format!(
-            "line {}",
-            Job::LOG_TAIL_LIMIT + 499
-        )));
+        assert!(j
+            .logs
+            .last()
+            .unwrap()
+            .message
+            .contains(&format!("line {}", Job::LOG_TAIL_LIMIT + 499)));
     }
 
     #[test]

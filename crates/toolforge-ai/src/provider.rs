@@ -44,9 +44,7 @@ impl AiProviderKind {
         match self {
             AiProviderKind::OpenAi => "https://api.openai.com/v1",
             AiProviderKind::DeepSeek => "https://api.deepseek.com/v1",
-            AiProviderKind::DashScope => {
-                "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            }
+            AiProviderKind::DashScope => "https://dashscope.aliyuncs.com/compatible-mode/v1",
             AiProviderKind::Moonshot => "https://api.moonshot.cn/v1",
             AiProviderKind::Ollama => "http://127.0.0.1:11434/v1",
             AiProviderKind::LmStudio => "http://127.0.0.1:1234/v1",
@@ -194,7 +192,12 @@ impl ImagePart {
 
     /// 按扩展名猜 MIME。猜不出来时按 PNG 处理（视觉端点对 PNG 的支持最稳）。
     pub fn from_ext(ext: &str, bytes: Vec<u8>) -> Self {
-        let mime = match ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+        let mime = match ext
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "jpg" | "jpeg" => "image/jpeg",
             "webp" => "image/webp",
             "gif" => "image/gif",
@@ -374,7 +377,9 @@ impl AiClient {
         system: Option<&str>,
     ) -> ToolforgeResult<String> {
         if images.is_empty() {
-            return Err(ToolforgeError::invalid("complete_with_images 至少需要一张图片"));
+            return Err(ToolforgeError::invalid(
+                "complete_with_images 至少需要一张图片",
+            ));
         }
 
         let mut content: Vec<serde_json::Value> = Vec::with_capacity(images.len() + 1);
@@ -444,30 +449,35 @@ impl AiClient {
                 404 => "端点或模型名不存在，请检查 baseUrl 与 model。",
                 413 => "请求体太大 —— 图片可能压得不够小，把「最长边」调小一些。",
                 429 => "触发限流，请稍后重试或更换模型。",
-                400 => "请求被拒绝。如果这条请求带了图片，很可能是**这个模型不支持图片输入**，\
-                        请换成视觉模型（如 gpt-4o / qwen-vl-max / llava 等）。",
+                400 => {
+                    "请求被拒绝。如果这条请求带了图片，很可能是**这个模型不支持图片输入**，\
+                        请换成视觉模型（如 gpt-4o / qwen-vl-max / llava 等）。"
+                }
                 _ => "服务端返回错误。",
             };
-            return Err(ToolforgeError::new(code, format!("AI 服务返回 HTTP {status}"))
-                .with_detail(format!(
-                    "{hint}\n\n{}",
-                    redact_with(&truncate(&text, 1200), &self.config.api_key)
-                )));
+            return Err(
+                ToolforgeError::new(code, format!("AI 服务返回 HTTP {status}")).with_detail(
+                    format!(
+                        "{hint}\n\n{}",
+                        redact_with(&truncate(&text, 1200), &self.config.api_key)
+                    ),
+                ),
+            );
         }
 
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            ToolforgeError::new(
-                ErrorCode::AiUnavailable,
-                "AI 服务的响应不是合法 JSON",
-            )
-            .with_detail(format!("{e}\n\n{}", truncate(&text, 600)))
+            ToolforgeError::new(ErrorCode::AiUnavailable, "AI 服务的响应不是合法 JSON")
+                .with_detail(format!("{e}\n\n{}", truncate(&text, 600)))
         })?;
 
         let content = v["choices"][0]["message"]["content"]
             .as_str()
             .ok_or_else(|| {
-                ToolforgeError::new(ErrorCode::AiUnavailable, "AI 响应里没有 choices[0].message.content")
-                    .with_detail(truncate(&text, 600))
+                ToolforgeError::new(
+                    ErrorCode::AiUnavailable,
+                    "AI 响应里没有 choices[0].message.content",
+                )
+                .with_detail(truncate(&text, 600))
             })?;
 
         Ok(content.to_string())
@@ -485,9 +495,9 @@ impl AiClient {
             ToolforgeError::new(
                 ErrorCode::AiUnavailable,
                 format!(
-                "无法连接：{}",
-                redact_with(&e.to_string(), &self.config.api_key)
-            ),
+                    "无法连接：{}",
+                    redact_with(&e.to_string(), &self.config.api_key)
+                ),
             )
         })?;
         let status = resp.status();
@@ -549,8 +559,8 @@ pub fn redact_with(text: &str, secret: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for token in s.split_inclusive(|c: char| c.is_whitespace() || c == '"' || c == '\'') {
         let trimmed = token.trim_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'');
-        let looks_like_key = (trimmed.starts_with("sk-") || trimmed.starts_with("sk_"))
-            && trimmed.len() > 12;
+        let looks_like_key =
+            (trimmed.starts_with("sk-") || trimmed.starts_with("sk_")) && trimmed.len() > 12;
         if looks_like_key {
             out.push_str("[REDACTED]");
             // 保留原 token 结尾的分隔符，避免把相邻的词粘在一起
@@ -618,14 +628,20 @@ mod tests {
         cfg.api_key = "sk-supersecret-0123456789".into();
         cfg.has_key = true;
         let json = serde_json::to_string(&cfg).unwrap();
-        assert!(!json.contains("supersecret"), "API Key 绝不能出现在发给前端的 JSON 里");
+        assert!(
+            !json.contains("supersecret"),
+            "API Key 绝不能出现在发给前端的 JSON 里"
+        );
         assert!(!json.contains("apiKey"));
         assert!(json.contains("hasKey"));
     }
 
     #[test]
     fn redact_removes_keys() {
-        assert_eq!(redact("key sk-abcdefghijklmnop is bad"), "key [REDACTED] is bad");
+        assert_eq!(
+            redact("key sk-abcdefghijklmnop is bad"),
+            "key [REDACTED] is bad"
+        );
         // Bearer 是方案名不是密钥，保留它、只抹掉后面那串
         assert_eq!(redact("Bearer sk-abcdefghijklmnop"), "Bearer [REDACTED]");
         assert!(!redact("Authorization: Bearer sk-abcdefghijklmnop").contains("abcdefghijklmnop"));

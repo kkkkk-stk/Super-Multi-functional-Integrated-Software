@@ -104,7 +104,7 @@ impl PythonPlugin {
         ];
         spec.cwd = Some(plugin_dir.to_path_buf());
         spec.clear_env = true; // 绝不继承父进程环境（可能含 API Key）
-        // 只有在清单显式开启、且用户确实授予了 net 能力时才允许联网
+                               // 只有在清单显式开启、且用户确实授予了 net 能力时才允许联网
         spec.deny_network = !(def.allow_network && granted.wants_network());
         spec.default_timeout = Duration::from_millis(def.timeout_ms);
         spec.init_timeout = Duration::from_millis(def.timeout_ms.min(600_000));
@@ -120,8 +120,7 @@ impl PythonPlugin {
                 .join(","),
         );
         // 不给 PYTHONPATH，避免插件意外 import 到宿主的包
-        spec.env
-            .insert("PYTHONNOUSERSITE".into(), "1".to_string());
+        spec.env.insert("PYTHONNOUSERSITE".into(), "1".to_string());
 
         // ---- `env { names }` 的注入通道 ----
         //
@@ -172,7 +171,10 @@ impl PythonPlugin {
             "network": self.def.allow_network,
         });
         self.supervisor
-            .initialize(params, Duration::from_millis(self.def.timeout_ms.min(600_000)))
+            .initialize(
+                params,
+                Duration::from_millis(self.def.timeout_ms.min(600_000)),
+            )
             .await
     }
 
@@ -307,10 +309,10 @@ async fn prepare_venv(
     )
     .await?;
     if !r.success() {
-        return Err(ToolforgeError::runtime(format!(
-            "为插件 `{plugin_id}` 创建 venv 失败"
-        ))
-        .with_detail(r.stderr));
+        return Err(
+            ToolforgeError::runtime(format!("为插件 `{plugin_id}` 创建 venv 失败"))
+                .with_detail(r.stderr),
+        );
     }
 
     let venv_python = venv_python_path(&venv);
@@ -344,14 +346,11 @@ async fn prepare_venv(
     )
     .await?;
     if !r.success() {
-        return Err(ToolforgeError::runtime(format!(
-            "为插件 `{plugin_id}` 安装依赖失败"
-        ))
-        .with_detail(format!(
-            "依赖列表：{}\n\n{}",
-            requirements.join(", "),
-            r.stderr
-        )));
+        return Err(
+            ToolforgeError::runtime(format!("为插件 `{plugin_id}` 安装依赖失败")).with_detail(
+                format!("依赖列表：{}\n\n{}", requirements.join(", "), r.stderr),
+            ),
+        );
     }
     Ok(())
 }
@@ -509,15 +508,15 @@ pub fn gate_exec_usage(
     }
 
     if !granted_exec {
-        return Err(ToolforgeError::denied(
-            "插件要用子进程，但你还没有授权 exec 能力",
-        )
-        .with_subject(plugin_id)
-        .with_detail(format!(
-            "扫到的地方：\n{where_}\n\n\
+        return Err(
+            ToolforgeError::denied("插件要用子进程，但你还没有授权 exec 能力")
+                .with_subject(plugin_id)
+                .with_detail(format!(
+                    "扫到的地方：\n{where_}\n\n\
              到插件详情页 → 权限，勾选「启动外部进程」之后再启用。\n\
              这一项等价于任意代码执行，只有你完全信任这个插件的来源时才应勾选。"
-        )));
+                )),
+        );
     }
 
     // 声明了也授权了：放行，但要留下痕迹
@@ -646,7 +645,10 @@ mod tests {
         let (injected, missing) = inject_declared_env(&set, &mut target);
         assert_eq!(injected, vec!["PATH".to_string()]);
         assert!(missing.is_empty());
-        assert_eq!(target.get("PATH").map(String::as_str), std::env::var("PATH").ok().as_deref());
+        assert_eq!(
+            target.get("PATH").map(String::as_str),
+            std::env::var("PATH").ok().as_deref()
+        );
     }
 
     /// 宿主上不存在的变量要被如实报成 `missing`，而不是静默什么都不做 ——
@@ -724,8 +726,12 @@ mod tests {
             ],
         );
         let hits = scan_python_sources(&dir);
-        assert!(hits.iter().any(|h| h.file == "main.py" && h.pattern.contains("subprocess")));
-        assert!(hits.iter().any(|h| h.file == "helper/util.py" && h.pattern.contains("os.system")));
+        assert!(hits
+            .iter()
+            .any(|h| h.file == "main.py" && h.pattern.contains("subprocess")));
+        assert!(hits
+            .iter()
+            .any(|h| h.file == "helper/util.py" && h.pattern.contains("os.system")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -737,7 +743,10 @@ mod tests {
             "venvskip",
             &[
                 ("main.py", "print('clean')\n"),
-                (".venv/Lib/site-packages/pip/_internal/x.py", "import subprocess\n"),
+                (
+                    ".venv/Lib/site-packages/pip/_internal/x.py",
+                    "import subprocess\n",
+                ),
                 ("__pycache__/main.cpython-311.pyc", "subprocess"),
             ],
         );

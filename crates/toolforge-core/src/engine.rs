@@ -812,10 +812,13 @@ mod tests {
     #[test]
     fn every_node_engine_reference_exists_in_catalog() {
         let cat = engine_catalog();
-        let known: std::collections::HashSet<&str> =
-            cat.iter().map(|e| e.id.as_str()).collect();
+        let known: std::collections::HashSet<&str> = cat.iter().map(|e| e.id.as_str()).collect();
         for node in crate::pipeline::builtin_nodes() {
-            for e in node.requires_engines.iter().chain(node.optional_engines.iter()) {
+            for e in node
+                .requires_engines
+                .iter()
+                .chain(node.optional_engines.iter())
+            {
                 assert!(
                     known.contains(e.as_str()),
                     "节点 `{}` 引用了目录里不存在的引擎 `{e}`",
@@ -876,7 +879,12 @@ mod tests {
                         "模型 {} 的哈希不是十六进制：{hash}",
                         m.id
                     );
-                    assert_eq!(hash, &hash.to_ascii_lowercase(), "模型 {} 的哈希要小写", m.id);
+                    assert_eq!(
+                        hash,
+                        &hash.to_ascii_lowercase(),
+                        "模型 {} 的哈希要小写",
+                        m.id
+                    );
                     assert!(
                         m.file_name.is_some(),
                         "模型 {} 有下载源却没有 file_name —— 装完了也不会被认出来",
@@ -1075,11 +1083,7 @@ mod tests {
     fn only_download_mode_engines_have_managed_install() {
         for e in engine_catalog() {
             if e.install_modes.contains(&EngineInstallMode::Download) {
-                assert!(
-                    e.approx_size_mb > 0,
-                    "{} 支持下载但没有给出体积估算",
-                    e.id
-                );
+                assert!(e.approx_size_mb > 0, "{} 支持下载但没有给出体积估算", e.id);
             }
             if e.install_modes == vec![EngineInstallMode::System] {
                 assert!(e.approx_size_mb > 0, "{} 应为系统安装", e.id);
@@ -1097,7 +1101,10 @@ mod tests {
     #[test]
     fn obviously_truncated_model_file_is_not_complete() {
         let approx = 928 * 1024 * 1024u64;
-        assert!(!model_size_looks_complete(approx / 2, 928), "半截下载应当被判为不完整");
+        assert!(
+            !model_size_looks_complete(approx / 2, 928),
+            "半截下载应当被判为不完整"
+        );
         assert!(!model_size_looks_complete(approx * 59 / 100, 928));
     }
 
@@ -1110,7 +1117,10 @@ mod tests {
         let approx = 928 * 1024 * 1024u64;
         assert!(model_size_looks_complete(approx, 928));
         assert!(model_size_looks_complete(approx * 61 / 100, 928));
-        assert!(model_size_looks_complete(approx * 105 / 100, 928), "比标称大也算完整");
+        assert!(
+            model_size_looks_complete(approx * 105 / 100, 928),
+            "比标称大也算完整"
+        );
         // 真实实测值：birefnet-general 标称 928，磁盘上 927.61 MB
         assert!(model_size_looks_complete(972_686_045, 928 - 1));
     }

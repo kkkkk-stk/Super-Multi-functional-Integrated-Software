@@ -114,9 +114,7 @@ pub struct AuditLog {
 
 impl AuditLog {
     pub fn new(paths: &AppPaths) -> Self {
-        Self {
-            dir: paths.audit(),
-        }
+        Self { dir: paths.audit() }
     }
 
     pub fn from_dir(dir: impl Into<PathBuf>) -> Self {
@@ -313,9 +311,8 @@ pub fn content_hash(plugin_dir: &Path) -> ToolforgeResult<String> {
     for (rel, path) in entries {
         hasher.update(rel.as_bytes());
         hasher.update([0u8]);
-        let bytes = std::fs::read(&path).map_err(|e| {
-            ToolforgeError::io(format!("读取 {} 失败：{e}", path.display()))
-        })?;
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ToolforgeError::io(format!("读取 {} 失败：{e}", path.display())))?;
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(&bytes);
     }

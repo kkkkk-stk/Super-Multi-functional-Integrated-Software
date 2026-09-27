@@ -46,7 +46,9 @@ pub async fn app_info() -> ToolforgeResult<toolforge_core::AppInfo> {
         name: "ToolForge".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         tauri_version: tauri::VERSION.into(),
-        rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.82").into(),
+        rust_version: option_env!("CARGO_PKG_RUST_VERSION")
+            .unwrap_or("1.82")
+            .into(),
         plugin_api_version: toolforge_core::PLUGIN_API_VERSION.into(),
         build_profile: if cfg!(debug_assertions) {
             "debug".into()
@@ -212,7 +214,10 @@ pub async fn jobs_list(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn jobs_get(state: State<'_, Arc<AppState>>, job_id: String) -> ToolforgeResult<Option<Job>> {
+pub async fn jobs_get(
+    state: State<'_, Arc<AppState>>,
+    job_id: String,
+) -> ToolforgeResult<Option<Job>> {
     Ok(state.queue.get(&job_id))
 }
 
@@ -250,9 +255,7 @@ pub async fn engines_catalog(state: State<'_, Arc<AppState>>) -> ToolforgeResult
     for d in engine_catalog() {
         let used_by: Vec<String> = nodes
             .iter()
-            .filter(|n| {
-                n.requires_engines.contains(&d.id) || n.optional_engines.contains(&d.id)
-            })
+            .filter(|n| n.requires_engines.contains(&d.id) || n.optional_engines.contains(&d.id))
             .map(|n| n.name.clone())
             .collect();
         let status = state.engines.status(&d.id).await;
@@ -271,7 +274,9 @@ pub async fn engines_catalog(state: State<'_, Arc<AppState>>) -> ToolforgeResult
 
 #[tauri::command]
 #[specta::specta]
-pub async fn engines_probe_all(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Vec<EngineEntry>> {
+pub async fn engines_probe_all(
+    state: State<'_, Arc<AppState>>,
+) -> ToolforgeResult<Vec<EngineEntry>> {
     state.engines.probe_all().await;
     engines_catalog(state).await
 }
@@ -313,7 +318,10 @@ pub async fn engines_install(
             "安装 {} 前需要确认其许可证条款",
             descriptor.name
         ))
-        .with_detail(format!("{}：{}", descriptor.license, descriptor.license_note)));
+        .with_detail(format!(
+            "{}：{}",
+            descriptor.license, descriptor.license_note
+        )));
     }
 
     // 确认过了就**记下来**（落盘 + 审计）。位置刻意放在硬门**之后**：
@@ -353,10 +361,9 @@ pub async fn engines_install(
             EngineInstallOutcome::NotConfigured { reason } => {
                 Err(ToolforgeError::engine_missing(&engine_id).with_detail(reason))
             }
-            EngineInstallOutcome::HashRequired { reason } => Err(ToolforgeError::new(
-                ErrorCode::IntegrityCheckFailed,
-                reason,
-            )),
+            EngineInstallOutcome::HashRequired { reason } => {
+                Err(ToolforgeError::new(ErrorCode::IntegrityCheckFailed, reason))
+            }
         }
     });
 
@@ -403,9 +410,7 @@ pub async fn models_list(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Vec
             // 判据与节点侧共用同一个函数（`model_size_looks_complete`），刻意宽松，
             // 见它的文档：误判完好文件为损坏比漏判更糟。
             let installed = installed_bytes
-                .map(|len| {
-                    toolforge_core::engine::model_size_looks_complete(len, m.approx_size_mb)
-                })
+                .map(|len| toolforge_core::engine::model_size_looks_complete(len, m.approx_size_mb))
                 .unwrap_or(false);
 
             // 归属**只认权重自己写的 `used_by`**，不再从"所属引擎被谁用"去推。
@@ -469,15 +474,14 @@ pub async fn models_install(
 
     // 没有下载源就**当场拒绝**，不要排一个注定失败的下载任务
     if spec.url.is_none() || spec.sha256.is_none() {
-        return Err(ToolforgeError::not_found(format!(
-            "{} 还没有配置可校验的下载源",
-            spec.name
-        ))
-        .with_detail(
-            "为了避免「下载来路不明的模型」，本项目只接受能核对 SHA-256 的来源；\
+        return Err(
+            ToolforgeError::not_found(format!("{} 还没有配置可校验的下载源", spec.name))
+                .with_detail(
+                    "为了避免「下载来路不明的模型」，本项目只接受能核对 SHA-256 的来源；\
              这个模型的哈希还没被核对过（见 crates/toolforge-core/src/engine.rs 里 \
              verified_sources_are_pinned 的说明）。",
-        ));
+                ),
+        );
     }
 
     let job = state.queue.create(
@@ -520,10 +524,8 @@ pub async fn models_remove(
 pub async fn plugins_list(state: State<'_, Arc<AppState>>) -> ToolforgeResult<PluginsSnapshot> {
     let plugins = state.plugins.list();
     Ok(PluginsSnapshot {
-        pending_permission_count: plugins
-            .iter()
-            .filter(|p| p.has_pending_permissions)
-            .count() as u32,
+        pending_permission_count: plugins.iter().filter(|p| p.has_pending_permissions).count()
+            as u32,
         plugins,
         audit_dir: state.paths.audit().display().to_string(),
     })
@@ -560,9 +562,8 @@ pub async fn plugins_validate(
         PluginSource::Bundle { yaml, .. } => yaml.clone(),
         PluginSource::Directory { path } => {
             let p = PathBuf::from(path).join("plugin.yaml");
-            std::fs::read_to_string(&p).map_err(|e| {
-                ToolforgeError::io(format!("读取 {} 失败：{e}", p.display()))
-            })?
+            std::fs::read_to_string(&p)
+                .map_err(|e| ToolforgeError::io(format!("读取 {} 失败：{e}", p.display())))?
         }
     };
 
@@ -605,9 +606,7 @@ pub async fn plugins_install(
     req: InstallPluginRequest,
 ) -> ToolforgeResult<toolforge_plugins::InstallReport> {
     if !req.permissions_acknowledged {
-        return Err(ToolforgeError::denied(
-            "安装前必须确认该插件申请的权限清单",
-        ));
+        return Err(ToolforgeError::denied("安装前必须确认该插件申请的权限清单"));
     }
 
     // 先解析出清单，判断运行时类型
@@ -668,14 +667,20 @@ pub async fn plugins_set_enabled(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn plugins_uninstall(state: State<'_, Arc<AppState>>, plugin_id: String) -> ToolforgeResult<()> {
+pub async fn plugins_uninstall(
+    state: State<'_, Arc<AppState>>,
+    plugin_id: String,
+) -> ToolforgeResult<()> {
     state.runner.unload(&plugin_id).await;
     state.plugins.uninstall(&plugin_id)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn plugins_audit(state: State<'_, Arc<AppState>>, limit: u32) -> ToolforgeResult<AuditSnapshot> {
+pub async fn plugins_audit(
+    state: State<'_, Arc<AppState>>,
+    limit: u32,
+) -> ToolforgeResult<AuditSnapshot> {
     let log = state.plugins.audit();
     Ok(AuditSnapshot {
         events: log.tail(limit.clamp(1, 2000) as usize),
@@ -758,11 +763,9 @@ fn submit_plugin_run(
     let kind = JobKind::PluginRun {
         plugin_id: req.plugin_id.clone(),
     };
-    let job = app.queue.create(
-        kind,
-        format!("{name} · {total_items} 项"),
-        total_items,
-    );
+    let job = app
+        .queue
+        .create(kind, format!("{name} · {total_items} 项"), total_items);
     let job_id = job.id.to_string();
 
     let runner = app.runner.clone();
@@ -803,8 +806,12 @@ fn submit_plugin_run(
             // 取消检查放在批次边界 —— 这是"取消秒级生效"的关键
             ctx.check()?;
 
-            let (input_root, outputs) =
-                build_io(inputs, &output_dir, &req.params, &record.manifest.io.outputs)?;
+            let (input_root, outputs) = build_io(
+                inputs,
+                &output_dir,
+                &req.params,
+                &record.manifest.io.outputs,
+            )?;
             let label = inputs
                 .values()
                 .find_map(|v| v.first())
@@ -816,7 +823,11 @@ fn submit_plugin_run(
                 })
                 .unwrap_or_else(|| plugin_id.clone());
 
-            ctx.step(&format!("处理 {}/{} · {label}", idx + 1, total), idx as u64, total as u64);
+            ctx.step(
+                &format!("处理 {}/{} · {label}", idx + 1, total),
+                idx as u64,
+                total as u64,
+            );
 
             let call_req = PluginCallRequest {
                 payload: serde_json::json!({
@@ -897,13 +908,7 @@ fn submit_plugin_run(
                     let value = runner.call(&record, &call_req, &ctx).await?;
                     // 插件返回值可能很大，只在 debug 级别留一份摘要，方便排查
                     ctx.log(LogLevel::Debug, format!("插件返回：{}", summarize(&value)));
-                    interpret_plugin_response(
-                        &record,
-                        &value,
-                        &output_dir,
-                        &ctx,
-                        &outputs,
-                    )?
+                    interpret_plugin_response(&record, &value, &output_dir, &ctx, &outputs)?
                 }
             };
 
@@ -1080,7 +1085,10 @@ fn expand_batches(
 /// 调用方应当用返回值去跟踪这次重试；旧 id 会永远停在它的终态上。
 #[tauri::command]
 #[specta::specta]
-pub async fn jobs_retry(state: State<'_, Arc<AppState>>, job_id: String) -> ToolforgeResult<String> {
+pub async fn jobs_retry(
+    state: State<'_, Arc<AppState>>,
+    job_id: String,
+) -> ToolforgeResult<String> {
     Ok(state.queue.retry(&job_id)?.to_string())
 }
 
@@ -1090,7 +1098,9 @@ pub async fn jobs_retry(state: State<'_, Arc<AppState>>, job_id: String) -> Tool
 
 #[tauri::command]
 #[specta::specta]
-pub async fn pipeline_nodes(state: State<'_, Arc<AppState>>) -> ToolforgeResult<NodeCatalogResponse> {
+pub async fn pipeline_nodes(
+    state: State<'_, Arc<AppState>>,
+) -> ToolforgeResult<NodeCatalogResponse> {
     let nodes: Vec<NodeDescriptor> = builtin_nodes();
     let mut availability: HashMap<String, bool> = HashMap::new();
     let mut missing_engines: HashMap<String, Vec<String>> = HashMap::new();
@@ -1177,7 +1187,9 @@ pub async fn pipeline_nodes(state: State<'_, Arc<AppState>>) -> ToolforgeResult<
 
 #[tauri::command]
 #[specta::specta]
-pub async fn ai_test_connection(state: State<'_, Arc<AppState>>) -> ToolforgeResult<AiTestConnectionResponse> {
+pub async fn ai_test_connection(
+    state: State<'_, Arc<AppState>>,
+) -> ToolforgeResult<AiTestConnectionResponse> {
     let client = state.ai.read().clone();
     let Some(client) = client else {
         return Ok(AiTestConnectionResponse {
@@ -1220,11 +1232,8 @@ pub async fn ai_generate(
     let client = {
         let guard = state.ai.read();
         guard.clone().ok_or_else(|| {
-            ToolforgeError::new(
-                ErrorCode::AiUnavailable,
-                "尚未配置 AI 服务",
-            )
-            .with_detail("请到「设置 → AI」填写提供方、模型与 API Key。也可以指向本地 Ollama。")
+            ToolforgeError::new(ErrorCode::AiUnavailable, "尚未配置 AI 服务")
+                .with_detail("请到「设置 → AI」填写提供方、模型与 API Key。也可以指向本地 Ollama。")
         })?
     };
 
@@ -1272,10 +1281,7 @@ pub async fn ai_generate(
         state.plugins.audit().record(
             toolforge_plugins::AuditEvent::new(
                 toolforge_plugins::audit::AuditEventKind::AiDraftRejected,
-                format!(
-                    "AI 草稿未通过安全审核（{} 项高危发现）",
-                    codes.len()
-                ),
+                format!("AI 草稿未通过安全审核（{} 项高危发现）", codes.len()),
             )
             .detail(serde_json::json!({
                 "model": client.config().model,
@@ -1515,7 +1521,10 @@ fn build_io(
     // （大多数内置插件的 `io.outputs` 就是空的，靠 `${dst}` 走通。）
     if outputs.is_empty() {
         let name = format!("{stem}.{}", format_ext.unwrap_or(original_ext));
-        outputs.insert("dst".to_string(), output_dir.join(name).display().to_string());
+        outputs.insert(
+            "dst".to_string(),
+            output_dir.join(name).display().to_string(),
+        );
     }
 
     Ok((
@@ -1543,17 +1552,16 @@ fn common_prefix(a: &std::path::Path, b: &std::path::Path) -> PathBuf {
 fn report_steps(ctx: &toolforge_core::queue::JobCtx, steps: &[StepResult]) {
     for s in steps {
         match s.status {
-            toolforge_plugins::l1::StepStatus::Ok => {
-                ctx.log(LogLevel::Debug, format!("✓ {}（{} ms）", s.label, s.duration_ms))
-            }
+            toolforge_plugins::l1::StepStatus::Ok => ctx.log(
+                LogLevel::Debug,
+                format!("✓ {}（{} ms）", s.label, s.duration_ms),
+            ),
             toolforge_plugins::l1::StepStatus::Skipped => ctx.warn(format!(
                 "⊘ {} 已跳过：{}",
                 s.label,
                 s.error.clone().unwrap_or_else(|| "条件不成立".into())
             )),
-            toolforge_plugins::l1::StepStatus::Failed => {
-                ctx.error(format!("✗ {}", s.label))
-            }
+            toolforge_plugins::l1::StepStatus::Failed => ctx.error(format!("✗ {}", s.label)),
         }
     }
 }
@@ -1627,8 +1635,13 @@ fn interpret_plugin_response(
     use toolforge_core::plugin::PortType;
 
     // 端口 id -> 类型
-    let ports: HashMap<&str, PortType> =
-        record.manifest.io.outputs.iter().map(|p| (p.id.as_str(), p.ty)).collect();
+    let ports: HashMap<&str, PortType> = record
+        .manifest
+        .io
+        .outputs
+        .iter()
+        .map(|p| (p.id.as_str(), p.ty))
+        .collect();
 
     let mut produced: Vec<String> = Vec::new();
 
@@ -1785,7 +1798,10 @@ mod tests {
 
         let inputs = inputs_of(&[&a, &b]);
         let out = sources_to_delete(&inputs, &[], true);
-        assert!(out.is_empty(), "keep_original=true 时不该删任何东西，实际 {out:?}");
+        assert!(
+            out.is_empty(),
+            "keep_original=true 时不该删任何东西，实际 {out:?}"
+        );
         assert!(a.exists() && b.exists(), "源文件必须原地还在");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1805,7 +1821,11 @@ mod tests {
         let produced = vec![src.to_string_lossy().into_owned()];
         let out = sources_to_delete(&inputs, &produced, false);
 
-        assert_eq!(out, vec![other.clone()], "同路径的产出必须被跳过，其余的照删");
+        assert_eq!(
+            out,
+            vec![other.clone()],
+            "同路径的产出必须被跳过，其余的照删"
+        );
         assert!(src.exists(), "产出文件被删掉了 —— 这是数据丢失");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1862,7 +1882,11 @@ mod tests {
 
         let mut out = sources_to_delete(&inputs, &[], false);
         out.sort();
-        assert_eq!(out.len(), 2, "两个输入端口的文件都该进删除列表，实际 {out:?}");
+        assert_eq!(
+            out.len(),
+            2,
+            "两个输入端口的文件都该进删除列表，实际 {out:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -257,11 +257,7 @@ mod tests {
         let p = AppPaths::new("/data");
         let dir = p.plugin_dir("../../evil");
         assert!(dir.starts_with(p.plugins()), "{}", dir.display());
-        assert!(
-            !dir.to_string_lossy().contains(".."),
-            "{}",
-            dir.display()
-        );
+        assert!(!dir.to_string_lossy().contains(".."), "{}", dir.display());
         // 逐级向上也不该逃出 plugins 目录
         assert!(p.plugin_dir("..").starts_with(p.plugins()));
         assert!(p.plugin_dir("").starts_with(p.plugins()));

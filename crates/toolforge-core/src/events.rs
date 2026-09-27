@@ -17,7 +17,11 @@ use crate::job::{Job, JobLogEntry, JobStatus};
 pub const EVENT_CHANNEL: &str = "toolforge://event";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum AppEvent {
     /// 任务整体状态变化（排队 → 运行 → 结束，或标题/产出变化）
     JobUpdated { job: Box<Job> },
@@ -26,7 +30,10 @@ pub enum AppEvent {
     /// **单独走一个事件而不是重推整个 `Job`**：转码任务一秒能产出几十次进度，
     /// 每次都序列化整条 Job（含日志数组）会把 IPC 打爆。
     /// 队列内部已经做了 100ms 节流。
-    JobProgressHint { job_id: String, progress: crate::job::JobProgress },
+    JobProgressHint {
+        job_id: String,
+        progress: crate::job::JobProgress,
+    },
     /// 任务新增日志行。**单独走一个事件**，避免日志刷屏时反复推送整个 Job。
     JobLog { job_id: String, entry: JobLogEntry },
     /// 任务终结（前端据此弹通知、刷新文件列表、决定是否重试）

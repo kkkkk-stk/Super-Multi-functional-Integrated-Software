@@ -327,13 +327,15 @@ pub fn run() {
     // 保留 shell 插件的注册只是为了对齐技术选型（以及未来的 sidecar 分发），
     // 但**零权限**意味着前端调不动它。
     tauri_builder = tauri_builder
-        .plugin(tauri_plugin_log::Builder::new()
-            .level(if cfg!(debug_assertions) {
-                tauri_plugin_log::log::LevelFilter::Debug
-            } else {
-                tauri_plugin_log::log::LevelFilter::Info
-            })
-            .build())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(if cfg!(debug_assertions) {
+                    tauri_plugin_log::log::LevelFilter::Debug
+                } else {
+                    tauri_plugin_log::log::LevelFilter::Info
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())

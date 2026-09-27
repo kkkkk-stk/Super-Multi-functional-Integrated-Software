@@ -130,16 +130,14 @@ pub fn save_api_key(paths: &AppPaths, key: Option<&str>) -> ToolforgeResult<()> 
             restrict_permissions(&file);
             Ok(())
         }
-        None => {
-            match std::fs::remove_file(&file) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(ToolforgeError::io(format!(
-                    "删除 {} 失败：{e}",
-                    file.display()
-                ))),
-            }
-        }
+        None => match std::fs::remove_file(&file) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ToolforgeError::io(format!(
+                "删除 {} 失败：{e}",
+                file.display()
+            ))),
+        },
     }
 }
 
@@ -148,9 +146,9 @@ pub fn save_api_key(paths: &AppPaths, key: Option<&str>) -> ToolforgeResult<()> 
 /// 临时文件名带进程 ID：两个实例同时写设置时不至于互相踩掉对方的临时文件
 /// （真实的并发覆盖仍然会以"后写者赢"，但至少不会产生一个拼接出来的怪文件）。
 fn write_atomic(target: &Path, bytes: &[u8]) -> ToolforgeResult<()> {
-    let parent = target.parent().ok_or_else(|| {
-        ToolforgeError::internal(format!("路径没有父目录：{}", target.display()))
-    })?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| ToolforgeError::internal(format!("路径没有父目录：{}", target.display())))?;
     std::fs::create_dir_all(parent)
         .map_err(|e| ToolforgeError::io(format!("创建 {} 失败：{e}", parent.display())))?;
 
@@ -177,10 +175,7 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> ToolforgeResult<()> {
 
     std::fs::rename(&tmp, target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        ToolforgeError::io(format!(
-            "替换 {} 失败：{e}",
-            target.display()
-        ))
+        ToolforgeError::io(format!("替换 {} 失败：{e}", target.display()))
     })
 }
 
@@ -265,7 +260,11 @@ mod tests {
         let paths = temp_paths("partial");
         std::fs::write(paths.settings_file(), r#"{"theme":"light"}"#).unwrap();
         let loaded = load(&paths);
-        assert!(loaded.from_disk, "缺字段不该算损坏：{:?}", loaded.load_error);
+        assert!(
+            loaded.from_disk,
+            "缺字段不该算损坏：{:?}",
+            loaded.load_error
+        );
         assert_eq!(loaded.settings.theme, "light");
         assert_eq!(loaded.settings.concurrency, Settings::default().concurrency);
         assert!(loaded.settings.keep_original);

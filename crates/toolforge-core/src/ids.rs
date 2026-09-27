@@ -11,7 +11,9 @@ use std::fmt;
 macro_rules! string_id {
     ($name:ident, $prefix:literal, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Type)]
+        #[derive(
+            Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Type,
+        )]
         #[serde(transparent)]
         pub struct $name(pub String);
 

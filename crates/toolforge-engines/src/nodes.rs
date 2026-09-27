@@ -462,29 +462,32 @@ async fn fs_copy(
             return Ok(NodeOutput::file(dst.display().to_string())
                 .with_value("path", dst.display().to_string()));
         }
-        std::fs::copy(&src, &dst).map_err(|e| {
-            ToolforgeError::io(format!("移动 {} 失败：{e}", src.display()))
-        })?;
+        std::fs::copy(&src, &dst)
+            .map_err(|e| ToolforgeError::io(format!("移动 {} 失败：{e}", src.display())))?;
         std::fs::remove_file(&src)
             .map_err(|e| ToolforgeError::io(format!("删除源文件失败：{e}")))?;
     } else {
-        std::fs::copy(&src, &dst).map_err(|e| {
-            ToolforgeError::io(format!("复制 {} 失败：{e}", src.display()))
-        })?;
+        std::fs::copy(&src, &dst)
+            .map_err(|e| ToolforgeError::io(format!("复制 {} 失败：{e}", src.display())))?;
     }
 
-    Ok(NodeOutput::file(dst.display().to_string())
-        .with_value("path", dst.display().to_string()))
+    Ok(NodeOutput::file(dst.display().to_string()).with_value("path", dst.display().to_string()))
 }
 
-async fn fs_mkdir(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> ToolforgeResult<NodeOutput> {
+async fn fs_mkdir(
+    ctx: &mut NodeCtx,
+    args: &BTreeMap<String, String>,
+) -> ToolforgeResult<NodeOutput> {
     let dir = resolve_path(ctx, "output", arg(args, "path")?)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| ToolforgeError::io(format!("创建目录 {} 失败：{e}", dir.display())))?;
     Ok(NodeOutput::default().with_value("path", dir.display().to_string()))
 }
 
-async fn fs_delete(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> ToolforgeResult<NodeOutput> {
+async fn fs_delete(
+    ctx: &mut NodeCtx,
+    args: &BTreeMap<String, String>,
+) -> ToolforgeResult<NodeOutput> {
     let target = resolve_path(ctx, "output", arg(args, "src")?)?;
     if !target.exists() {
         return Ok(NodeOutput::default());
@@ -629,7 +632,8 @@ async fn name_build(ctx: &mut NodeCtx) -> ToolforgeResult<NodeOutput> {
         let mut last_was_sep = false;
         for c in body.chars() {
             // 空白与一批常见的文件系统敏感字符一起归一化
-            let is_sep = c.is_whitespace() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
+            let is_sep = c.is_whitespace()
+                || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
             if is_sep {
                 if !last_was_sep {
                     out.push_str(&separator);
@@ -641,7 +645,9 @@ async fn name_build(ctx: &mut NodeCtx) -> ToolforgeResult<NodeOutput> {
             }
         }
         // 去掉首尾分隔符，避免「_报告_.pdf」
-        let trimmed = out.trim_matches(|c: char| separator.contains(c)).to_string();
+        let trimmed = out
+            .trim_matches(|c: char| separator.contains(c))
+            .to_string();
         body = if trimmed.is_empty() { out } else { trimmed };
     }
 
@@ -706,13 +712,13 @@ async fn name_build(ctx: &mut NodeCtx) -> ToolforgeResult<NodeOutput> {
 async fn flow_log(ctx: &mut NodeCtx) -> ToolforgeResult<NodeOutput> {
     let message = ctx.param_str("message", "");
     if message.trim().is_empty() {
-        return Err(ToolforgeError::plugin_invalid(
-            "flow.log 缺少 `message`",
-        ));
+        return Err(ToolforgeError::plugin_invalid("flow.log 缺少 `message`"));
     }
     let level = ctx.param_str("level", "info");
     match level.to_ascii_lowercase().as_str() {
-        "debug" | "trace" => ctx.job.log(toolforge_core::job::LogLevel::Debug, message.clone()),
+        "debug" | "trace" => ctx
+            .job
+            .log(toolforge_core::job::LogLevel::Debug, message.clone()),
         "warn" | "warning" => ctx.job.warn(message.clone()),
         "error" => ctx.job.error(message.clone()),
         _ => ctx.job.info(message.clone()),
@@ -736,10 +742,13 @@ async fn flow_branch(ctx: &mut NodeCtx) -> ToolforgeResult<NodeOutput> {
     }
     // 这里的 condition 已经在流水线执行器里渲染过模板（它来自 with 或参数），
     // 所以直接按"真值字面量"判断即可，不再二次求值。
-    let active = truthy(&condition) || (!is_falsey_literal(&condition) && !condition.trim().is_empty());
+    let active =
+        truthy(&condition) || (!is_falsey_literal(&condition) && !condition.trim().is_empty());
     let value = if active { "true" } else { "false" };
-    ctx.job
-        .log(toolforge_core::job::LogLevel::Debug, format!("分支判定：{condition} → {value}"));
+    ctx.job.log(
+        toolforge_core::job::LogLevel::Debug,
+        format!("分支判定：{condition} → {value}"),
+    );
     Ok(NodeOutput::value("active", value))
 }
 
@@ -861,7 +870,12 @@ async fn run_magick(ctx: &NodeCtx, args: Vec<String>) -> ToolforgeResult<()> {
 /// 但它的含义与 JPEG/WebP 完全不同（PNG 的 `Q` 是量化质量，会直接损毁照片），
 /// 而无损格式（bmp / tiff / gif）根本不认这个 option，传了会直接报错。
 fn vips_save_option(fmt: &str, quality: u8) -> Option<String> {
-    match fmt.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+    match fmt
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "jpg" | "jpeg" | "webp" | "avif" | "heic" | "heif" => Some(format!("Q={quality}")),
         // PNG：用压缩级别（0-9）。9 最慢但最小，对"转换"这个动作是合理的默认。
         "png" => Some("compression=9".into()),
@@ -871,7 +885,10 @@ fn vips_save_option(fmt: &str, quality: u8) -> Option<String> {
 
 fn magick_quality_flag(fmt: &str) -> bool {
     matches!(
-        fmt.trim().trim_start_matches('.').to_ascii_lowercase().as_str(),
+        fmt.trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .as_str(),
         "jpg" | "jpeg" | "webp" | "avif" | "heic" | "heif" | "tif" | "tiff"
     )
 }
@@ -999,8 +1016,10 @@ async fn image_probe(
     out.values.insert("width".into(), w.to_string());
     out.values.insert("height".into(), h.to_string());
     out.values.insert("color".into(), color.clone());
-    out.values
-        .insert("megapixels".into(), format!("{:.2}", (w as f64 * h as f64) / 1e6));
+    out.values.insert(
+        "megapixels".into(),
+        format!("{:.2}", (w as f64 * h as f64) / 1e6),
+    );
     Ok(out)
 }
 
@@ -1041,11 +1060,7 @@ async fn image_convert(
                 Some(opt) => format!("{}[{opt}]", dst.display()),
                 None => dst.display().to_string(),
             };
-            run_vips(
-                ctx,
-                vec!["copy".into(), src.display().to_string(), target],
-            )
-            .await?;
+            run_vips(ctx, vec!["copy".into(), src.display().to_string(), target]).await?;
         }
         ImageBackend::Magick => {
             let mut a = vec![src.display().to_string()];
@@ -1280,10 +1295,12 @@ async fn image_rotate(
     // 这时必须**明确降级到有能力的后端**，而不是静默取整（取整会让用户
     // 以为"转了 45°"，实际拿到一张没转的图）。
     if !right_angle && backend == ImageBackend::Rust {
-        return Err(ToolforgeError::engine_missing("imagemagick").with_detail(format!(
-            "纯 Rust 后端只支持 90° 整数倍旋转（当前 {angle}°）。\
+        return Err(
+            ToolforgeError::engine_missing("imagemagick").with_detail(format!(
+                "纯 Rust 后端只支持 90° 整数倍旋转（当前 {angle}°）。\
              任意角度旋转需要重采样，请到「设置 → 引擎管理」安装 libvips 或 ImageMagick。"
-        )));
+            )),
+        );
     }
 
     ctx.job.log(
@@ -1318,9 +1335,17 @@ async fn image_rotate(
             // 需要翻转时先落到临时文件，再对它做 flip —— 直接写同一个目标会互相覆盖。
             let needs_flip = flip_h || flip_v;
             let stage = dst.with_extension(format!("stage.{}", file_ext(&dst)));
-            let first_target = if needs_flip { stage.clone() } else { dst.clone() };
+            let first_target = if needs_flip {
+                stage.clone()
+            } else {
+                dst.clone()
+            };
 
-            let mut a = vec![action.into(), src.display().to_string(), first_target.display().to_string()];
+            let mut a = vec![
+                action.into(),
+                src.display().to_string(),
+                first_target.display().to_string(),
+            ];
             a.extend(extra);
             run_vips(ctx, a).await?;
 
@@ -1332,7 +1357,11 @@ async fn image_rotate(
                     _ => (Some("vertical"), None),
                 };
                 let mid = dst.with_extension(format!("mid.{}", file_ext(&dst)));
-                let after_first = if dir2.is_some() { mid.clone() } else { dst.clone() };
+                let after_first = if dir2.is_some() {
+                    mid.clone()
+                } else {
+                    dst.clone()
+                };
                 run_vips(
                     ctx,
                     vec![
@@ -1399,8 +1428,7 @@ async fn image_rotate(
         }
     }
 
-    Ok(NodeOutput::file(dst.display().to_string())
-        .with_value("backend", backend.id().to_string()))
+    Ok(NodeOutput::file(dst.display().to_string()).with_value("backend", backend.id().to_string()))
 }
 
 async fn image_enhance(
@@ -1550,7 +1578,10 @@ fn ensure_weight_file_complete(model_id: &str, path: &Path) -> ToolforgeResult<(
 ///   脚本会把 `modelScale` 与 `targetScale` 都报出来，别让用户以为模型支持 2×。
 /// * **`tile` 默认 256**：太小会让重叠边占比升高（推理量变大），太大则内存吃紧。
 ///   256 配 16 像素重叠，在"接缝看不出来"和"跑得动 4K 图"之间是个稳妥的折中。
-async fn ai_upscale(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> ToolforgeResult<NodeOutput> {
+async fn ai_upscale(
+    ctx: &mut NodeCtx,
+    args: &BTreeMap<String, String>,
+) -> ToolforgeResult<NodeOutput> {
     let src = resolve_path(ctx, "input", arg(args, "src")?)?;
     let dst = resolve_path(ctx, "output", arg(args, "dst")?)?;
 
@@ -1560,26 +1591,27 @@ async fn ai_upscale(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> Toolf
     let overlap = ctx.param_i64("overlap", 16).clamp(0, 128);
 
     let model_path = ctx.engines.model_path(&model_id).ok_or_else(|| {
-        ToolforgeError::not_found(format!("模型 {model_id} 不在引擎目录里登记"))
-            .with_detail("可用的超分模型：realesr-general-x4v3（4.9 MB）、realesrgan-anime6b（18 MB）。")
+        ToolforgeError::not_found(format!("模型 {model_id} 不在引擎目录里登记")).with_detail(
+            "可用的超分模型：realesr-general-x4v3（4.9 MB）、realesrgan-anime6b（18 MB）。",
+        )
     })?;
     if !model_path.is_file() {
-        return Err(ToolforgeError::not_found(format!(
-            "超分模型 {model_id} 还没下载"
-        ))
-        .with_detail(
-            "请到「设置 → 引擎管理 → 模型权重」里点「下载」。\n\
+        return Err(
+            ToolforgeError::not_found(format!("超分模型 {model_id} 还没下载")).with_detail(
+                "请到「设置 → 引擎管理 → 模型权重」里点「下载」。\n\
              realesr-general-x4v3 只有 4.9 MB，单块约 26 ms，建议先用它。"
-                .to_string(),
-        ));
+                    .to_string(),
+            ),
+        );
     }
     // 文件在 ≠ 文件能用（0 字节 / 半截下载都会骗过 `is_file()`）
     ensure_weight_file_complete(&model_id, &model_path)?;
 
-    ctx.job.progress_now(toolforge_core::job::JobProgress::indeterminate(format!(
-        "放大 {}",
-        file_label(&src)
-    )));
+    ctx.job
+        .progress_now(toolforge_core::job::JobProgress::indeterminate(format!(
+            "放大 {}",
+            file_label(&src)
+        )));
 
     let python = ensure_onnx_runtime(ctx).await?;
     let script = materialize_py_script(ctx, "upscale.py", UPSCALE_SCRIPT)?;
@@ -1649,7 +1681,10 @@ async fn ai_upscale(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> Toolf
     }
 
     let out_w = report.get("outWidth").and_then(|v| v.as_u64()).unwrap_or(0);
-    let out_h = report.get("outHeight").and_then(|v| v.as_u64()).unwrap_or(0);
+    let out_h = report
+        .get("outHeight")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let tiles = report.get("tiles").and_then(|v| v.as_u64()).unwrap_or(0);
     let uncovered = report
         .get("uncoveredRatio")
@@ -1772,14 +1807,13 @@ async fn image_remove_background(
             .with_detail("可用的抠图模型：u2netp（最快）、u2net、isnet-general、modnet-portrait、birefnet-general。")
     })?;
     if !model_path.is_file() {
-        return Err(ToolforgeError::not_found(format!(
-            "抠图模型 {model_id} 还没下载"
-        ))
-        .with_detail(
-            "请到「设置 → 引擎管理 → 模型权重」里点「下载」。\n\
+        return Err(
+            ToolforgeError::not_found(format!("抠图模型 {model_id} 还没下载")).with_detail(
+                "请到「设置 → 引擎管理 → 模型权重」里点「下载」。\n\
              u2netp 只有 4.4 MB，建议先装它；u2net / isnet-general 效果更好但约 170 MB。"
-                .to_string(),
-        ));
+                    .to_string(),
+            ),
+        );
     }
     // 文件在 ≠ 文件能用（0 字节 / 半截下载都会骗过 `is_file()`）
     ensure_weight_file_complete(&model_id, &model_path)?;
@@ -1788,9 +1822,11 @@ async fn image_remove_background(
     // （见 `py/rembg.py` 模块文档第 2 条），所以这里显式查表而不是让脚本猜。
     let normalize = rembg_normalize_for(&model_id);
 
-    ctx.job.progress_now(toolforge_core::job::JobProgress::indeterminate(
-        format!("抠图 {}", file_label(&src)),
-    ));
+    ctx.job
+        .progress_now(toolforge_core::job::JobProgress::indeterminate(format!(
+            "抠图 {}",
+            file_label(&src)
+        )));
 
     // ---- ② Python 运行时 ----
     let python = ensure_onnx_runtime(ctx).await?;
@@ -1949,9 +1985,8 @@ const UPSCALE_SCRIPT: &str = include_str!("../py/upscale.py");
 /// 它们都是"宿主自带的 Python 小工具"，放在一起便于排查。
 fn materialize_py_script(ctx: &NodeCtx, name: &str, body: &str) -> ToolforgeResult<PathBuf> {
     let dir = ctx.engines.paths().cache().join("onnx-runtime");
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        ToolforgeError::io(format!("创建 {} 失败：{e}", dir.display()))
-    })?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ToolforgeError::io(format!("创建 {} 失败：{e}", dir.display())))?;
     let path = dir.join(name);
     std::fs::write(&path, body)
         .map_err(|e| ToolforgeError::io(format!("写入 {} 失败：{e}", path.display())))?;
@@ -2009,22 +2044,22 @@ async fn ensure_onnx_runtime(ctx: &NodeCtx) -> ToolforgeResult<PathBuf> {
     )
     .await?;
     if !out.success() || !venv_python.is_file() {
-        return Err(ToolforgeError::engine_failed(
-            "python",
-            "创建抠图用的独立 Python 环境失败",
-        )
-        .with_detail(format!(
-            "解释器：{}\nstdout：{}\nstderr：{}",
-            base.display(),
-            out.stdout.trim(),
-            out.stderr.trim()
-        )));
+        return Err(
+            ToolforgeError::engine_failed("python", "创建抠图用的独立 Python 环境失败")
+                .with_detail(format!(
+                    "解释器：{}\nstdout：{}\nstderr：{}",
+                    base.display(),
+                    out.stdout.trim(),
+                    out.stderr.trim()
+                )),
+        );
     }
 
     // ---- 装依赖 ----
     // 不指定版本：onnxruntime 的 ABI 与 Python 小版本绑定，写死版本号
     // 反而会在某些 Python 上装不上。让 pip 自己挑这个解释器能用的最新版。
-    ctx.job.info("正在下载抠图依赖（onnxruntime / numpy / pillow，约 30 MB，仅首次）");
+    ctx.job
+        .info("正在下载抠图依赖（onnxruntime / numpy / pillow，约 30 MB，仅首次）");
     let job = ctx.job.clone();
     let out = toolforge_process::exec_streaming(
         ExecOptions::new(venv_python.clone())
@@ -2148,15 +2183,17 @@ async fn find_base_python(ctx: &NodeCtx) -> ToolforgeResult<PathBuf> {
         }
     }
 
-    Err(ToolforgeError::engine_missing("python").with_detail(format!(
-        "{}\n\n抠图需要 Python {}.{} ~ {}.{}。请到「设置 → 引擎管理」安装\
+    Err(
+        ToolforgeError::engine_missing("python").with_detail(format!(
+            "{}\n\n抠图需要 Python {}.{} ~ {}.{}。请到「设置 → 引擎管理」安装\
          「Python 运行时」—— 应用会装一个独立的 3.11，不会动你系统上的 Python。",
-        rejection.unwrap_or_else(|| "没有找到可用的 Python".into()),
-        ONNX_PY_MIN.0,
-        ONNX_PY_MIN.1,
-        ONNX_PY_MAX.0,
-        ONNX_PY_MAX.1,
-    )))
+            rejection.unwrap_or_else(|| "没有找到可用的 Python".into()),
+            ONNX_PY_MIN.0,
+            ONNX_PY_MIN.1,
+            ONNX_PY_MAX.0,
+            ONNX_PY_MAX.1,
+        )),
+    )
 }
 
 /// 读出 Python 的 `(major, minor)`。
@@ -2176,7 +2213,9 @@ async fn python_version(ctx: &NodeCtx, python: &Path) -> Option<(u32, u32)> {
         out.stdout
     };
     // `Python 3.11.16`（stdout）或 `Python 3.11.16`（老版本走 stderr）
-    let ver = text.split_whitespace().find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    let ver = text
+        .split_whitespace()
+        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
     let mut it = ver.split('.');
     let major = it.next()?.parse().ok()?;
     let minor = it.next()?.parse().ok()?;
@@ -2330,8 +2369,11 @@ async fn run_ffmpeg(
                 if let (Ok(us), Some(total)) = (v.trim().parse::<i64>(), duration) {
                     if total > 0.0 {
                         let done = (us as f64 / 1_000_000.0).min(total);
-                        let mut p =
-                            toolforge_core::job::JobProgress::ratio(label.clone(), done as u64, total as u64);
+                        let mut p = toolforge_core::job::JobProgress::ratio(
+                            label.clone(),
+                            done as u64,
+                            total as u64,
+                        );
                         p.current_item = Some(label.clone());
                         p.eta_seconds = Some((total - done).max(0.0));
                         job.progress(p);
@@ -2395,11 +2437,7 @@ async fn ffmpeg_transcode(
         }
     }
 
-    let mut a = vec![
-        "-y".into(),
-        "-i".into(),
-        src.display().to_string(),
-    ];
+    let mut a = vec!["-y".into(), "-i".into(), src.display().to_string()];
 
     // 硬件解码（放 -i 之后、编码参数之前）
     match hwaccel.as_str() {
@@ -2440,8 +2478,7 @@ async fn ffmpeg_transcode(
     let duration = ffprobe_duration(ctx, &src).await;
     run_ffmpeg(ctx, a, duration, file_label(&src)).await?;
 
-    Ok(NodeOutput::file(dst.display().to_string())
-        .with_value("path", dst.display().to_string()))
+    Ok(NodeOutput::file(dst.display().to_string()).with_value("path", dst.display().to_string()))
 }
 
 async fn ffmpeg_extract_audio(
@@ -2722,10 +2759,7 @@ fn require_ai(
 /// 为什么一定要缩：视觉模型的计费按像素折算 token，一张 4000×3000 的原图
 /// 在某些服务商那里一次就要几毛钱，而"看图说话"根本用不上那个分辨率。
 /// 缩放在**本地**做完再发出去，省的是用户的钱。
-fn shrink_for_vision(
-    img: &image::DynamicImage,
-    max_side: i64,
-) -> ToolforgeResult<Vec<u8>> {
+fn shrink_for_vision(img: &image::DynamicImage, max_side: i64) -> ToolforgeResult<Vec<u8>> {
     let (w, h) = (img.width(), img.height());
     let scaled = if max_side > 0 && (w.max(h) as i64) > max_side {
         let ratio = max_side as f64 / w.max(h) as f64;
@@ -2744,7 +2778,12 @@ fn shrink_for_vision(
     let rgb = scaled.to_rgb8();
     let mut cursor = std::io::Cursor::new(&mut buf);
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 85)
-        .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
         .map_err(|e| ToolforgeError::internal(format!("图片压缩失败：{e}")))?;
     Ok(buf)
 }
@@ -2755,10 +2794,7 @@ async fn ai_describe(
     args: &BTreeMap<String, String>,
 ) -> ToolforgeResult<NodeOutput> {
     let src = resolve_path(ctx, "input", arg(args, "src")?)?;
-    let instruction = ctx.param_str(
-        "instruction",
-        "用一句中文描述这张图片，并给出5个标签",
-    );
+    let instruction = ctx.param_str("instruction", "用一句中文描述这张图片，并给出5个标签");
     let max_tokens = ctx.param_i64("maxTokens", 512).clamp(64, 8192);
     let max_side = ctx.param_i64("maxSide", 1024).clamp(0, 8192);
 
@@ -2812,11 +2848,10 @@ async fn ai_describe(
     let text = text.trim().to_string();
     if text.is_empty() {
         // 空回答不能算成功：下游拿它去重命名会得到一个空名字
-        return Err(ToolforgeError::new(
-            ErrorCode::AiUnavailable,
-            "模型返回了空内容",
-        )
-        .with_detail("换一个模型或调整提示词后重试。"));
+        return Err(
+            ToolforgeError::new(ErrorCode::AiUnavailable, "模型返回了空内容")
+                .with_detail("换一个模型或调整提示词后重试。"),
+        );
     }
 
     // `maxTokens` 是给服务端的提示，本地也截一下，防止某些端点无视它
@@ -2859,7 +2894,10 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// 为什么要按页而不是整篇：一页 200 DPI 的 A4 大约是 1654×2339 像素，
 /// 一页就是 11 MB 的 RGB 数据。100 页的 PDF 一次性读进内存是 1 GB 级别 ——
 /// 逐页处理是唯一可行的做法，而且逐页之后超时/取消的粒度也更细。
-async fn doc_ocr(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> ToolforgeResult<NodeOutput> {
+async fn doc_ocr(
+    ctx: &mut NodeCtx,
+    args: &BTreeMap<String, String>,
+) -> ToolforgeResult<NodeOutput> {
     let src = resolve_path(ctx, "input", arg(args, "src")?)?;
     let dst = resolve_path(ctx, "output", arg(args, "dst")?)?;
     let lang = ctx.param_str("lang", "chi_sim+eng");
@@ -2926,7 +2964,12 @@ async fn doc_ocr(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> Toolforg
             .collect::<Vec<_>>()
             .join("\n\n")
     } else {
-        chunks.first().cloned().unwrap_or_default().trim().to_string()
+        chunks
+            .first()
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
     };
 
     if multi || backend == "ai-vision" {
@@ -3175,20 +3218,24 @@ async fn ebook_convert(
     // 就按自己的能力表把关，而不是相信它的退出码。
     if ctx.engines.is_available("pandoc").await {
         if !PANDOC_EBOOK_OUT.contains(&dst_ext.as_str()) {
-            return Err(ToolforgeError::engine_missing("calibre").with_detail(format!(
-                "pandoc 写不出 `.{dst_ext}`（它只会**默默把输出写成 HTML 并保留这个扩展名**，\
+            return Err(
+                ToolforgeError::engine_missing("calibre").with_detail(format!(
+                    "pandoc 写不出 `.{dst_ext}`（它只会**默默把输出写成 HTML 并保留这个扩展名**，\
                  退出码还是 0 —— 那种「成功」比失败更糟）。\n\
                  pandoc 能写的电子书格式只有：{}。\n\
                  要转 `.{dst_ext}` 请安装 Calibre：「设置 → 引擎管理 → Calibre」。",
-                PANDOC_EBOOK_OUT.join(" / ")
-            )));
+                    PANDOC_EBOOK_OUT.join(" / ")
+                )),
+            );
         }
         if !PANDOC_EBOOK_IN.contains(&src_ext.as_str()) {
-            return Err(ToolforgeError::engine_missing("calibre").with_detail(format!(
-                "pandoc 读不了 `.{src_ext}`（它能读的电子书格式只有：{}）。\n\
+            return Err(
+                ToolforgeError::engine_missing("calibre").with_detail(format!(
+                    "pandoc 读不了 `.{src_ext}`（它能读的电子书格式只有：{}）。\n\
                  要转 `.{src_ext}` 请安装 Calibre：「设置 → 引擎管理 → Calibre」。",
-                PANDOC_EBOOK_IN.join(" / ")
-            )));
+                    PANDOC_EBOOK_IN.join(" / ")
+                )),
+            );
         }
 
         let pandoc = ctx.engine("pandoc").await?;
@@ -3220,8 +3267,9 @@ async fn ebook_convert(
             "本次转换用的是 Pandoc（能写 EPUB / DOCX / FB2 / HTML / Markdown / RTF / ODT / TXT）。\
              要转 MOBI / AZW3 / PDF，请安装 Calibre。",
         );
-        return Ok(NodeOutput::file(dst.display().to_string())
-            .with_value("backend", "pandoc".to_string()));
+        return Ok(
+            NodeOutput::file(dst.display().to_string()).with_value("backend", "pandoc".to_string())
+        );
     }
 
     Err(ToolforgeError::engine_missing("calibre").with_detail(
@@ -3523,10 +3571,10 @@ async fn sevenzip_unpack(
             "检测到 {} 个解压条目疑似逃逸出目标目录",
             escaped.len()
         ));
-        return Err(ToolforgeError::denied(
-            "压缩包包含路径穿越条目（Zip Slip），已中止",
-        )
-        .with_detail(escaped.join("\n")));
+        return Err(
+            ToolforgeError::denied("压缩包包含路径穿越条目（Zip Slip），已中止")
+                .with_detail(escaped.join("\n")),
+        );
     }
 
     Ok(NodeOutput::default().with_value("path", dst.display().to_string()))
@@ -3601,7 +3649,10 @@ mod tests {
                 "模型 {id} 的归一化方式是 `{n}`，不是脚本支持的两种之一"
             );
             if id == "modnet-portrait" {
-                assert_eq!(n, "pm1", "MODNet 必须用 [-1,1]，喂 ImageNet 统计量不会报错但会糊");
+                assert_eq!(
+                    n, "pm1",
+                    "MODNet 必须用 [-1,1]，喂 ImageNet 统计量不会报错但会糊"
+                );
             }
         }
     }
@@ -3673,7 +3724,9 @@ mod tests {
     /// 所以宁可在这里用一条纯字符串断言的测试把它钉死。
     #[test]
     fn libreoffice_profile_url_has_no_backslashes() {
-        let u = file_url(Path::new(r"C:\Users\Foo Bar\AppData\Local\Temp\toolforge-lo-1234"));
+        let u = file_url(Path::new(
+            r"C:\Users\Foo Bar\AppData\Local\Temp\toolforge-lo-1234",
+        ));
         assert!(!u.contains('\\'), "URL 里不能有反斜杠：{u}");
         assert_eq!(
             u, "file:///C:/Users/Foo%20Bar/AppData/Local/Temp/toolforge-lo-1234",
@@ -3790,7 +3843,9 @@ mod tests {
         let id = job.id.to_string();
         let dir = std::env::temp_dir().join("tf-node-ctx-test");
         let _ = std::fs::create_dir_all(&dir);
-        let engines = Arc::new(EngineRegistry::new(toolforge_core::paths::AppPaths::new(&dir)));
+        let engines = Arc::new(EngineRegistry::new(toolforge_core::paths::AppPaths::new(
+            &dir,
+        )));
         let ctx = NodeCtx {
             job,
             engines,
@@ -3865,7 +3920,9 @@ mod tests {
     #[tokio::test]
     async fn flow_log_without_message_is_an_error() {
         let (mut ctx, _q, _id) = test_ctx();
-        let err = run(&mut ctx, "flow.log", &BTreeMap::new()).await.unwrap_err();
+        let err = run(&mut ctx, "flow.log", &BTreeMap::new())
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::PluginInvalid);
     }
 
@@ -3879,8 +3936,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out.values.get("value").map(|s| s.as_str()), Some("/output/x"));
-        assert_eq!(ctx.vars.get("outDir").map(|s| s.as_str()), Some("/output/x"));
+        assert_eq!(
+            out.values.get("value").map(|s| s.as_str()),
+            Some("/output/x")
+        );
+        assert_eq!(
+            ctx.vars.get("outDir").map(|s| s.as_str()),
+            Some("/output/x")
+        );
     }
 
     #[test]

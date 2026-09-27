@@ -196,9 +196,7 @@ impl Capability {
         }
         match host.rsplit_once(':') {
             Some((head, port)) => {
-                !head.is_empty()
-                    && !port.is_empty()
-                    && port.chars().all(|c| c.is_ascii_digit())
+                !head.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
             }
             None => false,
         }
@@ -261,20 +259,25 @@ impl PermissionSet {
 
     pub fn dedup(&mut self) {
         let mut seen = std::collections::HashSet::new();
-        self.capabilities
-            .retain(|c| seen.insert(c.fingerprint()));
+        self.capabilities.retain(|c| seen.insert(c.fingerprint()));
     }
 
     /// 全部指纹（前端用来做勾选状态）
     pub fn fingerprints(&self) -> Vec<String> {
-        self.capabilities.iter().map(Capability::fingerprint).collect()
+        self.capabilities
+            .iter()
+            .map(Capability::fingerprint)
+            .collect()
     }
 
     /// 本集合是否被 `other` 完全覆盖。
     /// 用于校验"AI 生成的新版本没有偷偷扩权"。
     pub fn is_subset_of(&self, other: &PermissionSet) -> bool {
-        let granted: std::collections::HashSet<_> =
-            other.capabilities.iter().map(Capability::fingerprint).collect();
+        let granted: std::collections::HashSet<_> = other
+            .capabilities
+            .iter()
+            .map(Capability::fingerprint)
+            .collect();
         self.capabilities
             .iter()
             .all(|c| granted.contains(&c.fingerprint()))
@@ -282,8 +285,11 @@ impl PermissionSet {
 
     /// `声明 ∩ 已授权`。**这是运行时真正生效的权限。**
     pub fn effective(declared: &PermissionSet, granted: &PermissionSet) -> PermissionSet {
-        let granted_set: std::collections::HashSet<_> =
-            granted.capabilities.iter().map(Capability::fingerprint).collect();
+        let granted_set: std::collections::HashSet<_> = granted
+            .capabilities
+            .iter()
+            .map(Capability::fingerprint)
+            .collect();
         let mut out = PermissionSet {
             capabilities: declared
                 .capabilities
@@ -312,7 +318,9 @@ impl PermissionSet {
     }
 
     pub fn wants_exec(&self) -> bool {
-        self.capabilities.iter().any(|c| matches!(c, Capability::Exec))
+        self.capabilities
+            .iter()
+            .any(|c| matches!(c, Capability::Exec))
     }
 
     pub fn has_read(&self, scope: &PathScope) -> bool {
@@ -336,14 +344,24 @@ impl PermissionSet {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum CapabilityRequest {
-    ReadFile { path: String },
-    WriteFile { path: String },
+    ReadFile {
+        path: String,
+    },
+    WriteFile {
+        path: String,
+    },
     /// 请求访问某个主机
-    Http { host: String },
+    Http {
+        host: String,
+    },
     /// 请求读取某个环境变量
-    ReadEnv { name: String },
+    ReadEnv {
+        name: String,
+    },
     /// 请求启动子进程
-    Spawn { program: String },
+    Spawn {
+        program: String,
+    },
 }
 
 impl CapabilityRequest {
@@ -402,21 +420,20 @@ impl CapabilityGuard {
     /// 注意：**这里返回 Deny 就一定要向上冒泡成 `ErrorCode::PluginCapabilityViolation`**，
     /// 由调用方同时写审计日志。静默降级（比如"读不到就当空文件"）会让攻击面隐形。
     pub fn check(&self, req: &CapabilityRequest) -> CapabilityVerdict {
-        let ok = match req {
-            CapabilityRequest::ReadFile { .. } => self.needs_fs(Capability::FsRead {
-                scope: PathScope::Workspace,
-            }),
-            CapabilityRequest::WriteFile { .. } => self.needs_fs(Capability::FsWrite {
-                scope: PathScope::Workspace,
-            }),
-            CapabilityRequest::Http { host } => self.check_host(host),
-            CapabilityRequest::ReadEnv { name } => self
-                .effective
-                .capabilities
-                .iter()
-                .any(|c| matches!(c, Capability::Env { names } if names.iter().any(|n| n == name))),
-            CapabilityRequest::Spawn { .. } => self.effective.wants_exec(),
-        };
+        let ok =
+            match req {
+                CapabilityRequest::ReadFile { .. } => self.needs_fs(Capability::FsRead {
+                    scope: PathScope::Workspace,
+                }),
+                CapabilityRequest::WriteFile { .. } => self.needs_fs(Capability::FsWrite {
+                    scope: PathScope::Workspace,
+                }),
+                CapabilityRequest::Http { host } => self.check_host(host),
+                CapabilityRequest::ReadEnv { name } => self.effective.capabilities.iter().any(
+                    |c| matches!(c, Capability::Env { names } if names.iter().any(|n| n == name)),
+                ),
+                CapabilityRequest::Spawn { .. } => self.effective.wants_exec(),
+            };
 
         if ok {
             CapabilityVerdict::Allow
@@ -634,10 +651,10 @@ impl PathResolver {
         let candidate = PathBuf::from(rel);
 
         if !matcher.is_match(&candidate) {
-            return Err(ToolforgeError::denied(format!(
-                "路径不在声明的宿主机范围内：{rel}"
-            ))
-            .with_detail(format!("声明范围：{pattern}")));
+            return Err(
+                ToolforgeError::denied(format!("路径不在声明的宿主机范围内：{rel}"))
+                    .with_detail(format!("声明范围：{pattern}")),
+            );
         }
         Ok(candidate)
     }
@@ -681,10 +698,8 @@ pub fn normalize_lexically(path: &Path) -> PathBuf {
             Component::CurDir => {}
             Component::ParentDir => {
                 // 只有栈顶是 Normal 才能吃掉它；栈顶是 `..`、`/` 或空前缀时保留
-                let top_is_real_dir = matches!(
-                    out.components().next_back(),
-                    Some(Component::Normal(_))
-                );
+                let top_is_real_dir =
+                    matches!(out.components().next_back(), Some(Component::Normal(_)));
                 if top_is_real_dir {
                     out.pop();
                 } else {
@@ -711,10 +726,14 @@ mod tests {
         // 正常相对路径放行
         assert!(r.resolve(&PathScope::Input, "a/b.png").is_ok());
         // 逃逸必须被拦
-        let err = r.resolve(&PathScope::Input, "../../../etc/passwd").unwrap_err();
+        let err = r
+            .resolve(&PathScope::Input, "../../../etc/passwd")
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         // 根**之外**的绝对路径必须被拦
-        let err = r.resolve(&PathScope::Input, "C:\\Windows\\System32").unwrap_err();
+        let err = r
+            .resolve(&PathScope::Input, "C:\\Windows\\System32")
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
     }
 
@@ -732,7 +751,8 @@ mod tests {
 
         // 用 Input 作用域读输出目录里的中间产物：放行
         assert_eq!(
-            r.resolve(&PathScope::Input, "/srv/output/frame.png").unwrap(),
+            r.resolve(&PathScope::Input, "/srv/output/frame.png")
+                .unwrap(),
             Path::new("/srv/output/frame.png")
         );
 
@@ -747,7 +767,9 @@ mod tests {
             "只读根对读生效"
         );
         // 只读根不会让**别的**目录变得可读
-        let err = r2.resolve(&PathScope::Input, "/srv/output/a.png").unwrap_err();
+        let err = r2
+            .resolve(&PathScope::Input, "/srv/output/a.png")
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
     }
 
@@ -758,10 +780,12 @@ mod tests {
             .with_input("/srv/input")
             .with_output("/srv/output")
             .with_read_root("/srv/input"); // 故意把输入目录登记成可读根
-        // 读输入目录本来就允许
+                                           // 读输入目录本来就允许
         assert!(r.resolve(&PathScope::Input, "/srv/input/a.png").is_ok());
         // 往输入目录"写"仍然被拒（Output 作用域的根是 /srv/output）
-        let err = r.resolve(&PathScope::Output, "/srv/input/a.png").unwrap_err();
+        let err = r
+            .resolve(&PathScope::Output, "/srv/input/a.png")
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::PermissionDenied);
     }
 
@@ -798,7 +822,9 @@ mod tests {
         );
 
         // 绝对路径里的 `..` 也要被正确展开后再判定
-        assert!(r.resolve(&PathScope::Input, "/srv/input/a/../b.png").is_ok());
+        assert!(r
+            .resolve(&PathScope::Input, "/srv/input/a/../b.png")
+            .is_ok());
         let err = r
             .resolve(&PathScope::Input, "/srv/input/../../etc/passwd")
             .unwrap_err();
@@ -831,10 +857,16 @@ mod tests {
             normalize_lexically(Path::new("../../evil")),
             Path::new("../../evil")
         );
-        assert_eq!(normalize_lexically(Path::new("a/../../b")), Path::new("../b"));
+        assert_eq!(
+            normalize_lexically(Path::new("a/../../b")),
+            Path::new("../b")
+        );
         assert_eq!(normalize_lexically(Path::new("a/b/../c")), Path::new("a/c"));
         // 绝对路径不能让 `..` 越过根
-        assert_eq!(normalize_lexically(Path::new("/a/../../b")), Path::new("/../b"));
+        assert_eq!(
+            normalize_lexically(Path::new("/a/../../b")),
+            Path::new("/../b")
+        );
     }
 
     #[test]

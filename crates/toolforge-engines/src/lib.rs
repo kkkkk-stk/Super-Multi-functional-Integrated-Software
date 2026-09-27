@@ -31,9 +31,7 @@
 pub mod nodes;
 pub mod registry;
 
-pub use registry::{
-    download, EngineInstallOutcome, EngineRegistry, ModelSpec, ENGINE_BINARIES,
-};
+pub use registry::{download, EngineInstallOutcome, EngineRegistry, ModelSpec, ENGINE_BINARIES};
 pub use toolforge_core::{ToolforgeError, ToolforgeResult};
 
 /// 引擎查找顺序里的第一站：应用托管目录下的相对路径。

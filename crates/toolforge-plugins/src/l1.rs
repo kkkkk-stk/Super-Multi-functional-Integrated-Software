@@ -336,9 +336,8 @@ pub async fn run_pipeline(
         // ---- 渲染参数模板 ----
         let mut rendered: BTreeMap<String, String> = BTreeMap::new();
         for (k, v) in &step.with {
-            let value = render_template(v, &tctx).map_err(|e| {
-                e.with_subject(format!("步骤 `{}` 的参数 `{k}`", step.id))
-            })?;
+            let value = render_template(v, &tctx)
+                .map_err(|e| e.with_subject(format!("步骤 `{}` 的参数 `{k}`", step.id)))?;
             rendered.insert(k.clone(), value);
         }
 
@@ -442,10 +441,7 @@ pub async fn run_pipeline(
                         audit.record(
                             crate::audit::AuditEvent::new(
                                 crate::audit::AuditEventKind::PathEscapeBlocked,
-                                format!(
-                                    "步骤 `{}` 试图访问授权范围之外的路径，已拦截",
-                                    step.id
-                                ),
+                                format!("步骤 `{}` 试图访问授权范围之外的路径，已拦截", step.id),
                             )
                             .subject(record.id())
                             .detail(serde_json::json!({

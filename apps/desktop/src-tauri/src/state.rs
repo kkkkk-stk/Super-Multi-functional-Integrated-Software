@@ -75,9 +75,7 @@ impl AppState {
             settings.concurrency.clamp(1, 64) as usize,
             events.clone(),
         ));
-        let engines = Arc::new(
-            EngineRegistry::new(paths.clone()).with_events(events.clone()),
-        );
+        let engines = Arc::new(EngineRegistry::new(paths.clone()).with_events(events.clone()));
 
         let audit = AuditLog::new(&paths);
         let plugins = Arc::new(PluginStore::new(
@@ -85,11 +83,7 @@ impl AppState {
             builtin_plugins_dir,
             events.clone(),
         ));
-        let runner = Arc::new(PluginRunner::new(
-            engines.clone(),
-            paths.clone(),
-            audit,
-        ));
+        let runner = Arc::new(PluginRunner::new(engines.clone(), paths.clone(), audit));
 
         let state = Arc::new(Self {
             paths,
@@ -189,7 +183,11 @@ impl AppState {
     /// 配置固化进连接池了，只改 `settings` 而不重建客户端，等于设置无效。
     pub fn rebuild_ai_client(&self) {
         let key = self.ai_api_key();
-        self.set_api_key(if key.trim().is_empty() { None } else { Some(key) });
+        self.set_api_key(if key.trim().is_empty() {
+            None
+        } else {
+            Some(key)
+        });
     }
 
     /// 读取 AI Key（内存侧；可能来自启动时恢复的落盘 Key）。

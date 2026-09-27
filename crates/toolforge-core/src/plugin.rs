@@ -483,16 +483,24 @@ impl PluginManifest {
         } else if !is_valid_plugin_id(id) {
             issues.push(ValidationIssue::error(
                 "ID_FORMAT",
-                format!("metadata.id `{id}` 非法：只允许小写字母、数字、`.`、`-`、`_`，且长度 3..=128"),
+                format!(
+                    "metadata.id `{id}` 非法：只允许小写字母、数字、`.`、`-`、`_`，且长度 3..=128"
+                ),
             ));
         }
         if self.metadata.name.trim().is_empty() {
-            issues.push(ValidationIssue::error("NAME_EMPTY", "metadata.name 不能为空"));
+            issues.push(ValidationIssue::error(
+                "NAME_EMPTY",
+                "metadata.name 不能为空",
+            ));
         }
         if semver::Version::parse(&self.metadata.version).is_err() {
             issues.push(ValidationIssue::error(
                 "VERSION_INVALID",
-                format!("metadata.version `{}` 不是合法 semver", self.metadata.version),
+                format!(
+                    "metadata.version `{}` 不是合法 semver",
+                    self.metadata.version
+                ),
             ));
         }
 
@@ -618,7 +626,10 @@ impl PluginManifest {
             }
             PluginRuntime::Wasm { wasm } => {
                 if wasm.path.trim().is_empty() {
-                    issues.push(ValidationIssue::error("WASM_PATH_EMPTY", "wasm.path 不能为空"));
+                    issues.push(ValidationIssue::error(
+                        "WASM_PATH_EMPTY",
+                        "wasm.path 不能为空",
+                    ));
                 }
                 if !wasm.path.ends_with(".wasm") {
                     issues.push(ValidationIssue::warning(
@@ -686,7 +697,10 @@ impl PluginManifest {
             }
             PluginRuntime::Python { python } => {
                 if python.entry.trim().is_empty() {
-                    issues.push(ValidationIssue::error("PY_ENTRY_EMPTY", "python.entry 不能为空"));
+                    issues.push(ValidationIssue::error(
+                        "PY_ENTRY_EMPTY",
+                        "python.entry 不能为空",
+                    ));
                 }
                 if !python.entry.ends_with(".py") {
                     issues.push(ValidationIssue::warning(
@@ -731,8 +745,12 @@ impl ParamSpec {
     /// 判断一个默认值是否符合声明的类型（宽容：Int 可以落在 Float 参数上）
     pub fn accepts(&self, v: &ParamValue) -> bool {
         match self.ty {
-            ParamType::Text | ParamType::Textarea | ParamType::Path | ParamType::Directory
-            | ParamType::Color | ParamType::KeyValue => v.as_str().is_some(),
+            ParamType::Text
+            | ParamType::Textarea
+            | ParamType::Path
+            | ParamType::Directory
+            | ParamType::Color
+            | ParamType::KeyValue => v.as_str().is_some(),
             ParamType::Int => v.as_i64().is_some(),
             ParamType::Float => v.as_f64().is_some(),
             ParamType::Bool => v.as_bool().is_some(),
@@ -959,7 +977,10 @@ pub enum PluginSource {
     /// 单个 YAML 清单（L1 插件，无需额外文件）
     Manifest { yaml: String },
     /// 多文件包 —— AI 生成的插件从这里落盘
-    Bundle { yaml: String, files: Vec<BundleFile> },
+    Bundle {
+        yaml: String,
+        files: Vec<BundleFile>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1002,7 +1023,10 @@ mod tests {
         params.insert("count".to_string(), ParamValue::Int(5));
         params.insert("ratio".to_string(), ParamValue::Float(1.5));
         params.insert("flag".to_string(), ParamValue::Bool(true));
-        params.insert("tags".to_string(), ParamValue::List(vec!["a".into(), "b".into()]));
+        params.insert(
+            "tags".to_string(),
+            ParamValue::List(vec!["a".into(), "b".into()]),
+        );
 
         let json = params_to_plain_json(&params);
 

@@ -206,7 +206,10 @@ pub struct ModelSpec {
 #[derive(Debug, Clone)]
 pub enum EngineInstallOutcome {
     /// 安装成功
-    Installed { path: PathBuf, version: Option<String> },
+    Installed {
+        path: PathBuf,
+        version: Option<String>,
+    },
     /// 已经有可用的（系统或托管）
     AlreadyAvailable { path: PathBuf, source: EngineSource },
     /// 当前平台没有配置下载源 —— 需要维护者补 `engine-sources.json`
@@ -290,8 +293,9 @@ impl EngineRegistry {
 
     /// 用外部文件覆盖内置来源表（便于内网部署）
     pub fn load_sources_file(&mut self, path: &Path) -> ToolforgeResult<usize> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| ToolforgeError::io(format!("读取来源文件 {} 失败：{e}", path.display())))?;
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            ToolforgeError::io(format!("读取来源文件 {} 失败：{e}", path.display()))
+        })?;
         let list: Vec<EngineSourceSpec> = serde_json::from_str(&text)
             .map_err(|e| ToolforgeError::invalid(format!("来源文件格式非法：{e}")))?;
         let platform = EngineSourceSpec::platform_key();
@@ -519,9 +523,8 @@ impl EngineRegistry {
                 return Ok(path);
             }
         }
-        Err(ToolforgeError::engine_missing(engine_id).with_detail(
-            "请在「设置 → 引擎管理」中安装，或把可执行文件加入系统 PATH 后重新探测。",
-        ))
+        Err(ToolforgeError::engine_missing(engine_id)
+            .with_detail("请在「设置 → 引擎管理」中安装，或把可执行文件加入系统 PATH 后重新探测。"))
     }
 
     /// 该引擎当前是否可用
@@ -564,7 +567,9 @@ impl EngineRegistry {
 
     /// 某个模型是否已经下载好
     pub fn is_model_installed(&self, model_id: &str) -> bool {
-        self.model_path(model_id).map(|p| p.exists()).unwrap_or(false)
+        self.model_path(model_id)
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
     /// 当前平台有没有这个引擎的可下载来源。
@@ -674,10 +679,16 @@ impl EngineRegistry {
             .next()
             .unwrap_or("engine.archive")
             .to_string();
-        let tmp = self.paths.cache().join(format!("{engine_id}-{archive_name}"));
+        let tmp = self
+            .paths
+            .cache()
+            .join(format!("{engine_id}-{archive_name}"));
         std::fs::create_dir_all(self.paths.cache()).ok();
 
-        job.info(format!("开始下载 {}（约 {} MB）", desc.name, desc.approx_size_mb));
+        job.info(format!(
+            "开始下载 {}（约 {} MB）",
+            desc.name, desc.approx_size_mb
+        ));
         let actual = download_with_fallback(
             "engine",
             &src.url,
@@ -810,9 +821,7 @@ impl EngineRegistry {
             }
         }
 
-        let detail = tar_res
-            .map(|r| r.stderr)
-            .unwrap_or_else(|e| e.to_string());
+        let detail = tar_res.map(|r| r.stderr).unwrap_or_else(|e| e.to_string());
         Err(ToolforgeError::internal(format!(
             "无法解压 {}（已尝试系统 tar 与 7-Zip）",
             archive.display()
@@ -889,10 +898,12 @@ impl EngineRegistry {
                 "模型 {model_id} 未在注册表里登记"
             )));
         };
-        let expected = spec
-            .sha256
-            .as_ref()
-            .map(|s| s.trim().strip_prefix("sha256:").unwrap_or(s.trim()).to_ascii_lowercase());
+        let expected = spec.sha256.as_ref().map(|s| {
+            s.trim()
+                .strip_prefix("sha256:")
+                .unwrap_or(s.trim())
+                .to_ascii_lowercase()
+        });
         if expected.is_none() && !allow_unverified {
             return Err(ToolforgeError::new(
                 ErrorCode::IntegrityCheckFailed,
@@ -1175,7 +1186,8 @@ async fn download_with_stall(
 
                 total = resp.content_length().unwrap_or(0) + received;
 
-                match stream_to_file(resp, dest, label, job, tx.clone(), stall, received, total).await
+                match stream_to_file(resp, dest, label, job, tx.clone(), stall, received, total)
+                    .await
                 {
                     Ok(n) => {
                         received = n;
@@ -1233,7 +1245,9 @@ async fn download_with_stall(
                     human_bytes(actual_total)
                 ),
             )
-            .with_detail(format!("URL：{url}\n\n请重试；反复出现说明这条链路会截断大文件。")));
+            .with_detail(format!(
+                "URL：{url}\n\n请重试；反复出现说明这条链路会截断大文件。"
+            )));
         }
         return Ok(h);
     };
@@ -1492,7 +1506,8 @@ async fn stream_to_file(
 
         if last_emit.elapsed() >= Duration::from_millis(500) {
             last_emit = std::time::Instant::now();
-            let speed = (downloaded - resume_from) as f64 / started.elapsed().as_secs_f64().max(0.001);
+            let speed =
+                (downloaded - resume_from) as f64 / started.elapsed().as_secs_f64().max(0.001);
             if let Some(tx) = &tx {
                 let _ = tx.send(AppEvent::EngineDownloadProgress {
                     engine_id: label.to_string(),
@@ -1502,11 +1517,7 @@ async fn stream_to_file(
                 });
             }
             let mut p = if total > 0 {
-                toolforge_core::job::JobProgress::ratio(
-                    format!("下载 {label}"),
-                    downloaded,
-                    total,
-                )
+                toolforge_core::job::JobProgress::ratio(format!("下载 {label}"), downloaded, total)
             } else {
                 toolforge_core::job::JobProgress::indeterminate(format!("下载 {label}"))
             };
@@ -1689,9 +1700,9 @@ fn platform_candidates(engine_id: &str) -> Vec<PathBuf> {
         match engine_id {
             "ffmpeg" => out.push(PathBuf::from("/opt/homebrew/bin/ffmpeg")),
             "imagemagick" => out.push(PathBuf::from("/opt/homebrew/bin/magick")),
-            "libreoffice" => {
-                out.push(PathBuf::from("/Applications/LibreOffice.app/Contents/MacOS/soffice"))
-            }
+            "libreoffice" => out.push(PathBuf::from(
+                "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+            )),
             "pandoc" => out.push(PathBuf::from("/opt/homebrew/bin/pandoc")),
             "7zip" => out.push(PathBuf::from("/opt/homebrew/bin/7zz")),
             "libvips" => out.push(PathBuf::from("/opt/homebrew/bin/vips")),
@@ -2046,12 +2057,30 @@ mod tests {
         }
         // `raw` 没有后缀约束：它就是把下载到的字节原样当引擎文件（例如单个可执行文件）
         const KINDS: &[Kind] = &[
-            Kind { name: "zip", suffix: ".zip" },
-            Kind { name: "tar.gz", suffix: ".tar.gz" },
-            Kind { name: "tar.xz", suffix: ".tar.xz" },
-            Kind { name: "7z", suffix: ".7z" },
-            Kind { name: "msi", suffix: ".msi" },
-            Kind { name: "raw", suffix: "" },
+            Kind {
+                name: "zip",
+                suffix: ".zip",
+            },
+            Kind {
+                name: "tar.gz",
+                suffix: ".tar.gz",
+            },
+            Kind {
+                name: "tar.xz",
+                suffix: ".tar.xz",
+            },
+            Kind {
+                name: "7z",
+                suffix: ".7z",
+            },
+            Kind {
+                name: "msi",
+                suffix: ".msi",
+            },
+            Kind {
+                name: "raw",
+                suffix: "",
+            },
         ];
 
         let list: Vec<EngineSourceSpec> = serde_json::from_str(BUILTIN_SOURCES)
@@ -2285,7 +2314,9 @@ mod tests {
 
         const TOTAL: usize = 300_000;
         const HALF: usize = TOTAL / 2;
-        let payload: Vec<u8> = (0..TOTAL as u32).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+        let payload: Vec<u8> = (0..TOTAL as u32)
+            .map(|i| ((i * 31 + 7) % 251) as u8)
+            .collect();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2561,9 +2592,16 @@ mod tests {
         for s in &list {
             let Some(raw) = &s.sha256 else { continue };
             let h = s.expected_hash().expect("sha256 字段存在时应当能规范化");
-            assert_eq!(h.len(), 64, "{}@{} 的 sha256 长度不是 64：{h}", s.id, s.platform);
+            assert_eq!(
+                h.len(),
+                64,
+                "{}@{} 的 sha256 长度不是 64：{h}",
+                s.id,
+                s.platform
+            );
             assert!(
-                h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                h.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
                 "{}@{} 的 sha256 含非法字符或大写：{h}",
                 s.id,
                 s.platform

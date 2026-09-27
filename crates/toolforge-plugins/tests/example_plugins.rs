@@ -21,8 +21,8 @@
 
 use std::path::{Path, PathBuf};
 
-use toolforge_core::plugin::PluginManifest;
 use toolforge_core::pipeline::builtin_nodes;
+use toolforge_core::plugin::PluginManifest;
 
 /// 仓库根目录（本 crate 在 `crates/toolforge-plugins`）
 fn repo_root() -> PathBuf {

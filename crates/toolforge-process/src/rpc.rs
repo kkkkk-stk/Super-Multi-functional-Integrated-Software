@@ -158,7 +158,10 @@ pub enum RpcMessage {
     /// 带 id 的响应
     Response(RpcResponse),
     /// 通知：有 method 但没有 id
-    Notification { method: String, params: Value },
+    Notification {
+        method: String,
+        params: Value,
+    },
 }
 
 impl RpcMessage {
@@ -171,8 +174,8 @@ impl RpcMessage {
         if trimmed.is_empty() {
             return Err(RpcError::parse("空行"));
         }
-        let v: Value =
-            serde_json::from_str(trimmed).map_err(|e| RpcError::parse(format!("JSON 解析失败：{e}")))?;
+        let v: Value = serde_json::from_str(trimmed)
+            .map_err(|e| RpcError::parse(format!("JSON 解析失败：{e}")))?;
 
         let obj = v
             .as_object()
@@ -232,11 +235,13 @@ impl RpcMessage {
         let mut s = match self {
             RpcMessage::Request(r) => serde_json::to_string(r),
             RpcMessage::Response(r) => serde_json::to_string(r),
-            RpcMessage::Notification { method, params } => serde_json::to_string(&serde_json::json!({
-                "jsonrpc": JSONRPC_VERSION,
-                "method": method,
-                "params": params,
-            })),
+            RpcMessage::Notification { method, params } => {
+                serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": JSONRPC_VERSION,
+                    "method": method,
+                    "params": params,
+                }))
+            }
         }
         .unwrap_or_else(|_| String::from("{}"));
         s.push('\n');
@@ -259,8 +264,9 @@ mod tests {
 
     #[test]
     fn parses_request_with_numeric_id() {
-        let m = RpcMessage::parse_line(r#"{"jsonrpc":"2.0","id":7,"method":"run","params":{"a":1}}"#)
-            .unwrap();
+        let m =
+            RpcMessage::parse_line(r#"{"jsonrpc":"2.0","id":7,"method":"run","params":{"a":1}}"#)
+                .unwrap();
         match m {
             RpcMessage::Request(r) => {
                 assert_eq!(r.method, "run");
@@ -273,8 +279,9 @@ mod tests {
 
     #[test]
     fn parses_notification_without_id() {
-        let m = RpcMessage::parse_line(r#"{"jsonrpc":"2.0","method":"progress","params":{"p":0.5}}"#)
-            .unwrap();
+        let m =
+            RpcMessage::parse_line(r#"{"jsonrpc":"2.0","method":"progress","params":{"p":0.5}}"#)
+                .unwrap();
         match m {
             RpcMessage::Notification { method, params } => {
                 assert_eq!(method, "progress");

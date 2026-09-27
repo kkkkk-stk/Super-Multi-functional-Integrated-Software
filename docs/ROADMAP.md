@@ -1148,11 +1148,15 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   > 而 `toolforge`（外壳）那 16 条测试是 `settings_store` / `license_acks` / `sources_to_delete`
   > 的纯逻辑与文件 IO，**不需要 WebView**（本机实测：`cargo test -p toolforge` 16 通过 / 0 失败）。
   > 那句注释把一个**可以跑的覆盖**挡在了 CI 外面，现在把它加回去。
-- ⚠️ **`cargo fmt --check` 仍然不干净**，这一条**故意没有动**：
+- ⚠️ **`cargo fmt --check` 当时不干净**，那一条**故意留到下一轮**：
   * 实测 **271 处 diff / 30 个文件**（`pipeline.rs` 57、`nodes.rs` 44、`commands.rs` 28……）；
   * **CI 并没有把它列为必过项**（CI 的 Rust job 只跑 check / test / clippy），所以它不是"红的"，只是本文档里"无输出"那句话是**错的**；
-  * 全仓重排是一次纯机械但**覆盖面很大**的改动，会把这一轮的 diff 淹掉，而且它跟"这个项目现在能不能跑"没有关系。所以本轮只做两件事：**把文档里的假话改掉**（附 A 与验收标准 §2 都标注了实测数字），并把"要不要 `cargo fmt --all`"留成一个**明确的待决项**（`docs/ROADMAP.md` 里那条 🚧）。
+  * 全仓重排是一次纯机械但**覆盖面很大**的改动，所以当时先把文档里的假话改掉（附 A 与验收标准 §2 都标注了实测数字），把"要不要 `cargo fmt --all`"记为待决项。
+  > ✅ **已决定并执行（见 §3.20）**：选择**采用 rustfmt** —— `cargo fmt --all` 重排了 30 个文件，
+  > 并把 `cargo fmt --all --check` 加进 `pnpm check:all` 与 CI。理由：文档里写着"零格式差异"这个验收标准，
+  > 要么让它成真、要么把那句话删掉；而这个项目的原则一直是**让声明成真**。
 - 实测：`clippy --workspace --all-targets -- -D warnings` **退出码 0**；`cargo test --workspace` **280 passed / 0 failed**；`cargo check --workspace --all-targets` **0 error / 0 warning**；`verify-platform.mjs` **345 项全通过**。
+  （`cargo fmt --all --check` 当时还不干净 —— 已由 §3.20 处理。）
 
 ### 3.16 把「文档里写的检查点」逐条真的跑一遍（本轮）
 
@@ -1170,12 +1174,14 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 真机验收 | `node scripts/devtools/verify-platform.mjs` | ✅ **345 项全通过**（【0】+【1】–【30】） |
 | 真机验收（**全部六个脚本**） | `node scripts/devtools/run.mjs` | ✅ **六个脚本全部 exit=0**（inspect / smoke / e2e / verify / verify-platform / verify-runtimes，见 §3.18） |
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | ⚠️ `typecheck` ✅；**`pnpm lint` 是个空壳**：它写着"未安装 ESLint（可选依赖），本次回退为 `tsc --noEmit`"，所以**它提供不了任何 `tsc` 之外的检查**（`react-hooks/exhaustive-deps`、`no-explicit-any`、`no-unused-vars` 一条都没在跑）。⚠️ 但要说清：**这是当初刻意的取舍，不是漏做** —— `apps/desktop/.eslintrc.cjs` 开头就写着"本仓库刻意不把 ESLint 装进依赖清单"，并在注释里给了**确切的安装命令**（eslint@8 + @typescript-eslint 7 + react-hooks 4 + react-refresh 0.4）与规则集，连启用时要改成哪条脚本都写了。所以这一行的问题**只在于"验收表里写着它、它却不提供那个保障"**，现已直说。要不要真的启用（会动 `pnpm-lock.yaml`，且第一次跑多半有一批存量告警要清）仍是个**待你拍板**的决定 |
-| 格式 | `cargo fmt --check` | ⚠️ 不干净（271 处 diff / 30 个文件），见 §3.14 末尾 |
+| 格式 | `cargo fmt --all --check`（= `pnpm check:fmt`） | ✅ **零格式差异**（§3.20 完成全仓重排并把这一步接进 CI） |
 
 > 这一节的价值不在"跑一遍"，而在于**把"文档里写着"与"真的跑过"分开**：
-> 上表里每一条都留下了命令与实测值；而 `pnpm lint` 与 `cargo fmt --check` 这两条，
-> 之前都属于"文档说它有、实际它不提供那个保障"的那一类 —— 与 §3.10 的 `keep_original`、
+> 上表里每一条都留下了命令与实测值；其中 `pnpm lint` 与 `cargo fmt --check` 这两条，
+> 当时都属于"文档说它有、实际它不提供那个保障"的那一类 —— 与 §3.10 的 `keep_original`、
 > §3.11 的装饰品参数是同一个毛病，只是发生在**质量基线**上。
+> 后续处置：`cargo fmt` 那条已在 §3.20 变成真的（重排 + 接进 CI）；
+> `pnpm lint` 那条仍是**刻意的取舍**（见上表说明），要不要启用 ESLint 依旧是个开放决定。
 
 ### 3.15 一次**自己造成的事故**：928 MB 的权重被截成 0 字节（本轮发生、定位、修复并补上防线）
 
@@ -1364,6 +1370,31 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 - **验证**：改完重新构建、再跑 `pnpm bindings` 两次（内容稳定、`git status` 只剩源码那一个改动），
   然后**启动应用** —— 这一次 `git status` 保持干净，说明启动过程**不再**碰这个文件了。
 
+### 3.20 采用 rustfmt：把"零格式差异"这条验收标准**变成可失败的**（本轮）
+
+**决定**：不删那句验收标准，而是让它成真。`cargo fmt --all` 一次重排 **30 个文件**
+（1365 行增 / 681 行删，纯机械：结构体字面量换行、长表达式折行、参数列表展开），
+然后把 `cargo fmt --all --check` 接进 `pnpm check:fmt` → `pnpm check:all` → CI 的 Rust job。
+
+为什么不是"把文档里的假话删掉"：这个项目一路在做的就是**让声明与行为对齐**（§3.10 的 `keep_original`、
+§3.11 的装饰品参数、§3.16 的 `pnpm lint`），格式这条没有理由例外 —— 它此前是"文档写着零差异、
+实际 271 处差异、CI 又不检查"，三样凑在一起，等于一个**永远不会失败的验收标准**。
+
+**改动是否安全**（逐条查过，不是"应该没事"）：
+
+| 检查 | 结果 |
+|---|---|
+| 行尾没有被换成 CRLF | 抽查 `pipeline.rs`：CRLF 计数 **0**（仓库用 LF，`.gitattributes` 也是这么声明的） |
+| `cargo test --workspace --locked` | **280 passed / 0 failed**（与重排前一致） |
+| `cargo check --workspace --all-targets --locked` | **0 error / 0 warning** |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | **退出码 0**（含 `#[allow(clippy::vec_init_then_push)]` 那处仍是显式 allow） |
+| `cargo fmt --all --check` | **退出码 0**（重排前后对比见 §3.14 的 271 处） |
+| `node scripts/devtools/run.mjs` | **六个脚本全部 exit=0**（重排后重建二进制再跑） |
+
+> 顺带说清一件事：**每次改动 Rust 源码之后都要重跑真机套件**，哪怕改动"看起来只是格式"。
+> 格式重排会改变**二进制**（行号、调试信息、内联布局都可能变），而套件验的是**那个二进制**。
+> 本轮就是这么做的：重排 → 重建 → 六个脚本全绿 → 才提交。
+
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
 - `crates/toolforge-core/src/engine.rs` 里为每个引擎与模型都提供了 `license`、`license_note`、`requires_license_ack`，并且有测试在守护这些字段非空。
@@ -1484,7 +1515,7 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 - [x] ✅ `scripts/env.ps1`、`scripts/gen-icon.mjs` 已存在
 - [x] ✅ 补 `scripts/enginectl.mjs`（`package.json` 已引用；`list` 只读打印引擎目录 + 来源表状态，`install` 打印实际哈希）。**本机实测**（`node scripts/enginectl.mjs list`，退出码 0）：12 个引擎的"安装方式 / 核心 / 许可证 / 需确认许可证 / 下载源"五列全部打印出来，并会**主动警告**"`engine-sources.json` 里有 N 条下载源没有 sha256"（当前 N = 1，即 `ffmpeg@macos`）—— 它不会假装全部就绪。
 - [x] ✅ CI 基线：`cargo clippy --workspace --all-targets -- -D warnings` **已成为 CI 的一个 job，且本机实测全绿**（见 §3.14 —— 它此前是**红的**，而本地四道检查里没有它，所以一直没被发现）。
-- [ ] 🚧 `cargo fmt --check`：**当前不干净** —— 实测 **271 处 diff / 30 个文件**（见 §3.14 末尾）。CI **没有**把它列为必过项，所以它不是"红的"，只是本文档 §附 A 里那句"无输出"是**错的**。要不要跑一次 `cargo fmt --all` 做全仓重排，是一个**待你拍板**的决定（一次机械重排，diff 会很大）。
+- [x] ✅ `cargo fmt --all --check`：**已全仓重排并接进检查链**（30 个文件、纯机械改动；`pnpm check:fmt` + CI 各一步，见 §3.20）。
 - [ ] 🚧 `pnpm check:rust` / `check:web` / `check:all` 可执行
 - [ ] 🚧 `README.md` 更新为 ToolForge 架构说明（当前仍是占位内容）
 - [ ] 🚧 补 `docs/SECURITY.md` 与 `docs/PLUGIN-SDK.md`（已被代码与示例引用）
@@ -1494,7 +1525,7 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 1. `cargo test --workspace` 全绿，且 `cargo test -p toolforge-core` 恰好 **61 个测试通过、0 失败**。
    > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **280 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
 2. `cargo clippy --workspace --all-targets -- -D warnings` 无输出（零告警）。**当前实测：全绿**（§3.14 修掉了最后 13 处）。
-   `cargo fmt --check` **目前不干净**（271 处 diff / 30 个文件），且 **CI 不检查它** —— 这一条要么补上 fmt 重排、要么把这句话改掉，不能就这么挂着（见 §3.14 末尾）。
+   `cargo fmt --all --check` **也已经是干净的**，并已接进 `pnpm check:all` 与 CI（§3.20）—— 这条验收标准现在是**可失败的**，不再是一句空话。
 3. `cargo check --workspace --all-targets` 成功（即 `pnpm check:rust` 通过），且 `Cargo.lock` 已生成并入库。
 4. `pnpm check:all` 退出码为 0。
 5. `pnpm bindings` 成功生成 `bindings.ts`；**连续执行两次，第二次后 `git status` 为干净**（生成结果稳定、且文件已入库）。
@@ -1771,7 +1802,7 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 | 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 280 passed / 0 failed** |
 | 全目标检查 | `cargo check --workspace --all-targets` | 退出码 0 |
 | 静态质量 | `cargo clippy --workspace --all-targets -- -D warnings`（= `pnpm check:clippy`） | **当前实测全绿**（§3.14 之前是红的） |
-| 格式 | `cargo fmt --check` | ⚠️ **不干净**：271 处 diff / 30 个文件；CI 目前不检查它（要不要全仓重排待定，见 §3.14） |
+| 格式 | `cargo fmt --all --check`（= `pnpm check:fmt`） | ✅ **零格式差异**；已接进 `pnpm check:all` 与 CI（见 §3.20） |
 | 脚本编码 | `pnpm check:encodings` | 退出码 0（`.ps1` 含非 ASCII 必须有 BOM，行尾必须 CRLF；见 §3.13） |
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | `pnpm typecheck` 退出码 0 ✅；⚠️ **`pnpm lint` 目前回退为 `tsc --noEmit`（本项目刻意不装 ESLint，见 `apps/desktop/.eslintrc.cjs` 头部的说明与安装命令）—— 它不提供 `tsc` 之外的任何检查**。写成"退出码 0"会让人以为有 linter，见 §3.16 |
 | 聚合 | `pnpm check:all` | 退出码 0 |
