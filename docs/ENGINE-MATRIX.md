@@ -157,6 +157,10 @@ EngineModel {
   > ③ `audio.normalize` 的 `loudnorm` 会**悄悄把 44.1 kHz 重采样成 48 kHz**（滤镜内部按 192 kHz 处理、再落到编码器默认值），现在显式 `-ar` 保住源采样率。
 - **缺失时会发生什么**：上述 7 个节点**全部不可用**，没有降级路径。这是全部功能域中影响面最大的单点依赖——音视频域目前只有这一个引擎。UI 应显示「需要安装 FFmpeg」并提供下载入口。
 - **许可证与分发注意点**：`LGPL-2.1+ / GPL-2.0+（取决于编译选项）`。官方构建常启用 GPL 组件，如果产品闭源分发，必须选用 LGPL 构建或自行编译。`requiresLicenseAck: true`，下载前必须让用户确认。
+- **三平台的来源现在都有了**（Windows / Linux 已带真实哈希；macOS 见下）：
+  - `ffmpeg@windows` / `ffmpeg@linux`：**BtbN 的 GitHub 版本固定直链**（`autobuild-2026-09-26-13-03`，n8.1.3）。换源的原因不是"想换个新的"：gyan.dev 实测只有 **15~43 KB/s**（105 MB 要 40 分钟以上，而客户端总超时当时是 30 分钟 —— 也就是说它**根本下不完**），GitHub 上是 9.3 MB/s。
+  - 两个已知代价，写清楚：① BtbN **不发布校验和**，所以这两条的哈希是**自己下载后算的**，溯源强度低于"上游旁挂文件"；② 是 **GPL 构建**（`-gpl`，含 libx264 / libx265）—— BtbN 另有 `-lgpl` 构建，但**它不含 libx264**，`video.compress` / `video.transcode` 会直接不可用。许可证影响面由"不随应用分发、用户按需下载"限制住。
+  - `ffmpeg@macos`：evermeet 的版本直链（9.0.2，26,198,325 字节），**`sha256` 仍是 `null`** —— 本机取不到字节（HEAD / GET 都试过；它的 `info` 接口是通的，所以不是站点整体不可达）。**拿不到字节就不填哈希**：抄一个哈希比不填更糟。装它需要用户显式勾选「允许安装没有校验值的来源」（对话框里本来就有这一项），或者 `brew install ffmpeg`。
 
 #### 音频节点与 FFmpeg 的关系
 
@@ -172,6 +176,7 @@ EngineModel {
 - **缺失时会发生什么**：这 4 个节点不会失效，因为它们的 `requiresEngines` 都是空数组，libvips 只是 `optionalEngines` 中的首选。缺失后自动降级：先退到 ImageMagick，两者都缺失时退到纯 Rust 的 `image` crate。代价是批量/大图场景更慢、更吃内存（libvips 的价值正是在于低内存、流式处理）。
   > ✅ **这条降级链现在是真的 —— 但只覆盖 4 个节点**：`nodes.rs::pick_image_backend()` 真的按 `libvips → imagemagick → 纯 Rust` 的顺序挑后端，并把用的是哪个报在节点输出的 `backend` 里（详见 5.1）。走这条链的是 **`image.convert` / `image.resize` / `image.crop` / `image.rotate`**；而 **`image.enhance` 与 `image.strip-metadata` 仍然是纯 Rust 实现、一行都不问引擎** —— 对应的 `provides` 声明已经撤掉（见 6.2），所以现在声明与实现是一致的。
 - **已实测的一键安装**：libvips 8.18.6 通过应用安装成功，可执行文件落在托管布局的 `…/engines/libvips/bin/vips.exe`，磁盘占用约 29.67 MB（数据点与顺带修掉的两个 `toolforge-process` 缺陷见 1.3）。
+- **Linux / macOS 为什么没有来源（查过，不是没查）**：上游 `libvips/libvips` 的 release 里**只有源码包**（`vips-8.18.6.tar.xz`），既没有 macOS 也没有 Linux 二进制；Windows 有对应的构建仓库（`libvips/build-win64-mxe`），**macOS / Linux 没有对应物**。也查过 Homebrew 的 bottle（那是能下载的 tar.gz），但 bottle 里的 dylib 依赖其它几十个 formula，单独解出来跑不起来 —— 所以这两个平台走 `brew install vips` / `apt install libvips-tools`。**这一条曾经写着一份并不存在的 macOS 资产**（详见 1.3 与 `engine-sources.json` 的教训）。
 - **许可证与分发注意点**：`LGPL-2.1`。以动态库方式调用即可满足 LGPL 要求，无需开源你自己的代码——这也是它被选为图像域首选引擎的原因。`requiresLicenseAck: false`。
 
 #### ImageMagick（`imagemagick`）
@@ -181,7 +186,8 @@ EngineModel {
 - **缺失时会发生什么**：节点仍可用（都不是必需引擎），但 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 会失去第二层兜底（libvips 仍优先）。`image.rotate` 的处境要看实现而不是看声明：libvips 可用时 `nodes.rs::image_rotate` 会**先用 libvips**（非 90° 倍数用 `vips similarity --angle`，ImageMagick 用 `-rotate`），**只有两个引擎都没有、只剩纯 Rust 时**才返回 `EngineMissing`（见 5.1）。
 - **Windows 上现在有下载源了（本轮新增）**：`imagemagick@windows` → `ImageMagick-7.1.2-31-portable-Q16-x64.7z`（11,739,115 字节，sha256 `33d8b47b…`，`archive: "7z"`，**`stripComponents: 0`**）。三点结论是**直接执行**出来的，不是推断：① 官方 Windows 便携包**只有 `.7z`**（没有 zip）；② **Windows 自带的 `tar`（bsdtar / libarchive）能读 7z** —— 实测 `tar -xf` 退出码 0、`magick.exe -version` 打印 `ImageMagick 7.1.2-31 Q16 x64`，所以装 ImageMagick **不需要先装 7-Zip**（那正是当初把 7-Zip 自己设成 System-only 的死结）；③ 压缩包里**没有顶层目录**（23 个条目直接在根），所以 `stripComponents` 必须是 0 而不是习惯上的 1。Linux / macOS **故意不写来源**（走 `apt` / `brew`）。
   > ✅ **已复验（这条 ⚠️ 至此解除，保留作历史）**：原本写的是"应用内的完整安装链路**没有复验**"——会话期间 `toolforge.exe` 被一个无关进程持有文件句柄，cargo 写不回链接产物（`link.exe` 1104），二进制重建不了、跑不了。句柄释放后重建并**真的装了一遍**：11.7 MB 下载 → SHA-256 校验通过 → 系统 `tar` 解开 `.7z` → `magick.exe` 落在 `…/engines/imagemagick/magick.exe`，**241.5 MB**，探测到的版本是 `ImageMagick 7.1.2-31 Q16 x64`。所以上面那四点从"直接执行验证过的前提"升级成了"整条链路端到端跑通"。
-  > ⚠️ **FFmpeg 是另一回事，它仍然没装成**：本机 `www.gyan.dev` 不可达（`curl` 直测也连不上），所以 `ffmpeg@windows` 的**应用内安装链路至今没有被验证过一次**。这是**环境事实，不是代码缺陷** —— ImageMagick 装通了恰好证明同一条安装代码路径本身是好的。
+  > ⚠️ **FFmpeg 是另一回事，它仍然没装成**（历史注记，保留）：当时本机 `www.gyan.dev` 不可达，所以 `ffmpeg@windows` 的应用内安装链路没有被验证过。**这件事后来解决了** —— 来源换成 BtbN 的 GitHub 版本固定直链（gyan.dev 实测只有 15~43 KB/s，105 MB 根本下不完），FFmpeg 已装通并真跑过。
+- **Linux / macOS 为什么还是没有来源（查过，不是没查）**：GitHub release 里 Linux **只有 AppImage**（`ImageMagick-7.1.2-31-gcc-x86_64.AppImage`，33 MB）、macOS **完全没有便携归档**（只有 `.pkg` / `.dmg` 安装器）。AppImage 看着是个单文件、很适合 `archive: "raw"`，但**实际不行**：它要靠 FUSE 挂载（很多容器 / 服务器上不可用），拿到手还得 `chmod +x`，而托管布局按名字找的是 `magick` —— 一个叫 `ImageMagick-7.1.2-31-gcc-x86_64.AppImage` 的文件不会被认为"ImageMagick 已就位"。要支持它得为 AppImage 单独写一条解包路径，收益（`apt install imagemagick` / `brew install imagemagick` 一行命令的事）远小于代价，所以**刻意不写来源**：宁可按钮是灰的，也不放一个点了装不上的按钮。
 - **实测过的后端切换（本轮新增）**：把 `engines/libvips` 临时改名成 `engines_probe_all` → 应用日志里 `image.convert` 报 `后端 = ImageMagick（格式最全）`，并且真的产出了**有损 VP8** 的 WebP；随后把目录改回来，探测状态恢复为 `libvips = installed`。这就是"只有 ImageMagick 可用"那一档的环境基线 —— 它以前一直是空的，因为本机从来没装过 ImageMagick。`verify-platform.mjs`【12】把这个动作固化成了检查（改名 → 断言 → `finally` 还原，失败也会还原）。
 - **许可证与分发注意点**：`ImageMagick License（Apache-2.0 风格）`，本体宽松；但若链接了 GPL 组件（如部分 delegate）会传染，分发前需确认构建配置。`requiresLicenseAck: false`。
 
@@ -224,6 +230,8 @@ EngineModel {
 - **提供的节点（2 个）**：`doc.convert`、`ebook.convert`。
 - **缺失时会发生什么**：`doc.convert` **不可用**（`requiresEngines: ["pandoc"]`，无降级）。`ebook.convert` 不会因此被标记为不可用（它的 `requiresEngines` 是空数组），但会失去唯一可用的降级后端——只剩 `calibre`。若 `calibre` 也不在，`ebook.convert` 将没有任何可用后端。
 - **许可证与分发注意点**：`GPL-2.0+`。以独立进程调用不构成衍生作品，可随闭源应用分发；**但不得静态链接进你的二进制**。`requiresLicenseAck: true`。
+- **下载源**：Windows（zip，39.8 MB）与 Linux（tar.gz，33.3 MB）都有真实哈希；**macOS 没有来源**，而且这一条是"文件真的存在、但装了也没用"的典型：上游只发 `.pkg`，而 `.pkg` 要用 `installer` 以 root 安装到 `/usr/local`，**不是一个能解压出来用的归档**。留着它的实际后果是 macOS 用户下完 39.8 MB、解压产物里找不到 `pandoc` 可执行文件，于是引擎仍然显示未安装 —— 花了流量，得到一句"没装上"。所以那条**整个删掉**，macOS 只走 `brew install pandoc`。
+  > 📌 **一条留作 v0.2 的线索（没有验证过，所以没有写进数据表）**：macOS 自带 `pkgutil --expand-full <pkg> <dir>`，理论上能把 `.pkg` 解开、取出里面的 `pandoc` 二进制。**本机没有 macOS，这条路径一行都没有验证过** —— 按本项目的纪律，"看起来可行"不足以写进 `engine-sources.json`，所以它只是一条待验的线索，不是一个方案。
 
 #### LibreOffice (headless)（`libreoffice`）
 
@@ -282,7 +290,7 @@ EngineModel {
   > ✅ **这条边界现在已经定义好了（`nodes.rs::ebook_convert`），而且有一处必须记下来的教训。** `calibre` 优先（格式最全），缺了就退到 `pandoc`；但**在调用 pandoc 之前**，执行器会先按两张能力表（`PANDOC_EBOOK_IN` / `PANDOC_EBOOK_OUT`）检查输入输出扩展名，不通过就直接拒绝并要求装 Calibre。
   > 理由是本项目遇到过的**最阴的一种失败模式**：pandoc 对认不出的输出扩展名**不报错** —— 它打一句 `[WARNING] Could not deduce format from file extension .mobi` + `Defaulting to html`，然后**退出码 0**，文件也真的生成了，只是那是一个 HTML 文件被命名成了 `.mobi`。要是把 `mobi` 直接交给它，用户会拿到一个"转换成功"的、扩展名骗人的坏文件。**它认不出输入格式时更糟：会把文件当纯文本读，产出垃圾。** 所以这里不能相信子进程的退出码，必须自己把关。
   > **实测**（真机）：epub → docx 产出的是真正的 `PK` magic ZIP；epub → md 中文文本完整保留；epub → mobi 且没有 Calibre 时被**干净地拒绝**，磁盘上不留任何东西。`verify-platform.mjs` 的【9】号检查盯着这条降级与拦停。
-- **许可证与分发注意点**：`GPL-3.0`，强 copyleft。仅以独立进程调用；**如要随包分发请先做合规评审**。`requiresLicenseAck: true`。与 `libreoffice`、`tesseract` 一样，它也只有 `System` 一种安装方式。
+- **许可证与分发注意点**：`GPL-3.0`，强 copyleft。仅以独立进程调用；**如要随包分发请先做合规评审**。`requiresLicenseAck: true`。它也只有 `System` 一种安装方式 —— 官方只发安装器，`calibre-portable` 还得先有 Calibre 才能自解压（同 7-Zip 那个坑，见 3.4），所以 `download_platforms` 是空数组。
 
 ### 3.6 AI 域与跨域运行时
 

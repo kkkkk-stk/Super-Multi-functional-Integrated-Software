@@ -110,7 +110,7 @@
 | --- | --- |
 | `scripts/env.ps1` | ✅ 已存在（把 Rust 工具链与 pnpm 指向仓库内 `.tools/`） |
 | `scripts/gen-icon.mjs` | ✅ 已存在（182 行）。`package.json` 的 `icons` 脚本已能走到它 |
-| `scripts/enginectl.mjs` | 🚧 **不存在**，但 `package.json` 的 `engines:list` / `engines:install` 已引用它（见不一致项 4） |
+| `scripts/enginectl.mjs` | ✅ 已存在（`package.json` 的 `engines:list` / `engines:install` 指向它）。**历史**：这里曾写着"🚧 不存在，但 `package.json` 已引用"（见不一致项 4）—— 那个不一致已经消掉，本机实测 `list` 退出码 0 |
 | `.gitignore` | ✅ 已就绪：忽略 `target/`、`/engines/`、`/models/`、`apps/desktop/src-tauri/{engines,models}/`、`plugins/**/target/`、`plugins/**/*.wasm`、`plugins/**/dist/`、`plugins/**/.venv/`、`.tools/`、`.cache/`，并且**显式说明前端的 `bindings.ts` 要入库** |
 | `rust-toolchain.toml` | ✅ `channel = "stable"`、`profile = "minimal"` |
 | CI 配置 | 🚧 不存在（无 `.github/` 等） |
@@ -977,7 +977,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 
 - [x] ✅ `.gitignore` 已就绪（含前端口径：`bindings.ts` 要入库）
 - [x] ✅ `scripts/env.ps1`、`scripts/gen-icon.mjs` 已存在
-- [ ] 🚧 补 `scripts/enginectl.mjs`（`package.json` 已引用；在引擎哈希回填之前，先让 `list` 能只读地打印 `engine-sources.json`）
+- [x] ✅ 补 `scripts/enginectl.mjs`（`package.json` 已引用；`list` 只读打印引擎目录 + 来源表状态，`install` 打印实际哈希）。**本机实测**（`node scripts/enginectl.mjs list`，退出码 0）：12 个引擎的"安装方式 / 核心 / 许可证 / 需确认许可证 / 下载源"五列全部打印出来，并会**主动警告**"`engine-sources.json` 里有 N 条下载源没有 sha256"（当前 N = 1，即 `ffmpeg@macos`）—— 它不会假装全部就绪。
 - [ ] 🚧 CI 基线：`cargo fmt --check`、`cargo clippy --workspace -- -D warnings`、`cargo test --workspace` 三条必过
 - [ ] 🚧 `pnpm check:rust` / `check:web` / `check:all` 可执行
 - [ ] 🚧 `README.md` 更新为 ToolForge 架构说明（当前仍是占位内容）
@@ -1019,9 +1019,11 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 - [ ] ⛔ 回填**全部 12 条**下载源的 `sha256`，否则 `install` 会按设计拒绝下载（不一致 3）
 - [ ] 🚧 许可证闸门：把 `requires_license_ack` 接进 `install` 路径，未确认不得安装；确认结果落盘（不一致 4）
 - [ ] 🚧 引擎接入：ffmpeg / pandoc / libreoffice / 7zip 已在 `nodes.rs` 中真实接线，需在真实环境逐个跑通
-  > 进度：**libvips 已跑通**（一键安装成功 + 四个图像节点真实调用，见上面两条与「阻塞 14」）；**ImageMagick 现在也装过、也实测过了**（本轮：应用内安装成功 241.5 MB 的 `magick.exe`，版本 7.1.2-31 Q16 x64；藏掉 `engines/libvips` 后后端日志 = ImageMagick（格式最全）、产出有损 VP8 WebP，见 §3 与开放项 8）。ffmpeg / pandoc / libreoffice / 7zip 这四个"必需引擎"档位的逐个真机跑通仍未完成。另外 FFmpeg 在本机因 `www.gyan.dev` 不可达而**未能完成安装** —— 那是环境问题，不是代码缺陷（见 §3）。
+  > 进度：**libvips 已跑通**（一键安装成功 + 四个图像节点真实调用，见上面两条与「阻塞 14」）；**ImageMagick 现在也装过、也实测过了**（应用内安装成功 241.5 MB 的 `magick.exe`，版本 7.1.2-31 Q16 x64；藏掉 `engines/libvips` 后后端日志 = ImageMagick（格式最全）、产出有损 VP8 WebP，见 §3 与开放项 8）；**FFmpeg 也已装通并真跑过**（n8.1.3，484 MB；7 个音视频节点用 ffprobe 读回真实属性验证，见【17】）；**7-Zip 已装通**（26.03，`verify-platform.mjs`【18】用系统 tar 独立解回来逐字节比对）。
+  > **剩下的一个**：`libreoffice`（约 420 MB，且只有系统安装模式）—— 它的 `doc.to-pdf` 至今没有真机基线。
+  > **历史**（保留）：这一段原来写着"ffmpeg / pandoc / libreoffice / 7zip 四个必需引擎的逐个真机跑通仍未完成，且 FFmpeg 因 `www.gyan.dev` 不可达而未能完成安装" —— 那是环境问题不是代码缺陷，后来把来源换成 BtbN 的 GitHub 地址就解决了（见 §3）。
 - [ ] 🚧 **真实接通图片加速链路（libvips 与 ImageMagick 都已达成，图像域那两个节点仍缺）**：`libvips` 已由 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 真实调用并可在日志/节点输出里观测（`verify-platform.mjs`【6】在真机上验证），**中间档 ImageMagick 也已实测被挑中**（【12】）；仍缺的是 —— `image.enhance` / `image.strip-metadata` 不接外部后端（这是性能议题，声明侧已经不再谎称"装了会更快"）、**三档结果一致性没有测试**（见不一致 2 的更新）。
-- [ ] 🚧 `scripts/enginectl.mjs`：`list` / `install` / `verify` / `clean` 子命令
+- [ ] 🚧 `scripts/enginectl.mjs`：`list` / `install` ✅ 已有并实测；`verify` / `clean` 仍未实现
 - [ ] 🚧 离线 / 镜像源可配置（企业内网可用）
 
 **L2 WASM 运行时**
