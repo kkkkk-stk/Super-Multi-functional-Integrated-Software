@@ -29,6 +29,7 @@
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -2895,6 +2896,267 @@ c.section('【20】"一句话生成插件"闭环：草稿 → 审核 → 安装 
       await client.invoke('settings_patch', { patch: { ai: restore } }).catch(() => {});
     }
     mock.kill();
+  }
+}
+
+// ============================================================================
+// 【21】任务取消：子进程真的被杀掉、队列记账对得上
+// ============================================================================
+//
+// `jobs_cancel` 是**安全相关**的：用户在界面上点"取消"，期待的是"它现在停下"，
+// 而不是"界面说取消了、后台还在写文件"。这条路径此前**没有任何运行时验证**
+// （`docs/ROADMAP.md` 的开放项里就写着"取消路径可验证：取消令牌触发后子进程树被杀死，无孤儿"）。
+//
+// 这一节用的是**真实工作负载**：内置 `doc-to-pdf` 插件处理一份两万段的 docx
+// （实测四千段约 8 秒，两万段留出的取消窗口足够）。选 LibreOffice 还有一个原因：
+// 它会派生 `soffice.bin` —— 正好用来检验"取消之后有没有孤儿进程"。
+//
+// 顺带把四个此前从没被调用过的队列命令走一遍：`jobs_list` / `jobs_stats` /
+// `jobs_retry` / `jobs_clear_finished`，外加 `models_remove`（用**备份还原**，
+// 全程零网络：先把权重文件复制到一边，移除后用命令确认状态，再复制回来）。
+c.section('【21】任务取消：子进程真的被杀掉、队列记账对得上');
+{
+  /** 列出某个镜像名的进程（跨平台；取不到就返回空数组） */
+  const listProcesses = (imageName) => {
+    try {
+      if (process.platform === 'win32') {
+        const out = execFileSync(
+          'tasklist',
+          ['/FI', `IMAGENAME eq ${imageName}`, '/FO', 'CSV', '/NH'],
+          { encoding: 'utf8', windowsHide: true }
+        );
+        return out
+          .split(/\r?\n/)
+          .map((l) => /^"([^"]+)","(\d+)"/.exec(l))
+          .filter(Boolean)
+          .map((m) => m[2]);
+      }
+      const out = execFileSync('pgrep', ['-f', imageName], { encoding: 'utf8' });
+      return out.trim().split('\n').filter(Boolean);
+    } catch {
+      return [];
+    }
+  };
+
+  const engines = await client.invoke('engines_probe_all');
+  const usable = (id) => {
+    const e = engines.find((x) => x.descriptor.id === id);
+    return Boolean(e && (e.status.state === 'detected' || e.status.state === 'installed'));
+  };
+
+  if (!usable('libreoffice')) {
+    c.note('跳过：本机没有可用的 LibreOffice（取消测试需要一个"跑得够久"的任务）');
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    // ---- 素材：两万段的 docx ----
+    const work = join(REPO_ROOT, '.tools', 'smoke', 'out-cancel');
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+    const bigDocx = join(work, 'big.docx');
+    const paras = Array.from(
+      { length: 20000 },
+      (_, i) => `第 ${i} 段：这是一段用来把转换时间拉长的正文，取消测试需要它跑得够久。`
+    ).join('\n');
+    writeFileSync(bigDocx, makeDocx(paras));
+    console.log(`   输入：${(readFileSync(bigDocx).length / 1024).toFixed(0)} KB / 20000 段`);
+
+    const outDir = join(work, 'out');
+    mkdirSync(outDir, { recursive: true });
+    const beforeProcs = new Set(listProcesses('soffice.bin'));
+
+    const sub = await client.invoke('plugins_run', {
+      req: {
+        pluginId: 'com.toolforge.builtin.doc-to-pdf',
+        inputs: { src: [bigDocx] },
+        params: {},
+        outputDir: outDir,
+      },
+    });
+    // 等它真的进入 running（否则会把"还没来得及启动"当成"取消成功"）
+    let running = false;
+    for (let i = 0; i < 40; i++) {
+      const j = await client.invoke('jobs_get', { jobId: sub.jobId });
+      if (j?.status === 'running') {
+        running = true;
+        break;
+      }
+      if (['succeeded', 'failed', 'cancelled'].includes(j?.status)) break;
+      await sleep(500);
+    }
+    c.check(running, '① 任务进入了 running（取消测试的前提）', running ? 'running' : '还没开始就结束了');
+
+    if (running) {
+      const t0 = Date.now();
+      const after = await client.invoke('jobs_cancel', { jobId: sub.jobId });
+      c.check(
+        after?.status === 'cancelled' || after?.status === 'running',
+        '② `jobs_cancel` 被接受（返回的任务对象状态已变更或正在收敛）',
+        String(after?.status)
+      );
+
+      let final = null;
+      for (let i = 0; i < 60; i++) {
+        const j = await client.invoke('jobs_get', { jobId: sub.jobId });
+        if (['succeeded', 'failed', 'cancelled'].includes(j?.status)) {
+          final = j;
+          break;
+        }
+        await sleep(500);
+      }
+      const secs = ((Date.now() - t0) / 1000).toFixed(1);
+      console.log(`   取消后 ${secs} 秒收敛：${final?.status}`);
+      c.check(final?.status === 'cancelled', '★ ③ 任务最终状态是 cancelled（不是"仍在跑"）', String(final?.status));
+      c.check(
+        (final?.outputs ?? []).length === 0,
+        '④ 被取消的任务不报告任何产出（不能把半截 PDF 当成结果）',
+        JSON.stringify(final?.outputs ?? [])
+      );
+      // 收尾：等一会儿再数进程 —— 杀进程是异步的，立刻数会数到"正在退出的那个"
+      await sleep(2500);
+      const afterProcs = listProcesses('soffice.bin');
+      const leaked = afterProcs.filter((p) => !beforeProcs.has(p));
+      c.check(
+        leaked.length === 0,
+        '★ ⑤ 取消后没有留下孤儿的 soffice.bin（LibreOffice 会派生它，正是最容易漏杀的那个）',
+        leaked.length ? `残留 PID：${leaked.join(', ')}` : `取消前 ${beforeProcs.size} 个，取消后 ${afterProcs.length} 个`
+      );
+
+      // ---- 队列记账 ----
+      const snap = await client.invoke('jobs_list', { req: { filter: {} } });
+      const listed = (snap?.jobs ?? []).find((j) => j.id === sub.jobId);
+      c.check(Boolean(listed), '⑥ `jobs_list` 里能找到这个任务', listed?.status ?? '(没有)');
+      c.check(
+        listed?.status === 'cancelled',
+        '⑦ 列表里的状态与 `jobs_get` 一致（不存在两套口径）',
+        String(listed?.status)
+      );
+
+      const stats = await client.invoke('jobs_stats');
+      c.check(
+        (stats?.cancelled ?? stats?.byStatus?.cancelled ?? 0) >= 1,
+        '⑧ `jobs_stats` 把取消计入统计',
+        JSON.stringify(stats)
+      );
+
+      // ---- 重试：插件运行注册过重放闭包，应当能重跑 ----
+      //
+      // ⚠️ 这里踩到一个真实细节，值得写下来：**重放会创建一个新任务（新 id）**。
+      // 第一版按旧 id 轮询，于是永远读到上一次的终态 `cancelled`，
+      // 接着对已经结束的旧任务又调了一次取消（无效），而新任务其实在跑 ——
+      // 结果 ⑪ 把新任务正在用的 `soffice.bin` 误判成"取消留下的孤儿"。
+      // **一个返回说谎的 API 能让上游结论完全反掉**，所以 `jobs_retry` 现在返回新 id。
+      const retryId = await client.invoke('jobs_retry', { jobId: sub.jobId });
+      c.check(
+        typeof retryId === 'string' && retryId.length > 0 && retryId !== sub.jobId,
+        '⑨ `jobs_retry` 返回**新任务**的 id（重放是重新提交，id 必然不同）',
+        `旧 ${sub.jobId} → 新 ${retryId}`
+      );
+
+      // 新任务要真的跑起来
+      let retriedStatus = '';
+      let sawRunning = false;
+      for (let i = 0; i < 60; i++) {
+        const j = await client.invoke('jobs_get', { jobId: retryId });
+        retriedStatus = j?.status ?? '';
+        if (retriedStatus === 'running') {
+          sawRunning = true;
+          break;
+        }
+        if (['succeeded', 'failed', 'cancelled'].includes(retriedStatus)) break;
+        await sleep(300);
+      }
+      c.check(sawRunning, '⑩ 重试之后新任务真的开始跑了（不只是"入队成功"）', retriedStatus);
+
+      if (sawRunning) {
+        await client.invoke('jobs_cancel', { jobId: retryId });
+        for (let i = 0; i < 60; i++) {
+          const j = await client.invoke('jobs_get', { jobId: retryId });
+          if (['succeeded', 'failed', 'cancelled'].includes(j?.status)) break;
+          await sleep(500);
+        }
+        await sleep(2500);
+        const leaked2 = listProcesses('soffice.bin').filter((p) => !beforeProcs.has(p));
+        c.check(
+          leaked2.length === 0,
+          '⑪ 重试出来的那个任务被取消后，同样没有孤儿进程',
+          leaked2.length ? `残留 PID：${leaked2.join(', ')}` : '干净'
+        );
+      }
+
+      const cleared = await client.invoke('jobs_clear_finished');
+      c.check(Number(cleared) >= 1, '⑫ `jobs_clear_finished` 清掉了已结束的任务', String(cleared));
+      const after2 = await client.invoke('jobs_list', { req: { filter: {} } });
+      const stillThere = (after2?.jobs ?? []).some((j) => j.id === sub.jobId);
+      c.check(!stillThere, '⑬ 清理之后它不再出现在列表里', stillThere ? '还在' : '已移除');
+    }
+  }
+
+  // ---- 顺带：三个从没被调用过的只读命令 ----
+  const info = await client.invoke('app_info');
+  c.check(Boolean(info?.version), '⑭ `app_info` 报得出应用版本', JSON.stringify(info));
+  const paths = await client.invoke('app_paths');
+  // `app_paths` 返回的是 `{entries: [{label, path}]}`（给"设置 → 关于"那张表用），
+  // 不是 `{dataDir, cacheDir}` —— 第一版按后者断言，于是把一条**正确的**返回判成了失败。
+  const entries = paths?.entries ?? [];
+  c.check(
+    entries.length >= 4 && entries.every((e) => e.label && e.path),
+    '⑮ `app_paths` 返回若干条带标签的目录（不是空表、也不是同一路径填两遍）',
+    `${entries.length} 条：${entries.map((e) => e.label).join(' / ')}`
+  );
+  c.check(
+    new Set(entries.map((e) => e.path)).size === entries.length,
+    '⑮b 这些目录路径互不相同',
+    entries.map((e) => e.path).join(' / ')
+  );
+  const sys = await client.invoke('system_status');
+  c.check(Boolean(sys), '⑯ `system_status` 有返回', JSON.stringify(sys).slice(0, 120));
+
+  // ---- `models_remove`：用备份还原，全程零网络 ----
+  //
+  // ⚠️ `ModelEntry` 里**没有 `path` 字段**（前端不需要知道落盘路径），
+  // 而且落盘结构是 `<data>/models/<modelId>/<file_name>.onnx` —— 文件名不一定等于 id
+  // （`birefnet-lite` 落成 `model.onnx`，`realesrgan-x4plus` 落成 `realesrgan-x4-256.onnx`）。
+  // 第一版按 `m.path` 取，于是这一节被静默跳过（"没有已安装的权重"），
+  // 而机器上其实装着 6 个 —— **一条永远跳过的检查等于没有检查**，这次改成自己找文件。
+  const models = await client.invoke('models_list');
+  const installedModel = (models ?? []).find((m) => m.installed);
+  const dataDir = (await client.invoke('app_paths'))?.entries?.find((e) => e.label === '数据目录')?.path;
+  const modelDir = dataDir && installedModel ? join(dataDir, 'models', installedModel.id) : null;
+  let modelFile = null;
+  if (modelDir && existsSync(modelDir)) {
+    const files = readdirSync(modelDir).filter((f) => f.endsWith('.onnx'));
+    if (files.length === 1) modelFile = join(modelDir, files[0]);
+  }
+  if (!installedModel || !modelFile) {
+    c.note(
+      `（找不到已安装权重的落盘文件，跳过 models_remove：installedModel=${
+        installedModel?.id ?? '无'
+      }，modelDir=${modelDir ?? '无'}）`
+    );
+  } else {
+    const backup = `${modelFile}.verify-backup`;
+    const sizeBefore = statSync(modelFile).size;
+    copyFileSync(modelFile, backup);
+    try {
+      await client.invoke('models_remove', { modelId: installedModel.id });
+      const after = await client.invoke('models_list');
+      const m2 = (after ?? []).find((m) => m.id === installedModel.id);
+      c.check(m2 && m2.installed === false, '⑰ `models_remove` 之后权重显示为未安装', String(m2?.installed));
+      c.check(!existsSync(modelFile), '⑱ 文件真的被删掉了（不是只改了状态）', modelFile);
+    } finally {
+      // 还原：把它放回去，后面的检查（以及用户的机器状态）不该被这一节改坏
+      mkdirSync(dirname(modelFile), { recursive: true });
+      copyFileSync(backup, modelFile);
+      rmSync(backup, { force: true });
+    }
+    const restored = await client.invoke('models_list');
+    const m3 = (restored ?? []).find((m) => m.id === installedModel.id);
+    c.check(Boolean(m3?.installed), '⑲ 还原之后权重重新被认作已安装（这一节不留副作用）', String(m3?.installed));
+    c.check(
+      existsSync(modelFile) && statSync(modelFile).size === sizeBefore,
+      '⑳ 还原出来的文件字节数与原来一致（不是被截断的空壳）',
+      `${statSync(modelFile).size} / ${sizeBefore}`
+    );
   }
 }
 

@@ -686,8 +686,13 @@ pub async fn plugins_run(
     app.queue.set_retry(
         &response.job_id,
         Arc::new(move || {
-            if let Err(e) = submit_plugin_run(&retry_app, retry_req.clone()) {
-                tracing::warn!("重试提交失败：{}", e.message);
+            match submit_plugin_run(&retry_app, retry_req.clone()) {
+                // 返回**新任务的 id**：重放是重新提交，任务 id 一定不同
+                Ok(r) => Some(toolforge_core::ids::JobId::from(r.job_id)),
+                Err(e) => {
+                    tracing::warn!("重试提交失败：{}", e.message);
+                    None
+                }
             }
         }),
     );
@@ -1021,11 +1026,14 @@ fn expand_batches(
 }
 
 /// 任务重试。仅对注册过重放闭包的任务有效（插件运行可以，引擎安装与 AI 生成不行）。
+///
+/// **返回的是新任务的 id**，不是传进来的那个：重放会重新提交一次
+/// （`submit_plugin_run` → `queue.create()`），拿到的是一个新任务。
+/// 调用方应当用返回值去跟踪这次重试；旧 id 会永远停在它的终态上。
 #[tauri::command]
 #[specta::specta]
 pub async fn jobs_retry(state: State<'_, Arc<AppState>>, job_id: String) -> ToolforgeResult<String> {
-    state.queue.retry(&job_id)?;
-    Ok(job_id)
+    Ok(state.queue.retry(&job_id)?.to_string())
 }
 
 // ============================================================================

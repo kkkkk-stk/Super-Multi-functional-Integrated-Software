@@ -45,7 +45,13 @@ export const commands = {
 	jobsCancel: (jobId: string) => typedError<Job_Serialize, ToolforgeError_Serialize>(__TAURI_INVOKE("jobs_cancel", { jobId })),
 	jobsClearFinished: () => typedError<number, ToolforgeError_Serialize>(__TAURI_INVOKE("jobs_clear_finished")),
 	jobsStats: () => typedError<JobStats, ToolforgeError_Serialize>(__TAURI_INVOKE("jobs_stats")),
-	/**  任务重试。仅对注册过重放闭包的任务有效（插件运行可以，引擎安装与 AI 生成不行）。 */
+	/**
+	 *  任务重试。仅对注册过重放闭包的任务有效（插件运行可以，引擎安装与 AI 生成不行）。
+	 * 
+	 *  **返回的是新任务的 id**，不是传进来的那个：重放会重新提交一次
+	 *  （`submit_plugin_run` → `queue.create()`），拿到的是一个新任务。
+	 *  调用方应当用返回值去跟踪这次重试；旧 id 会永远停在它的终态上。
+	 */
 	jobsRetry: (jobId: string) => typedError<string, ToolforgeError_Serialize>(__TAURI_INVOKE("jobs_retry", { jobId })),
 	enginesCatalog: () => typedError<EngineEntry_Serialize[], ToolforgeError_Serialize>(__TAURI_INVOKE("engines_catalog")),
 	enginesProbeAll: () => typedError<EngineEntry_Serialize[], ToolforgeError_Serialize>(__TAURI_INVOKE("engines_probe_all")),

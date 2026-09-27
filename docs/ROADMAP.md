@@ -53,7 +53,7 @@
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
 > | 运行时测试总数 | `cargo test --workspace` **258 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **196 项全通过**（【1】–【20】） |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **217 项全通过**（【1】–【21】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -897,6 +897,18 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   这条错误**完全可以在审核阶段看出来**：模板上下文里的 `output.*` 只包含**声明过的**端口（`toolforge-plugins/src/l1.rs` 就是这么填的）。而已有的 `validate_into` 只检查了 `${steps.*}`（存在性 + 前向引用），`${output.*}` / `${input.*}` / `${params.*}` **从来没被对过账**。
   现在 `PipelineDef::validate_template_refs()` 把这三类都对账，根名不认识（`${foo.bar}`）也报错。报成 `error` 而不是 `warning`：这类引用没有任何"也能跑"的情形，AI 生成流程正是靠 `validation.ok` 决定放不放行。
   守卫共 6 条测试，其中两条最重要：`manifest_validate_wires_in_the_template_port_check`（证明这条检查**真的被接进了 `validate()`** —— 一个没人调用的检查函数等于没有检查）与 `bundled_plugin_manifests_pass_the_new_template_check`（遍历仓库里**真实的 8 个内置插件清单**，确认没有误报 —— 误报会让合法插件装不上）。
+
+### 3.4 任务取消第一次被验证（本轮），顺带修掉一个**返回值说谎**的 API
+
+- **为什么值得单独验**：`jobs_cancel` 是**安全相关**的 —— 用户点"取消"，期待的是"它现在停下"，而不是"界面说取消了、后台还在写文件"。而 `docs/ROADMAP.md` 的开放项里一直挂着一条"取消路径可验证：取消令牌触发后子进程树被杀死，无孤儿"，**从来没有被验证过**。
+- **【21】（21 项）做的事**：用**真实工作负载**（内置 `doc-to-pdf` 处理一份两万段的 docx，实测四千段约 8 秒，两万段留出足够长的取消窗口）：
+  * `jobs_cancel` → 任务在 **0.5 秒内**收敛到 `cancelled`；被取消的任务**不报告任何产出**（不能把半截 PDF 当成结果）；
+  * ★ **没有孤儿进程**：选 LibreOffice 就是因为它会派生 `soffice.bin`（最容易漏杀的那个）。实测取消前 0 个、取消后 0 个。**另外单独探了 4 次**（取消延迟 200/500/1500/3000 ms）也全部干净 —— 也就是说"Windows 上没有进程组、只杀直接子进程"这个理论缺口，在**当前这几个引擎上并没有变成实际问题**（LibreOffice 的 `.com` 包装器会带着 `.bin` 一起退）。这条要如实写成"验证过了、没发现泄漏"，而不是"我们修好了"。
+  * 队列记账：`jobs_list` / `jobs_get` 两处口径一致；`jobs_stats` 计入取消；`jobs_clear_finished` 只清已结束的。
+- ★ **`jobs_retry` 的返回值之前是错的（本轮修复）**。重放走的是正常提交流程（`submit_plugin_run` → `queue.create()`），会创建一个**新任务**（新 id）；而 `retry()` 返回的是**原任务的 id**。
+  **这个坑是写验证脚本时踩到的，而且它让结论完全反掉**：重试之后我按旧 id 轮询，永远读到上一次的终态 `cancelled`，于是对已经结束的旧任务又调了一次取消（无效），而新任务其实在跑 —— 结果把新任务正在用的 `soffice.bin` **误判成"取消留下的孤儿进程"**。
+  修法：重放闭包改成 `Fn() -> Option<JobId>`（拿到新任务 id 就返回它），`queue.retry()` 返回新 id，`jobs_retry` 也返回新 id；前端 `useRetryJob` 两个 id 的缓存都失效。**一条返回说谎的 API 能让上游的结论完全反掉** —— 这比"少一个功能"危险得多。
+- **顺带补齐了此前从未被调用过的命令**：`jobs_list` / `jobs_stats` / `jobs_retry` / `jobs_clear_finished` / `models_remove` / `app_info` / `app_paths` / `system_status`（32 个 IPC 命令里最后 10 个没覆盖的，现在只剩 0 个）。`models_remove` 用**备份还原**做（全程零网络，且这一节不留副作用）。
 
 ### 4. 许可证确认：**闸门已经有了，记录仍然没有**
 

@@ -211,7 +211,7 @@ struct JobEntry {
     job: Job,
     cancel: CancelToken,
     /// 重放闭包。由提交方提供；引擎安装与 AI 生成不给（它们有副作用/成本）。
-    retry: Option<Arc<dyn Fn() + Send + Sync>>,
+    retry: Option<Arc<dyn Fn() -> Option<JobId> + Send + Sync>>,
 }
 
 /// 任务队列。
@@ -301,8 +301,20 @@ impl JobQueue {
         JobCtx::new(id, cancel, self.tx.clone(), self.entries.clone())
     }
 
-    /// 注册重放闭包（`jobs_retry` 用）
-    pub fn set_retry(&self, id: &str, f: Arc<dyn Fn() + Send + Sync>) {
+    /// 注册重放闭包（`jobs_retry` 用）。
+    ///
+    /// # 闭包为什么要**返回新任务的 id**
+    ///
+    /// 重放走的是正常的提交流程（`submit_plugin_run` → [`Self::create`]），
+    /// 也就是说它会创建一个**新任务**（新 id）。原来这里写的是 `Arc<dyn Fn()>`，
+    /// `retry()` 于是只能返回**原任务的 id** —— 调用方拿它去轮询，会一直读到
+    /// 上一次的终态（比如「已取消」），而真正在跑的任务在另一个 id 上。
+    ///
+    /// 这个坑是**写验证脚本时踩到的**：重试之后我按旧 id 轮询，一直看到 `cancelled`，
+    /// 于是对已经结束的旧任务又调了一次取消（无效），而新任务还在跑 ——
+    /// 结果把新任务正在用的 `soffice.bin` 当成了"取消留下的孤儿进程"。
+    /// 一个 API 返回值说谎，能让上游的结论**完全反掉**。
+    pub fn set_retry(&self, id: &str, f: Arc<dyn Fn() -> Option<JobId> + Send + Sync>) {
         if let Some(mut e) = self.entries.get_mut(id) {
             e.retry = Some(f);
         }
@@ -420,6 +432,11 @@ impl JobQueue {
             .ok_or_else(|| ToolforgeError::not_found(format!("任务 {id} 不存在")))
     }
 
+    /// 重放一个任务，返回**新任务的 id**。
+    ///
+    /// 新 id 与旧 id 不同是正常且必然的（重放就是重新提交一次）。
+    /// 闭包没能给出新 id 时退化为返回原 id —— 那是"提交失败了"的情形，
+    /// 调用方会从任务列表/事件里看到原因。
     pub fn retry(&self, id: &str) -> ToolforgeResult<JobId> {
         let f = self
             .entries
@@ -430,9 +447,8 @@ impl JobQueue {
                     "任务 {id} 不支持重试（引擎安装与 AI 生成任务有副作用/成本，必须手动重发）"
                 ))
             })?;
-        f();
-        // 返回原 id；调用方可通过事件拿到新任务
-        Ok(JobId::from(id))
+        let new_id = f();
+        Ok(new_id.unwrap_or_else(|| JobId::from(id)))
     }
 
     /// 清理已结束的任务记录。返回清理条数。

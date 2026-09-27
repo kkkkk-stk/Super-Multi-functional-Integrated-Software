@@ -84,14 +84,19 @@ export function useCancelJob() {
  * 后端只对**注册过重放闭包**的任务放行（插件运行可以；引擎安装与 AI 生成不行，
  * 因为会重复下载 / 重复计费）。`JobKind` 上也有 `is_retryable()` 的同口径判断，
  * UI 用 `isRetryableKind()` 决定要不要显示按钮，真正的裁决仍然在后端。
+ *
+ * ⚠️ **返回值是「新任务」的 id，不是传进去的那个**：重放会重新提交一次，
+ * 拿到的是一个新任务。两个 id 都要失效缓存 —— 旧的在列表里要变成"已取消"，
+ * 新的那张卡片要被拉进来。
  */
 export function useRetryJob() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (jobId: string) => jobsRetry(jobId),
-    onSuccess: (jobId: string) => {
+    mutationFn: (jobId: string) => jobsRetry(jobId).then((newId) => ({ oldId: jobId, newId })),
+    onSuccess: ({ oldId, newId }: { oldId: string; newId: string }) => {
       void client.invalidateQueries({ queryKey: queryKeys.jobs });
-      void client.invalidateQueries({ queryKey: queryKeys.job(jobId) });
+      void client.invalidateQueries({ queryKey: queryKeys.job(oldId) });
+      void client.invalidateQueries({ queryKey: queryKeys.job(newId) });
       void client.invalidateQueries({ queryKey: queryKeys.jobStats });
       toast.success("已重新入队");
     },
