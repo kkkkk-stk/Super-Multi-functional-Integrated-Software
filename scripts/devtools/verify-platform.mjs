@@ -44,7 +44,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
 
-import { Checker, connect, makeDocx, makePng, REPO_ROOT, sleep, webpInfo, writeInputPdf } from './cdp.mjs';
+import { Checker, connect, decodePng, makeDocx, makePng, makeQuadrantPng, pixelAt, quadrantName, REPO_ROOT, sleep, webpInfo, writeInputPdf } from './cdp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -407,9 +407,13 @@ c.section('【7】任意角度旋转在无重采样后端时是否明确报错')
   const job = await client.waitJob(sub.jobId);
   c.check(job.status === 'succeeded', '对照组：90° 之外的基础转换仍然成功', job.status);
   c.note(`本机 ${canResample ? '有' : '没有'}可做重采样的后端（libvips / ImageMagick）`);
-  // 这条只是把"当前能力边界"记录在案：有后端时任意角度应该能转，
-  // 没后端时必须报明确错误（由 Rust 侧的单测与错误文案保证，这里不重复构造）。
-  c.check(true, '能力边界已记录（详见 image.rotate 的错误文案）');
+  // ⚠️ 这一节**名不副实**，别再被骗一次：它跑的是 `image-convert`，
+  // 一行都没有碰 `image.rotate`。本节末尾原本还有一句
+  // `c.check(true, '能力边界已记录（…）')` —— 那种"永远为真"的检查只是
+  // 把计数做大，什么也没验（本项目自己定的规矩：每条检查都必须能被证伪）。
+  // 真验证在【32】⑨：那里真的按角度跑 `image.rotate`，
+  // 并断言"有后端就必须真的转出别的尺寸 / 没后端就必须 ENGINE_MISSING"。
+  c.note('本节不验旋转本身，旋转见【32】⑨（本节的"能力边界"断言原来是永远为真的假检查，已删除）');
 }
 
 // ============================================================================
@@ -434,7 +438,7 @@ c.section('【8】AI 抠图（image.remove-background）是否真的能出透明
       `跳过：${bgModels.length === 0 ? '没有已下载的抠图权重（到「模型权重」下 u2netp，4.4 MB）' : ''}` +
         `${!runtimeReady ? ' 抠图运行时尚未初始化（首次运行会自动准备）' : ''}`
     );
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     const modelId = bgModels[0].id;
     const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-rembg-verify');
@@ -568,7 +572,7 @@ c.section('【9】电子书转换（ebook.convert）的降级与拦截');
 
   if (!hasCalibre && !hasPandoc) {
     c.note('跳过：两个引擎都没装（到「引擎管理」装 Pandoc 只 40 MB）');
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-ebook-verify');
     rmSync(outDir, { recursive: true, force: true });
@@ -785,7 +789,7 @@ c.section('【11】AI 超分（ai.upscale）是否真的按倍数放大');
       `跳过：${!upModel ? '没有已下载的超分权重（到「模型权重」下 realesr-general-x4v3，4.9 MB）' : ''}` +
         `${!runtimeReady ? ' ONNX 运行时尚未初始化' : ''}`
     );
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-upscale-verify');
     rmSync(outDir, { recursive: true, force: true });
@@ -846,7 +850,7 @@ c.section('【11】AI 超分（ai.upscale）是否真的按倍数放大');
     );
     if (!fixedModel) {
       c.note('跳过固定尺寸模型的检查：没有已下载的 realesrgan-x4plus（67 MB）');
-      c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+      c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
     } else {
       const fixedDir = join(REPO_ROOT, '.tools', 'smoke', 'out-upscale-fixed');
       rmSync(fixedDir, { recursive: true, force: true });
@@ -978,7 +982,7 @@ c.section('【11】AI 超分（ai.upscale）是否真的按倍数放大');
         }
       } else {
         c.note(`跳过接缝反证：找不到脚本或权重（${script} / ${modelPath}）`);
-        c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+        c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
       }
     }
 
@@ -1058,7 +1062,7 @@ c.section('【12】图片降级链的**中间档**（ImageMagick）是否真的�
       `跳过：需要 libvips 与 imagemagick **同时装着**才谈得上"藏掉前者看后者接管"` +
         `（当前 libvips=${usable('libvips')} imagemagick=${usable('imagemagick')}）`
     );
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     const vipsDir = join(DATA_DIR, 'engines', 'libvips');
     const hidden = join(DATA_DIR, 'engines', 'libvips__hidden_by_verify');
@@ -1148,7 +1152,7 @@ c.section('【13】图片降级链的**兜底档**（纯 Rust）是否真的能�
   const hideable = ['libvips', 'imagemagick'].filter(managedOnly);
   if (hideable.length === 0) {
     c.note('跳过：没有任何"应用托管"的图片引擎可以临时藏起来');
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     const ENG = join(DATA_DIR, 'engines');
     const moved = [];
@@ -1242,7 +1246,7 @@ c.section('【14】视频 → GIF（video-to-gif 内置插件）是否真的跑�
 
   if (!usable(ff) || !ffPath || !existsSync(ffPath)) {
     c.note('跳过：本机没有可用的 ffmpeg（到「引擎管理」一键安装，约 105 MB）');
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     c.note(`ffmpeg: ${ffPath}`);
     const work = join(REPO_ROOT, '.tools', 'smoke', 'out-platform-video');
@@ -1339,7 +1343,7 @@ c.section('【15】扫描件 PDF 的 OCR（Poppler 栅格化 + 逐页识别）')
 
   if (!usable(pop)) {
     c.note('跳过：本机没有 Poppler（到「引擎管理」一键安装，约 42 MB，GPL）');
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     c.note(`poppler: ${pop.status.path}`);
     if (usable(tess)) {
@@ -1656,7 +1660,7 @@ c.section('【17】音频 / 视频节点是否真的产出正确的媒体');
 
   if (!usable(ff) || !probePath || !existsSync(probePath)) {
     c.note('跳过：本机没有可用的 ffmpeg / ffprobe（到「引擎管理」一键安装，约 105 MB）');
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     /** 用 ffprobe 读回媒体属性（真正断言用的就是它） */
     const probeJson = (file) => {
@@ -1952,7 +1956,7 @@ runtime:
       );
     } else {
       c.note('跳过 ④：第二个 mp3 产出没找到');
-      c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+      c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
     }
 
     // ---- ⑤ audio.convert：容器与采样率都按参数来 ----
@@ -2215,7 +2219,7 @@ c.section('【18】压缩包节点（7-Zip 打包 / 解压）是否真的产出�
 
   if (!zUsable) {
     c.note('跳过：本机没有可用的 7-Zip（到「引擎管理」一键安装；三平台都有下载源，Windows 约 2 MB）');
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     console.log(`   7-Zip: ${zPath}`);
     console.log(`   版本: ${z.status.version ?? '(未知)'}`);
@@ -2527,7 +2531,7 @@ c.section('【19】`doc.to-pdf`：Office 文档 → PDF 是否真的转出来了
 
   if (!loUsable) {
     c.note('跳过：本机没有可用的 LibreOffice（Windows 可在「引擎管理」一键安装，约 356 MB）');
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     console.log(`   LibreOffice: ${lo.status.path}`);
     console.log(`   版本: ${lo.status.version ?? '(未知)'}`);
@@ -2973,7 +2977,7 @@ c.section('【21】任务取消：子进程真的被杀掉、队列记账对得�
 
   if (!usable('libreoffice')) {
     c.note('跳过：本机没有可用的 LibreOffice（取消测试需要一个"跑得够久"的任务）');
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     // ---- 素材：两万段的 docx ----
     const work = join(REPO_ROOT, '.tools', 'smoke', 'out-cancel');
@@ -3257,7 +3261,7 @@ c.section('【22】流程编辑器：画布 → plugin.yaml → 后端校验 →
   const need = ['image.resize', 'image.convert'];
   if (need.some((n) => !byName.has(n))) {
     c.note(`（节点目录里没有 ${need.join(' / ')}，跳过画布验证）`);
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     const payload = {
       meta: {
@@ -3519,7 +3523,7 @@ c.section('【23】`PLUGIN-SDK.md` 的节点表与节点目录是否对得上');
   const sdkPath = join(REPO_ROOT, 'docs', 'PLUGIN-SDK.md');
   if (!existsSync(sdkPath)) {
     c.note('（找不到 docs/PLUGIN-SDK.md，跳过）');
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     const mdLines = readFileSync(sdkPath, 'utf8').split(/\r?\n/);
 
@@ -3774,7 +3778,7 @@ c.section('【25】许可证确认：硬门有效、并且留下可追溯的记�
 
   if (!acksFile) {
     c.note('（拿不到数据目录，跳过）');
-    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
   } else {
     // 从一个**干净状态**开始：删掉记录文件，确认目录里本来也没有别的确认
     rmSync(acksFile, { force: true });
@@ -3787,7 +3791,7 @@ c.section('【25】许可证确认：硬门有效、并且留下可追溯的记�
     );
     if (!subject) {
       c.note('（本机没有"需要确认许可证且有下载源"的引擎，跳过）');
-      c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+      c.skip('前置条件不满足，本次跳过（**不计入通过**）；拿不出前置的机器上这条永远是跳过 —— 别把它当成验过了');
     } else {
       const engineId = subject.descriptor.id;
       console.log(`   用 ${engineId} 做验证（requiresLicenseAck=true，已安装，安装会短路）`);
@@ -5351,8 +5355,815 @@ c.section('【30】权重文件被截断时，应用还会不会声称"已就绪
   }
 }
 
+// ============================================================================
+// 【31】两个**从来没有运行时证据**的图像节点
+// ============================================================================
+//
+// 32 个内置节点里，`image.enhance` 与 `image.strip-metadata` 是仅有的两个
+// **既没有单测、也没有任何真机检查**碰过的节点 —— 它们在节点目录里、在流程编辑器里能拖出来、
+// 参数面板（前者四个滑杆）也在，但**没有人真的跑过一次**。
+// 而这两个恰好都是"纯 Rust 实现"（不与外部引擎交互），所以最容易被漏掉：
+// 装了什么引擎都不影响它们，跑通了也没有 `backend` 日志可看。
+//
+// 这一节把它们的**可观测性质**钉住（不是"任务成功"就算数）：
+//
+// * `image.strip-metadata`：输入 PNG **带一个 tEXt 元数据块**，输出里必须没有它，
+//   而**像素必须一字不改**（用"与 enhance 全零参数产出的字节完全相同"来证明 ——
+//   两者都是"解码再编码"，编码器确定、输入像素相同，字节就该相同）；
+// * `image.enhance`：**参数真的起作用** —— 全零参数 = 原样输出，而
+//   `sharpen=80 / contrast=40` 的产出必须与它**不同**；两次都必须是合法 PNG 且尺寸不变。
+c.section('【31】image.enhance / image.strip-metadata 这两个节点到底跑不跑得通');
+{
+  const work = join(REPO_ROOT, '.tools', 'smoke', 'out-enhance');
+  const PLUGIN_ENHANCE = 'com.verify.enhance';
+  const PLUGIN_STRIP = 'com.verify.strip-meta';
+
+  /**
+   * 造一个"带 tEXt 元数据块的 PNG" —— 元数据是 strip 节点的唯一靶子。
+   *
+   * ⚠️ 位置有讲究：**必须插在 IHDR 之后**。第一版把它插在签名之后、IHDR 之前，
+   * 于是产出的根本不是合法 PNG（PNG 规定 IHDR 必须是第一个块），
+   * 节点解码时就报 `INVALID_ARGUMENT` —— 三条检查一起红，而原因在测试素材自己身上。
+   */
+  const withTextChunk = (png, keyword, text) => {
+    const textChunk = pngChunk(
+      'tEXt',
+      Buffer.concat([
+        Buffer.from(keyword, 'latin1'),
+        Buffer.from([0]),
+        Buffer.from(text, 'latin1'),
+      ])
+    );
+    const chunks = [];
+    let off = 8;
+    while (off < png.length) {
+      const len = png.readUInt32BE(off);
+      chunks.push(png.subarray(off, off + 12 + len));
+      off += 12 + len;
+    }
+    const [ihdr, ...rest] = chunks; // IHDR 一定在最前（上面 makePng 就是这么写的）
+    return Buffer.concat([png.subarray(0, 8), ihdr, textChunk, ...rest]);
+  };
+
+  const pluginYaml = (id, uses, label) => `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${id}
+  name: ${label}（验证用）
+  version: 1.0.0
+  description: 仅用于给一个内置节点做端到端验证。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 图片
+      type: file
+      accept: [".png"]
+      required: true
+  outputs:
+    - id: dst
+      label: 输出
+      type: file
+      accept: [".png"]
+      required: true
+  params:
+    - id: sharpen
+      label: 锐化
+      type: int
+      default: { kind: int, value: 0 }
+      required: false
+    - id: contrast
+      label: 对比度
+      type: int
+      default: { kind: int, value: 0 }
+      required: false
+runtime:
+  kind: pipeline
+  pipeline:
+    steps:
+      - id: s1
+        uses: ${uses}
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+${uses === 'image.enhance' ? '          sharpen: "${params.sharpen}"\n          contrast: "${params.contrast}"\n' : ''}`;
+
+  const installPlugin = async (id, yaml) => {
+    const dir = join(work, id);
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'plugin.yaml'), yaml, 'utf8');
+    const existing = await client.invoke('plugins_get', { pluginId: id }).catch(() => null);
+    if (existing) {
+      await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+    }
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'directory', path: dir },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: false,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: id,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'output' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: id, enabled: true });
+  };
+
+  try {
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+
+    // ---- 造输入：带元数据块的 PNG ----
+    const srcDir = join(work, 'in');
+    mkdirSync(srcDir, { recursive: true });
+    const srcFile = join(srcDir, 'meta.png');
+    const plain = makePng(96, 64, 7);
+    const marked = withTextChunk(plain, 'Comment', 'toolforge-has-metadata');
+    writeFileSync(srcFile, marked);
+    c.check(
+      marked.includes(Buffer.from('tEXt')) && marked.length > plain.length,
+      '① 前置：输入 PNG 真的带了一个元数据块（否则这条检查测的是空气）',
+      `${plain.length} → ${marked.length} 字节`
+    );
+
+    await installPlugin(PLUGIN_STRIP, pluginYaml(PLUGIN_STRIP, 'image.strip-metadata', '清除元数据'));
+    await installPlugin(PLUGIN_ENHANCE, pluginYaml(PLUGIN_ENHANCE, 'image.enhance', '图像增强'));
+
+    const runNode = async (pluginId, params, outName) => {
+      const outDir = join(work, outName);
+      mkdirSync(outDir, { recursive: true });
+      const sub = await client.invoke('plugins_run', {
+        req: { pluginId, inputs: { src: [srcFile] }, params, outputDir: outDir },
+      });
+      const job = await client.waitJob(sub.jobId, 120, 1000);
+      const files = (job.outputs ?? []).filter((p) => p.toLowerCase().endsWith('.png'));
+      return { job, outDir, file: files[0] ? files[0] : null };
+    };
+
+    // ---- ② strip-metadata：去掉元数据、**不动像素** ----
+    const strip = await runNode(PLUGIN_STRIP, {}, 'strip');
+    console.log(`   清除元数据：${strip.job.status}${strip.job.error ? ` — ${strip.job.error.code}` : ''}`);
+    c.check(strip.job.status === 'succeeded', '② 清除元数据任务成功', strip.job.status);
+    c.check(!!strip.file, '②b 产出了一个 PNG', strip.file ?? '(无)');
+    if (strip.file) {
+      const out = readFileSync(strip.file);
+      const info = pngInfo(out);
+      c.check(!!info && info.width === 96 && info.height === 64, '②c 产出是合法 PNG 且尺寸不变', JSON.stringify(info));
+      c.check(
+        !out.includes(Buffer.from('tEXt')) && !out.includes(Buffer.from('toolforge-has-metadata')),
+        '★ ②d 产出里**没有**那个元数据块（这是这个节点存在的意义）',
+        `含 tEXt=${out.includes(Buffer.from('tEXt'))}`
+      );
+    }
+
+    // ---- ③ enhance 全零参数 = 原样（与 strip 的产出逐字节相同） ----
+    const zero = await runNode(PLUGIN_ENHANCE, {}, 'enhance-zero');
+    console.log(`   增强（全零参数）：${zero.job.status}${zero.job.error ? ` — ${zero.job.error.code}` : ''}`);
+    c.check(zero.job.status === 'succeeded', '③ 图像增强（全零参数）任务成功', zero.job.status);
+
+    // ---- ④ enhance 带参数 = 产出必须**不一样** ----
+    const sharp = await runNode(
+      PLUGIN_ENHANCE,
+      { sharpen: { kind: 'int', value: 80 }, contrast: { kind: 'int', value: 40 } },
+      'enhance-sharp'
+    );
+    console.log(`   增强（sharpen=80, contrast=40）：${sharp.job.status}${sharp.job.error ? ` — ${sharp.job.error.code}` : ''}`);
+    c.check(sharp.job.status === 'succeeded', '④ 图像增强（带参数）任务成功', sharp.job.status);
+
+    if (strip.file && zero.file && sharp.file) {
+      const a = readFileSync(strip.file);
+      const b = readFileSync(zero.file);
+      const d = readFileSync(sharp.file);
+      c.check(
+        a.equals(b),
+        '★ ③b 全零参数的增强 == 清除元数据的产出（逐字节相同）—— 说明"不改像素"是事实，不是感觉',
+        `${a.length} vs ${b.length} 字节`
+      );
+      const infoD = pngInfo(d);
+      c.check(
+        !!infoD && infoD.width === 96 && infoD.height === 64,
+        '④b 带参数的产出仍是同尺寸合法 PNG',
+        JSON.stringify(infoD)
+      );
+      c.check(
+        !d.equals(b),
+        '★ ④c 带参数的产出与全零参数**不同** —— 即那四个滑杆真的接到了执行器上（不是装饰品）',
+        `${b.length} vs ${d.length} 字节`
+      );
+    }
+  } finally {
+    for (const id of [PLUGIN_ENHANCE, PLUGIN_STRIP]) {
+      await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+    }
+  }
+}
+
+// ============================================================================
+// 【32】`image.crop` / `image.rotate` —— 最后两个没有任何运行时证据的图像节点
+// ============================================================================
+//
+// 【31】补掉了 `image.enhance` / `image.strip-metadata`，然后顺手做了一次
+// **全仓库反查**："32 个内置节点里，还有哪几个从来没被真的跑过一次？"
+// 答案剩这两个：
+//
+// ```powershell
+// Get-ChildItem -Recurse -Include *.rs,*.mjs,*.yaml -Path crates,apps,scripts,plugins |
+//   Select-String -Pattern "image\.crop"   # 只有声明、注释和错误文案，没有一次真调用
+// ```
+//
+// `image.rotate` 唯一一次出现在检查脚本里，是在【?】的一句**错误文案断言**里
+// （"能力边界已记录"）—— 也就是说它连一次都没被真的执行过。
+//
+// 为什么这两个特别值得补：它们和 enhance/strip 不是一回事，它们**会去挑后端**
+// （`pick_image_backend()` → libvips / ImageMagick / 纯 Rust），
+// 也就是说"三个后端切出来的位置完全一致"这句写在节点描述里的话，
+// 在此之前**没有一条证据**。
+//
+// 这一节的断言全部落在**像素**上，而不是"任务成功"：
+//
+// * 素材是四象限纯色图（`cdp.mjs::makeQuadrantPng`），四个角互不相同；
+// * 断言"裁出来的是哪一块"要能算出来 —— 中心裁剪的落点是手算的，
+//   所以一个"把输入原样拷过去"的空实现**必然失败**（它会让右下角变成左上角的颜色）；
+// * `rotate` 的断言刻意**不依赖顺时针/逆时针**（那是实现细节，不是契约）：
+//   90° 断言"宽高互换 + 四角仍是四个象限色"，再用 "90° 与 270° 产出必须不同"
+//   来证明角度方向真的被用上了。180° / 水平翻转 / 垂直翻转则可以定向断言。
+// * `autoOrient`（本轮新接上的 EXIF 方向校正）用**尺寸**验证：
+//   96×64 的图写着 EXIF Orientation=6，开开关是 64×96、关开关是 96×64。
+c.section('【32】image.crop / image.rotate 这两个节点跑起来对不对（按像素验）');
+{
+  const work = join(REPO_ROOT, '.tools', 'smoke', 'out-crop-rotate');
+  const PLUGIN_CROP = 'com.verify.crop';
+  const PLUGIN_ROTATE = 'com.verify.rotate';
+  const W = 96;
+  const H = 64;
+
+  const cropPlugin = `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${PLUGIN_CROP}
+  name: 裁剪（验证用）
+  version: 1.0.0
+  description: 仅用于给 image.crop 做端到端验证。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 图片
+      type: file
+      accept: [".png"]
+      required: true
+  outputs:
+    - id: dst
+      label: 输出
+      type: file
+      accept: [".png"]
+      required: true
+  params:
+    - id: mode
+      label: 裁剪模式
+      type: enum
+      default: { kind: str, value: center }
+      options:
+        - { value: center, label: 居中 }
+        - { value: custom, label: 自定义 }
+      required: false
+    - id: width
+      label: 宽度
+      type: int
+      default: { kind: int, value: 32 }
+      required: false
+    - id: height
+      label: 高度
+      type: int
+      default: { kind: int, value: 16 }
+      required: false
+    - id: x
+      label: X
+      type: int
+      default: { kind: int, value: 0 }
+      required: false
+    - id: y
+      label: Y
+      type: int
+      default: { kind: int, value: 0 }
+      required: false
+runtime:
+  kind: pipeline
+  pipeline:
+    steps:
+      - id: s1
+        uses: image.crop
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+          mode: "\${params.mode}"
+          width: "\${params.width}"
+          height: "\${params.height}"
+          x: "\${params.x}"
+          y: "\${params.y}"
+`;
+
+  const rotatePlugin = `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${PLUGIN_ROTATE}
+  name: 旋转（验证用）
+  version: 1.0.0
+  description: 仅用于给 image.rotate 做端到端验证。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 图片
+      type: file
+      accept: [".png", ".jpg"]
+      required: true
+  outputs:
+    - id: dst
+      label: 输出
+      type: file
+      accept: [".png", ".jpg"]
+      required: true
+  params:
+    - id: angle
+      label: 角度
+      type: float
+      default: { kind: float, value: 90 }
+      required: false
+    - id: flipH
+      label: 水平镜像
+      type: bool
+      default: { kind: bool, value: false }
+      required: false
+    - id: flipV
+      label: 垂直镜像
+      type: bool
+      default: { kind: bool, value: false }
+      required: false
+    - id: autoOrient
+      label: 按 EXIF 自动校正方向
+      type: bool
+      default: { kind: bool, value: true }
+      required: false
+    - id: format
+      label: 输出扩展名
+      type: enum
+      description: 这个参数**不是给 image.rotate 的**，是被**宿主**读走的 ——
+        输出文件名按 params.format 定扩展名（见 commands.rs 的端口分配规则，
+        image-convert 也靠同一条约定）。验证 EXIF 方向得先造一张 JPEG，就靠它。
+      default: { kind: str, value: png }
+      options:
+        - { value: png, label: png }
+        - { value: jpg, label: jpg }
+      required: false
+runtime:
+  kind: pipeline
+  pipeline:
+    steps:
+      - id: s1
+        uses: image.rotate
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+          angle: "\${params.angle}"
+          flipH: "\${params.flipH}"
+          flipV: "\${params.flipV}"
+          autoOrient: "\${params.autoOrient}"
+          format: "\${params.format}"
+`;
+
+  const installPlugin = async (id, yaml) => {
+    const dir = join(work, id);
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'plugin.yaml'), yaml, 'utf8');
+    const existing = await client.invoke('plugins_get', { pluginId: id }).catch(() => null);
+    if (existing) {
+      await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+    }
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'directory', path: dir },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: false,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: id,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'output' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: id, enabled: true });
+  };
+
+  try {
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+
+    const srcDir = join(work, 'in');
+    mkdirSync(srcDir, { recursive: true });
+    const srcFile = join(srcDir, 'quad.png');
+    writeFileSync(srcFile, makeQuadrantPng(W, H));
+
+    // ---- ① 前置：素材本身得是"四个角互不相同"的 ----
+    const srcImg = decodePng(readFileSync(srcFile));
+    const corners = {
+      TL: pixelAt(srcImg, 0, 0),
+      TR: pixelAt(srcImg, W - 1, 0),
+      BL: pixelAt(srcImg, 0, H - 1),
+      BR: pixelAt(srcImg, W - 1, H - 1),
+    };
+    c.check(
+      srcImg !== null &&
+        srcImg.width === W &&
+        srcImg.height === H &&
+        new Set(Object.values(corners).map((p) => p.join(','))).size === 4,
+      '① 前置：素材解出来是 96x64，且四角是四种不同的颜色（否则下面的像素断言全是空转）',
+      Object.entries(corners)
+        .map(([k, v]) => `${k}=${quadrantName(v)}`)
+        .join(' ')
+    );
+
+    await installPlugin(PLUGIN_CROP, cropPlugin);
+    await installPlugin(PLUGIN_ROTATE, rotatePlugin);
+
+    const runNode = async (pluginId, src, params, outName, ext = 'png') => {
+      const outDir = join(work, outName);
+      rmSync(outDir, { recursive: true, force: true });
+      mkdirSync(outDir, { recursive: true });
+      const sub = await client.invoke('plugins_run', {
+        req: { pluginId, inputs: { src: [src] }, params, outputDir: outDir },
+      });
+      const job = await client.waitJob(sub.jobId, 120, 1000);
+      const files = (job.outputs ?? []).filter((p) => p.toLowerCase().endsWith(`.${ext}`));
+      return { job, outDir, file: files[0] ?? null, files };
+    };
+    /** 把节点日志里那句 "后端 = …" 取出来 —— 用它决定"该期待哪一支行为" */
+    const backendOf = (job) => {
+      const line = (job.logs ?? [])
+        .map((l) => String(l.message))
+        .find((m) => m.includes('后端 =')) ?? '';
+      const m = line.match(/后端 = (libvips|imagemagick|纯 Rust)/);
+      return m ? m[1] : '(没读到)';
+    };
+
+    // ---- ② 中心裁剪：尺寸 + **落点** ----
+    // 96x64 里取 32x16，中心裁剪的落点是 x=(96-32)/2=32, y=(64-16)/2=24。
+    // 源图在 x<48 / y<32 处是左上象限，所以：
+    //   输出 (0,0)  = 源 (32,24) → 左上 → 红
+    //   输出 (31,15)= 源 (63,39) → 右下 → 白
+    const center = await runNode(PLUGIN_CROP, srcFile, {}, 'crop-center');
+    console.log(`   中心裁剪：${center.job.status}${center.job.error ? ` — ${center.job.error.code}` : ''}`);
+    c.check(center.job.status === 'succeeded', '② 中心裁剪任务成功', center.job.status);
+    if (center.file) {
+      const img = decodePng(readFileSync(center.file));
+      c.check(
+        !!img && img.width === 32 && img.height === 16,
+        '②b 产出是 32x16 的合法 PNG',
+        img ? `${img.width}x${img.height}` : '(解码失败)'
+      );
+      c.check(
+        quadrantName(pixelAt(img, 0, 0)) === 'TL',
+        '★ ②c 产出左上角 = 源图 (32,24) 那一块（左上/红）—— 中心裁剪的落点算对了',
+        quadrantName(pixelAt(img, 0, 0))
+      );
+      // ★ 这一条同时是**反证**：一个"把输入原样拷到输出"的空实现会让
+      // 输出 (31,15) = 源 (31,15) = 左上 = 红，与这里要求的"白"不符。
+      c.check(
+        quadrantName(pixelAt(img, 31, 15)) === 'BR',
+        '★ ②d 产出右下角 = 源图 (63,39) 那一块（右下/白）—— 一个"什么都不做"的实现必然在这里失败',
+        quadrantName(pixelAt(img, 31, 15))
+      );
+    }
+
+    // ---- ③ 自定义偏移：**同样尺寸、不同内容** ----
+    // 取 x=48 y=32 32x16：这一整块都落在右下象限里，所以四个角**全白**。
+    // 它与 ② 的尺寸完全相同 —— 只断言尺寸的话这两次运行毫无区别，
+    // 所以第三条必须看像素。
+    const custom = await runNode(
+      PLUGIN_CROP,
+      srcFile,
+      {
+        mode: { kind: 'str', value: 'custom' },
+        width: { kind: 'int', value: 32 },
+        height: { kind: 'int', value: 16 },
+        x: { kind: 'int', value: 48 },
+        y: { kind: 'int', value: 32 },
+      },
+      'crop-custom'
+    );
+    console.log(`   自定义偏移：${custom.job.status}${custom.job.error ? ` — ${custom.job.error.code}` : ''}`);
+    c.check(custom.job.status === 'succeeded', '③ 自定义偏移裁剪成功', custom.job.status);
+    if (custom.file) {
+      const img = decodePng(readFileSync(custom.file));
+      const all = [
+        pixelAt(img, 0, 0),
+        pixelAt(img, 31, 0),
+        pixelAt(img, 0, 15),
+        pixelAt(img, 31, 15),
+      ].map(quadrantName);
+      c.check(
+        !!img && img.width === 32 && img.height === 16,
+        '③b 尺寸与中心裁剪相同（32x16）—— 所以只看尺寸分辨不出这两次运行',
+        img ? `${img.width}x${img.height}` : '(解码失败)'
+      );
+      c.check(
+        all.every((n) => n === 'BR'),
+        '★ ③c 四个角全是右下象限的颜色 —— 偏移 (48,32) 真的被用上了，不是被忽略后当中心裁剪',
+        all.join(' ')
+      );
+    }
+
+    // ---- ④ 越界请求必须**钳制**，而且日志要报**钳制后**的矩形 ----
+    const clamp = await runNode(
+      PLUGIN_CROP,
+      srcFile,
+      {
+        mode: { kind: 'str', value: 'custom' },
+        width: { kind: 'int', value: 500 },
+        height: { kind: 'int', value: 500 },
+      },
+      'crop-clamp'
+    );
+    const clampLog =
+      (clamp.job.logs ?? []).map((l) => String(l.message)).find((m) => m.includes('取 (')) ?? '';
+    c.check(clamp.job.status === 'succeeded', '④ 越界裁剪请求没有失败（钳到图像边界）', clamp.job.status);
+    c.check(
+      /取 \(0,0\) 96x64/.test(clampLog),
+      '★ ④b 日志里报的是**钳制后**的 96x64，而不是用户请求的 500x500（报原值等于骗人）',
+      clampLog || '(没读到裁剪日志)'
+    );
+
+    // ---- ⑤ 旋转 90°：尺寸互换 ----
+    const r90 = await runNode(PLUGIN_ROTATE, srcFile, {}, 'rot-90');
+    console.log(`   旋转 90°：${r90.job.status} 后端=${backendOf(r90.job)}`);
+    c.check(r90.job.status === 'succeeded', '⑤ 旋转 90° 任务成功', r90.job.status);
+    const r270 = await runNode(
+      PLUGIN_ROTATE,
+      srcFile,
+      { angle: { kind: 'float', value: 270 } },
+      'rot-270'
+    );
+    if (r90.file && r270.file) {
+      const a = decodePng(readFileSync(r90.file));
+      const b = decodePng(readFileSync(r270.file));
+      c.check(
+        !!a && a.width === 64 && a.height === 96,
+        '★ ⑤b 90° 把 96x64 转成了 64x96（宽高互换是"真的转了"最直接的证据）',
+        a ? `${a.width}x${a.height}` : '(解码失败)'
+      );
+      // 直角旋转会把"四个象限"整体搬运，四个角仍应是四种纯色 ——
+      // 若实现偷偷改成了"按比例缩放"或"取整到 0°"，这里会露馅。
+      const rc = [pixelAt(a, 0, 0), pixelAt(a, 63, 0), pixelAt(a, 0, 95), pixelAt(a, 63, 95)].map(
+        quadrantName
+      );
+      c.check(
+        rc.every((n) => n === 'TL' || n === 'TR' || n === 'BL' || n === 'BR') &&
+          new Set(rc).size === 4,
+        '★ ⑤c 90° 产出四角仍是四个象限色（直角旋转不插值）',
+        rc.join(' ')
+      );
+      c.check(
+        !readFileSync(r90.file).equals(readFileSync(r270.file)),
+        '★ ⑤d 90° 与 270° 的产出**不同** —— 角度方向真的生效了（"永远顺时针转 90"的实现会在这里失败）',
+        `${a ? a.width : '?'}x${a ? a.height : '?'} vs ${b ? b.width : '?'}x${b ? b.height : '?'}`
+      );
+    }
+
+    // ---- ⑥ 180°：尺寸不变，方向**可以定向断言**（顺逆都是同一张） ----
+    const r180 = await runNode(
+      PLUGIN_ROTATE,
+      srcFile,
+      { angle: { kind: 'float', value: 180 } },
+      'rot-180'
+    );
+    if (r180.file) {
+      const img = decodePng(readFileSync(r180.file));
+      c.check(
+        !!img && img.width === 96 && img.height === 64,
+        '⑥ 180° 后尺寸不变（96x64）',
+        img ? `${img.width}x${img.height}` : '(解码失败)'
+      );
+      c.check(
+        quadrantName(pixelAt(img, 0, 0)) === 'BR',
+        '★ ⑥b 180° 后左上角 = 原来的右下角（白）—— 定向断言，能排除"什么都没转"',
+        quadrantName(pixelAt(img, 0, 0))
+      );
+    }
+
+    // ---- ⑦⑧ 水平 / 垂直镜像：都能定向断言 ----
+    const flipH = await runNode(
+      PLUGIN_ROTATE,
+      srcFile,
+      { angle: { kind: 'float', value: 0 }, flipH: { kind: 'bool', value: true } },
+      'flip-h'
+    );
+    const flipV = await runNode(
+      PLUGIN_ROTATE,
+      srcFile,
+      { angle: { kind: 'float', value: 0 }, flipV: { kind: 'bool', value: true } },
+      'flip-v'
+    );
+    if (flipH.file) {
+      const img = decodePng(readFileSync(flipH.file));
+      c.check(
+        quadrantName(pixelAt(img, 0, 0)) === 'TR',
+        '★ ⑦ 水平镜像后左上角 = 原来的右上角（绿）—— flipH 真的镜像了左右',
+        quadrantName(pixelAt(img, 0, 0))
+      );
+    }
+    if (flipV.file) {
+      const img = decodePng(readFileSync(flipV.file));
+      c.check(
+        quadrantName(pixelAt(img, 0, 0)) === 'BL',
+        '★ ⑧ 垂直镜像后左上角 = 原来的左下角（蓝）—— flipV 真的镜像了上下',
+        quadrantName(pixelAt(img, 0, 0))
+      );
+    }
+
+    // ---- ⑨ 任意角度：要么真的转了，要么**明确报错**，不许静默取整 ----
+    // 节点描述里承诺："任意角度必须有 libvips 或 ImageMagick（纯 Rust 需要重采样，
+    // 装不了就是明确的报错，不会静默取整）"。这一条就是钉那句话的：
+    // 走纯 Rust 时必须 `ENGINE_MISSING`；有引擎时必须真的变了形。
+    const r45 = await runNode(
+      PLUGIN_ROTATE,
+      srcFile,
+      { angle: { kind: 'float', value: 45 } },
+      'rot-45'
+    );
+    const b45 = backendOf(r45.job);
+    console.log(`   旋转 45°：${r45.job.status} 后端=${b45}`);
+    if (b45 === '纯 Rust') {
+      c.check(
+        r45.job.status === 'failed' && r45.job.error?.code === 'ENGINE_MISSING',
+        '★ ⑨ 纯 Rust 后端下 45° 必须明确报 ENGINE_MISSING（静默取整成 0° 是这里最坏的失败形态）',
+        `${r45.job.status} / ${r45.job.error?.code ?? '(无错误码)'}`
+      );
+    } else {
+      const img = r45.file ? decodePng(readFileSync(r45.file)) : null;
+      c.check(
+        r45.job.status === 'succeeded' && !!img && (img.width !== 96 || img.height !== 64),
+        `★ ⑨ 有 ${b45} 时 45° 必须真的转出别的尺寸（不能什么都不做）`,
+        `${r45.job.status} / ${img ? `${img.width}x${img.height}` : '(无产出)'}`
+      );
+    }
+
+    // ---- ⑩ EXIF 方向校正：本机**新接上**的 `autoOrient` ----
+    //
+    // 顺带补的债：`autoOrient` 这个参数在此之前**没有任何代码读它** ——
+    // 界面上的开关默认打开、标签写着"按 EXIF 自动校正方向"，而后端一行都没看。
+    // 手机竖拍的照片进来是横着的，开关却显示"已开启"。
+    //
+    // 这里用**尺寸**验证，因为它与图像内容无关、也不受 JPEG 有损影响：
+    // 96x64 的图 + EXIF Orientation=6（"顺时针转 90° 才正"）
+    //   → autoOrient 开：64x96
+    //   → autoOrient 关：96x64
+    // 先让节点自己产出一张 JPEG（`angle: 0` 走完一整条解码/编码链），
+    // 再往它里面插 EXIF —— 这样素材不依赖仓库里的二进制文件。
+    const base = await runNode(
+      PLUGIN_ROTATE,
+      srcFile,
+      { angle: { kind: 'float', value: 0 }, format: { kind: 'str', value: 'jpg' } },
+      'exif-base',
+      'jpg'
+    );
+    c.check(base.job.status === 'succeeded' && !!base.file, '⑩ 前置：先由节点产出一张 JPEG（EXIF 的载体）', base.job.status);
+    if (base.file) {
+      const markedPath = join(srcDir, 'marked.jpg');
+      writeFileSync(markedPath, withExifOrientation(readFileSync(base.file), 6));
+      c.check(
+        readFileSync(markedPath).length > readFileSync(base.file).length,
+        '⑩b 前置：EXIF 段真的被插进去了（字节数变大）',
+        `${readFileSync(base.file).length} → ${readFileSync(markedPath).length} 字节`
+      );
+
+      const aoOn = await runNode(
+        PLUGIN_ROTATE,
+        markedPath,
+        {
+          angle: { kind: 'float', value: 0 },
+          autoOrient: { kind: 'bool', value: true },
+          format: { kind: 'str', value: 'png' },
+        },
+        'exif-on'
+      );
+      const aoOff = await runNode(
+        PLUGIN_ROTATE,
+        markedPath,
+        {
+          angle: { kind: 'float', value: 0 },
+          autoOrient: { kind: 'bool', value: false },
+          format: { kind: 'str', value: 'png' },
+        },
+        'exif-off'
+      );
+      const onImg = aoOn.file ? decodePng(readFileSync(aoOn.file)) : null;
+      const offImg = aoOff.file ? decodePng(readFileSync(aoOff.file)) : null;
+      console.log(
+        `   EXIF 方向校正：开=${aoOn.job.status}(${onImg ? `${onImg.width}x${onImg.height}` : '?'}) ` +
+          `关=${aoOff.job.status}(${offImg ? `${offImg.width}x${offImg.height}` : '?'})`
+      );
+      c.check(
+        !!onImg && onImg.width === 64 && onImg.height === 96,
+        '★ ⑩c autoOrient=开 时 96x64 的图被 EXIF 立成了 64x96（界面开关不再是摆设）',
+        onImg ? `${onImg.width}x${onImg.height}` : '(无产出)'
+      );
+      c.check(
+        !!offImg && offImg.width === 96 && offImg.height === 64,
+        '★ ⑩d autoOrient=关 时保持 96x64 —— 开关**两个位置都能观测到**，不是"永远打开"',
+        offImg ? `${offImg.width}x${offImg.height}` : '(无产出)'
+      );
+    }
+
+    // ---- ⑪ 中间文件不能留在输出目录里 ----
+    // `vips autorot` 那条路会落一个 `<名字>.oriented.<扩展名>` 的中间文件，
+    // 翻转那条路会落 `stage.` / `mid.`。它们和产物同目录，留着就会被
+    // "输出目录里有几个文件"这类检查当成产物。
+    const strays = [];
+    for (const d of readdirSync(work, { withFileTypes: true })) {
+      if (!d.isDirectory()) continue;
+      const sub = join(work, d.name);
+      for (const f of readdirSync(sub)) {
+        if (/\.(oriented|stage|mid)\./.test(f)) strays.push(`${d.name}/${f}`);
+      }
+    }
+    c.check(strays.length === 0, '⑪ 输出目录里没有 oriented/stage/mid 中间文件残留', strays.join(', ') || '干净');
+  } finally {
+    for (const id of [PLUGIN_CROP, PLUGIN_ROTATE]) {
+      await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+    }
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
+
+/**
+ * 往一张 JPEG 里插一个最小的 EXIF APP1 段，只带 `Orientation` 一个标签。
+ *
+ * 为什么要手搓：仓库里不存二进制测试素材，而 `image` crate **能读不能写** EXIF。
+ * 想验证"EXIF 方向校正到底有没有生效"，就必须自己造一张"文件里写着方向"的图。
+ *
+ * ⚠️ **IFD 条目的字段偏移极容易错一位。** 第一版把 value 写进了 count 的
+ * 高半字节，产出的字节流"看着有 EXIF"、`vipsheader -a` 却一个 `exif-ifd0-*`
+ * 都读不出来，于是我据此得出了"libvips 不会自动校正方向"这个**建立在坏素材上**的结论。
+ * 布局是：`tag(2) type(2) count(4) value(4)`，共 12 字节，从偏移 10 开始。
+ */
+function withExifOrientation(jpeg, orientation) {
+  if (jpeg[0] !== 0xff || jpeg[1] !== 0xd8) throw new Error('不是 JPEG（缺 SOI）');
+  const tiff = Buffer.alloc(8 + 2 + 12 + 4);
+  tiff.write('II', 0, 'ascii'); // 小端
+  tiff.writeUInt16LE(0x2a, 2);
+  tiff.writeUInt32LE(8, 4); // IFD0 的偏移
+  tiff.writeUInt16LE(1, 8); // 一个条目
+  tiff.writeUInt16LE(0x0112, 10); // Orientation
+  tiff.writeUInt16LE(3, 12); // SHORT
+  tiff.writeUInt32LE(1, 14); // count
+  tiff.writeUInt16LE(orientation, 18); // 值
+  tiff.writeUInt32LE(0, 22); // 没有下一个 IFD
+  const payload = Buffer.concat([Buffer.from('Exif\0\0', 'latin1'), tiff]);
+  const app1 = Buffer.alloc(4);
+  app1[0] = 0xff;
+  app1[1] = 0xe1;
+  app1.writeUInt16BE(payload.length + 2, 2);
+  return Buffer.concat([jpeg.subarray(0, 2), app1, payload, jpeg.subarray(2)]);
+}
 
 /**
  * 直接调用一个外部程序（仅用于造测试素材）。

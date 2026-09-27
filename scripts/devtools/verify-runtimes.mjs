@@ -633,8 +633,7 @@ runtime:
     const hostNeg = process.env[NEG];
 
     if (!hostPos) {
-      c.note(`跳过：验证脚本自己的环境里没有 ${POS}`);
-      c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+      c.skip(`跳过：验证脚本自己的环境里没有 ${POS}（**不计入通过**）`);
     } else {
       const ENV_PROBE = 'com.toolforge.test.env-probe';
       const probeDir = join(STAGE, 'env-probe');

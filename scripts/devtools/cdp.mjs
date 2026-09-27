@@ -47,7 +47,7 @@
  * 接口形状，而真实数据流只有真跑一次才会经过。
  */
 
-import { deflateSync, constants as zlibConstants } from 'node:zlib';
+import { deflateSync, inflateSync, constants as zlibConstants } from 'node:zlib';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -206,17 +206,32 @@ export async function connect() {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** 极简断言器：把"通过/失败"计数与打印收在一处，避免每个脚本各写一套 */
+/** 极简断言器：把"通过/失败/跳过"计数与打印收在一处，避免每个脚本各写一套 */
 export class Checker {
   constructor(title) {
     this.pass = 0;
     this.fail = 0;
+    this.skip = 0;
     if (title) console.log(`\n${title}`);
   }
   check(ok, label, extra = '') {
     console.log(`${ok ? '✅' : '❌'} ${label}${extra ? '  ' + extra : ''}`);
     ok ? this.pass++ : this.fail++;
     return ok;
+  }
+  /**
+   * 记一次**跳过**（前置条件不满足：缺引擎、缺权重、缺 API Key…）。
+   *
+   * 为什么一定要和"通过"分开计数：这两件事以前都写成
+   * `c.check(true, '前置条件不满足，已显式记为跳过')` —— 打印出来是绿的 `✅`，
+   * 最后也被算进"N 通过"。于是"本机没装 X，8 条检查全跳过"和
+   * "8 条检查真的都验过了"在汇总里**长得一模一样**，而标签上还写着
+   * "不是『通过』" —— 那句话对汇总数字而言是假的。
+   * 现在跳过打 `⏭`，单独计数，并且**不计入**通过数。
+   */
+  skip(label, extra = '') {
+    console.log(`⏭ ${label}${extra ? '  ' + extra : ''}`);
+    this.skip++;
   }
   section(title) {
     console.log(`\n${title}`);
@@ -225,7 +240,8 @@ export class Checker {
     console.log(`   ${text}`);
   }
   summary() {
-    console.log(`\n================ ${this.pass} 通过 / ${this.fail} 失败 ================`);
+    const skips = this.skip ? ` / ${this.skip} 跳过（跳过不计入通过）` : '';
+    console.log(`\n================ ${this.pass} 通过 / ${this.fail} 失败${skips} ================`);
     return this.fail === 0;
   }
 }
@@ -528,6 +544,145 @@ export function webpInfo(buf) {
     height,
     signature,
   };
+}
+
+/**
+ * 生成一张"四象限纯色"的 PNG —— 四面**互不相同**、且离中心足够远。
+ *
+ * 为什么需要它：`image.crop` / `image.rotate` / `image.flip` 这类节点，
+ * 「任务成功 + 输出文件存在」**完全不能证明任何事**。一个把参数吃掉的空实现
+ * 同样会产出一张合法 PNG。要证明"裁的是哪一块""转的是哪个方向"，
+ * 就必须让输出的**像素**说话 —— 而这需要一个每个角都认得出的输入。
+ *
+ * 四个象限的坐标是刻意不对称的（96×64 的左半比右半宽），
+ * 所以"中心裁剪"落点的期望值可以手算，见 `verify-platform.mjs`【32】。
+ */
+export function makeQuadrantPng(width, height) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // RGB
+  const stride = width * 3;
+  const raw = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y++) {
+    raw[y * (stride + 1)] = 0; // filter: None
+    for (let x = 0; x < width; x++) {
+      const o = y * (stride + 1) + 1 + x * 3;
+      const top = y < height / 2;
+      const left = x < width / 2;
+      const c = top ? (left ? QUADRANTS.tl : QUADRANTS.tr) : left ? QUADRANTS.bl : QUADRANTS.br;
+      raw[o] = c[0];
+      raw[o + 1] = c[1];
+      raw[o + 2] = c[2];
+    }
+  }
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(raw, { level: zlibConstants.Z_DEFAULT_COMPRESSION })),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+/** 四个象限的颜色（左上 / 右上 / 左下 / 右下），四面互不相同、无渐变 */
+export const QUADRANTS = {
+  tl: [255, 0, 0],
+  tr: [0, 255, 0],
+  bl: [0, 0, 255],
+  br: [255, 255, 255],
+};
+
+/** 把一个颜色三元组说成人类可读的名字（断言失败时看得懂） */
+export function quadrantName(px) {
+  for (const [name, c] of Object.entries(QUADRANTS)) {
+    if (px && px[0] === c[0] && px[1] === c[1] && px[2] === c[2]) return name.toUpperCase();
+  }
+  return px ? `rgb(${px.join(',')})` : '(越界)';
+}
+
+/**
+ * 极简 PNG 解码器：只处理 **8 位、非隔行、colorType 2(RGB) 或 6(RGBA)**。
+ *
+ * 为什么要自己写：要验证 `image.crop` 裁的是哪一块、`image.rotate` 转的是
+ * 哪个方向、`image.enhance` 是不是真的动了像素，就得读**像素**。
+ * 而 Node 标准库不带图像解码，仓库也刻意不引 sharp/canvas 这类依赖。
+ *
+ * ⚠️ **必须实现全部 5 种行过滤器**（None/Sub/Up/Average/Paeth）：
+ * 我们自己写出来的 PNG 只用 None，但 **`image` crate / libvips 编出来的
+ * 输出会用别的**（常见 Paeth）。只实现 None 的话，读自己造的输入永远对、
+ * 读节点产出永远错 —— 那会是一条**方向性错误**的断言：越是成功的产出
+ * 越会被判为失败（或者更糟：把错的值当成对的）。
+ */
+export function decodePng(buf) {
+  if (buf.length < 8 || buf.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a') return null;
+  let off = 8;
+  let width = 0;
+  let height = 0;
+  let channels = 0;
+  const idat = [];
+  while (off + 8 <= buf.length) {
+    const len = buf.readUInt32BE(off);
+    const type = buf.subarray(off + 4, off + 8).toString('ascii');
+    const data = buf.subarray(off + 8, off + 8 + len);
+    if (type === 'IHDR') {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      if (data[8] !== 8) return null; // 只支持 8 位
+      if (data[12] !== 0) return null; // 不支持隔行
+      if (data[9] === 2) channels = 3;
+      else if (data[9] === 6) channels = 4;
+      else return null; // 调色板 / 灰度 / 16 位一律不处理（宁可返回 null，也不要瞎猜）
+    } else if (type === 'IDAT') {
+      idat.push(data);
+    } else if (type === 'IEND') {
+      break;
+    }
+    off += 12 + len;
+  }
+  if (!width || !height || !channels) return null;
+
+  const raw = inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  if (raw.length < (stride + 1) * height) return null;
+  const out = Buffer.alloc(stride * height);
+  let prev = Buffer.alloc(stride);
+  for (let y = 0; y < height; y++) {
+    const filter = raw[y * (stride + 1)];
+    const src = raw.subarray(y * (stride + 1) + 1, y * (stride + 1) + 1 + stride);
+    const cur = out.subarray(y * stride, (y + 1) * stride);
+    for (let i = 0; i < stride; i++) {
+      const a = i >= channels ? cur[i - channels] : 0; // 左
+      const b = prev[i]; // 上
+      const c = i >= channels ? prev[i - channels] : 0; // 左上
+      let v = src[i];
+      if (filter === 1) v += a;
+      else if (filter === 2) v += b;
+      else if (filter === 3) v += (a + b) >> 1;
+      else if (filter === 4) v += paeth(a, b, c);
+      else if (filter !== 0) return null;
+      cur[i] = v & 0xff;
+    }
+    prev = cur;
+  }
+  return { width, height, channels, data: out };
+}
+
+function paeth(a, b, c) {
+  const p = a + b - c;
+  const pa = Math.abs(p - a);
+  const pb = Math.abs(p - b);
+  const pc = Math.abs(p - c);
+  if (pa <= pb && pa <= pc) return a;
+  return pb <= pc ? b : c;
+}
+
+/** 取某个像素的 `[r,g,b]`（越界返回 `null`，而不是抛异常 —— 断言里更想看到"(越界)"） */
+export function pixelAt(img, x, y) {
+  if (!img) return null;
+  if (x < 0 || y < 0 || x >= img.width || y >= img.height) return null;
+  const o = (y * img.width + x) * img.channels;
+  return [img.data[o], img.data[o + 1], img.data[o + 2]];
 }
 
 /** 内置的示例插件 id —— 这些随应用分发，DevTools 用它们做真实任务测试 */
