@@ -54,7 +54,7 @@
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
 > | 运行时测试总数 | `cargo test --workspace` **286 passed / 0 failed** |
 > | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **408 项全通过**（【1】–【35】） |
-> | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
+> | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **82 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
 > 下面这段原始快照保留原样，**不要据此判断现状**：
@@ -1348,7 +1348,7 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 ✅ e2e.mjs              exit=0   端到端任务（真实转换 + 产出校验）
 ✅ verify.mjs           exit=0   验证包（解码 / 多文件扇出 / 恶意插件安全测试）
 ✅ verify-platform.mjs  exit=0   平台功能（408 项）
-✅ verify-runtimes.mjs  exit=0   插件运行时（L2 WASM / L3 Python，70 项）
+✅ verify-runtimes.mjs  exit=0   插件运行时（L2 WASM / L3 Python，82 项）
 全部通过。
 ```
 
@@ -1821,6 +1821,127 @@ let is_sep = c.is_whitespace()
 > 又一条同源的教训：**"绿"不等于"对"**。这一节存在的理由就是防"文档说的和实际不一样"，
 > 结果它自己的输出先犯了一次同样的错。
 
+### 3.27 L3 的取消**没有回收 Python 子进程** —— 写验证的过程中查出来的（本轮）
+
+这一轮的起点是 v0.2 清单里两句话：
+
+* 「常驻进程复用验证：连续调用同一插件 100 次，进程数保持为 1」
+* 「取消能真正终止正在执行的 Python 调用并回收子进程」
+
+两条都挂着 🚧，而实现其实早就有了（`ChildSupervisor` 复用同一个子进程；`python.rs::call`
+每 80ms `job.check()` 一次）。**没有验证**这件事本身就该修 —— 而修它的过程中，
+第二条直接暴露成一个真缺陷。
+
+#### 缺陷
+
+`python.rs::call` 里，取消走的是这句：
+
+```rust
+_ = tokio::time::sleep(Duration::from_millis(80)) => {
+    job.check()?;          // ← 取消时在这里返回
+    ...
+}
+```
+
+`job.check()` 在任务被取消时返回 `Err(Cancelled)`，`?` 立刻把错误抛出去。
+**任务确实"立刻"变成已取消**（用户看到的没错），但那个 Python 进程
+**没有被杀**，会一直跑到自己结束。同一个 `match` 里 `Timeout` 那条路是一直杀的：
+
+```rust
+if e.code == ErrorCode::Timeout { self.supervisor.kill().await; }
+```
+
+唯独取消漏了。后果有两个，都不好查：
+
+1. **"取消"并没有真的省下资源** —— CPU、显存、加载好的模型全都还占着，
+   而用户以为它停了（这本该是取消的全部意义）；
+2. **下一个任务会莫名变慢 / 串味** —— 那个进程还在 `time.sleep(60)`，
+   它对 stdin 的响应会排在下一次调用的响应**前面**。
+
+#### 修法
+
+取消与超时**同等对待**：进程已经不可信（它正卡在任意用户代码里 —— `time.sleep`、
+死循环、一次 native 调用），JSON-RPC 协议上没有任何"请停下"的说法，所以只能杀掉重建。
+
+```rust
+let mut canceled = false;
+let outcome = loop {
+    tokio::select! {
+        result = &mut call => break result,
+        _ = tokio::time::sleep(Duration::from_millis(80)) => {
+            if let Err(e) = job.check() { canceled = true; break Err(e); }
+            ...
+        }
+    }
+};
+drop(call);
+...
+if canceled {
+    tracing::warn!(plugin = %plugin_id, "任务已取消：回收仍在执行的 Python 子进程");
+    self.supervisor.kill().await;
+}
+```
+
+#### 连带必须补的一半：`ensure_loaded` 要认出"进程已经没了"
+
+杀了就完事会引出**第二个**问题：`kill()` 把监督者置为 `Dead`，而
+`PluginRunner::ensure_loaded` 原本是"缓存里有就直接复用"：
+
+```rust
+if self.loaded.lock().contains_key(&id) { return Ok(()); }
+```
+
+于是**取消一次任务 = 把这个插件在本会话里彻底废掉**，除非用户去把插件禁用再启用
+（那才会走到 `unload`）。同样的问题也盖住"子进程被 OOM / 杀软干掉"。
+
+修法：缓存里的实例**进程已退出**时换掉它。两条边界写清楚：
+
+* 判据只认 `Dead`，**不认 `Unavailable`** —— 后者是"插件自己报告它跑不了"
+  （依赖装不上、模型加载失败），那种情况下保持缓存是对的：每次调用都重走一遍装载既慢、
+  又会把审计日志刷满，而错误信息本来就已经清楚了；
+* **这不违背"不做静默重启"**（`supervisor.rs` 的模块文档：静默重启会把"插件反复崩溃"
+  这件事藏起来）。区别要说准：**调用过程中**崩的 → 那次调用仍然失败（`PROCESS_GONE`，
+  带 stderr 尾巴），反复崩的插件**每次都失败**；**调用之间**死的 → 下一次调用重新拉起。
+  自愈的是"进程没了"，不是"崩溃被吞了"。
+
+> 顺带一个发现：`SupervisorState::is_usable()` 此前**只有测试在用** ——
+> 全仓库没有一个生产调用点。这条判断本该是它的用武之地（虽然最终判据取得更窄）。
+
+#### 实现时踩到的两个 Rust 坑（都不是逻辑问题，但会卡住编译）
+
+两个都是 **`!Send` 的 `parking_lot::MutexGuard` 跨 await**，而 `ensure_loaded` 的 future
+必须能丢进 tokio 任务：
+
+1. **不要把 `return` 写在持有 guard 的作用域里**。编译器对"提前 return 时 guard 的析构"
+   是保守的，会把 guard 判成跨 await 存活，报 `*mut () cannot be sent between threads safely`
+   （错误信息指向的是**调用方** `commands.rs`，离现场很远）。改成"先在短作用域里取出结论，
+   再做决定"。
+2. **`if let Some(x) = mutex.lock().remove(&k) { ….await }` 里的 `MutexGuard` 会活到
+   整个 `if let` 结束**（包括里面的 `.await`）—— 这是 `if let` 临时值的生命周期规则。
+   先把取出的值绑到一个变量上再 `if let`。文件里 `unload()` 早就是正确写法，抄它就行。
+
+#### 验证（`verify-runtimes.mjs`【6c】，12 条）
+
+判据全部落在**进程**上，不是"任务显示取消了"：
+
+| # | 断言 | 实测 |
+|---|---|---|
+| ① | 探针插件可用并回报 pid | pid=251564 |
+| ②③ | 连续 **100 次**调用全部成功、pid 去重后**恰好 1 个** | 100/100，1 个 pid，8.2s |
+| ④④b | **反证**：外部杀掉该 pid → 下一次调用成功且换成**新** pid | 251564 → 268152 |
+| ⑤⑤b | **前置**：取消前子进程**确实活着**、任务**正在跑** | alive=true / running |
+| ⑥⑥b | 取消后进入 `cancelled`，且**及时** | **258ms** |
+| ⑦ | 那个子进程**真的被收掉了** | alive=false |
+| ⑧ | 取消回收之后运行时**仍可用**，且是**新**进程 | succeeded / 新 pid |
+
+两条反证/前置是刻意的：少了 ④，"1 个 pid"可能只是宿主把一个常量回显了 100 次；
+少了 ⑤，"取消后没了"可能只是因为那个 pid 早就死了。
+
+★ **证伪做了**：把修复临时关掉、重新构建、重跑 —— ⑦ 报 `alive=true`（还在跑那 60 秒的
+sleep）、⑧ 报 `running`（**下一个**调用被卡在那个还在睡的旧进程后面，正是"取消之后下一个
+任务莫名变慢"这个真实症状），而 ④/④b 保持绿。这精确隔离出"取消回收"这一处改动是唯一原因。
+随后恢复并重测：82 项全通过。
+
 
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
@@ -1986,12 +2107,26 @@ let is_sep = c.is_whitespace()
 - [x] ✅ 骨架完成：`engine-sources.json`（12 条候选源）、`EngineRegistry::install` / `download_to` / `install_model`、SHA-256 比对、`system_binary` 探测
 - [x] ✅ **一键安装引擎已端到端跑通（不再是"代码写完但没人试过"）**：通过应用真实安装 **libvips 8.18.6** —— 下载约 30 MB → SHA-256 校验 → 解压 → 探测为 `installed`，落在 `<data_dir>/engines/libvips/bin/vips.exe`，约 29.67 MB。**它跑通之前这条路径是坏的**（裸命令名 `tar` 不查 PATH，见阻塞 14），所以这个 ✅ 是靠真机跑出来的，不是靠读代码得出的。
 - [ ] ⛔ 回填**全部 12 条**下载源的 `sha256`，否则 `install` 会按设计拒绝下载（不一致 3）
+  > **本轮实测复核**：`node scripts/enginectl.mjs list` 会主动警告
+  > 「`engine-sources.json` 里有 **1** 条下载源没有 sha256」。15 条来源里 14 条已固定哈希，
+  > 唯一缺的是 **`ffmpeg@macos`** —— 而且它是**刻意的**：那台机器不存在，
+  > Windows 上无法核对 macOS 构建产物的哈希，硬填一个没验证过的哈希比留空更糟。
+  > Rust 侧的规定是"sha256 为 null 时禁止自动安装"，所以在 macOS 上 ffmpeg 只能走系统安装 ——
+  > 这是**一条被明确记录的能力缺口**，不是"忘了回填"。
+  > 因此这一条不该再挂着 ⛔（它会让读者以为安装链路是坏的）：
+  > 正确的表述是"Windows / Linux 的来源已全部固定哈希；macOS 的 ffmpeg 需要一台真机去核对哈希后才能补"。
 - [ ] 🚧 许可证闸门：把 `requires_license_ack` 接进 `install` 路径，未确认不得安装；确认结果落盘（不一致 4）
 - [ ] 🚧 引擎接入：ffmpeg / pandoc / libreoffice / 7zip 已在 `nodes.rs` 中真实接线，需在真实环境逐个跑通
   > 进度：**libvips 已跑通**（一键安装成功 + 四个图像节点真实调用，见上面两条与「阻塞 14」）；**ImageMagick 现在也装过、也实测过了**（应用内安装成功 241.5 MB 的 `magick.exe`，版本 7.1.2-31 Q16 x64；藏掉 `engines/libvips` 后后端日志 = ImageMagick（格式最全）、产出有损 VP8 WebP，见 §3 与开放项 8）；**FFmpeg 也已装通并真跑过**（n8.1.3，484 MB；7 个音视频节点用 ffprobe 读回真实属性验证，见【17】）；**7-Zip 已装通**（26.03，`verify-platform.mjs`【18】用系统 tar 独立解回来逐字节比对）。
   > **剩下的一个**：`libreoffice`（约 420 MB，且只有系统安装模式）—— 它的 `doc.to-pdf` 至今没有真机基线。
   > **历史**（保留）：这一段原来写着"ffmpeg / pandoc / libreoffice / 7zip 四个必需引擎的逐个真机跑通仍未完成，且 FFmpeg 因 `www.gyan.dev` 不可达而未能完成安装" —— 那是环境问题不是代码缺陷，后来把来源换成 BtbN 的 GitHub 地址就解决了（见 §3）。
-- [ ] 🚧 **真实接通图片加速链路（libvips 与 ImageMagick 都已达成，图像域那两个节点仍缺）**：`libvips` 已由 `image.convert` / `image.resize` / `image.crop` / `image.rotate` 真实调用并可在日志/节点输出里观测（`verify-platform.mjs`【6】在真机上验证），**中间档 ImageMagick 也已实测被挑中**（【12】）；仍缺的是 —— `image.enhance` / `image.strip-metadata` 不接外部后端（这是性能议题，声明侧已经不再谎称"装了会更快"）、**三档结果一致性没有测试**（见不一致 2 的更新）。
+- [ ] 🚧 **真实接通图片加速链路（只剩性能议题）**：`libvips` 已由 `image.convert` / `image.resize` /
+  `image.crop` / `image.rotate` 真实调用并可在日志/节点输出里观测（【6】在真机上验证），
+  **中间档 ImageMagick 也已实测被挑中**（【12】），**兜底档纯 Rust 也验过**（【13】）。
+  ✅ **"三档结果一致性没有测试"这一条已经补上**（§3.25 的【34】）：三档各跑一遍、
+  逐像素比 —— 裁剪 32×16 三档都是 `TL`/`BR`、旋转 90° 三档都是 64×96 且方向一致。
+  剩下的是**纯性能议题**：`image.enhance` / `image.strip-metadata` 只有纯 Rust 实现
+  （不接外部后端），而那是刻意的 —— 声明侧已经不再谎称"装了会更快"。
 - [x] ✅ `scripts/enginectl.mjs`：`list` / `install` / `probe` 已有并实测；**`verify` 与 `clean` 本轮补齐并真机验证**（见 §3.17、§3.21）
 - [ ] 🚧 离线 / 镜像源可配置（企业内网可用）
 
@@ -2000,30 +2135,82 @@ let is_sep = c.is_whitespace()
 - [x] ✅ 骨架完成：`WasmPlugin::load`（`with_wasi(false)`、`with_memory_max`、`with_fuel_limit`、入口函数存在性预检）、`fuel_for_timeout`（1e8 燃料/秒，下限 1e7）、清单内 `memoryLimitMb` → 64 KiB 页换算（钳制 1 MiB..4 GiB）
 - [ ] 🚧 宿主函数白名单**真正注入**：当前 v0.1 只校验 `allowHostFunctions`（`log`/`kv`）而不注入任何自定义宿主函数（不一致 6f）
 - [ ] 🚧 KV 宿主函数接入（需给 `Manifest` 配 KV store）
-- [ ] 🚧 越权样本测试：尝试文件读取 / 网络访问的 WASM 插件被拒绝；耗尽燃料被 trap 且不影响宿主存活
-- [ ] 🚧 `plugins/wasm-example` 打通端到端调用（`.wasm` 已构建）
+- [x] ✅ 越权样本测试（**网络那一半**）：尝试访问未授权主机的 WASM 插件被拒绝，且是**对照实验** ——
+  同一份输入只改授权 / 只改主机名（`verify-runtimes.mjs`【2】）。带端口的白名单在**校验阶段**就被拒。
+- [ ] 🚧 越权样本测试（**文件读取那一半**）：L2 是 `with_wasi(false)`，本身没有文件系统，
+  所以"读文件被拒"这条在 L2 上**没有可拒绝的对象**（不是没测，是没有这个能力）。
+  真正需要它的地方是 L1/L3 —— 那两处的路径收敛已由【26】与 `permission.rs` 的单测覆盖。
+  > **重新表述这一条**：原来它把"文件读取 / 网络访问 / 耗尽燃料"三件事写在一行里，
+  > 但三件事的处境完全不同（一个不适用、一个已验、一个没验），混在一行会让"这行是🚧"
+  > 看不出到底缺哪一半。
+- [ ] 🚧 越权样本测试（**耗尽燃料那一半**）：`fuel_for_timeout` 的**换算**有单测
+  （1e8 燃料/秒、下限 1e7），但**没有运行时检查**证明"一个死循环的 WASM 插件会被燃料耗尽 trap 掉、
+  且宿主仍然活着"。`runtimes/wasm.rs` 里已经有识别 `all fuel consumed` 的代码路径，
+  缺的只是一个**真的会烧光燃料的模块**与一条断言 —— 这是 L2 侧最值得补的一条。
+- [x] ✅ `plugins/wasm-example` 打通端到端调用 —— **实测**：`verify-runtimes.mjs`【1】把它暂存后
+  真的装、真的跑，并核对**算出来的数**（`Hello 世界` = 8 字符 / 12 字节），
+  `params` 也确实传进了沙箱；【2】复用同一个模块验 net 白名单。`wasm-http-example` 同样被【2】/【4】用到。
 
 **L3 Python 运行时**
 
 - [x] ✅ 骨架完成：独立 venv（`<plugin>/.venv`）、JSON-RPC over stdio（复用 `toolforge_process::rpc`）、清空继承环境变量（只留 `PATH`）、工作目录锁定、默认断网（代理指向 `127.0.0.1:1`）、默认 300 秒超时、优雅关闭（先 `shutdown` 再关 stdin 最后 kill）
-- [ ] 🚧 常驻进程复用验证：连续调用同一插件 100 次，进程数保持为 1
-- [ ] 🚧 取消能真正终止正在执行的 Python 调用并回收子进程
+- [x] ✅ 常驻进程复用验证：连续调用同一插件 100 次，进程数保持为 1 —— **本轮补上**（`verify-runtimes.mjs`【6c】）：
+  一个只回报 `os.getpid()` 的探针插件，连续调用 **100 次全部成功、pid 去重后恰好 1 个**（实测 8.2 秒跑完 100 次，平均每次 ~80ms —— 这个数字本身就是"复用在生效"的旁证：真每次都 spawn 一个 Python 的话不可能这么快）。
+  > ★ 配套的**反证**：外部把那个 pid 杀掉，下一次调用必须**成功**且换成**新** pid。
+  > 少了这条，"1 个 pid"可能只是宿主把一个常量回显了 100 次 —— 而这条反证同时也证明了
+  > 监督者能自愈（进程意外退出后重新拉起）。
+- [x] ✅ 取消能真正终止正在执行的 Python 调用并回收子进程 —— **本轮补上，而且当场查出一个真缺陷**（见 §3.27）：
+  `python.rs::call` 里取消走的是 `job.check()?`，任务**立刻**变成"已取消"（用户看到的没错），
+  但那个 Python 进程**没有被杀**，会一直跑到自己结束（`Timeout` 那条路一直是杀的，唯独取消漏了）。
+  修好后实测：取消 **258ms** 内任务进入 `cancelled`，**子进程真的没了**（`process.kill(pid, 0)` 抛错），
+  且下一次调用仍然成功、用的是**新**进程。
+  > ★ **做过证伪**：把修复临时关掉重跑，两条断言如期变红 ——
+  > 「子进程真的被收掉」报 `alive=true`（还在跑那 60 秒的 sleep），
+  > 「之后运行时仍可用」报 `running`（**下一个**调用被卡在那个还在睡的旧进程后面，
+  > 正是"取消之后下一个任务莫名变慢"这个真实症状）。而 ④/④b 保持绿，
+  > 精确隔离出"取消回收"这一处改动是唯一原因。
 - [ ] 🚧 **补齐进度字段**：`handle_notification` 目前丢弃 `currentItem` / `speed` / `etaSeconds`（不一致 6g）
+  > **本轮复核：仍然是空的**（`runtimes/python.rs` 里 `current_item: None` / `eta_seconds: None`）。
+  > 也就是说 L3 插件报上来的细粒度进度（当前在处理哪个文件、速度、预计剩余）**全部被丢掉**，
+  > 前端只能看到一个不确定态的进度条。这是 L3 与 L1/引擎节点在进度体验上的唯一实质差距。
 - [ ] 🚧 依赖预装与缓存策略（当前只负责建 venv 并调 pip）
-- [ ] 🚧 `plugins/python-example` 打通端到端调用（`main.py` 已在）
+- [x] ✅ `plugins/python-example` 打通端到端调用 —— **实测**：`verify-runtimes.mjs`【5】把
+  `plugins/python-example` 暂存后真的装、真的授权、真的跑（venv 冷启动 + `pip install Pillow` +
+  JSON-RPC 循环），产出色卡图并被登记为真实产出
 
 **权限**
 
 - [x] ✅ 骨架完成：`PermissionSet`、`PluginRecord::effective()`（声明 ∩ 已授权）、`set_granted`、`AuditLog` 的 `record_violation` / `record_escalation` / `record_integrity`
-- [ ] 🚧 权限授权 UI：逐条展示能力、逐条授权/撤销、展示授予范围与风险等级（高危能力标红）
-- [ ] 🚧 运行时裁决：未授权能力在 L1/L2/L3 三处一致地被拒绝
-- [ ] 🚧 路径收敛落地：文件访问被限制在授权目录内，越界被拒绝并记审计
-- [ ] 🚧 扩权检测：插件升级引入新能力时必须重新确认后才可运行
+- [x] ✅ 权限授权 UI：逐条展示能力、逐条授权/撤销、展示授予范围与风险等级（高危能力标红）——
+  `components/plugins/permission-gate.tsx`（逐条勾选 + 风险等级 + L3 额外确认代码已读）、
+  `plugin-detail.tsx`、`lib/capability.ts` 的**风险分级表**（含 `net` 在 L2/L3 强制程度不同的说明）。
+  **实测**：【26】验"前端能直接调什么、被拒的是不是真的被拒"，【29】验"许可证勾选框的点击穿透"
+- [x] ✅ 运行时裁决：未授权能力在 L1/L2/L3 三处一致地被拒绝 —— 【26】（capability 清单与实际裁决一致）、
+  【2】（L2 net 白名单对照实验）、【6】/【6b】（L3 env 与 exec 的对照实验）、
+  【7】号参数守卫（L1 的 `fs` 能力硬检查）
+- [x] ✅ 路径收敛落地：文件访问被限制在授权目录内，越界被拒绝并记审计 ——
+  `permission.rs::PathResolver` + 单测（含"先写输出、再读它 → 以前直接 `PERMISSION_DENIED`"那个真实缺陷的回归）、
+  以及【32】/【33】里真的把文件写到输出目录的端到端用例
+- [x] ✅ 扩权检测：插件升级引入新能力时必须重新确认后才可运行 —— `store.rs` 的**权限差异检测**
+  （与已装旧版本比是否扩权）+ `AuditEventKind::record_escalation`；另有 `quarantine_if_changed`
+  （安装后被改动过就隔离）与 `ensure_loaded` 里的**装载前内容哈希校验**，两者都有单测。
+  > 边界要说准：这道门在**安装/启用**时生效（扩权会被拦下来要求重新确认），
+  > 它不是"运行期持续监控"。这与 `docs/SECURITY.md` 的表述一致。
 
 **内核级隔离（L3 的诚实边界）**
 
 - [ ] 🚧 Windows Job Object + AppContainer、macOS `sandbox-exec`、Linux seccomp 三选一先行试点（模块文档已明确 L3 **当前不是**内核级沙箱）
-- [ ] 🚧 UI 与文档**不得**把 L3 称为「沙箱」——需在插件详情页如实标注隔离强度
+- [x] ✅ UI 与文档**不得**把 L3 称为「沙箱」，并如实标注隔离强度 —— **实测复核（本轮）**：
+  * `use-plugins.ts::runtimeKindLabel`：L2 = 「L2 · WASM 沙箱」（**这个说法是对的**，见下），
+    L3 = 「**L3 · Python 进程**」—— 没有沿用"沙箱"；
+  * `permission-gate.tsx`（安装确认页，比详情页更该说清的地方）：
+    「L3 插件以你的身份运行独立 Python 进程。宿主的隔离（清空环境变量、锁定工作目录、默认禁网、
+    逐次能力裁决）**只能挡住「非蓄意的越权」，挡不住恶意代码**。必须逐行读过 `main.py`
+    之类的入口文件之后才应勾选。」
+  * `settings-page.tsx`：「L3 Python 插件以你的身份运行，隔离挡不住蓄意恶意代码。」
+  * `plugin-detail.tsx`：「L3 可执行代码：将以你的身份运行，请自行阅读入口文件。」
+  > L2 叫"沙箱"是**准确**的：`with_wasi(false)` 意味着没有文件系统、没有网络、没有时钟，
+  > 只有纯计算 + 燃料上限 —— 那确实是沙箱。真正不能叫沙箱的只有 L3，而它没有被这么叫。
 
 **文件与数据安全**
 
