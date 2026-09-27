@@ -522,27 +522,28 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                 EngineModel {
                     id: "realesrgan-x4plus".into(),
                     name: "Real-ESRGAN x4plus".into(),
-                    purpose: "完整版通用超分，质量最好的一档".into(),
+                    purpose: "完整版通用超分，质量最好的一档。**输入尺寸固定 256×256** —— \
+                              需要把图切成 256 的块、补齐边缘块再裁回去，所以比动态尺寸的那两个慢一些（每块约 0.4 秒）。"
+                        .into(),
                     approx_size_mb: 67,
                     license: "BSD-3-Clause".into(),
                     commercial_use: true,
-                    // ⚠️ 这一条**故意**没有配下载源，原因和别的不同，值得写清楚：
+                    // ⚠️ 这一条**曾经故意没有配下载源**，注释写着"要做 x4plus：补上补齐 + 裁切，
+                    // 重新跑一遍接缝检查，再把哈希填进来"。三件事现在都做完了：
                     //
-                    // 找到的 x4plus ONNX 导出都是**固定输入尺寸**（64×64 或 128×128），
-                    // 也就是说想用它必须把整张图切成小块、逐块推理再拼回去。
-                    // 切块逻辑 `py/upscale.py` 里已经有了，但固定尺寸还要额外的
-                    // "补齐到 64×64 再裁掉"这一步，而补边的质量直接影响边缘块的结果 ——
-                    // 与其先上一个会留下网格状接缝的版本，不如先把两个**动态尺寸**
-                    // 的模型（上面那两条）做扎实：它们对任意尺寸都能直接推理。
+                    // * 补齐 + 裁切：`py/upscale.py` 早就实现了（读会话的输入形状，
+                    //   固定尺寸时用 `np.pad(mode="edge")` 补到 256×256 再裁掉）；
+                    // * 接缝检查：脚本新增 `seamRatioX/Y` 指标（块边界上的平均跳变
+                    //   相对整幅图中位数跳变的倍数），验证脚本里还有一条 `--seamProbeShift`
+                    //   的**反证** —— 故意错位之后指标必须明显变差，否则那个指标没有被验证过；
+                    // * 哈希：真实下载后算出来的（见下）。
                     //
-                    // 要做 x4plus：补上补齐 + 裁切，重新跑一遍接缝检查，再把哈希填进来。
-                    // 哈希必须来自真实下载（见 `verified_sources_are_pinned`）。
-                    url: None,
-                    sha256: None,
-                    file_name: None,
+                    // 这个 ONNX 导出**确实是固定输入**（`[1,3,256,256]` → `[1,3,1024,1024]`），
+                    // 不是"看着像"。选购型时用 onnxruntime 读过它的输入形状才敢写进来。
+                    url: Some("https://hf-mirror.com/AXERA-TECH/Real-ESRGAN/resolve/main/onnx/realesrgan-x4-256.onnx".into()),
+                    sha256: Some("279da2949cfc4f4f87ca90df784e443e304ed82b8cbc27b40b995c745cbd3d5c".into()),
+                    file_name: Some("realesrgan-x4-256.onnx".into()),
                     installed: false,
-                    // 它**是**给超分用的，只是还没配下载源 ——
-                    // 归属要照实写，"暂时下不了"和"没人用它"是两件事。
                     used_by: vec!["ai.upscale".into()],
                 },
             ],

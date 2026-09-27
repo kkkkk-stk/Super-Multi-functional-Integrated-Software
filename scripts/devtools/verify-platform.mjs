@@ -744,6 +744,153 @@ c.section('【11】AI 超分（ai.upscale）是否真的按倍数放大');
       c.check(false, '产出 1 个文件', produced.join(', '));
     }
 
+    // ★ 固定输入尺寸的模型（realesrgan-x4plus，输入写死 256×256）
+    //
+    // 上一节的图是 300×200，用**动态尺寸**模型时只会切成 1~2 块，接缝检查很弱。
+    // 这里换一张 700×500 的图：step = 256-16 = 240，于是横向有 3 块、纵向有 3 块，
+    // 块与块的边界真实存在 —— 而且 x4plus 的输入是**写死的**，必须走
+    // "补齐到 256×256 → 推理 → 裁回去"那条路径。
+    const fixedModel = (models ?? []).find(
+      (m) => m.installed && m.id === 'realesrgan-x4plus'
+    );
+    if (!fixedModel) {
+      c.note('跳过固定尺寸模型的检查：没有已下载的 realesrgan-x4plus（67 MB）');
+      c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    } else {
+      const fixedDir = join(REPO_ROOT, '.tools', 'smoke', 'out-upscale-fixed');
+      rmSync(fixedDir, { recursive: true, force: true });
+      mkdirSync(fixedDir, { recursive: true });
+      const bigSrc = join(REPO_ROOT, '.tools', 'smoke', 'in-upscale-fixed.png');
+      writeFileSync(bigSrc, makeSubjectPng(700, 500, [140, 100, 560, 400]));
+
+      const sub2 = await client.invoke('plugins_run', {
+        req: {
+          pluginId: 'com.toolforge.builtin.image-upscale',
+          inputs: { src: [bigSrc] },
+          params: {
+            model: { kind: 'str', value: 'realesrgan-x4plus' },
+            scale: { kind: 'int', value: 4 },
+          },
+          outputDir: fixedDir,
+        },
+      });
+      const job2 = await client.waitJob(sub2.jobId, 900, 1000);
+      if (job2.error) c.note(`${job2.error.code}：${job2.error.message}`);
+      c.check(job2.status === 'succeeded', '固定尺寸模型（x4plus）超分成功', job2.status);
+
+      const out2 = existsSync(fixedDir) ? readdirSync(fixedDir) : [];
+      if (out2.length === 1) {
+        const png = pngInfo(readFileSync(join(fixedDir, out2[0])));
+        c.check(png?.width === 2800, '宽度 = 700 × 4', String(png?.width));
+        c.check(png?.height === 2000, '高度 = 500 × 4', String(png?.height));
+      } else {
+        c.check(false, '固定尺寸模型产出 1 个文件', out2.join(', '));
+      }
+
+      const logs2 = (job2.logs ?? []).map((l) => String(l.message));
+      const detail2 = logs2.find((l) => l.includes('块；输出')) ?? '';
+      c.note(detail2);
+      c.check(
+        !logs2.some((l) => l.includes('没被任何分块覆盖')),
+        '固定尺寸路径下也没有"像素未被覆盖"的警告',
+        ''
+      );
+      c.check(
+        /模型 realesrgan-x4plus/.test(detail2),
+        '确实用的是 x4plus',
+        detail2
+      );
+      // ★ x4plus 的输入是**写死的 256×256**，所以它必须走"补齐 → 推理 → 裁回"
+      // 那条路。这一条断言把"补边路径真的被执行过"钉住了 ——
+      // 否则那个分支可能从来没被任何真实权重走到过（这正是它此前没被验证的原因）。
+      c.check(
+        /权重输入尺寸固定，已按边缘像素补齐再裁回/.test(detail2),
+        '★ 固定尺寸权重确实走了"补齐 → 推理 → 裁回"那条路径',
+        detail2
+      );
+    }
+
+    // ★ 接缝指标本身必须**能被证伪**
+    //
+    // `upscale.py` 现在会报 `seamRatioX/Y`（块边界上的跳变 ÷ **紧邻几个位置**的跳变）。
+    // 但一个永远只报"很好"的指标等于没有指标 —— 所以这里直接调脚本、
+    // 用 `--seamProbeShift 200` **故意把每块挪 200 个输出像素**，断言指标确实变差。
+    // 这正是本项目反复强调的那件事：**一个没生效的反证和一个没生效的守卫
+    // 看起来完全一样**。
+    //
+    // 200 这个量级是有讲究的：块之间有 `overlap` 像素重叠，挪几个像素只会让
+    // 后来者覆盖掉一条位置相近、内容也相近的区域，**看不出任何差别** ——
+    // 第一版就是拿 3 去试的，指标从 3.5331 变成 3.5416，什么都说明不了。
+    if (upModel && runtimeReady) {
+      const py = join(DATA_DIR, 'cache', 'onnx-runtime', 'Scripts', 'python.exe');
+      const script = join(DATA_DIR, 'cache', 'onnx-runtime', 'upscale.py');
+      const modelPath = join(DATA_DIR, 'models', upModel.id, `${upModel.id}.onnx`);
+      if (existsSync(py) && existsSync(script) && existsSync(modelPath)) {
+        const seamSrc = join(REPO_ROOT, '.tools', 'smoke', 'in-seam.png');
+        // ⚠️ 接缝探针**必须用高频/渐变图，不能用"平底 + 硬边色块"**。
+        //
+        // 试过两轮才明白：那张椭圆图的大片区域是**纯色**，把块挪开之后
+        // 覆盖上去的还是同一片纯色 —— 像素级上根本没有差别，也就没有接缝可言。
+        // 渐变图则相反：每个像素与邻居都差一点点，任何错位都会在边界上
+        // 露出一个远大于正常步长的跳变。
+        writeFileSync(seamSrc, makePng(700, 500, 2));
+        const runUpscale = (extraArgs) => {
+          const out = join(REPO_ROOT, '.tools', 'smoke', `out-seam-${extraArgs.length}.png`);
+          const r = spawnSync(
+            py,
+            [script, '--model', modelPath, '--input', seamSrc, '--output', out, '--scale', '4', ...extraArgs],
+            { encoding: 'utf8', windowsHide: true }
+          );
+          if (r.status !== 0) return { error: String(r.stderr ?? '').slice(0, 300) };
+          try {
+            return JSON.parse(String(r.stdout).trim().split('\n').pop());
+          } catch (e) {
+            return { error: `解析脚本输出失败：${e.message}` };
+          }
+        };
+        const clean = runUpscale([]);
+        // 101 是故意挑的：不是任何周期的整数倍，不会被周期性的纹理"对齐"掉
+        const broken = runUpscale(['--seamProbeShift', '101']);
+        console.log(`   接缝指标：正常 ${JSON.stringify({ x: clean.seamRatioX, y: clean.seamRatioY })} / 故意错位 ${JSON.stringify({ x: broken.seamRatioX, y: broken.seamRatioY })}`);
+        if (clean.error || broken.error) {
+          c.check(false, '接缝指标探测跑通', clean.error ?? broken.error);
+        } else {
+          c.check(
+            typeof clean.seamRatioX === 'number' && typeof clean.seamRatioY === 'number',
+            '脚本会报接缝指标 seamRatioX/Y',
+            JSON.stringify({ x: clean.seamRatioX, y: clean.seamRatioY })
+          );
+          // 阈值 8 是**实测定出来的**：这张渐变图上正常拼接是 3.7 / 2.4，
+          // 而故意错位是 10.6 / 15.1。它不是"越接近 1 越好" —— 分块推理本身
+          // 就会在块边界留下一点差异（相邻块对同一片区域的推断结果不完全一样），
+          // 所以 3 上下是这类模型的正常水位。
+          // ⚠️ 阈值**与图像内容有关**：同一个指标在"硬边色块"那张图上会到 6~7
+          // （椭圆边缘正好落在某条缝上时，取最大值就会抬上去）。所以只在
+          // 这张渐变图上断言绝对值 —— 换个图就得重新测水位，别把 8 当成通用常数。
+          c.check(
+            clean.seamRatioX < 8 && clean.seamRatioY < 8,
+            '正常拼接时块边界没有异常跳变（指标在实测正常水位内）',
+            `x=${clean.seamRatioX} y=${clean.seamRatioY}`
+          );
+          c.check(
+            broken.seamRatioX > clean.seamRatioX * 1.5 || broken.seamRatioY > clean.seamRatioY * 1.5,
+            '★ 反证一：故意把块错位后接缝指标明显变差（说明这个指标真的能发现接缝）',
+            `正常 x=${clean.seamRatioX}/y=${clean.seamRatioY} → 错位 x=${broken.seamRatioX}/y=${broken.seamRatioY}`
+          );
+          // ★ 反证二，**独立于上面那个指标**：错位会在结果里留下没人写过的洞。
+          // 有两个互不相干的信号同时变化，比一个信号自己说自己灵要可信得多。
+          c.check(
+            clean.uncoveredRatio === 0 && broken.uncoveredRatio > 0.01,
+            '★ 反证二：错位会让 uncoveredRatio 从 0 变成明显的比例（独立信号）',
+            `正常 ${clean.uncoveredRatio} → 错位 ${broken.uncoveredRatio}`
+          );
+        }
+      } else {
+        c.note(`跳过接缝反证：找不到脚本或权重（${script} / ${modelPath}）`);
+        c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+      }
+    }
+
     // ★ 反向断言：拿一个**非超分**权重（抠图模型）去超分，必须被拒绝。
     //
     // 这条是被一个真事故逼出来的：验证脚本曾经按"谁服务于 ai.upscale"挑模型，

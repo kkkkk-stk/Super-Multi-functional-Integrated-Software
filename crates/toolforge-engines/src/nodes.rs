@@ -1630,9 +1630,36 @@ async fn ai_upscale(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> Toolf
         ));
     }
 
+    // 固定输入尺寸的权重（例如 realesrgan-x4plus 的 256×256）走的是
+    // "补齐 → 推理 → 裁回去"那条路，而不是直接喂 patch。**这一点必须写进日志**：
+    // 两条路径的行为差异（速度、边缘块的处理方式）用户应当看得见，
+    // 而且没有它，"到底有没有走补边路径"就只能靠读代码猜。
+    let fixed_input = report
+        .get("fixedInput")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let seam_x = report.get("seamRatioX").and_then(|v| v.as_f64());
+    let seam_y = report.get("seamRatioY").and_then(|v| v.as_f64());
+
     ctx.job.log(
         toolforge_core::job::LogLevel::Debug,
-        format!("ai.upscale：模型 {model_id}；{tiles} 块；输出 {out_w}x{out_h}"),
+        format!(
+            "ai.upscale：模型 {model_id}；{tiles} 块；输出 {out_w}x{out_h}{}{}{}",
+            if fixed_input {
+                "；权重输入尺寸固定，已按边缘像素补齐再裁回"
+            } else {
+                ""
+            },
+            match (seam_x, seam_y) {
+                (Some(x), Some(y)) => format!("；接缝指标 {x:.2}/{y:.2}"),
+                _ => String::new(),
+            },
+            if uncovered > 0.0001 {
+                format!("；未覆盖 {:.3}%", uncovered * 100.0)
+            } else {
+                String::new()
+            }
+        ),
     );
 
     Ok(NodeOutput::file(dst.display().to_string())

@@ -999,11 +999,16 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         params: vec![
             // 枚举必须与 `engine_catalog()` 里 `onnx-models` 的模型表一致 ——
             // 列出目录里没有的模型 = 用户选到一个永远下不到的模型。
+            // 反方向也一样：模型表里能下到的模型都该能在这里选中。
             enum_param(
                 "model",
                 "模型",
                 "realesr-general-x4v3",
-                &["realesr-general-x4v3", "realesrgan-anime6b"],
+                &[
+                    "realesr-general-x4v3",
+                    "realesrgan-anime6b",
+                    "realesrgan-x4plus",
+                ],
             ),
             range_param("scale", "放大倍数", ParamType::Int, 4.0, 2.0, 4.0),
             range_param("tile", "分块边长（px）", ParamType::Int, 256.0, 32.0, 2048.0),

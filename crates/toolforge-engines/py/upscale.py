@@ -33,6 +33,63 @@ def fail(msg: str) -> "None":
     sys.exit(2)
 
 
+def _seam_ratio(arr, seams, axis: int, span: int = 4) -> float:
+    """接缝处相邻像素的跳变，相对**紧邻它的几个位置**的跳变的倍数（取中位数）。
+
+    ## 这个指标在回答什么
+
+    `ai.upscale` 是分块推理再拼回去的。拼错了的表现不是"尺寸不对"（那会被
+    别的断言抓住），而是**块与块交界处出现一条硬边** —— 尺寸、通道数、覆盖比例
+    全都正常，只有肉眼能看出来。而"看起来有没有接缝"没法写进自动化。
+
+    ## 第一版写错了，而且是被自己的反证抓住的
+
+    第一版拿"块边界上的平均跳变 ÷ **整幅图**的中位数跳变"当指标。它在真实图上
+    报 3.53 —— 看着像"有接缝"，其实是**图像内容**造成的：测试图是一个硬边椭圆，
+    只要椭圆的边落在块边界附近，那个平均值就被它抬上去了。
+    这个指标分不清"图里本来就有边"和"我拼错了"。
+
+    现在改成**局部对照**：只看接缝那一条线与它左右各 `span` 条线的比较。
+    图里本来就有边 → 邻居同样大 → 比值≈1；拼接错位 → 邻居是平的、接缝突然一跳
+    → 比值明显大于 1。
+
+    ## 它仍然**不是**画质指标
+
+    它只用来抓拼接错误，而且这一点由 `--seamProbeShift` 那条反证守着：
+    故意错位之后指标必须明显变差，否则这个指标等于没有。
+    """
+    import numpy as np
+
+    d = np.abs(np.diff(arr, axis=axis))
+    other = tuple(a for a in (0, 1, 2) if a != axis)
+    per_line = d.mean(axis=other)
+
+    ratios = []
+    for s in sorted(seams):
+        if s <= 0 or s >= per_line.shape[0]:
+            continue
+        # ⚠️ 下标要**两个都看**：`np.diff` 的第 j 项是 `arr[j+1] - arr[j]`，
+        # 所以"块的第一列与它左边那一列"之间的跳变落在 `per_line[s-1]`，
+        # 而不是 `per_line[s]`。第一版只看 `s`，于是检查的是块**内部**的两个像素 ——
+        # 难怪故意错位之后指标纹丝不动（1.2043 → 1.2211）。
+        for probe in (s - 1, s):
+            if probe < 1 or probe >= per_line.shape[0]:
+                continue
+            lo = max(0, probe - span)
+            hi = min(per_line.shape[0], probe + span + 1)
+            neigh = np.concatenate([per_line[lo:probe], per_line[probe + 1 : hi]])
+            if neigh.size == 0:
+                continue
+            base = max(float(np.median(neigh)), 1e-6)
+            # 上限保护：邻居完全平坦时比值会爆掉，而那种情况本身没有信息量
+            ratios.append(min(float(per_line[probe]) / base, 1000.0))
+    if not ratios:
+        return 0.0
+    # 取**最大**而不是中位数：一条接缝出问题就够了，别被其它正常的缝冲淡。
+    # 正常拼接时每条缝都在 1 附近，最大值与中位数差别不大。
+    return float(max(ratios))
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Real-ESRGAN 超分")
     p.add_argument("--model", required=True)
@@ -45,6 +102,15 @@ def main() -> None:
     p.add_argument("--tile", type=int, default=256)
     p.add_argument("--overlap", type=int, default=16)
     p.add_argument("--tileOverlap", type=int, default=8)
+    # ⚠️ **验证钩子，不是给用户用的**：把每个块贴回结果时的位置故意往左上挪若干
+    # **输出像素**，用来制造一条**真的接缝**。存在的理由很直白 —— 接缝指标如果
+    # 永远只报"很好"，那它就没有被验证过（一个没生效的守卫和一个没生效的反证
+    # 看起来完全一样）。
+    #
+    # 量级很重要：挪几个像素**不会**产生可见接缝 —— 块之间有 `overlap` 像素的重叠，
+    # 小位移只是让后来者覆盖掉位置相近、内容也相近的一条，看不出差别。
+    # 验证脚本用的是 200（输出像素，即 50 个输入像素），足以露出完全不同的内容。
+    p.add_argument("--seamProbeShift", type=int, default=0)
     args = p.parse_args()
 
     try:
@@ -113,6 +179,10 @@ def main() -> None:
 
     step = max(1, tile - overlap)
     tiles = 0
+    # 每个块**贴回结果时**的左/上边界（输出坐标）。接缝检查靠它们定位 ——
+    # 没有这两个集合，"接缝在哪"就只能靠猜。
+    seam_xs: set = set()
+    seam_ys: set = set()
     for y0 in range(0, h, step):
         for x0 in range(0, w, step):
             y1 = min(y0 + tile, h)
@@ -175,6 +245,12 @@ def main() -> None:
             # 裁掉补齐的部分，再换算到原图坐标
             pred = pred[: ph * scale, : pw * scale, :]
             oy, ox = y0c * scale, x0c * scale
+            if args.seamProbeShift:
+                # 故意错位（只用于验证"接缝指标真的能发现接缝"）
+                ox = max(0, ox - args.seamProbeShift)
+                oy = max(0, oy - args.seamProbeShift)
+            seam_xs.add(ox)
+            seam_ys.add(oy)
             out[oy : oy + pred.shape[0], ox : ox + pred.shape[1], :] = pred
             covered[oy : oy + pred.shape[0], ox : ox + pred.shape[1], :] = 1.0
 
@@ -182,6 +258,8 @@ def main() -> None:
         fail("没有可处理的块（图片尺寸异常？）")
 
     missing = float((covered < 0.5).mean())
+    seam_ratio_x = _seam_ratio(out, seam_xs, axis=1)
+    seam_ratio_y = _seam_ratio(out, seam_ys, axis=0)
     result = Image.fromarray((out.clip(0.0, 1.0) * 255.0 + 0.5).astype(np.uint8), mode="RGB")
 
     # 目标倍数小于模型原生倍数时，用 Lanczos 缩回去。
@@ -211,6 +289,10 @@ def main() -> None:
                 "fixedInput": bool(fixed_hw),
                 # 没被任何块覆盖到的像素比例。正常应该是 0；非 0 说明切块有洞。
                 "uncoveredRatio": round(missing, 6),
+                # 接缝指标（见 `_seam_ratio`）。1 附近 = 边界不特殊；
+                # 明显大于 1 = 拼回去的时候错位了。
+                "seamRatioX": round(seam_ratio_x, 4),
+                "seamRatioY": round(seam_ratio_y, 4),
                 "model": args.model,
             },
             ensure_ascii=False,
