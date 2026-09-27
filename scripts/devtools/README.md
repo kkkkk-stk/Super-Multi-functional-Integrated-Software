@@ -42,7 +42,7 @@ node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
 node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（101 项）
-node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（58 项）
+node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（70 项）
 ```
 
 `pnpm dev:cdp` 与 `pnpm verify:app` 是上面两条命令的简写。
@@ -163,7 +163,7 @@ libvips 只要在，`image.convert` 就永远走它，中间档与兜底档根�
 前置条件不满足时（没下权重、没装引擎）会**显式记为跳过**，
 而不是悄悄放过 —— "跳过"和"通过"是两回事。
 
-### `verify-runtimes.mjs` —— 三级插件里的 L2 与 L3（50 项）
+### `verify-runtimes.mjs` —— 三级插件里的 L2 与 L3（70 项）
 
 L1（内置流水线）天天在跑，而 **L2（Extism WASM）与 L3（Python 子进程）在写出来之后
 一次都没被执行过**：单元测试、清单校验、`cargo check` 全绿，示例插件也"在仓库里躺着
@@ -176,6 +176,7 @@ L1（内置流水线）天天在跑，而 **L2（Extism WASM）与 L3（Python �
 | 【2】 | L2 的 net 主机白名单：**同一份输入，只改授权 / 只改主机名**的对照实验（见下）；带端口的白名单在**校验阶段**就被拒 |
 | 【4】 | 装载前的体检：垃圾字节、**用 `wasm32-wasip1` 构建的模块**、未知宿主函数，三种都给出可操作报错 |
 | 【5】 | L3：venv 冷启动（真的 `pip install Pillow`）→ JSON-RPC 循环 → 色卡图被登记为真实产出 |
+| 【6】 | L3 的 `env` 与 `exec` —— 两个曾经"勾了等于没勾"的能力：env 用对照实验验注入（撤销授权读不到 / 授权后值与宿主一致 / 没声明的仍然读不到）；exec 验**装载期静态门**（没声明 → 拒绝装载、声明了没授权 → 拒绝、声明+授权 → 子进程真的起来并拿到输出） |
 
 **最值得看的是【2】那三行**：
 

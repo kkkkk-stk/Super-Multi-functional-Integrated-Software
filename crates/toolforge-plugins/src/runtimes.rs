@@ -208,6 +208,29 @@ impl PluginRunner {
                     )
                 })?;
 
+                // ---- `exec` 的装载期静态门 ----
+                //
+                // L3 是普通进程，宿主**无法在运行期**拦住它起子进程（那需要
+                // Job Object + AppContainer / seccomp，见 SECURITY.md §9 第 3 项）。
+                // 能做的是在装载时读一遍它的源码：用了起子进程的 API 却没声明
+                // `exec` → 拒绝装载。挡的是"作者忘了 / 用户没注意"，挡不住蓄意绕过。
+                let exec_usage = crate::runtimes::python::scan_python_sources(&record.dir);
+                let effective = record.effective();
+                crate::runtimes::python::gate_exec_usage(
+                    &id,
+                    &exec_usage,
+                    record
+                        .manifest
+                        .permissions
+                        .capabilities
+                        .iter()
+                        .any(|c| matches!(c, toolforge_core::permission::Capability::Exec)),
+                    effective
+                        .capabilities
+                        .iter()
+                        .any(|c| matches!(c, toolforge_core::permission::Capability::Exec)),
+                )?;
+
                 // 握手时只告知**插件私有目录**：它是跨任务稳定的。
                 //
                 // 本次任务的 input / output / work 目录是**每次 run 调用时**才在
@@ -229,7 +252,7 @@ impl PluginRunner {
                     &python_exe,
                     &plugin_paths,
                     &id,
-                    record.effective(),
+                    effective.clone(),
                 )
                 .await?;
                 p.initialize(&id).await?;
@@ -241,6 +264,24 @@ impl PluginRunner {
                             "entry": python.entry,
                             "requirements": python.requirements,
                             "network": python.allow_network,
+                            // 装载期扫到的"会起子进程"的用法。**如实记录**：
+                            // 出了问题之后，"它当时是不是声明并授权了 exec"
+                            // 是第一个要回答的问题。
+                            "execUsage": exec_usage.iter().map(|u| format!("{}: {}", u.file, u.pattern)).collect::<Vec<_>>(),
+                            "execGranted": effective
+                                .capabilities
+                                .iter()
+                                .any(|c| matches!(c, toolforge_core::permission::Capability::Exec)),
+                            // 环境变量白名单的**名字**（不含值！）—— 见 python.rs::inject_declared_env
+                            "envNames": effective
+                                .capabilities
+                                .iter()
+                                .filter_map(|c| match c {
+                                    toolforge_core::permission::Capability::Env { names } => Some(names.clone()),
+                                    _ => None,
+                                })
+                                .flatten()
+                                .collect::<Vec<_>>(),
                         })),
                 );
                 RunningPlugin::Python(p)

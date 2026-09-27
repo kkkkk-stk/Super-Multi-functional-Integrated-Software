@@ -53,7 +53,7 @@
 > | 内置示例插件 | **7 个** |
 > | 引擎下载源 | `engine-sources.json` 共 **12 条**（5 个引擎 × 各平台），其中 **7 条**的 SHA-256 是真实下载后核对过的；其余 5 条 `sha256: null`，`install` 会对它们返回 `HashRequired` 而**不放行** |
 > | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **111 项全通过**（【1】–【15】） |
-> | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **58 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验） |
+> | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
 > 下面这段原始快照保留原样，**不要据此判断现状**：

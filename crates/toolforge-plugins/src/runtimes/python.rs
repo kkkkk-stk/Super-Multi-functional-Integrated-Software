@@ -18,6 +18,26 @@
 //! `requirements` 会在**插件私有 venv**（`<plugin>/.venv`）里安装，与系统 Python
 //! 和其它插件完全隔离。安装失败的插件会被标记为不可用，而不是静默降级。
 //! v0.1 只负责**创建 venv 并调用 pip**，依赖的预装与缓存策略见 ROADMAP。
+//!
+//! ## `exec` 能力：为什么是"装载时按代码扫描"而不是"运行期拦截"
+//!
+//! L3 插件是**普通进程**：它 `import subprocess` 就能起子进程，宿主既不在它的
+//! `CreateProcess` 路径上，也没有内核级隔离（Windows Job Object + AppContainer /
+//! Linux seccomp 都在 v0.2 的路线图上）。所以"运行期拦截起子进程"这件事
+//! **在 v0.1 做不到**，任何声称做了的说法都是假的。
+//!
+//! 能做而且值得做的是**装载时的静态门**：读插件的 `.py`，如果代码里用了
+//! 起子进程的 API，而生效能力里没有 `exec`，就**拒绝装载**并说清怎么办。
+//!
+//! 它挡住的是什么、挡不住什么，必须讲明白：
+//!
+//! * ✅ **挡住**"作者忘了声明 / 用户没注意到"这一类 —— 也就是 UI 上那句
+//!   "只能挡住非蓄意的越权"里说的那部分；
+//! * ❌ **挡不住**蓄意绕过：`__import__("subprocess")`、把代码拼成字符串再
+//!   `exec`、走 `ctypes` 直接调 Win32 —— 静态扫描对这类写法无能为力。
+//!
+//! 也就是说它是**知情的门**，不是沙箱。这一点与 `docs/SECURITY.md` §9 第 3 项
+//! 的表述一致：那一项至今仍写着"运行期无法强制"，本次改的是**装载期**。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -349,6 +369,166 @@ fn capability_tag(c: &toolforge_core::permission::Capability) -> String {
     c.label().to_string()
 }
 
+// ============================================================================
+// 装载时的 `exec` 静态门
+// ============================================================================
+
+/// 会**启动子进程**的 Python API（子串匹配，大小写敏感）。
+///
+/// 刻意保守：只收"确定会创建进程"的那些，不收 `ctypes`（它能干的事太多，
+/// 收进来会把大量无害插件挡在门外，而这个门必须让人信服）。
+const EXEC_PATTERNS: &[(&str, &str)] = &[
+    ("subprocess", "subprocess 模块"),
+    ("os.system", "os.system"),
+    ("os.popen", "os.popen"),
+    ("os.execv", "os.execv"),
+    ("os.execve", "os.execve"),
+    ("os.execl", "os.execl"),
+    ("os.spawn", "os.spawn*"),
+    ("os.fork", "os.fork"),
+    ("pty.spawn", "pty.spawn"),
+    ("multiprocessing", "multiprocessing"),
+    ("CreateProcess", "Win32 CreateProcess"),
+    ("shell=True", "subprocess 的 shell=True"),
+];
+
+/// 命中一处代码：
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecUsage {
+    /// 相对插件目录的文件名
+    pub file: String,
+    /// 命中的模式（人类可读）
+    pub pattern: String,
+}
+
+/// 扫描插件目录里的 Python 源码，找出会起子进程的用法。
+///
+/// * 只看 `.py`，跳过 `.venv`（那是我们自己装的依赖，几十 MB 的第三方代码）、
+///   `__pycache__` 与隐藏目录；
+/// * 每个文件最多读 [`SCAN_MAX_BYTES`]，最多看 [`SCAN_MAX_FILES`] 个文件 ——
+///   装载路径上不能因为一个巨大的插件目录卡住；
+/// * 读不了的文件**跳过**而不是报错：扫描是"尽力而为的知情"，不是安全边界，
+///   为了它让插件装不上是不划算的。
+pub fn scan_python_sources(plugin_dir: &Path) -> Vec<ExecUsage> {
+    const SCAN_MAX_FILES: usize = 200;
+    const SCAN_MAX_BYTES: u64 = 512 * 1024;
+
+    let mut out: Vec<ExecUsage> = Vec::new();
+    let mut seen = 0usize;
+
+    let walker = walkdir::WalkDir::new(plugin_dir)
+        .max_depth(6)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            // `.venv` 是我们自己 pip install 出来的第三方依赖；
+            // `__pycache__` 是字节码。两者都不是插件作者写的代码。
+            !(e.file_type().is_dir()
+                && (name == ".venv" || name == "__pycache__" || name.starts_with('.')))
+        });
+
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("py") {
+            continue;
+        }
+        if entry.metadata().map(|m| m.len()).unwrap_or(0) > SCAN_MAX_BYTES {
+            continue;
+        }
+        seen += 1;
+        if seen > SCAN_MAX_FILES {
+            break;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let label = path
+            .strip_prefix(plugin_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (needle, human) in EXEC_PATTERNS {
+            if text.contains(needle) {
+                out.push(ExecUsage {
+                    file: label.clone(),
+                    pattern: (*human).to_string(),
+                });
+            }
+        }
+    }
+
+    out.sort_by(|a, b| (&a.file, &a.pattern).cmp(&(&b.file, &b.pattern)));
+    out.dedup();
+    out
+}
+
+/// 把扫描结果变成一次**装载裁决**。
+///
+/// 返回 `Ok(())` 表示放行；`Err` 里的文案必须同时说清"哪一行代码"与"怎么办"，
+/// 否则这个门只会让人困惑（而困惑的门会被人想办法绕过去，而不是去补声明）。
+pub fn gate_exec_usage(
+    plugin_id: &str,
+    usage: &[ExecUsage],
+    declared_exec: bool,
+    granted_exec: bool,
+) -> ToolforgeResult<()> {
+    if usage.is_empty() {
+        return Ok(());
+    }
+
+    let where_ = usage
+        .iter()
+        .take(6)
+        .map(|u| format!("  - {} 里的 {}", u.file, u.pattern))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let more = usage.len().saturating_sub(6);
+    let where_ = if more > 0 {
+        format!("{where_}\n  …另有 {more} 处")
+    } else {
+        where_
+    };
+
+    if !declared_exec {
+        return Err(ToolforgeError::plugin_invalid(
+            "插件代码里会启动子进程，但清单没有声明 exec 能力",
+        )
+        .with_subject(plugin_id)
+        .with_detail(format!(
+            "扫到的地方：\n{where_}\n\n\
+             L3 插件以你的身份运行普通进程，宿主**没有办法在运行期拦住**它起子进程，\
+             所以这里用的是装载期的静态检查：代码里出现这些 API 就必须先声明 `exec`，\
+             由用户在授权面板上明确勾选（那一项是**极高风险**，能起任意程序）。\n\n\
+             作者请在 plugin.yaml 的 permissions 里加上：\n\
+             \x20   - kind: exec\n\
+             用户请在插件详情页勾选它之后再启用。"
+        )));
+    }
+
+    if !granted_exec {
+        return Err(ToolforgeError::denied(
+            "插件要用子进程，但你还没有授权 exec 能力",
+        )
+        .with_subject(plugin_id)
+        .with_detail(format!(
+            "扫到的地方：\n{where_}\n\n\
+             到插件详情页 → 权限，勾选「启动外部进程」之后再启用。\n\
+             这一项等价于任意代码执行，只有你完全信任这个插件的来源时才应勾选。"
+        )));
+    }
+
+    // 声明了也授权了：放行，但要留下痕迹
+    tracing::warn!(
+        plugin = plugin_id,
+        hits = usage.len(),
+        "这个 L3 插件会启动子进程，且 exec 已被授权"
+    );
+    Ok(())
+}
+
 /// 按 `env { names }` 白名单把宿主的环境变量注入子进程。
 ///
 /// # 返回值
@@ -504,6 +684,116 @@ mod tests {
         let (injected, missing) = inject_declared_env(&set, &mut target);
         assert!(injected.is_empty() && missing.is_empty());
         assert!(target.is_empty(), "{target:?}");
+    }
+
+    // ========================================================================
+    // `exec` 的装载期静态门
+    // ========================================================================
+
+    /// 在临时目录里搭一个插件目录，写几个文件。
+    fn scaffold(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("tf-execscan-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, body) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn clean_plugin_has_no_exec_usage() {
+        let dir = scaffold(
+            "clean",
+            &[("main.py", "import json\nprint(json.dumps({'ok': True}))\n")],
+        );
+        assert!(scan_python_sources(&dir).is_empty());
+        // 没有命中时永远放行，给什么都不拦
+        assert!(gate_exec_usage("p", &[], false, false).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subprocess_use_is_detected_with_file_and_pattern() {
+        let dir = scaffold(
+            "subprocess",
+            &[
+                ("main.py", "import subprocess\nsubprocess.run(['ls'])\n"),
+                ("helper/util.py", "import os\nos.system('echo hi')\n"),
+            ],
+        );
+        let hits = scan_python_sources(&dir);
+        assert!(hits.iter().any(|h| h.file == "main.py" && h.pattern.contains("subprocess")));
+        assert!(hits.iter().any(|h| h.file == "helper/util.py" && h.pattern.contains("os.system")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **venv 里的第三方代码不算插件作者的代码** —— 否则只要装了任何依赖，
+    /// 扫描就会命中一堆无关的 `subprocess`（pip 自己就大量使用它）。
+    #[test]
+    fn venv_and_pycache_are_skipped() {
+        let dir = scaffold(
+            "venvskip",
+            &[
+                ("main.py", "print('clean')\n"),
+                (".venv/Lib/site-packages/pip/_internal/x.py", "import subprocess\n"),
+                ("__pycache__/main.cpython-311.pyc", "subprocess"),
+            ],
+        );
+        assert!(
+            scan_python_sources(&dir).is_empty(),
+            "venv 与 __pycache__ 里的内容不该被算成插件代码"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 三种状态的裁决：没声明 → PluginInvalid；声明了但没授权 → PermissionDenied；
+    /// 声明且授权 → 放行。**错误码不同是有意的**：前者是作者的问题，
+    /// 后者是用户还没勾选，界面上该给不同的引导。
+    #[test]
+    fn exec_gate_distinguishes_not_declared_from_not_granted() {
+        let usage = vec![ExecUsage {
+            file: "main.py".into(),
+            pattern: "subprocess 模块".into(),
+        }];
+
+        let e1 = gate_exec_usage("p", &usage, false, false).unwrap_err();
+        assert_eq!(e1.code, ErrorCode::PluginInvalid);
+        assert!(e1.detail.as_deref().unwrap_or("").contains("main.py"));
+        assert!(
+            e1.detail.as_deref().unwrap_or("").contains("kind: exec"),
+            "必须告诉作者怎么写声明：{:?}",
+            e1.detail
+        );
+
+        let e2 = gate_exec_usage("p", &usage, true, false).unwrap_err();
+        assert_eq!(e2.code, ErrorCode::PermissionDenied);
+        assert!(e2.detail.as_deref().unwrap_or("").contains("勾选"));
+
+        assert!(gate_exec_usage("p", &usage, true, true).is_ok());
+    }
+
+    /// 挡住的是"忘了声明"，**挡不住蓄意绕过** —— 这一点写进测试，
+    /// 免得以后有人把这道门当成沙箱。
+    #[test]
+    fn the_gate_is_not_a_sandbox_and_we_say_so() {
+        let dir = scaffold(
+            "bypass",
+            &[(
+                "main.py",
+                "import importlib\nm = importlib.import_module('sub' + 'process')\nm.run(['ls'])\n",
+            )],
+        );
+        // 拼字符串绕过了子串匹配 —— 扫描**看不见**它。
+        // 这条测试记录的是这道门的能力边界，不是缺陷：真正的隔离要等
+        // Windows Job Object / Linux seccomp（SECURITY.md §9 第 3 项）。
+        assert!(
+            scan_python_sources(&dir).is_empty(),
+            "静态子串匹配本来就会被这种写法绕过；如果哪天它被抓到了，说明换了更强的机制，\
+             那时应当同步更新 SECURITY.md 里「挡不住蓄意绕过」的表述"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

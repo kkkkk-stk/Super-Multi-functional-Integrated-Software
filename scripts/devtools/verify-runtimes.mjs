@@ -615,7 +615,7 @@ runtime:
   }
 
   // ==========================================================================
-  // 【6】L3 · env 白名单：勾了到底有没有用（**惰性能力的对照实验**）
+  // 【6】L3 · env 与 exec：两个曾经"勾了等于没勾"的能力
   // ==========================================================================
   //
   // 这一项此前是彻底惰性的：L3 进程被 `env_clear()`，而白名单没有注入通道 ——
@@ -828,6 +828,224 @@ main()
   }
 
   // ==========================================================================
+  // 【6b】L3 · exec：运行期拦不住，但装载期必须拦得住
+  // ==========================================================================
+  //
+  // L3 是普通进程，宿主**没有办法在运行期**阻止它 `import subprocess`（那需要
+  // Job Object + AppContainer / seccomp，见 SECURITY.md §9 第 3 项）。
+  // 能做的是装载期的静态门：代码里出现起子进程的 API 而生效能力里没有 `exec`
+  // → 拒绝装载。这一节验的就是这道门，以及"声明并授权之后它不该挡路"。
+  c.section('【6b】L3 · exec：没声明/没授权时起子进程会被拦住吗');
+  {
+    const EXEC_PROBE = 'com.toolforge.test.exec-probe';
+    const probeDir = join(STAGE, 'exec-probe');
+    const probeMain = `"""exec 探针：代码里真的会起子进程（走 sys.executable，不经过 shell）。"""
+import json
+import os
+import subprocess
+import sys
+
+
+def _write(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\\n")
+    sys.stdout.flush()
+
+
+def handle_initialize(params):
+    return {"ok": True}
+
+
+def handle_run(params):
+    want = bool((params.get("params") or {}).get("spawn"))
+    if not want:
+        return {"outputs": {"report": json.dumps({"spawned": False})}}
+    # 用 sys.executable 而不是 shell，跨平台且不依赖 PATH
+    child = subprocess.run(
+        [sys.executable, "-c", "print('child-ok')"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return {"outputs": {"report": json.dumps({
+        "spawned": True,
+        "exit": child.returncode,
+        "stdout": child.stdout.strip(),
+        "hasSubprocess": hasattr(subprocess, "Popen"),
+        "envCount": len(os.environ),
+    })}}
+
+
+def handle_shutdown(params):
+    return {"ok": True}
+
+
+HANDLERS = {"initialize": handle_initialize, "run": handle_run, "shutdown": handle_shutdown}
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        handler = HANDLERS.get(msg.get("method"))
+        if handler is None:
+            continue
+        try:
+            result = handler(msg.get("params") or {})
+            _write({"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
+        except Exception as exc:  # noqa: BLE001
+            _write({"jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32000, "message": str(exc)}})
+
+
+main()
+`;
+    const probeYaml = (withExec) => `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${EXEC_PROBE}
+  name: exec 探针（测试用）
+  version: 1.0.0
+  description: 仅用于验证 exec 能力的装载期静态门。
+permissions:
+  capabilities:
+${withExec ? '    - kind: exec\n' : ''}    - kind: fsRead
+      scope: { kind: input }
+io:
+  inputs:
+    - id: src
+      label: 任意文本
+      type: text
+      required: true
+  outputs:
+    - id: report
+      label: 报告
+      type: json
+      required: false
+  params:
+    - id: spawn
+      label: 是否真的起子进程
+      type: bool
+      default: { kind: bool, value: false }
+      required: false
+runtime:
+  kind: python
+  python:
+    entry: main.py
+    pythonVersion: "3.11"
+    requirements: []
+    timeoutMs: 60000
+    workers: 1
+    allowNetwork: false
+`;
+
+    /** 装一份探针（可切换是否声明 exec）并启用 */
+    const installProbe = async (withExec) => {
+      rmSync(probeDir, { recursive: true, force: true });
+      mkdirSync(probeDir, { recursive: true });
+      writeFileSync(join(probeDir, 'plugin.yaml'), probeYaml(withExec), 'utf8');
+      writeFileSync(join(probeDir, 'main.py'), probeMain, 'utf8');
+      await install(EXEC_PROBE, probeDir, { executableCode: true });
+      await client.invoke('plugins_set_enabled', { pluginId: EXEC_PROBE, enabled: true });
+    };
+
+    const runProbe = async (tag, spawn) => {
+      const { job } = await run(
+        EXEC_PROBE,
+        { src: ['x'] },
+        { spawn: { kind: 'bool', value: spawn } },
+        prepareOutDir(`out-rt-exec-${tag}`)
+      );
+      const text = logText(job);
+      const m = /\\?"spawned\\?":\s*(true|false)/.exec(text);
+      const out = /\\?"stdout\\?":\s*\\?"([^"\\]*)\\?"/.exec(text);
+      const exit = /\\?"exit\\?":\s*(-?\d+)/.exec(text);
+      return {
+        status: job.status,
+        code: job.error?.code,
+        message: job.error?.message,
+        detail: job.error?.detail,
+        spawned: m ? m[1] === 'true' : undefined,
+        childStdout: out ? out[1] : undefined,
+        childExit: exit ? Number(exit[1]) : undefined,
+      };
+    };
+
+    // ---- 6b-1：**没声明** exec，代码里却用了 subprocess → 拒绝装载 ----
+    await installProbe(false);
+    const blocked = await runProbe('undeclared', false);
+    console.log(`   [没声明 exec] ${blocked.status} / ${blocked.code} — ${String(blocked.message).slice(0, 70)}`);
+    c.check(blocked.status === 'failed', '没声明 exec 时插件跑不起来', String(blocked.status));
+    c.check(
+      blocked.code === 'PLUGIN_INVALID',
+      '错误码是 PLUGIN_INVALID（作者漏声明，不是运行期故障）',
+      String(blocked.code)
+    );
+    c.check(
+      /main\.py/.test(String(blocked.detail ?? '')) && /subprocess/.test(String(blocked.detail ?? '')),
+      '详情点名了是哪个文件里的哪个 API',
+      String(blocked.detail ?? '').split('\n')[0]
+    );
+    c.check(
+      /kind: exec/.test(String(blocked.detail ?? '')),
+      '并且告诉作者声明该怎么写',
+      ''
+    );
+
+    // ---- 6b-2：声明了 exec、但**没授权** → 仍然拦住（部分授权模型下这是可达状态）----
+    await installProbe(true);
+    const notGranted = await runProbe('notgranted', false);
+    console.log(`   [声明但没授权] ${notGranted.status} / ${notGranted.code} — ${String(notGranted.message).slice(0, 60)}`);
+    c.check(notGranted.status === 'failed', '声明了但没授权时仍然跑不起来', String(notGranted.status));
+    c.check(
+      notGranted.code === 'PERMISSION_DENIED',
+      '错误码是 PERMISSION_DENIED（这次是用户还没勾选）',
+      String(notGranted.code)
+    );
+
+    // ---- 6b-3：声明 + 授权 → 放行，而且子进程**真的起来了** ----
+    await grant(EXEC_PROBE, [
+      { kind: 'exec' },
+      { kind: 'fsRead', scope: { kind: 'input' } },
+    ]);
+    const allowed = await runProbe('granted', true);
+    console.log(`   [声明 + 授权] ${allowed.status} spawned=${allowed.spawned} exit=${allowed.childExit} stdout=${JSON.stringify(allowed.childStdout)}`);
+    c.check(allowed.status === 'succeeded', '声明并授权之后插件能跑', String(allowed.status));
+    c.check(allowed.spawned === true, '插件真的起了子进程', String(allowed.spawned));
+    c.check(
+      allowed.childStdout === 'child-ok' && allowed.childExit === 0,
+      '子进程真的执行了并且输出被拿到（不是"假装成功"）',
+      `${allowed.childExit} / ${allowed.childStdout}`
+    );
+
+    // ---- 6b-4：审计里要留下"这个插件会起子进程"的记录 ----
+    const audit = await client.invoke('plugins_audit', { limit: 300 });
+    const loads = (audit.events ?? []).filter(
+      (e) => e.subject === EXEC_PROBE && e.kind === 'installed'
+    );
+    const withUsage = loads
+      .map((e) => {
+        try {
+          return JSON.parse(e.detail ?? '{}');
+        } catch {
+          return {};
+        }
+      })
+      .filter((d) => Array.isArray(d.execUsage) && d.execUsage.length > 0);
+    console.log(`   L3 装载事件 ${loads.length} 条，其中记了 execUsage 的 ${withUsage.length} 条`);
+    c.check(withUsage.length > 0, '审计记录了装载期扫到的 subprocess 用法');
+    c.check(
+      withUsage.some((d) => d.execGranted === true),
+      '审计里也记了"当时 exec 是否已授权"',
+      JSON.stringify(withUsage.map((d) => d.execGranted))
+    );
+
+    await uninstall(EXEC_PROBE);
+  }
+
+  // ==========================================================================
   // 【7】收尾：测试插件不能留在用户的插件列表里
   // ==========================================================================
   c.section('【7】测试插件已清理');
@@ -838,6 +1056,7 @@ main()
       L3_PY,
       NET_PROBE,
       'com.toolforge.test.env-probe',
+      'com.toolforge.test.exec-probe',
       'com.toolforge.test.garbage-wasm',
       'com.toolforge.test.wasi-wasm',
       'com.toolforge.test.hostfn-wasm',

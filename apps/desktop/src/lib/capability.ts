@@ -153,11 +153,32 @@ export function capabilityEnforcement(
       return { level: "partial", note: null };
     }
 
-    case "exec":
+    case "exec": {
+      if (runtimeKind === "python") {
+        // 装载期静态门 + 运行期无法强制 —— 两句话都要说，只说不好的那半
+        // 会让用户以为这个勾毫无意义，只说好的那半就是骗人。
+        return {
+          level: "partial",
+          note: "装载时会扫描插件代码：出现 subprocess / os.system 这类调用而这一项没勾，插件会被**拒绝装载**。但静态扫描挡不住蓄意绕过（拼字符串导入、走 ctypes），插件进程一旦跑起来，宿主仍然无法阻止它起子进程。",
+        };
+      }
+      if (runtimeKind === "wasm") {
+        return {
+          level: "enforced",
+          note: "WASM 沙箱里没有创建进程的能力，这一项对 L2 插件不需要也不生效。",
+        };
+      }
+      if (runtimeKind === "pipeline") {
+        return {
+          level: "inert",
+          note: "L1 的节点不会执行插件指定的任意命令（没有这样的内置节点），这一项对 L1 只是声明。",
+        };
+      }
       return {
-        level: "inert",
-        note: "L3 插件可以直接启动子进程。授权它等于确认你知道这件事。",
+        level: "partial",
+        note: null,
       };
+    }
 
     case "env": {
       if (runtimeKind === "python") {
