@@ -52,7 +52,7 @@
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **7 个** |
 > | 引擎下载源 | `engine-sources.json` 共 **12 条**（5 个引擎 × 各平台），其中 **7 条**的 SHA-256 是真实下载后核对过的；其余 5 条 `sha256: null`，`install` 会对它们返回 `HashRequired` 而**不放行** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **157 项全通过**（【1】–【17】） |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **161 项全通过**（【1】–【17】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -529,15 +529,21 @@
 > 而**另一个隐患更隐蔽** —— 抠图脚本把输入尺寸硬编成 320×320、归一化写死 ImageNet
 > 统计量。这两件事**喂错了都不会报错**，只会给出一张糊掉的蒙版。
 
-1. **三个模型的来源补齐**（哈希全部来自真实下载）：
-
+1. **三个模型的来源补齐**（哈希全部来自真实下载，**并且都走通了应用内下载 + 哈希校验 + 推理**）：
    | 模型 | 体积 | 来源 | 状态 |
    |---|---|---|---|
-   | `modnet-portrait` | 25 MB | hf-mirror（社区镜像） | ✅ 应用内下载 + 哈希校验通过 + 推理实测 |
-   | `birefnet-lite` | 214 MB | GitHub（rembg 官方 release） | ✅ 同上（与 HF 上那份逐字节相同） |
-   | `birefnet-general` | 928 MB | hf-mirror | ⚠️ **可下、未实测**：哈希来自一次完整下载，但 927 MB 在当前降级线路上把应用和 curl 都拖垮了 |
+   | `modnet-portrait` | 25 MB | hf 镜像（社区镜像） | ✅ 应用内下载 + 哈希校验 + 推理实测 |
+   | `birefnet-lite` | 214 MB | hf 镜像 | ✅ 同上（25 秒下完；两个来源逐字节相同，选了实测更快的那个） |
+   | `birefnet-general` | 928 MB | hf 镜像 | ✅ 同上（140 秒下完） |
 
-   > `modnet-portrait` 现在**可商用为否**，所以下载前要求确认许可证 —— 这条门原本就有。
+   > 换源那件事值得记一笔：`birefnet-lite` 一开始配的是 GitHub（rembg 官方 release）。
+   > 同一个文件，GitHub 用 curl 下了 553 秒（0.4 MB/s），在应用里两次卡在
+   > "连接后不再有数据"（60 秒静默就被判超时）；而 hf 镜像下 928 MB 只用了 140 秒。
+   > 两个来源**逐字节相同**（`5600024376…`），所以换源没有任何风险 ——
+   > 换source 的依据是**实测速度**，不是偏好。
+   > 顺带验证了卡死检测本身：它确实在 60 秒静默之后中止了下载并给出可读信息。
+   >
+   > `modnet-portrait` 是"不可商用"权重，所以下载前要求确认许可证 —— 这条门原本就有。
 
 2. **预处理改成"按模型决定"**（这一步比补来源更重要）。`py/rembg.py` 原来硬编：
    输入 320×320、ImageNet 归一化。而
@@ -563,8 +569,9 @@
 | `u2netp` | 320×320 | imagenet | 18.87% |
 | `modnet-portrait` | 320×320 | **pm1** | 18.83% |
 | `birefnet-lite` | **1024×1024** | imagenet | 18.83% |
+| `birefnet-general` | **1024×1024** | imagenet | 19.24% |
 
-三个模型在同一张"白底 + 椭圆"图上给出几乎一致的占比，这本身就是一条交叉验证 ——
+四个模型在同一张"白底 + 椭圆"图上给出几乎一致的占比，这本身就是一条交叉验证 ——
 而"任务成功"在这里完全不能说明问题（预处理喂错也是"成功"）。
 
 ### 基线（历史实测：阻塞 1–13 修复后）

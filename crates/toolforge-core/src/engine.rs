@@ -508,15 +508,16 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                     approx_size_mb: 214,
                     license: "MIT".into(),
                     commercial_use: true,
-                    // 这个资产名（`BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx`）来自
-                    // rembg 的官方 release，与 HuggingFace 上 `onnx-community/BiRefNet_lite-ONNX`
-                    // 的 `model.onnx` **是同一个文件** —— 两边下下来逐字节相同
-                    // （224,005,088 字节 / sha256 `5600024376…`）。
-                    // 选 GitHub 是因为实测更稳：同一个 213 MB，GitHub 一次过，
-                    // 而 hf 镜像那次是"连上但不再有数据"（见下面 general 那条的说明）。
-                    url: Some(format!("{REMBG_RELEASE}/BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx")),
+                    // 两个来源**逐字节相同**（224,005,088 字节 / sha256 `5600024376…`）：
+                    // rembg 官方 release 的 `BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx`
+                    // 与 HF 上 `onnx-community/BiRefNet_lite-ONNX` 的 `model.onnx`。
+                    // 选后者是因为**实测更快**：同一天里 hf 镜像下 928 MB 用了 140 秒
+                    // （6.6 MB/s），而 GitHub 下这个 213 MB 用 curl 花了 553 秒、
+                    // 在应用里还两次卡在"连接后不再有数据"（60 秒静默就被判超时）。
+                    // 换源不是"想换个新的"，是原来那个在当前线路上跑不动。
+                    url: Some("https://hf-mirror.com/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx".into()),
                     sha256: Some("5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333".into()),
-                    file_name: Some("BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx".into()),
+                    file_name: Some("model.onnx".into()),
                     installed: false,
                     used_by: vec!["image.remove-background".into()],
                 },
