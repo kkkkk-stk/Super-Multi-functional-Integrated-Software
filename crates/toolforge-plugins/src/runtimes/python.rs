@@ -103,6 +103,27 @@ impl PythonPlugin {
         spec.env
             .insert("PYTHONNOUSERSITE".into(), "1".to_string());
 
+        // ---- `env { names }` 的注入通道 ----
+        //
+        // 这一项在此前是**惰性的**：L3 进程 `env_clear()` 之后一个变量都读不到，
+        // 而白名单没有任何注入通道，所以用户勾了"允许读取环境变量 FOO"，
+        // 插件里 `os.environ.get("FOO")` 仍然是 `None`。授权面板上的勾选
+        // 于是变成一次没有意义的安全决策（SECURITY.md §9 第 4 项）。
+        //
+        // 现在：**只有清单声明、且用户逐条勾选的**那些名字会被读出来注入。
+        // 顺序上刻意放在 `env_clear` 之后，所以插件看到的环境里除了运行时自己
+        // 需要的那几个（PATH / PYTHON*）与这里的白名单，什么都没有。
+        let (injected, missing) = inject_declared_env(&granted, &mut spec.env);
+        if !injected.is_empty() || !missing.is_empty() {
+            tracing::info!(
+                plugin = plugin_id,
+                injected = injected.len(),
+                missing = missing.len(),
+                names = %injected.join(","),
+                "L3 环境变量白名单已注入"
+            );
+        }
+
         let supervisor = ChildSupervisor::spawn(plugin_id, spec).await?;
 
         Ok(Self {
@@ -325,16 +346,65 @@ fn venv_python_path(venv: &Path) -> PathBuf {
 
 /// 能力 → 给插件看的短标签
 fn capability_tag(c: &toolforge_core::permission::Capability) -> String {
-    use toolforge_core::permission::Capability as C;
-    match c {
-        C::FsRead { .. } => "fsRead".into(),
-        C::FsWrite { .. } => "fsWrite".into(),
-        C::Net { .. } => "net".into(),
-        C::Exec => "exec".into(),
-        C::Env { .. } => "env".into(),
-        C::Ai => "ai".into(),
-        C::Gpu => "gpu".into(),
+    c.label().to_string()
+}
+
+/// 按 `env { names }` 白名单把宿主的环境变量注入子进程。
+///
+/// # 返回值
+///
+/// `(注入成功的名字, 宿主上不存在的名字)`。
+///
+/// # 为什么"不存在"要单独报出来
+///
+/// 用户勾了 `env { names: ["MY_TOKEN"] }`，而宿主进程里根本没有 `MY_TOKEN` ——
+/// 这时插件读到的是 `None`。如果不区分"没授权"和"宿主上没这个变量"，
+/// 插件作者会一直以为是权限没生效，而实际上是他自己的启动环境就没设。
+/// 宿主日志里那行 `missing = N` 就是给这种情况留的线索。
+///
+/// # 边界（不要读成比实际更强的保证）
+///
+/// * 注入的是**宿主进程自己的**环境变量值。宿主是在用户会话里启动的，
+///   所以用户级/系统级环境变量都能拿到 —— 这正是"读取环境变量"该有的语义；
+/// * 名字来自清单声明 ∩ 用户授权（调用方传的是 `effective`），
+///   所以插件要一个没声明过的变量是拿不到的；
+/// * **L1 / L2 不适用**：L1 的节点跑在宿主进程里（本来就能读环境），
+///   L2 的 WASM 沙箱没有环境概念（`with_wasi(false)` 之后连 `environ_get` 都调不到）。
+///   也就是说 `env` 能力只在 L3 上是"有强制意义"的 —— UI 上也这么说。
+fn inject_declared_env(
+    granted: &PermissionSet,
+    target: &mut std::collections::HashMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut injected = Vec::new();
+    let mut missing = Vec::new();
+
+    for cap in &granted.capabilities {
+        let toolforge_core::permission::Capability::Env { names } = cap else {
+            continue;
+        };
+        for name in names {
+            let name = name.trim();
+            // 空名字、以及带 `=` 的名字都不是合法的环境变量名。
+            // 直接跳过而不是注入一个奇怪的东西 —— 拒绝在这里没有意义，
+            // 因为"注入不了"的结果就是插件读不到，与没授权等价（fail-closed）。
+            if name.is_empty() || name.contains('=') {
+                continue;
+            }
+            match std::env::var(name) {
+                Ok(v) => {
+                    target.insert(name.to_string(), v);
+                    injected.push(name.to_string());
+                }
+                Err(_) => missing.push(name.to_string()),
+            }
+        }
     }
+
+    injected.sort();
+    injected.dedup();
+    missing.sort();
+    missing.dedup();
+    (injected, missing)
 }
 
 #[cfg(test)]
@@ -362,6 +432,78 @@ mod tests {
         );
         assert_eq!(capability_tag(&Capability::Exec), "exec");
         assert_eq!(capability_tag(&Capability::Net { hosts: vec![] }), "net");
+    }
+
+    // ========================================================================
+    // env 白名单注入 —— 这一组补的是"勾了也不生效"的惰性能力
+    // ========================================================================
+
+    /// 没有 `env` 授权时，一个变量都不该被注入。
+    ///
+    /// 这是**安全默认值**，必须钉住：一旦这里开始注入，所有 L3 插件就都能
+    /// 读到宿主的环境（里面可能有 API Key、Token）。
+    #[test]
+    fn no_env_grant_injects_nothing() {
+        let mut target = std::collections::HashMap::new();
+        let (injected, missing) = inject_declared_env(&PermissionSet::empty(), &mut target);
+        assert!(injected.is_empty(), "{injected:?}");
+        assert!(missing.is_empty(), "{missing:?}");
+        assert!(target.is_empty());
+    }
+
+    /// 授权了的名字会被真的读出来注入 —— 用一个**当前进程确定有**的变量
+    /// （`PATH` 在任何平台上都有），否则这条测试会随环境飘。
+    #[test]
+    fn granted_env_names_are_injected_from_the_host() {
+        use toolforge_core::permission::Capability;
+
+        let mut target = std::collections::HashMap::new();
+        let set = PermissionSet {
+            capabilities: vec![Capability::Env {
+                names: vec!["PATH".into()],
+            }],
+        };
+        let (injected, missing) = inject_declared_env(&set, &mut target);
+        assert_eq!(injected, vec!["PATH".to_string()]);
+        assert!(missing.is_empty());
+        assert_eq!(target.get("PATH").map(String::as_str), std::env::var("PATH").ok().as_deref());
+    }
+
+    /// 宿主上不存在的变量要被如实报成 `missing`，而不是静默什么都不做 ——
+    /// 否则"没授权"与"宿主上没这个变量"在插件侧看起来一模一样。
+    #[test]
+    fn absent_host_variables_are_reported_as_missing() {
+        use toolforge_core::permission::Capability;
+
+        let mut target = std::collections::HashMap::new();
+        let set = PermissionSet {
+            capabilities: vec![Capability::Env {
+                names: vec!["TOOLFORGE_TEST_ABSENT_VAR_4C1F".into()],
+            }],
+        };
+        let (injected, missing) = inject_declared_env(&set, &mut target);
+        assert!(injected.is_empty());
+        assert_eq!(missing, vec!["TOOLFORGE_TEST_ABSENT_VAR_4C1F".to_string()]);
+        assert!(target.is_empty());
+    }
+
+    /// 非 `env` 的能力不会被误当成变量名注入（比如把 `net` 的 host 塞进环境）。
+    #[test]
+    fn other_capabilities_do_not_leak_into_the_environment() {
+        use toolforge_core::permission::Capability;
+
+        let mut target = std::collections::HashMap::new();
+        let set = PermissionSet {
+            capabilities: vec![
+                Capability::Net {
+                    hosts: vec!["api.example.com".into()],
+                },
+                Capability::Exec,
+            ],
+        };
+        let (injected, missing) = inject_declared_env(&set, &mut target);
+        assert!(injected.is_empty() && missing.is_empty());
+        assert!(target.is_empty(), "{target:?}");
     }
 
     #[test]

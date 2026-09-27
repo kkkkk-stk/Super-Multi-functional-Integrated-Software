@@ -159,11 +159,31 @@ export function capabilityEnforcement(
         note: "L3 插件可以直接启动子进程。授权它等于确认你知道这件事。",
       };
 
-    case "env":
-      return {
-        level: "inert",
-        note: "宿主尚未实现环境变量注入 —— L3 插件进程的环境被清空，所以即使授权，插件也读不到任何变量。",
-      };
+    case "env": {
+      if (runtimeKind === "python") {
+        // L3：真的注入了，见 `runtimes/python.rs::inject_declared_env`
+        return {
+          level: cap.names.length > 0 ? "enforced" : "inert",
+          note:
+            cap.names.length > 0
+              ? "只有这里列出的变量会被**逐个**从宿主环境读出并注入插件进程；插件进程的其它环境变量一律为空。宿主上不存在的名字会记进应用日志，插件读到的是空。"
+              : "名单为空 —— 没有任何变量会被注入，插件进程的环境里只有运行时自己需要的几个（PATH、PYTHON*）。",
+        };
+      }
+      if (runtimeKind === "wasm") {
+        return {
+          level: "inert",
+          note: "WASM 沙箱关掉了 WASI，模块连 environ 都读不到 —— 这一项对 L2 插件没有任何作用。",
+        };
+      }
+      if (runtimeKind === "pipeline") {
+        return {
+          level: "inert",
+          note: "L1 的节点跑在宿主进程里，本身就能读环境变量，宿主没有可拦的位置 —— 这一项对 L1 只是声明。",
+        };
+      }
+      return { level: "inert", note: null };
+    }
 
     case "ai":
       return {

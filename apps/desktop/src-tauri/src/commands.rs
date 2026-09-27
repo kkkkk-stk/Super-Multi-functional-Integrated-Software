@@ -711,7 +711,7 @@ fn submit_plugin_run(
     let ungranted = app.plugins.ungranted_declared(&req.plugin_id);
 
     // 把多文件输入展开成单文件批次（目录会先展开成里面的文件）
-    let batches = expand_batches(&req.inputs)?;
+    let batches = expand_batches(&req.inputs, &record.manifest.io.inputs)?;
     let total_items = batches.len().max(1) as u32;
 
     let output_dir = resolve_output_dir(app, &req)?;
@@ -936,24 +936,56 @@ fn expand_dir(dir: &std::path::Path) -> ToolforgeResult<Vec<String>> {
 
 /// 把多文件输入展开成"一批一个文件"。
 ///
-/// ## 两条展开规则
+/// ## 三条规则
 ///
-/// 1. **目录 → 里面的文件**：`build_io` 会把输入根收敛成"输入文件的公共父目录"，
+/// 1. **只有"文件类"端口才做目录展开**（见下）。
+/// 2. **目录 → 里面的文件**：`build_io` 会把输入根收敛成"输入文件的公共父目录"，
 ///    如果直接把目录当输入，那个根会退化成**目录的父级**（选了 `D:\照片` 就授权到
 ///    `D:\`）。先展开成文件，根就正好是那个目录本身 —— 权限更紧，行为也更符合
 ///    "拖进一个文件夹，逐个处理"的直觉。
-/// 2. **多文件 → 逐文件**：选**文件数最多的那个输入端口**作为主端口来扇出。
+/// 3. **多文件 → 逐文件**：选**文件数最多的那个文件类端口**作为主端口来扇出。
 ///    这是唯一能在插件的输入契约（可能同时有 `image` 与 `mask` 两个端口）下
 ///    保持行为可预测的规则。其余端口的值在每一批里原样保留。
 ///
 /// 单文件输入时退化为一次调用，与之前行为一致。
-fn expand_batches(inputs: &HashMap<String, Vec<String>>) -> ToolforgeResult<Vec<HashMap<String, Vec<String>>>> {
+///
+/// ## 为什么要按端口类型区分（这一条是真机测出来的）
+///
+/// 原来对**所有**端口一律做 `Path::new(v).is_dir()` 判断。于是一个
+/// `type: text` 的端口，只要用户填的字符串恰好是一个存在的目录
+/// （比如往"网址/路径"文本框里粘了 `D:\照片`），就会被**静默展开成那个目录里的
+/// 所有文件**，然后逐文件跑 5000 次。用户看到的是"我明明只想传一个字符串"。
+///
+/// 探针插件把它撞出来了：`env` 白名单的验证要让插件比对宿主环境变量的值，
+/// 那个值是 `C:\Users\<用户>` —— 一个真实存在的目录，于是输入端口被展开，
+/// 插件拿到的是目录里的第一个文件名。字符串输入和文件输入是**两种东西**，
+/// 判定只能看清单声明的类型。
+///
+/// 没声明过的端口（清单里 `io.inputs` 为空，或端口名对不上）保持旧行为 ——
+/// 那些插件本来就依赖"字符串看着像目录就展开"，改掉它们会静默破坏行为。
+fn expand_batches(
+    inputs: &HashMap<String, Vec<String>>,
+    declared_inputs: &[toolforge_core::plugin::IoPort],
+) -> ToolforgeResult<Vec<HashMap<String, Vec<String>>>> {
+    use toolforge_core::plugin::PortType;
+
+    let declared: HashMap<&str, PortType> = declared_inputs
+        .iter()
+        .map(|p| (p.id.as_str(), p.ty))
+        .collect();
+    // 这个端口是不是"文件/目录"语义（决定要不要展开、能不能当主端口）
+    let is_fileish = |port: &str| match declared.get(port) {
+        Some(PortType::File | PortType::Files | PortType::Directory) => true,
+        Some(_) => false, // text / number / boolean / json / any 都不是路径
+        None => true,     // 清单没声明 → 保持旧行为
+    };
+
     // 第一步：目录展开（这一步会先做，因为它会改变"哪个端口最大"）
     let mut expanded: HashMap<String, Vec<String>> = HashMap::new();
     for (port, paths) in inputs {
         let mut out: Vec<String> = Vec::new();
         for p in paths {
-            if std::path::Path::new(p).is_dir() {
+            if is_fileish(port) && std::path::Path::new(p).is_dir() {
                 out.extend(expand_dir(std::path::Path::new(p))?);
             } else {
                 out.push(p.clone());
@@ -964,6 +996,7 @@ fn expand_batches(inputs: &HashMap<String, Vec<String>>) -> ToolforgeResult<Vec<
 
     let primary = expanded
         .iter()
+        .filter(|(port, _)| is_fileish(port))
         .max_by_key(|(_, v)| v.len())
         .map(|(k, _)| k.clone());
 

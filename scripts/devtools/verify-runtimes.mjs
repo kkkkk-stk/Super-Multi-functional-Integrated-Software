@@ -55,7 +55,7 @@
  */
 
 import { createServer } from 'node:http';
-import { cpSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { Checker, connect, prepareOutDir, REPO_ROOT, SMOKE_DIR, writeInputPng } from './cdp.mjs';
@@ -615,15 +615,229 @@ runtime:
   }
 
   // ==========================================================================
-  // 【6】收尾：测试插件不能留在用户的插件列表里
+  // 【6】L3 · env 白名单：勾了到底有没有用（**惰性能力的对照实验**）
   // ==========================================================================
-  c.section('【6】测试插件已清理');
+  //
+  // 这一项此前是彻底惰性的：L3 进程被 `env_clear()`，而白名单没有注入通道 ——
+  // 用户勾了"允许读取环境变量 FOO"，插件里 `os.environ.get("FOO")` 仍然是 None。
+  // 现在宿主会把**声明 ∩ 授权**里的名字逐个读出来注入。
+  //
+  // 验证方式仍然是对照：同一个探针插件、同一份输入，只改授权。
+  // 用 `USERPROFILE`（Windows）/ `HOME`（其它平台）当"存在的变量"，
+  // 用 `USERNAME` / `USER` 当"存在但没声明的变量" —— 后者必须**读不到**。
+  c.section('【6】L3 · env 白名单是否真的注入了（勾了有没有用）');
+  {
+    const POS = process.platform === 'win32' ? 'USERPROFILE' : 'HOME';
+    const NEG = process.platform === 'win32' ? 'USERNAME' : 'USER';
+    const hostPos = process.env[POS];
+    const hostNeg = process.env[NEG];
+
+    if (!hostPos) {
+      c.note(`跳过：验证脚本自己的环境里没有 ${POS}`);
+      c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    } else {
+      const ENV_PROBE = 'com.toolforge.test.env-probe';
+      const probeDir = join(STAGE, 'env-probe');
+      rmSync(probeDir, { recursive: true, force: true });
+      mkdirSync(probeDir, { recursive: true });
+      writeFileSync(
+        join(probeDir, 'plugin.yaml'),
+        `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${ENV_PROBE}
+  name: 环境变量白名单探针（测试用）
+  version: 1.0.0
+  description: 仅用于验证 env 能力是否真的注入了环境变量。
+permissions:
+  capabilities:
+    - kind: env
+      names: ["${POS}"]
+io:
+  inputs:
+    - id: src
+      label: 任意文本
+      type: text
+      required: true
+  outputs:
+    - id: report
+      label: 报告
+      type: json
+      required: false
+  params:
+    - id: expected
+      label: 期望值
+      type: text
+      description: 宿主侧那个环境变量的真实值；插件拿它和 os.environ 里的比对。
+      required: false
+runtime:
+  kind: python
+  python:
+    entry: main.py
+    pythonVersion: "3.11"
+    requirements: []
+    timeoutMs: 60000
+    workers: 1
+    allowNetwork: false
+`,
+        'utf8'
+      );
+      // 探针脚本：把**比较**放在插件里做，只回报布尔值。
+      //
+      // 为什么不让插件把变量的值回传、由脚本比对：插件返回值会嵌进宿主的
+      // JSON 日志里，Windows 路径里的反斜杠要经过**两层**转义
+      // （`C:\Users\...` → `C:\\\\Users\\\\...`），脚本侧一不小心就把
+      // "值不一致"当成缺陷报出来 —— 那是测试自己错了，不是产品错了。
+      // 让插件比对、只回布尔，输出里连一个反斜杠都没有。
+      writeFileSync(
+        join(probeDir, 'main.py'),
+        `"""env 白名单探针：只报告布尔结论，不回传变量的值。"""
+import json
+import os
+import sys
+
+POS = ${JSON.stringify(POS)}
+NEG = ${JSON.stringify(NEG)}
+
+
+def _write(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\\n")
+    sys.stdout.flush()
+
+
+def handle_initialize(params):
+    return {"ok": True}
+
+
+def handle_run(params):
+    # 期望值走**参数**而不是输入端口。
+    #
+    # 两个原因：① 输入端口的值会被宿主当成"路径/值"处理（目录展开、输入根收敛），
+    # 参数不会；② 参数正是"插件作者想要的配置"这条语义。
+    # （这段 Python 源码整个嵌在 JS 模板字符串里，所以**不能**出现反引号 ——
+    #   一个反引号就会把模板提前结束掉，报的却是"missing ) after argument list"）
+    expected = (params.get("params") or {}).get("expected")
+    declared = os.environ.get(POS)
+    report = {
+        "declaredIsNone": declared is None,
+        "declaredMatches": declared is not None and declared == expected,
+        "undeclaredIsNone": os.environ.get(NEG) is None,
+        "envCount": len(os.environ),
+    }
+    return {"outputs": {"report": json.dumps(report)}}
+
+
+def handle_shutdown(params):
+    return {"ok": True}
+
+
+HANDLERS = {"initialize": handle_initialize, "run": handle_run, "shutdown": handle_shutdown}
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        handler = HANDLERS.get(msg.get("method"))
+        if handler is None:
+            continue
+        try:
+            result = handler(msg.get("params") or {})
+            _write({"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
+        except Exception as exc:  # noqa: BLE001
+            _write({"jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32000, "message": str(exc)}})
+
+
+main()
+`,
+        'utf8'
+      );
+
+      await install(ENV_PROBE, probeDir, { executableCode: true });
+      await client.invoke('plugins_set_enabled', { pluginId: ENV_PROBE, enabled: true });
+
+      /** 跑一次探针（参数带上宿主侧的真值）并解析它回报的布尔结论 */
+      const probeOnce = async (tag) => {
+        const { job } = await run(
+          ENV_PROBE,
+          { src: ['x'] },
+          { expected: { kind: 'str', value: hostPos } },
+          prepareOutDir(`out-rt-env-${tag}`)
+        );
+        const text = logText(job);
+        const flag = (name) => {
+          const m = new RegExp(`${name}\\\\?":\\s*(true|false)`).exec(text);
+          return m ? m[1] === 'true' : undefined;
+        };
+        const count = /envCount\\?":\s*(\d+)/.exec(text);
+        return {
+          status: job.status,
+          error: job.error?.message,
+          declaredIsNone: flag('declaredIsNone'),
+          declaredMatches: flag('declaredMatches'),
+          undeclaredIsNone: flag('undeclaredIsNone'),
+          envCount: count ? Number(count[1]) : undefined,
+        };
+      };
+
+      // ---- 6a：撤销全部授权（插件仍启用）→ 两个都读不到 ----
+      await grant(ENV_PROBE, []);
+      const noGrant = await probeOnce('nogrant');
+      console.log(`   [撤销授权] ${JSON.stringify(noGrant)}`);
+      c.check(noGrant.status === 'succeeded', '零授权时探针仍能运行（不因缺权限而崩）', noGrant.status);
+      c.check(
+        noGrant.declaredIsNone === true,
+        `零授权时声明过的 ${POS} 读不到`,
+        String(noGrant.declaredIsNone)
+      );
+
+      // ---- 6b：授权 → 声明的那个能读到且值一致，未声明的仍然读不到 ----
+      await grant(ENV_PROBE, [{ kind: 'env', names: [POS] }]);
+      const granted = await probeOnce('granted');
+      console.log(`   [授权 ${POS}] ${JSON.stringify(granted)}`);
+      c.check(granted.status === 'succeeded', '授权后探针运行成功', granted.status);
+      c.check(
+        granted.declaredMatches === true,
+        `声明并授权后 ${POS} 真的被注入（值就是宿主的那一份）`,
+        String(granted.declaredMatches)
+      );
+      c.check(
+        granted.undeclaredIsNone === true,
+        `没声明的 ${NEG} 依然读不到（白名单不是"放行整个环境"）`,
+        String(granted.undeclaredIsNone)
+      );
+      c.check(
+        typeof granted.envCount === 'number' && granted.envCount < 20,
+        '插件进程的环境变量总数很少（说明 env_clear 仍然生效）',
+        String(granted.envCount)
+      );
+      c.check(
+        (granted.envCount ?? 0) >= (noGrant.envCount ?? 0),
+        '授权后环境变量数不减少（注入是加法）',
+        `${noGrant.envCount} → ${granted.envCount}`
+      );
+
+      await uninstall(ENV_PROBE);
+    }
+  }
+
+  // ==========================================================================
+  // 【7】收尾：测试插件不能留在用户的插件列表里
+  // ==========================================================================
+  c.section('【7】测试插件已清理');
   {
     const all = [
       L2_TEXT,
       L2_HTTP,
       L3_PY,
       NET_PROBE,
+      'com.toolforge.test.env-probe',
       'com.toolforge.test.garbage-wasm',
       'com.toolforge.test.wasi-wasm',
       'com.toolforge.test.hostfn-wasm',

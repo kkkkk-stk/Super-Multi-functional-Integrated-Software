@@ -251,9 +251,10 @@ CapabilityGuard::check(&CapabilityRequest) -> CapabilityVerdict { Allow | Deny {
 3. **`PathResolver`**（回答"这个具体文件能不能碰"，见 §4）；
 4. L1 的 `fsRead` 预检（流水线引用 `${src}` 却没声明 fsRead 时提前拒绝并记审计）；
 5. L3 的 `deny_network` 布尔开关与超时强杀；
-6. **L2 的 Extism 主机白名单**（`runtimes/wasm.rs::allowed_hosts_from` 把"声明 ∩ 授权"翻译成 `allowed_hosts`，`net` 的越界请求由沙箱自己拒绝 —— 这是本项目第一个**真正按字节落到沙箱**的能力裁决）。
+6. **L2 的 Extism 主机白名单**（`runtimes/wasm.rs::allowed_hosts_from` 把"声明 ∩ 授权"翻译成 `allowed_hosts`，`net` 的越界请求由沙箱自己拒绝 —— 这是本项目第一个**真正按字节落到沙箱**的能力裁决）；
+7. **L3 的环境变量白名单**（`runtimes/python.rs::inject_declared_env`，装载时按「声明 ∩ 授权」注入，其余一律为空）。
 
-**仍未覆盖**：`ReadEnv` / `Spawn` 两类请求没有运行时调用点 —— 宿主不代插件读环境变量，而 L3 起子进程由它自己发起（见 §9 第 2–4 项）；`Http` 请求对 **L3** 也不在宿主手里（只有 L2 走 Extism 内置的 `http_request`，受白名单约束）。
+**仍未覆盖**：`ReadEnv` / `Spawn` 两类请求没有运行时调用点 —— 前者已随第 7 条变得不必要（环境在装载时就定好了），后者由 L3 插件自己发起（见 §9 第 3 项）；`Http` 请求对 **L3** 也不在宿主手里（只有 L2 走 Extism 内置的 `http_request`，受白名单约束）。
 
 **路径收敛的适用范围（必须写清楚，否则会严重误判 L3 的安全性）**：
 
@@ -960,7 +961,7 @@ pub fn is_subset_of(&self, other: &PermissionSet) -> bool
 | 1 | ~~`CapabilityGuard::check()` 没有生产调用点~~ | —— | ✅ **已修复**：`nodes.rs::resolve_path()` 现在对**每一次**文件访问先调 `check()`（input 走 `ReadFile`、其余走 `WriteFile`），拒绝时返回 `PluginCapabilityViolation`，并由 `l1.rs` 在**应用 `onError` 策略之前**写入审计（否则 `onError: skip` 会让越权记录凭空消失）。四条回归测试钉住：`fs_write_is_rejected_without_the_capability`、`fs_read_is_rejected_without_the_capability`、`fs_write_passes_once_the_capability_is_granted`、`path_traversal_is_still_blocked_after_the_capability_check`。**注意 `ReadEnv` / `Spawn` 两个分支仍无调用点**，见第 3、4 项。另有一条**同类但更隐蔽**的缺口已于 2026-09 关闭：装载门的 `runnable_or_grant_all()` 让"声明 ∩ 授权"退化成恒等式，也就是说第 1 项修好的这套裁决**在真实链路上根本走不到**（详见 §2.2 的修正） | 关闭（fsRead/fsWrite 部分） |
 | 2 | `Net { hosts }` 白名单**对 L2 已强制，对 L3 仍未强制**（`check_host()` 仍无调用点） | **L2**：Extism 内置 `http_request` 受 `allowed_hosts` 约束，而宿主把「声明 ∩ 授权」翻译成这份名单（`runtimes/wasm.rs::allowed_hosts_from`），越界请求由沙箱自己拒绝并回传 `HTTP request to … is not allowed`。<br>**L3**：`hosts` 仍只影响 UI 文案；真正的控制只有"能否联网"的布尔开关，且可用 socket 绕过代理变量 | `deny_network` 默认开、`PYTHON_NET_WITHOUT_PERMISSION` 错误、`scan_code()` 的模式扫描、`NET_HOST_WITH_PORT` 校验（带端口的白名单必然失配）。**盘点时发现的两个真实缺陷**：① 宿主此前从不设置 `allowed_hosts`，于是 L2 的 `net` **勾了也没用**（fail-closed，方向安全但功能是坏的）；② 清单写 `api.example.com:443` 这种带端口的白名单**永远匹配不上** —— Extism 用 `url.host_str()` 比较，端口不参与 | L2 部分关闭；L3 留给 v0.2（需内核级隔离，否则"白名单"对 L3 仍是空话） |
 | 3 | `Exec` **无运行时强制**；且 `supervisor.rs` 在 `env_clear()` 后**刻意保留 `PATH`**，L3 插件可起 PATH 内程序 | 拿到 `Exec`（或干脆不声明）的 L3 插件等价于任意代码执行；越权无法被拦 | 仅风险定级 `Critical` + `CRITICAL_CAPABILITY` 警告 + 审阅扫描。**另需修正 `review.rs` 中"起外部程序会被拒绝"这句与实际不符的用户可见文案** | v0.2 |
-| 4 | `Env { names }` **无任何实现**（无注入通道；`ReadEnv` 分支未被调用） | 该能力只影响 UI 与风险等级；"白名单防 API Key"在 L3 里实际由 `clear_env` 承担 | L3 `clear_env = true`（真防线）；L1/L2 无环境读取路径 | v0.2（或明确降级为"仅声明"并在 UI 说明） |
+| 4 | ~~`Env { names }` **无任何实现**（无注入通道；`ReadEnv` 分支未被调用）~~ → **L3 已实现，L1/L2 不适用** | **已修复（L3）**：`runtimes/python.rs::inject_declared_env()` 把「声明 ∩ 授权」里的名字逐个从宿主环境读出、注入 L3 子进程（`env_clear()` 之后，所以插件看到的环境 = 运行时必需的那几个 + 白名单）。宿主上不存在的名字记进应用日志（`missing = N`），插件读到的是空 —— 这一条很重要：不区分"没授权"和"宿主上没这个变量"，作者会一直以为是权限没生效。**`ReadEnv` 分支仍然没有调用点**，但也不再需要：L3 的环境在**装载时**就定好了，运行期不存在"读一个变量"这个动作。**L1 与 L2 不适用且如实标注**：L1 的节点跑在宿主进程里、本来就能读环境（没有可拦的位置）；L2 关掉了 WASI，模块连 `environ_get` 都调不到。UI 上按运行时分别说明（`capability.ts::capabilityEnforcement`） | ✅ 关闭（L3）；L1/L2 在 UI 上如实标注为"仅是声明" |
 | 5 | `Ai` / `Gpu` **无裁决点，也无对应请求类型**（`CapabilityRequest` 只有 5 个变体） | 两项能力目前只有风险等级与文案；`Ai` 的"额度消耗 + 数据外传"没有被任何机制约束 | `Ai` 走宿主侧 `AiClient`（插件不能直接拿到 Key）；风险文案 | v0.5 |
 | 6 | `PathScope::Explicit` **无法通过 `plugin.yaml` 表达**（内部标签 + `String` newtype 变体无法调和） | `HOST_PATH_WRITE` 警告与 `FsRead{Explicit}` 的 High 分支**暂不可达**；需要访问固定系统目录的合法插件也写不出来 | 无（逃生舱口实际锁死） | 待定（需先定 §3.8 的方案 A / B） |
 | 7 | 词法规范化**挡不住符号链接**、Windows 8.3 短名、UNC/设备路径、TOCTOU | 若攻击者能在授权根内放置链接，可读到根目录之外 | 绝对路径拒绝 + `starts_with(root)` 组件级比较 | v0.2 起（`openat`/`O_NOFOLLOW`/逐级校验） |
