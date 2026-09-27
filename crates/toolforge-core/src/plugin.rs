@@ -499,6 +499,14 @@ impl PluginManifest {
         // --- 运行时 ---
         self.validate_runtime(&mut issues);
 
+        // --- 模板变量 vs 声明的端口 ---
+        // `validate_into` 只管 `${steps.*}`；`${output.x}` / `${input.x}` / `${params.x}`
+        // 必须在这里对账（只有这里同时拿得到 io 段和流水线）。见那个函数的文档：
+        // AI 生成的草稿最常见的错法就是引用了没声明的输出端口，而它此前**能装上、跑起来才报**。
+        if let PluginRuntime::Pipeline { pipeline } = &self.runtime {
+            pipeline.validate_template_refs(&self.io, &mut issues);
+        }
+
         // --- IO 自洽性 ---
         let mut seen = std::collections::HashSet::new();
         for port in self.io.inputs.iter().chain(self.io.outputs.iter()) {

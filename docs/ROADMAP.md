@@ -52,8 +52,8 @@
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
-> | 运行时测试总数 | `cargo test --workspace` **252 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **178 项全通过**（【1】–【19】） |
+> | 运行时测试总数 | `cargo test --workspace` **258 passed / 0 failed** |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **193 项全通过**（【1】–【20】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -884,11 +884,29 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   4. 版本探测有结果且没挂住（盯着 `soffice.com` / `soffice.exe` 那个选择）；
   5. **反证被实测推翻了，于是改成了另一条**：原本想断言"假 docx 必须失败"，但 LibreOffice 是**按内容嗅探**的，宽容得超出预期 —— 普通文本改名 `.docx` 正常转换、**4 KB 随机二进制**也"成功"（产出 781 KB PDF）、**0 字节空文件**同样"成功"（6.5 KB）。所以"拒绝坏输入"不该由这个节点承担（扩展名把关在 `accept` 列表那一层），检查改成盯**我们自己的不变量**：绝不产出 0 字节的 PDF 冒充成功。
 
-### 4. 许可证确认有数据、无强制
+### 3.3 "一句话生成插件"这条闭环第一次被走完（本轮），顺带补上一条校验
+
+- **原状**：`ai_generate` / `ai_review_draft` 有实现、有单元测试，但**从来没有人从"一句话"走到"装上一个能跑的插件"**。原因和 `doc.to-pdf` 是同一类：它需要一个**会按约定吐 YAML 的模型**，而真模型不可复现（同一个需求两次生成的插件不一样，还会偶发不合规）。于是产品最核心的那句话（README 第一段："你描述一下，它自己长出来"）**没有任何真机证据**。
+- **做法**：让 `mock-openai.mjs` 兼任"插件生成器" —— 请求里带 `[mock:draft]` / `[mock:broken]` / `[mock:malicious]` 分别回一份合规草稿 / 引用未声明端口的草稿 / 越权草稿。真模型"答得好不好"仍然不在验证范围内（与【10】的边界一致），但**我们这一侧**从此有证据。
+- **实测（【20】，15 项）**：草稿被解析成 `plugin.yaml` → 静态审核 `recommended: true, risk: low` → 写成目录 → `plugins_install` → 授权 → 启用 → 用一张真 PNG 跑一次 → 产出是**真的 WebP**（`RIFF/WEBP` 魔数），而且 **AI 写进 YAML 的参数真的生效**：`width: "400"` → 实测 **400×300**（这条断言很关键：它证明 AI 写的参数走进了节点参数解析，而不是"插件跑通了但参数被忽略"）。
+- **反证（两份坏草稿都必须被拦）**：
+  * **越权草稿**（`fsWrite` 用 `explicit` 作用域写系统 hosts + `exec`）：`recommended: false`、`riskLevel: critical`、点名 `HOST_PATH_WRITE` / `CRITICAL_CAPABILITY` / `HIGH_RISK_CAPABILITY`，并且**落审计**（`aiDraftRejected`）。注意前提：这份草稿是**语法完全合法的清单** —— 被拦的原因必须是"申请了高危能力"，而不是"YAML 写错了"。攻击者会写合法的 YAML。
+  * **引用未声明端口的草稿**：见下，它是本轮**新加的一条校验**逼出来的。
+- ★ **新校验：`TEMPLATE_UNKNOWN_OUTPUT_PORT`（以及 input / params 的同款）**。第一版"合规草稿"的中间步骤写了 `${output.resized}`，却没声明 `resized` 端口 —— 草稿**通过了审核、装得上**，直到真跑才报 `PLUGIN_INVALID: 模板变量 ${output.resized} 无法解析`。
+  这条错误**完全可以在审核阶段看出来**：模板上下文里的 `output.*` 只包含**声明过的**端口（`toolforge-plugins/src/l1.rs` 就是这么填的）。而已有的 `validate_into` 只检查了 `${steps.*}`（存在性 + 前向引用），`${output.*}` / `${input.*}` / `${params.*}` **从来没被对过账**。
+  现在 `PipelineDef::validate_template_refs()` 把这三类都对账，根名不认识（`${foo.bar}`）也报错。报成 `error` 而不是 `warning`：这类引用没有任何"也能跑"的情形，AI 生成流程正是靠 `validation.ok` 决定放不放行。
+  守卫共 6 条测试，其中两条最重要：`manifest_validate_wires_in_the_template_port_check`（证明这条检查**真的被接进了 `validate()`** —— 一个没人调用的检查函数等于没有检查）与 `bundled_plugin_manifests_pass_the_new_template_check`（遍历仓库里**真实的 8 个内置插件清单**，确认没有误报 —— 误报会让合法插件装不上）。
+
+### 4. 许可证确认：**闸门已经有了，记录仍然没有**
 
 - `crates/toolforge-core/src/engine.rs` 里为每个引擎与模型都提供了 `license`、`license_note`、`requires_license_ack`，并且有测试在守护这些字段非空。
-- 但 `crates/toolforge-engines/src/registry.rs` **对 `requires_license_ack` 零引用**——没有任何安装前确认流程。
-- 结论：**许可证信息是「声明式数据」，尚未成为「流程闸门」**。v0.2 需要把它接进 `install` 路径并落盘记录确认结果。
+- ⚠️ **本条原文（"registry.rs 对 `requires_license_ack` 零引用——没有任何安装前确认流程"）已经过期**。闸门**已经接上了**，只是位置不在 `registry.rs`，而在**命令层**（`apps/desktop/src-tauri/src/commands.rs`）：
+  * `engines_install`：`if descriptor.requires_license_ack && !license_accepted { return Err(denied) }`，注释写的是"许可证确认是硬门：不能靠前端自觉"；
+  * `models_install`：模型那边更严 —— `if !spec.commercial_use && !license_accepted { … }`（不可商用的权重**必须**逐次确认，与 `requires_license_ack` 无关）。
+- **为什么放在命令层而不是 `registry.rs`**：那道门的目的是"挡住一个被攻陷/越权的前端悄悄装东西"，属于**宿主边界**；`EngineRegistry::install()` 是宿主内部 API，调用它的人已经在门内了（`engines:install` 那个 CLI 也是用户自己的 shell）。
+  **代价要说清楚**：这意味着"任何人只要拿到 `EngineRegistry` 就能绕过确认"——将来新增调用方时**必须自己记得传 `license_accepted`**。目前没有第二条调用路径（一条命令 + 一个 CLI），所以没有实际缺口，但这是一条靠纪律维持的不变量，不是靠类型系统。
+- **仍然没做的那一半**：确认结果**没有落盘**。没有审计事件、没有"我已确认过 X 的许可证"的持久记录，所以每次重装都要重新勾一次（对合规审查来说也拿不出证据链）。这一条保持不变，仍是 v0.2 的事。
+- 另有一处**语义**要对齐：`requires_license_ack` 是"装之前要确认"，而 `commercial_use == false` 是"不许商用"。两者混在一个 `license_accepted` 标志上，对**不可商用**的模型来说，勾一次框并不能让它变得可商用 —— UI 文案必须说清这个区别（见 `docs/ENGINE-MATRIX.md` 的模型表）。
 
 ### 5. `package.json` 的 `bindings` 脚本指向不存在的包名 ✅ 已修复
 

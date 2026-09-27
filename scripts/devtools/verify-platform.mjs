@@ -2610,6 +2610,252 @@ c.section('【19】`doc.to-pdf`：Office 文档 → PDF 是否真的转出来了
   }
 }
 
+// ============================================================================
+// 【20】"用一句话生成插件"这条闭环：草稿 → 审核 → 安装 → **真的跑出东西**
+// ============================================================================
+//
+// 这是产品的招牌能力（README 第一段就是它），但**此前从未被端到端跑过**：
+// `ai_generate` / `ai_review_draft` 有实现、有单测，可是没有人从"一句话"走到
+// "装上一个能跑的插件"。原因和 `doc.to-pdf` 一样：它要一个**会按约定吐 YAML 的模型**，
+// 而真模型不可复现 —— 同一个需求两次生成的插件不一样，还会偶发不合规。
+//
+// 于是 `mock-openai.mjs` 兼任"插件生成器"（请求里带 `[mock:draft]` / `[mock:malicious]`
+// 就分别回一份合规草稿 / 一份越权草稿）。这一节断言的是**我们这一侧**：
+//
+//   1. 草稿被正确解析（`parse_model_output` 认得出 ```yaml 块、要求 plugin.yaml 存在）；
+//   2. 静态审核对**合规草稿**放行（`recommended === true`）且风险等级不高；
+//   3. ★ **装上去真的能跑**：把草稿写成目录 → `plugins_install` → 授权 → 启用 →
+//      用一张真 PNG 跑一次 → 产出必须是**真的 WebP**（不是"任务成功"就算）。
+//      这一步才是这条链路的验收标准 —— 草稿好看但跑不起来等于没验证；
+//   4. **反证**：一份语法完全合法、但申请了 `explicit` 路径写入 + `exec` 的草稿，
+//      必须被判为**不建议放行**，并且点出高危能力（而不是先撞上"YAML 解析失败"）。
+//      注意区分这两件事：解析失败拦下来不算安全 —— 攻击者会写合法的 YAML。
+//
+// 模型"答得好不好"仍然不在验证范围内（那是模型能力，不是我们的正确性），
+// 这条边界与【10】的说明保持一致。
+c.section('【20】"一句话生成插件"闭环：草稿 → 审核 → 安装 → 真的跑出东西');
+{
+  const MOCK_PORT = 18124;
+  const mock = spawn(process.execPath, [join(HERE, 'mock-openai.mjs'), String(MOCK_PORT)], {
+    stdio: 'ignore',
+    detached: false,
+  });
+  await sleep(600);
+  const mockBase = `http://127.0.0.1:${MOCK_PORT}`;
+  const DRAFT_ID = 'com.mock.shrink';
+
+  const cleanupPlugin = async (id) => {
+    const existing = await client.invoke('plugins_get', { pluginId: id }).catch(() => null);
+    if (existing) {
+      await client.invoke('plugins_set_enabled', { pluginId: id, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
+    }
+  };
+
+  let restore = null;
+  try {
+    const before = await client.invoke('settings_get');
+    restore = before.ai;
+    await client.invoke('settings_patch', {
+      patch: {
+        ai: {
+          provider: 'ollama',
+          baseUrl: `${mockBase}/v1`,
+          model: 'mock-text',
+          temperature: 0,
+          persistApiKey: false,
+        },
+      },
+    });
+    await fetch(`${mockBase}/__reset`);
+
+    // ---- 1) 合规草稿 ----
+    const gen = await client.invoke('ai_generate', {
+      req: { description: '把图片缩到宽 400 并转成 WebP [mock:draft]', allowPython: false },
+    });
+    const fileNames = (gen.draft?.files ?? []).map((f) => f.path);
+    console.log(`   草稿文件：${fileNames.join(', ') || '(空)'}`);
+    c.check(fileNames.includes('plugin.yaml'), '① 模型输出被解析成含 plugin.yaml 的草稿', fileNames.join(', '));
+    c.check(gen.review?.parseable === true, '② 草稿清单能被解析', gen.review?.parseError ?? '');
+    c.check(
+      gen.review?.recommended === true,
+      '★ ③ 合规草稿通过静态审核（可以进入"用户确认"环节）',
+      `recommended=${gen.review?.recommended} risk=${gen.review?.riskLevel} findings=${JSON.stringify(
+        (gen.review?.findings ?? []).map((f) => f.code)
+      )}`
+    );
+    c.check(
+      (gen.review?.validation?.issues ?? []).every((i) => i.severity !== 'error'),
+      '④ 静态校验没有 error 级问题',
+      JSON.stringify((gen.review?.validation?.issues ?? []).map((i) => i.code))
+    );
+    console.log(`   运行时摘要：${gen.review?.runtimeSummary ?? '(无)'}`);
+    console.log(`   能力清单：${(gen.review?.capabilities ?? []).join(' / ')}`);
+
+    // ---- 2) 把草稿写成目录、装上去、真跑 ----
+    // 这一步是**人在确认页上做的动作**的等价物：写盘 + plugins_install（不自动装）。
+    const draftDir = join(REPO_ROOT, '.tools', 'smoke', 'ai-draft');
+    rmSync(draftDir, { recursive: true, force: true });
+    mkdirSync(draftDir, { recursive: true });
+    for (const f of gen.draft.files) {
+      // 草稿里的路径来自模型，必须自己收敛：只允许写进草稿目录（防 `../` 之类的路径逃逸）
+      const target = join(draftDir, f.path);
+      if (!target.startsWith(draftDir)) {
+        c.check(false, '草稿文件路径必须落在草稿目录内', f.path);
+        continue;
+      }
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, f.content, 'utf8');
+    }
+    await cleanupPlugin(DRAFT_ID);
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'directory', path: draftDir },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: false,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: DRAFT_ID,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'output' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: DRAFT_ID, enabled: true });
+    const installed = await client.invoke('plugins_get', { pluginId: DRAFT_ID });
+    c.check(Boolean(installed), '⑤ 生成的插件能被安装（清单通过了装载校验）', DRAFT_ID);
+
+    const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-ai-draft');
+    rmSync(outDir, { recursive: true, force: true });
+    mkdirSync(outDir, { recursive: true });
+    const src = join(REPO_ROOT, '.tools', 'smoke', 'in-ai-draft.png');
+    writeFileSync(src, makePng(800, 600, 5));
+    const sub = await client.invoke('plugins_run', {
+      req: { pluginId: DRAFT_ID, inputs: { src: [src] }, params: {}, outputDir: outDir },
+    });
+    const job = await client.waitJob(sub.jobId, 180, 1000);
+    console.log(`   运行生成的插件：${job.status}${job.error ? ` — ${job.error.code}: ${job.error.message}` : ''}`);
+    c.check(job.status === 'succeeded', '★ ⑥ 生成的插件真的能跑（不是"装上了但一跑就崩"）', job.status);
+
+    const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+    // ⚠️ 要挑 **WebP 那个**，不能拿 `produced[0]`：这个插件声明了两个输出端口
+    // （中间文件 `resized` + 最终 `dst`），readdir 的顺序是不保证的 ——
+    // 第一版就是这么写的，结果断言看的是那个 `.png` 中间产物，报"产出不是 WebP"。
+    const webpName = produced.find((f) => f.toLowerCase().endsWith('.webp'));
+    const outFile = webpName ? join(outDir, webpName) : null;
+    console.log(`   产出：${produced.join(', ') || '(空)'}（取 WebP：${webpName ?? '(无)'}）`);
+    if (outFile && existsSync(outFile)) {
+      const buf = readFileSync(outFile);
+      c.check(
+        buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP',
+        '★ ⑦ 产出是真的 WebP（RIFF/WEBP 魔数，不是被改了扩展名的别的格式）',
+        `${webpName}：${buf.subarray(0, 12).toString('latin1')}`
+      );
+      // 生成时写的参数是"宽度 = 400"，所以这里顺手验一下参数真的生效了 ——
+      // 这条断言的价值在于：**AI 写进 YAML 的参数**真的走到了节点参数解析里，
+      // 而不是"插件跑通了但参数被忽略"（那种"空转成功"是本仓库打过交道的坑）。
+      const info = webpInfo(buf);
+      if (info && info.width) {
+        c.check(
+          info.width === 400,
+          '★ ⑧ 生成时写的参数（宽 400）真的生效了',
+          `${info.width}x${info.height}`
+        );
+      } else {
+        c.note('（webpInfo 读不出尺寸，跳过宽度断言）');
+      }
+    } else {
+      c.check(false, '★ ⑦ 生成的插件产出了文件', produced.join(', ') || '(输出目录为空)');
+    }
+
+    // ---- 3) 反证 A：**语法合法但引用未声明端口**的草稿必须在校验阶段就被拒 ----
+    //
+    // 这一条来自一次真实的踩坑：第一版"合规草稿"中间步骤写了 `${output.resized}`
+    // 却没声明 `resized` 端口 —— 它通过了审核、装得上，**跑起来才报**
+    // 「模板变量无法解析」。这类错误完全可以在审核阶段看出来（模板上下文里的
+    // `output.*` 只含声明过的端口），所以补了 `TEMPLATE_UNKNOWN_OUTPUT_PORT` 这条校验。
+    const broken = await client.invoke('ai_generate', {
+      req: { description: '随便做点什么 [mock:broken]', allowPython: false },
+    });
+    const brokenCodes = [
+      ...(broken.review?.validation?.issues ?? []).map((i) => i.code),
+      ...(broken.review?.findings ?? []).map((f) => f.code),
+    ];
+    console.log(
+      `   坏草稿：recommended=${broken.review?.recommended} ok=${broken.review?.validation?.ok} codes=${brokenCodes.join(', ')}`
+    );
+    c.check(
+      brokenCodes.includes('TEMPLATE_UNKNOWN_OUTPUT_PORT'),
+      '★ ⑨ 引用未声明的输出端口在校验阶段就被点名（不必等到跑起来才炸）',
+      brokenCodes.join(', ')
+    );
+    c.check(
+      broken.review?.recommended === false,
+      '★ ⑩ 这种草稿不会被推荐放行',
+      `recommended=${broken.review?.recommended}`
+    );
+
+    // ---- 4) 反证 B：合法但越权的草稿必须被拦下 ----
+    const evil = await client.invoke('ai_generate', {
+      req: { description: '随便做点什么 [mock:malicious]', allowPython: false },
+    });
+    const evilCodes = (evil.review?.findings ?? []).map((f) => f.code);
+    console.log(`   越权草稿：recommended=${evil.review?.recommended} risk=${evil.review?.riskLevel} codes=${evilCodes.join(', ')}`);
+    c.check(
+      evil.review?.parseable === true,
+      '⑪ 反证的前提成立：越权草稿是**能解析的合法清单**（不是靠 YAML 写错拦下来的）',
+      evil.review?.parseError ?? ''
+    );
+    c.check(
+      evil.review?.recommended === false,
+      '★ ⑫ 申请了 explicit 路径写入 + exec 的草稿被判为**不建议放行**',
+      `recommended=${evil.review?.recommended}`
+    );
+    c.check(
+      evilCodes.includes('HIGH_RISK_CAPABILITY'),
+      '⑬ 高危能力被点名（而不是只给一个笼统的"审核未通过"）',
+      evilCodes.join(', ')
+    );
+    c.check(
+      evil.review?.riskLevel === 'critical',
+      '⑭ 整体风险等级被拉到 critical',
+      String(evil.review?.riskLevel)
+    );
+
+    // ---- 5) 被拒的草稿要留审计 ----
+    // `plugins_audit` 返回 `{ events, files, dir }`；事件带 `kind`。
+    let auditKinds = [];
+    try {
+      const snap = await client.invoke('plugins_audit', { limit: 80 });
+      auditKinds = (snap?.events ?? []).map((e) => String(e.kind ?? ''));
+    } catch (e) {
+      c.note(`（读不到审计：${String(e.message).slice(0, 80)}）`);
+    }
+    if (auditKinds.length) {
+      const draftKinds = auditKinds.filter((k) => k.toLowerCase().includes('draft'));
+      c.check(
+        draftKinds.length > 0,
+        '⑮ 被拒的 AI 草稿落了审计（"模型是不是经常试图越权"这件事要可追溯）',
+        draftKinds.length ? draftKinds.join(', ') : `最近 ${auditKinds.length} 条里没有 draft 事件`
+      );
+    } else {
+      c.note('（审计队列为空，跳过"被拒草稿落审计"这条断言）');
+    }
+  } finally {
+    await cleanupPlugin(DRAFT_ID);
+    if (restore) {
+      await client.invoke('settings_patch', { patch: { ai: restore } }).catch(() => {});
+    }
+    mock.kill();
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

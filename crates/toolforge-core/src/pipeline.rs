@@ -231,6 +231,123 @@ impl PipelineDef {
         }
     }
 
+    /// 模板变量引用是否指向**真实存在**的东西（端口 / 参数 / 更早的步骤）。
+    ///
+    /// # 为什么这条要单独补出来
+    ///
+    /// [`Self::validate_into`] 早就会检查 `${steps.x.y}`（含前向引用），
+    /// 但 **`${output.x}` / `${input.x}` / `${params.x}` 从来没被检查过**。
+    /// 后果是一类特别难受的失败：清单**能通过校验、能装上**，
+    /// 跑起来才报 `PLUGIN_INVALID: 模板变量 ${output.resized} 无法解析`。
+    ///
+    /// 这不是理论问题，是**实测撞到的**：一条 AI 生成的"缩图并转 WebP"草稿
+    /// 中间步骤写 `${output.resized}`，却没有声明 `resized` 这个输出端口 ——
+    /// 草稿看着完全合理，静态审核给了 `recommended: true`，装也装上了，
+    /// 直到真跑才炸。而它**完全可以在审核阶段看出来**：模板上下文里的
+    /// `output.*` 只包含**声明过的**端口（`toolforge-plugins/src/l1.rs` 里就是这么填的）。
+    ///
+    /// 报成 `error` 而不是 `warning`：这类引用没有任何"也能跑"的情形，
+    /// 它必然在执行第一步时失败。AI 生成流程正是靠 `validation.ok` 决定要不要放行的。
+    pub fn validate_template_refs(&self, io: &crate::plugin::PluginIo, issues: &mut Vec<ValidationIssue>) {
+        let input_ids: Vec<&str> = io.inputs.iter().map(|p| p.id.as_str()).collect();
+        let output_ids: Vec<&str> = io.outputs.iter().map(|p| p.id.as_str()).collect();
+        let param_ids: Vec<&str> = io.params.iter().map(|p| p.id.as_str()).collect();
+
+        for (idx, step) in self.steps.iter().enumerate() {
+            let at = format!("runtime.pipeline.steps[{idx}]");
+            for (key, val) in &step.with {
+                for var in extract_vars(val) {
+                    // `${input.a.first}` 里的 `.first` 是单值简写，不属于端口 id
+                    let head = var.split('.').next().unwrap_or("");
+                    let second = var.split('.').nth(1).unwrap_or("");
+                    match head {
+                        "output" => {
+                            if !output_ids.contains(&second) {
+                                issues.push(
+                                    ValidationIssue::error(
+                                        "TEMPLATE_UNKNOWN_OUTPUT_PORT",
+                                        format!(
+                                            "步骤 `{}` 的参数 `{key}` 引用了未声明的输出端口 `{second}`。\n\
+                                             模板里的 `${{output.<id>}}` 只能引用**清单 io.outputs 里声明过的**端口；\
+                                             没声明的端口宿主不会分配路径，所以这一步**必然**在执行时报\
+                                             「模板变量无法解析」。\n已声明的输出端口：{}",
+                                            step.id,
+                                            if output_ids.is_empty() {
+                                                "（一个都没有）".to_string()
+                                            } else {
+                                                output_ids.join(", ")
+                                            }
+                                        ),
+                                    )
+                                    .at(at.clone()),
+                                );
+                            }
+                        }
+                        "input" => {
+                            if !input_ids.contains(&second) {
+                                issues.push(
+                                    ValidationIssue::error(
+                                        "TEMPLATE_UNKNOWN_INPUT_PORT",
+                                        format!(
+                                            "步骤 `{}` 的参数 `{key}` 引用了未声明的输入端口 `{second}`。\
+                                             已声明的输入端口：{}",
+                                            step.id,
+                                            if input_ids.is_empty() {
+                                                "（一个都没有）".to_string()
+                                            } else {
+                                                input_ids.join(", ")
+                                            }
+                                        ),
+                                    )
+                                    .at(at.clone()),
+                                );
+                            }
+                        }
+                        "params" => {
+                            if !param_ids.contains(&second) {
+                                issues.push(
+                                    ValidationIssue::error(
+                                        "TEMPLATE_UNKNOWN_PARAM",
+                                        format!(
+                                            "步骤 `{}` 的参数 `{key}` 引用了未声明的参数 `{second}`。\
+                                             已声明的参数：{}",
+                                            step.id,
+                                            if param_ids.is_empty() {
+                                                "（一个都没有）".to_string()
+                                            } else {
+                                                param_ids.join(", ")
+                                            }
+                                        ),
+                                    )
+                                    .at(at.clone()),
+                                );
+                            }
+                        }
+                        // 以下由宿主在运行时注入，永远可用（见 l1.rs 的模板上下文）：
+                        //   src / dst 两个端口简写，src.stem / src.ext / src.name / src.dir，
+                        //   batch.index / batch.zeroIndex / batch.total
+                        "src" | "dst" | "batch" => {}
+                        // `steps.*` 已由 `validate_into` 检查（存在性 + 前向引用）
+                        "steps" => {}
+                        other => {
+                            issues.push(
+                                ValidationIssue::error(
+                                    "TEMPLATE_UNKNOWN_VAR",
+                                    format!(
+                                        "步骤 `{}` 的参数 `{key}` 引用了未知变量 `${{{var}}}`（根名 `{other}`）。\
+                                         可用根名：input / output / params / steps / src / dst / batch",
+                                        step.id
+                                    ),
+                                )
+                                .at(at.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 返回流水线所有步骤**依赖**的引擎（去重）
     pub fn required_engines(&self) -> Vec<String> {
         let catalog = builtin_nodes();
@@ -1465,6 +1582,238 @@ mod tests {
         let mut issues = Vec::new();
         p.validate_into(&mut issues);
         assert!(issues.iter().any(|i| i.code == "STEP_UNKNOWN_NODE"));
+    }
+
+    // ------------------------------------------------------------------
+    // 模板变量 ↔ 声明的端口 / 参数（`validate_template_refs`）
+    // ------------------------------------------------------------------
+
+    fn io_with(inputs: &[&str], outputs: &[&str], params: &[&str]) -> crate::plugin::PluginIo {
+        crate::plugin::PluginIo {
+            inputs: inputs
+                .iter()
+                .map(|id| crate::plugin::IoPort {
+                    id: (*id).into(),
+                    label: (*id).into(),
+                    ty: crate::plugin::PortType::File,
+                    accept: vec![],
+                    multiple: false,
+                    required: false,
+                    description: None,
+                })
+                .collect(),
+            outputs: outputs
+                .iter()
+                .map(|id| crate::plugin::IoPort {
+                    id: (*id).into(),
+                    label: (*id).into(),
+                    ty: crate::plugin::PortType::File,
+                    accept: vec![],
+                    multiple: false,
+                    required: false,
+                    description: None,
+                })
+                .collect(),
+            params: params
+                .iter()
+                .map(|id| ParamSpec {
+                    id: (*id).into(),
+                    label: (*id).into(),
+                    ty: ParamType::Text,
+                    description: None,
+                    default: None,
+                    options: vec![],
+                    min: None,
+                    max: None,
+                    required: false,
+                    affects_output: false,
+                    multiline: false,
+                    placeholder: None,
+                    step: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn pipeline_refs(pairs: &[(&str, &str)]) -> PipelineDef {
+        PipelineDef {
+            steps: pairs
+                .iter()
+                .map(|(id, val)| PipelineStep {
+                    id: (*id).into(),
+                    uses: "image.convert".into(),
+                    with: [("src".to_string(), (*val).to_string())].into_iter().collect(),
+                    label: None,
+                    when: None,
+                    on_error: None,
+                    retry: 0,
+                    timeout_ms: None,
+                    position: None,
+                    depends_on: vec![],
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// ★ **这条就是被一次真机失败逼出来的**：AI 生成的草稿写了 `${output.resized}`
+    /// 却没声明 `resized` 端口 —— 草稿能通过校验、能装上，**跑起来才报**
+    /// 「模板变量无法解析」。现在必须在**审核阶段**就红。
+    #[test]
+    fn template_ref_to_undeclared_output_port_is_an_error() {
+        let p = pipeline_refs(&[("s1", "${output.resized}")]);
+        let mut issues = Vec::new();
+        p.validate_template_refs(&io_with(&["src"], &["dst"], &[]), &mut issues);
+        assert!(
+            issues.iter().any(|i| i.code == "TEMPLATE_UNKNOWN_OUTPUT_PORT"),
+            "引用了未声明的输出端口必须报错，实际：{issues:?}"
+        );
+        // 报错信息要能直接告诉作者"你有哪些端口可用"，否则他只能猜
+        let msg = issues
+            .iter()
+            .find(|i| i.code == "TEMPLATE_UNKNOWN_OUTPUT_PORT")
+            .map(|i| i.message.clone())
+            .unwrap_or_default();
+        assert!(msg.contains("resized") && msg.contains("dst"), "信息里要同时出现错的和对的：{msg}");
+    }
+
+    #[test]
+    fn template_ref_to_declared_ports_and_params_is_clean() {
+        let p = pipeline_refs(&[
+            ("s1", "${input.src}"),
+            ("s2", "${output.dst}"),
+            ("s3", "${params.width}"),
+            ("s4", "${src}"),
+            ("s5", "${dst}"),
+            ("s6", "${batch.index}"),
+            ("s7", "${src.stem}"),
+            ("s8", "${steps.s1.backend}"),
+        ]);
+        let mut issues = Vec::new();
+        p.validate_template_refs(&io_with(&["src"], &["dst"], &["width"]), &mut issues);
+        assert!(
+            issues.is_empty(),
+            "这些都是宿主会注入的、或已声明的引用，不该报任何问题：{issues:?}"
+        );
+    }
+
+    #[test]
+    fn template_ref_to_undeclared_input_port_and_param_is_an_error() {
+        let p = pipeline_refs(&[("s1", "${input.nope}"), ("s2", "${params.nope}")]);
+        let mut issues = Vec::new();
+        p.validate_template_refs(&io_with(&["src"], &["dst"], &["width"]), &mut issues);
+        let codes: Vec<&str> = issues.iter().map(|i| i.code.as_str()).collect();
+        assert!(codes.contains(&"TEMPLATE_UNKNOWN_INPUT_PORT"), "{codes:?}");
+        assert!(codes.contains(&"TEMPLATE_UNKNOWN_PARAM"), "{codes:?}");
+    }
+
+    /// 根名都不认识的变量（`${foo.bar}`）同样是"必然解析失败"，必须报出来。
+    #[test]
+    fn template_ref_with_unknown_root_is_an_error() {
+        let p = pipeline_refs(&[("s1", "${foo.bar}")]);
+        let mut issues = Vec::new();
+        p.validate_template_refs(&io_with(&["src"], &["dst"], &[]), &mut issues);
+        assert!(
+            issues.iter().any(|i| i.code == "TEMPLATE_UNKNOWN_VAR"),
+            "{issues:?}"
+        );
+    }
+
+    /// 端到端的一小步：**`PluginManifest::validate()` 必须真的把这条检查接上**。
+    ///
+    /// 上面那条测试直接调 `validate_template_refs`，证明不了"它被接进了校验流程"——
+    /// 一个没被调用的检查函数和没有检查是一回事（本项目在别处踩过：写好的功能没人调）。
+    /// 这里构造完整清单走 `validate()`，并断言 `ok == false`（AI 生成流程就是靠它决定放不放行）。
+    #[test]
+    fn manifest_validate_wires_in_the_template_port_check() {
+        let text = r#"
+apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: com.example.broken
+  name: 引用未声明端口的插件
+  version: 1.0.0
+io:
+  inputs:
+    - id: src
+      label: 输入
+      type: file
+  outputs:
+    - id: dst
+      label: 输出
+      type: file
+  params: []
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+runtime:
+  kind: pipeline
+  pipeline:
+    steps:
+      - id: s1
+        uses: image.convert
+        with:
+          src: "${src}"
+          dst: "${output.resized}"
+"#;
+        let manifest: crate::plugin::PluginManifest = serde_yaml::from_str(text).unwrap();
+        let report = manifest.validate();
+        assert!(
+            report.issues.iter().any(|i| i.code == "TEMPLATE_UNKNOWN_OUTPUT_PORT"),
+            "`validate()` 必须报出未声明的输出端口，实际：{:?}",
+            report.issues.iter().map(|i| i.code.clone()).collect::<Vec<_>>()
+        );
+        assert!(!report.ok, "有 error 级问题时 report.ok 必须是 false（AI 流程靠它放行）");
+    }
+
+    /// 遍历**仓库里真实的内置插件清单**，确保新校验没有误报。
+    ///
+    /// 这条比任何手写用例都重要：误报会让合法插件装不上（而且是在安装阶段才炸）。
+    /// 清单是纯文本 YAML，直接读目录即可 —— 不需要宿主、不需要引擎。
+    #[test]
+    fn bundled_plugin_manifests_pass_the_new_template_check() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("plugins")
+            .join("builtin");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            // 打包后的环境里没有 plugins/ 目录 —— 跳过而不是失败
+            return;
+        };
+        let mut checked = 0;
+        for entry in entries.flatten() {
+            let file = entry.path().join("plugin.yaml");
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let manifest: crate::plugin::PluginManifest = serde_yaml::from_str(&text)
+                .unwrap_or_else(|e| panic!("{} 解析失败：{e}", file.display()));
+            let report = manifest.validate();
+            let bad: Vec<&str> = report
+                .issues
+                .iter()
+                .filter(|i| i.code.starts_with("TEMPLATE_"))
+                .map(|i| i.code.as_str())
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "内置插件 {} 触碰了新的模板校验：{bad:?}\n{}",
+                file.display(),
+                report
+                    .issues
+                    .iter()
+                    .filter(|i| i.code.starts_with("TEMPLATE_"))
+                    .map(|i| i.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            checked += 1;
+        }
+        assert!(checked >= 4, "只检查到 {checked} 个内置插件，路径是不是变了？");
     }
 
     #[test]
