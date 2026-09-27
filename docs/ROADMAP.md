@@ -45,14 +45,16 @@
 > | 项 | 现在的值 |
 > | --- | --- |
 > | 编译 | `cargo check --workspace --all-targets` **0 error / 0 warning** |
-> | 测试 | `cargo test --workspace` **218 passed / 0 failed** |
+> | 测试 | `cargo test --workspace` **232 passed / 0 failed** |
 > | 前端 | `apps/desktop/src` 下有 93 个文件；`tsc --noEmit` 0 错误、`vite build` 通过 |
 > | `Cargo.lock` | **已存在并入库** |
 > | IPC 命令 | **32 个**（`COMMAND_NAMES` 与生成的 `bindings.ts` 逐条对齐，由 `export_bindings` 守卫） |
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **7 个** |
 > | 引擎下载源 | `engine-sources.json` 共 **12 条**（5 个引擎 × 各平台），其中 **7 条**的 SHA-256 是真实下载后核对过的；其余 5 条 `sha256: null`，`install` 会对它们返回 `HashRequired` 而**不放行** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **82 项全通过**（【1】–【13】） |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **89 项全通过**（【1】–【14】） |
+> | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **50 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动） |
+> | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `realesr-general-x4v3` |
 >
 > 下面这段原始快照保留原样，**不要据此判断现状**：
 
@@ -389,6 +391,112 @@
 3. **卡死检测只能靠"等 60 秒"来验证 → 等于没有被验证**。stall 超时原来**硬编在 `stream_to_file` 里**，唯一的验证方式是干等 60 秒，没人会做。
    - **修复**：把它变成**参数**（生产传 `STALL_TIMEOUT`，测试传 300 ms），于是 `stalled_download_fails_with_a_readable_error` 能用一个**裸 TCP server**（收请求 → 回 `200` 头 → 永远沉默）真的测它，断言错误码 `Network`、信息里说清「卡住」、**<10 s 返回**（证明不是靠 30 分钟总超时）、**半截文件被删掉**。`toolforge-engines` 测试数 37 → 38。
    - **次生收获**：CDP 脚手架自己的报错也在骗人 —— `cdp.mjs::evaluate()` 只取 `exception?.description ?? text`，页面 reject 一个**普通对象**（Tauri 的错误就是这么走的）时两者都是 `undefined`，最终抛出一句 `Error: Object`。**真实原因被自己的错误处理吃掉了**，那几轮"脚本挂了但不知道为什么"就是这么来的。现在它把 description / text / value / preview 全摊开，于是立刻看到真凶：`插件 com.toolforge.builtin.ebook-convert 未安装`（也就是上面第 1 条）。
+
+### 阻塞 17：**两个从未被执行过的运行时**，一共藏了 9 个缺陷 ✅ 已修复
+
+> **这一条是"阻塞 16"的下半场，而且更彻底。** 阻塞 16 的教训是"没有重建的二进制不算数"；
+> 这一条的教训是"**没有跑过的运行时不算数**"。三级插件里 L1（内置流水线）天天在跑，
+> 而 **L2（Extism WASM）与 L3（Python 子进程）从写出来那天起一次都没被执行过** ——
+> 它们的单元测试、清单校验、`cargo check` 全是绿的，示例插件也"在仓库里躺着看起来没问题"。
+>
+> 真的装一次、授权一次、跑一次之后，**9 个缺陷同时现形**，其中 4 个是"必然失败"级别。
+
+**先装进去就失败的（L2）**
+
+1. **示例插件的构建目标选错了，装上也跑不起来**。`plugins/wasm-example` 的构建说明写的是
+   `--target wasm32-wasip1`。而 Rust 的 **wasip1 版 std 在启动时无条件读环境变量**
+   （`std::rt::init` 调 `environ_get`），所以任何用 std 写出来的 wasip1 模块**必然**导入
+   `wasi_snapshot_preview1`；宿主又刻意关掉了 WASI（`with_wasi(false)`，这是"插件没有文件系统"
+   的实现手段），于是实例化直接失败：
+   `unknown import: wasi_snapshot_preview1::environ_get has not been defined`。
+   **wasip1 对这个宿主来说是错的目标，不是"配置问题"。**
+   - **修复**：两个示例插件与 `docs/PLUGIN-SDK.md` 全部改成 `--target wasm32-unknown-unknown`；
+     并在装载前用 `wasmparser` **读一遍导入段**（`runtimes/wasm.rs::inspect_imports`），
+     遇到 WASI 导入直接给出"请改用 `wasm32-unknown-unknown` 重新构建"。
+     同一处还顺手补上了"导入了宿主没提供的自定义宿主函数"的精确报错（此前只有 wasmtime 那句
+     `unknown import`）。
+2. **插件的参数载荷形状是错的 —— 文档对、实现错**。`PluginCallRequest::payload` 的 `params`
+   曾经直接塞 `ParamValue`，而它的 serde 形状是 `{"kind":"int","value":5}`
+   （那是给前端做可判别联合用的**内部**约定）。后果是**两个语言不同、互相独立的示例插件同时挂掉**：
+   L2 报 `invalid type: map, expected a string`，L3 报 `无法把 {'kind': 'int', 'value': 5} 解释为整数`。
+   而 `docs/PLUGIN-SDK.md` 与两个插件的注释里写的都是 `"params": { "format": "webp" }`。
+   - **修复**：新增 `ParamValue::to_plain_json()` / `params_to_plain_json()`，给插件的一律是裸值；
+     测试里带一条**反证**（断言 `serde_json::to_value(ParamValue::Int(5))` 与 `json!(5)` **不相等**，
+     否则"转换"这回事可能根本没人验证过）。
+3. **能力标签给的是 Rust 的 Debug 输出**。`capabilities` 载荷曾经是 `format!("{c:?}")`，
+   于是插件收到 `["FsRead { scope: Input }"]` 而不是文档写的 `["fsRead"]`。
+   `plugins/python-example/main.py` 里 `if "fsRead" not in caps: raise ...` 于是**永远成立** ——
+   那个插件必然报"没有 fsRead 能力"，而用户明明授权了。L2 的两个示例只是把标签打进日志，所以没暴露。
+   - **修复**：新增 `Capability::label()`（camelCase，与清单里的 `kind:` 逐字一致），载荷改用它。
+4. **`${output.<第二个端口>}` 根本解析不了**。`build_io` 只为 `dst` 分配输出路径，声明了第二个
+   输出端口的插件在第一步就报 `模板变量 ${output.frame} 无法解析`。内置的 `video-to-gif`
+   **从写出来那天起就没跑通过**。
+
+**跑起来但结果不对的**
+
+5. **多步流水线在第二步就断（路径收敛与作用域冲突）**。中间产物落在**输出**目录里，
+   下游步骤却用 `src` 端口（Input 作用域）去读它 → `PERMISSION_DENIED`
+   「路径逃逸被拦截：… 解析后落在授权目录之外」。这个缺陷**被第 4 条挡住了**：
+   模板变量先解析不了，所以没人走到这一步。修掉第 4 条之后它立刻现形。
+   - **修复**：`PathResolver::with_read_root()` —— **只对读**放开"输入根 ∪ 输出根"，
+     写仍然必须落在该作用域自己的根里。两条新测试钉住（含一条反向：只读根不会放宽写）。
+6. **插件报错的文案永远到不了用户眼前**。Extism 1.30 只在**输出已被设置**时读取插件设置的错误
+   （`plugin.rs`: `if output_res.is_ok() && self.extism_error_is_set()`），而 PDK 的
+   `#[plugin_fn]` 在 `Err` 分支上只 `error_set`、不设置输出 —— 于是作者写的所有可操作提示都丢了，
+   用户看到的是一句 `0x8bd7 - <unknown>!<wasm function 92>`。
+   - **修复**：L2 的错误约定改为**把错误放进返回值**（`{"error": "…"}`），宿主据此失败任务；
+     示例插件里的 `fail()` 直接可抄。宿主的错误映射也改用 `{e:?}`（anyhow 的 Display 只给最外层
+     一句话，真正的原因在 cause 链上），并对"只有回溯没有 cause"的情况补一句"为什么 + 怎么办"。
+7. **L2/L3 的产出根本没有映射回输出端口**。宿主只认 `outputs` 是**数组**的老写法，而文档写的、
+   插件返回的是**对象**（`{"swatch": "…png"}`）；对象形态被静默忽略，落到 `build_io` 算出来的
+   那个路径上 —— 而那个文件**从来没有人写过**。任务于是"成功"，产出列表里挂着一个不存在的文件。
+   - **修复**：`interpret_plugin_response()` 逐条对照清单声明的输出端口：文件类端口必须是
+     **真实存在**且**落在输出目录之内**的路径（越界判 `PERMISSION_DENIED` + 记审计，
+     不存在记 warning 且不计入产出）；非文件端口当成**值**写进任务日志
+     （否则"输出一段 JSON"的插件跑完，用户在界面上什么都看不到）。
+8. **启用门槛把"最小授权"变成了恒等式**。`set_enabled()` 原先要求"清单声明的每一项都已授权"，
+   而 `set_granted()` 又只接受声明里有的 ⇒ `已授权 == 声明` ⇒ 运行期那句
+   "声明 ∩ 授权"**永远等于声明本身**。也就是说 `effective()` / `allowed_hosts_from()` /
+   `CapabilityGuard` 里那套"少一个都不给"的逻辑在真实链路上**从来没被走到过**。
+   实际代价还更糟：插件只要申请了一项你不想要的权限（最典型的是"任意主机 net"），
+   你就只能整包放弃 —— 这正是"最小授权"想避免的**习惯性全选**。
+   - **修复**：去掉那道门。现在的模型是一条直线：**装**（校验 + 落盘）→ **启用**（你说了算）→
+     **用**（碰了没授权的动作就当场拒绝并记审计）。缺哪些能力由
+     `PluginStore::ungranted_declared()` 在运行前作为**警告**报出来。
+9. **L2 的 `net` 勾了也没用，而 `hosts` 带端口必然失配**（本轮更早的一个提交，一并记在这里）。
+   宿主此前从不设置 Extism 的 `allowed_hosts`（`None` = 一切请求被拒），
+   用户在授权面板上勾 `net` **没有任何效果**；而 Extism 的匹配用的是 `url.host_str()`，
+   **端口不参与比较**，所以清单里写 `api.example.com:443` 永远匹配不上 —— 作者以为写得更严格，
+   实际得到一个必然连不上网的插件。前者改 `allowed_hosts_from()`，后者加
+   `NET_HOST_WITH_PORT` 校验错误 + 运行期防御性剥端口。
+
+**顺带补上的两个"同一类"问题**：`WASM_WITH_PERMISSIONS` 校验警告曾把 `net` 也算作
+"WASM 访问不到的能力"（那句话对网络是**错的**，会引导作者删掉一个必须声明的东西）；
+授权面板上 `capabilityEnforcementNote(net)` 写着"宿主不代插件发 HTTP、没有运行时校验白名单" ——
+它对 L3 仍然成立，对 L2 已经变成**假的**。两处都改成按运行时分别陈述。
+
+**还有一个是"跑起来顺手撞见的"**：修好上面第 4、5 条之后真机跑 `video-to-gif`，
+`git status` 里冒出一个 `plugins/audit/`。原因是 `l1.rs::record_dir_audit()` 按
+"插件目录是 `<data>/plugins/<id>`"**反推**审计目录（`dir.parent().parent().join("audit")`）——
+那个假设对用户插件成立，对**内置插件**不成立（`<仓库>/plugins/builtin/<id>`），于是：
+位置不对（不在应用数据目录里）、**污染工作树**、并且让 L1 与 L2/L3 的审计落在两个地方
+（后者走 `PluginRunner` 注入的 AuditLog，位置是对的）。事后取证时"同一个事件在哪个文件里"
+取决于运行时，这本身就不该发生。
+- **修复**：`run_pipeline()` 增加 `audit: &AuditLog` 参数，由命令层传**应用那一个**；
+  旧函数留着并标注废弃，让"曾经这么错过"在代码里可查。
+
+**这一轮的验收方式**：新增 `scripts/devtools/verify-runtimes.mjs`（**50 项**），
+其中最有价值的一组是 **L2 的 net 对照实验** —— 同一个插件、同一份输入，只改授权/主机名：
+
+| 状态 | 请求 | 期望 |
+| --- | --- | --- |
+| 撤销全部授权（仍启用） | `http://127.0.0.1:PORT/` | ❌ `is not allowed` |
+| 授权 `net{hosts:["127.0.0.1"]}` | `http://127.0.0.1:PORT/` | ✅ 成功，标题/描述/状态码都对 |
+| 同上 | `http://localhost:PORT/` | ❌ `is not allowed` |
+
+最后一行是**反证的核心**：同一个服务、同一个端口，只有主机名不同 ——
+所以"成功→失败"这个差异只可能来自白名单的逐主机匹配。没有它，"被拒绝了"无法与
+"网络本来就是坏的"区分开。
 
 ### 基线（历史实测：阻塞 1–13 修复后）
 

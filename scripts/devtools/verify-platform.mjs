@@ -21,11 +21,13 @@
  * 7. **AI 抠图能不能真的输出透明背景** —— 它是产品定位里的招牌能力。
  * 8. **电子书转换的降级与拦截** —— pandoc 遇到写不出的格式会**假装成功**
  *    （生成一个扩展名骗人的 HTML），所以必须验证"该拒的真的拒了"。
+ * 9. **视频 → GIF** —— `video-to-gif` 内置插件在 ffmpeg 装好之前**一次都没跑过**，
+ *    而它同时压着"唯一一个视频节点 + 多步模板引用 + 第二个输出端口"三件事。
  *
  * 用法：`node scripts/devtools/verify-platform.mjs`
  */
 
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -33,6 +35,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -980,8 +983,118 @@ c.section('【13】图片降级链的**兜底档**（纯 Rust）是否真的能�
   }
 }
 
+// ============================================================================
+// 【14】视频抽帧 → GIF：`video-to-gif` 内置插件是否真的跑得通
+// ============================================================================
+//
+// 这个插件在 ffmpeg 装好之前**一次都没被跑过**（这台机器上一直是
+// 「10 个节点不可用」的状态）。它同时压着三件事：
+//
+//   1. `video.thumbnail` 这个**唯一**的视频节点（引擎解析 + PATH 查找 + 抽帧）；
+//   2. 多步流水线里 `${steps.<id>.<键>}` 的引用（`image.probe` → `flow.set-var`）；
+//   3. 中间产物走**第二个输出端口**（`${output.frame}`）而不是 `${dst}`。
+//
+// 素材用 ffmpeg 自己合成（`lavfi` 的 testsrc），所以不依赖任何外部视频文件。
+c.section('【14】视频 → GIF（video-to-gif 内置插件）是否真的跑得通');
+{
+  const engines = await client.invoke('engines_probe_all');
+  const usable = (e) => e && (e.status.state === 'detected' || e.status.state === 'installed');
+  const ff = engines.find((e) => e.descriptor.id === 'ffmpeg');
+  const ffPath = ff?.status?.path;
+
+  if (!usable(ff) || !ffPath || !existsSync(ffPath)) {
+    c.note('跳过：本机没有可用的 ffmpeg（到「引擎管理」一键安装，约 105 MB）');
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    c.note(`ffmpeg: ${ffPath}`);
+    const work = join(REPO_ROOT, '.tools', 'smoke', 'out-platform-video');
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+    const src = join(work, 'testsrc.mp4');
+
+    // 合成一段 3 秒、160x120、10fps 的测试视频。
+    // 用 `yuv420p` 是因为默认的 testsrc 像素格式很多播放器/GIF 路径不接受。
+    const gen = await runEngine(ffPath, [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-y',
+      '-f', 'lavfi',
+      '-i', 'testsrc=duration=3:size=160x120:rate=10',
+      '-pix_fmt', 'yuv420p',
+      src,
+    ]);
+    c.check(gen.ok && existsSync(src), '用 ffmpeg 合成一段测试视频', gen.err || `${statSync(src).size} 字节`);
+
+    if (existsSync(src)) {
+      const outDir = join(REPO_ROOT, '.tools', 'smoke', 'out-platform-video-gif');
+      rmSync(outDir, { recursive: true, force: true });
+      mkdirSync(outDir, { recursive: true });
+      const sub = await client.invoke('plugins_run', {
+        req: {
+          pluginId: 'com.toolforge.builtin.video-to-gif',
+          inputs: { src: [src] },
+          params: {
+            at: { kind: 'str', value: '00:00:01' },
+            width: { kind: 'int', value: 160 },
+            quality: { kind: 'int', value: 80 },
+          },
+          outputDir: outDir,
+        },
+      });
+      const job = await client.waitJob(sub.jobId, 120, 1000);
+      console.log(`   任务状态: ${job.status}`);
+      if (job.error) console.log(`   错误: ${job.error.code} — ${job.error.message}`);
+
+      c.check(job.status === 'succeeded', '视频 → GIF 任务成功', job.status);
+
+      const produced = job.outputs ?? [];
+      console.log(`   产出: ${JSON.stringify(produced)}`);
+      const gif = produced.find((p) => p.toLowerCase().endsWith('.gif'));
+      c.check(!!gif, '产出了一个 .gif', gif ?? produced.join(', '));
+
+      if (gif && existsSync(gif)) {
+        const buf = readFileSync(gif);
+        // GIF89a / GIF87a 魔数：只看存在性不够，要看位流真的写了
+        const head = buf.subarray(0, 6).toString('ascii');
+        c.check(head === 'GIF89a' || head === 'GIF87a', '文件真的是 GIF（魔数）', head);
+        // 逻辑屏幕宽高在偏移 6/8（小端）
+        const w = buf.readUInt16LE(6);
+        const h = buf.readUInt16LE(8);
+        c.check(w === 160 && h === 120, 'GIF 尺寸与抽帧尺寸一致 160x120', `${w}x${h}`);
+        c.note(`${gif}  ${buf.length} 字节`);
+      }
+
+      // 抽帧的中间产物是**第二个输出端口**，它必须也被登记 ——
+      // 否则"多输出端口"这条设计在真实链路上就是假的
+      const frame = produced.find((p) => p.toLowerCase().endsWith('.png'));
+      c.check(!!frame, '中间抽帧（第二个输出端口）也被登记为产出', frame ?? '（没有 png 产出）');
+
+      // 日志里应当能看到 `${steps.probe.width}x${steps.probe.height}` 被真的算出来
+      const logs = (job.logs ?? []).map((l) => l.message).join('\n');
+      c.check(
+        !/TEMPLATE|未知的引用|undefined/.test(logs),
+        '模板引用没有留下未解析的痕迹',
+        ''
+      );
+    }
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
+
+/**
+ * 直接调用一个外部程序（仅用于造测试素材）。
+ *
+ * 用 `spawnSync` 而不是 `execSync`：后者会把 stderr 混进返回值，而且
+ * 参数拼接要靠字符串转义。这里参数是数组，不经过 shell。
+ */
+function runEngine(exe, args) {
+  const r = spawnSync(exe, args, { encoding: 'utf8', windowsHide: true });
+  if (r.error) return { ok: false, err: r.error.message };
+  if (r.status !== 0) return { ok: false, err: `exit=${r.status} ${String(r.stderr ?? '').slice(0, 200)}` };
+  return { ok: true, err: '' };
+}
 
 /**
  * 生成"白底 + 一个纯色椭圆"的 PNG。
