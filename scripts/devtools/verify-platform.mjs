@@ -458,6 +458,69 @@ c.section('【8】AI 抠图（image.remove-background）是否真的能出透明
         `${pct}%`
       );
     }
+
+    // ---- ★ 逐个模型跑一遍（**每个模型的预处理都不一样**）----
+    //
+    // 这一族模型有两件事"喂错了不会报错、只会给出糊掉的蒙版"：
+    //   ① 输入尺寸（U²-Net 固定 320、BiRefNet 固定 1024、MODNet 动态）；
+    //   ② 归一化（MODNet 用 [-1,1]，其余用 ImageNet 统计量）。
+    // 所以每装一个模型就真跑一次，并把脚本实际用的**尺寸与归一化**读回来断言 ——
+    // "任务成功"在这里完全不能说明问题。
+    const EXPECT = {
+      u2netp: { size: '320x320', normalize: 'imagenet' },
+      u2net: { size: '320x320', normalize: 'imagenet' },
+      'isnet-general': { size: '320x320', normalize: 'imagenet' },
+      // 动态尺寸模型走 320（32 的倍数），但归一化是 [-1,1]
+      'modnet-portrait': { size: '320x320', normalize: 'pm1' },
+      // 固定 1024：脚本会问模型自己，所以这里必须看到 1024x1024
+      'birefnet-lite': { size: '1024x1024', normalize: 'imagenet' },
+      'birefnet-general': { size: '1024x1024', normalize: 'imagenet' },
+    };
+    for (const m of bgModels) {
+      const expect = EXPECT[m.id];
+      const oneDir = join(REPO_ROOT, '.tools', 'smoke', `out-rembg-${m.id}`);
+      rmSync(oneDir, { recursive: true, force: true });
+      mkdirSync(oneDir, { recursive: true });
+      const sub2 = await client.invoke('plugins_run', {
+        req: {
+          pluginId: 'com.toolforge.builtin.remove-bg',
+          inputs: { src: [src] },
+          params: {
+            model: { kind: 'str', value: m.id },
+            mode: { kind: 'str', value: 'alpha' },
+          },
+          outputDir: oneDir,
+        },
+      });
+      const job2 = await client.waitJob(sub2.jobId, 600, 1000);
+      const log2 =
+        (job2.logs ?? []).map((l) => String(l.message)).find((t) => t.includes('image.remove-background：')) ?? '';
+      console.log(`   [${m.id}] ${job2.status} :: ${log2}`);
+      if (job2.error) console.log(`      ${job2.error.code} — ${job2.error.message}`);
+      c.check(job2.status === 'succeeded', `模型 ${m.id} 能跑出结果`, job2.status);
+
+      const files2 = existsSync(oneDir) ? readdirSync(oneDir) : [];
+      if (files2.length === 1) {
+        const png2 = pngInfo(readFileSync(join(oneDir, files2[0])));
+        c.check(png2?.colorType === 6, `模型 ${m.id}：产出带 alpha 的 PNG`, String(png2?.colorType));
+      }
+
+      if (expect) {
+        c.check(
+          log2.includes(`输入 ${expect.size}`),
+          `模型 ${m.id}：输入尺寸是 ${expect.size}（脚本问的是模型自己）`,
+          (log2.match(/输入 \S+/) ?? [''])[0]
+        );
+        c.check(
+          log2.includes(`归一化 ${expect.normalize}`),
+          `模型 ${m.id}：归一化是 ${expect.normalize}`,
+          (log2.match(/归一化 \w+/) ?? [''])[0]
+        );
+      } else {
+        c.note(`（${m.id} 不在期望表里：新加的模型请同时更新这张表）`);
+        c.check(false, `模型 ${m.id} 有预处理期望值`, 'EXPECT 表里没有它');
+      }
+    }
   }
 }
 

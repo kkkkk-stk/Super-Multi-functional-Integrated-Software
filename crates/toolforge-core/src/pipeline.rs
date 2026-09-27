@@ -820,7 +820,22 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         params: vec![
             // 默认给最轻的 u2netp：4.4 MB 就能试，而 u2net 是 168 MB。
             // "先让它跑起来"比"一上来就要下 168 MB"重要得多。
-            enum_param("model", "模型", "u2netp", &["u2netp", "u2net", "isnet-general"]),
+            //
+            // 枚举必须覆盖目录里**全部有下载源**的抠图权重（反方向也一样）：
+            // 能下到却选不到、或能选到却下不到，都是缺陷。
+            enum_param(
+                "model",
+                "模型",
+                "u2netp",
+                &[
+                    "u2netp",
+                    "u2net",
+                    "isnet-general",
+                    "modnet-portrait",
+                    "birefnet-lite",
+                    "birefnet-general",
+                ],
+            ),
             enum_param("mode", "输出方式", "alpha", &["alpha", "color"]),
             param("background", "替换背景色（mode=color 时生效，如 #FFFFFF）", ParamType::Color, Some("#FFFFFF".into()), false),
             range_param("threshold", "蒙版阈值（0 = 不卡，越大越干净但可能啃掉边缘）", ParamType::Int, 0.0, 0.0, 99.0),

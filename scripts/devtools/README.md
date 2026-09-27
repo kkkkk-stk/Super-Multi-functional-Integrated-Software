@@ -41,7 +41,7 @@ node scripts/devtools/inspect.mjs   # 单页体检
 node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
-node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（145 项）
+node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（157 项）
 node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（70 项）
 ```
 
@@ -129,7 +129,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 ### `verify-platform.mjs` —— 平台能力（**这一轮新增的主要内容**）
 
 `verify.mjs` 验的是**安全属性**，这个脚本验的是**平台声称能做到的事是不是真的做到了**。
-十七节，145 项：
+十七节，157 项：
 
 | 节 | 验什么 | 它抓到过什么 |
 |---|---|---|
@@ -140,7 +140,7 @@ DOM 节点数、可交互元素、页面异常，并保存一张 CDP 截图。
 | 【5】 | `flow.foreach` 是否已从目录里消失 | —— |
 | 【6】 | 图片后端（libvips / ImageMagick）是否真被调用 | 三层降级图写了好几个月，**一行代码都没调过它们** |
 | 【7】 | 任意角度旋转的边界 | —— |
-| 【8】 | 抠图是否真的输出透明背景 | 招牌功能此前从未工作过 |
+| 【8】 | 抠图是否真的输出透明背景 | 招牌功能此前从未工作过。**现在还会逐个已装模型真跑一遍**：抠图脚本原来把输入尺寸硬编 320、归一化写死 ImageNet，而 BiRefNet 固定 1024×1024、MODNet 要 [-1,1] —— 喂错了**不报错**，只是蒙版糊掉。所以这一节把脚本实际用的尺寸与归一化读回来断言 |
 | 【9】 | 电子书转换的降级与**拦截** | pandoc 遇到写不出的格式会**假装成功**（给你一个扩展名骗人的 HTML） |
 | 【10】 | AI 视觉链路的请求形状与下游接线 | 见下 |
 | 【11】 | 超分是否真的按倍数放大 | 见下 |

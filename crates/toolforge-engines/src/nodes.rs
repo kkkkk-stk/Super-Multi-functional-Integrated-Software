@@ -1689,6 +1689,30 @@ async fn ai_upscale(ctx: &mut NodeCtx, args: &BTreeMap<String, String>) -> Toolf
 ///
 /// 这三件事都必须"说得清、做得到"：任何一条缺失时的报错都要**指名道姓**
 /// 地告诉用户去哪儿点哪个按钮。含糊的报错会让人以为功能坏了。
+/// 抠图模型该用哪种输入归一化。
+///
+/// # 为什么必须有这张表
+///
+/// 归一化喂错了**不会报错** —— 模型照常推理，只是输出一张糊掉的蒙版。
+/// 那是这个项目里最糟的一类失败（"看起来跑通了但结果不对"），所以宁可用一张
+/// 显式的表，也不让脚本去猜。
+///
+/// | 模型族 | 归一化 | 输入尺寸 |
+/// |---|---|---|
+/// | U²-Net / ISNet / BiRefNet | ImageNet 统计量 `(x/255 - mean) / std` | 320（U2Net）/ 1024（BiRefNet，模型自己声明） |
+/// | MODNet | `(x/255 - 0.5) / 0.5`（拉到 [-1, 1]） | 动态，32 的倍数 |
+///
+/// 尺寸不用在这张表里写：`py/rembg.py` **问模型自己**（读 `get_inputs()[0].shape`），
+/// 固定尺寸的照它来、动态的退回 320。这样加一个新模型只要确认归一化方式。
+fn rembg_normalize_for(model_id: &str) -> &'static str {
+    match model_id {
+        "modnet-portrait" => "pm1",
+        // u2netp / u2net / isnet-general / birefnet-general / birefnet-lite
+        // 以及将来的新模型都走这里 —— ImageNet 统计量是这一族里最常见的。
+        _ => "imagenet",
+    }
+}
+
 async fn image_remove_background(
     ctx: &mut NodeCtx,
     args: &BTreeMap<String, String>,
@@ -1710,7 +1734,7 @@ async fn image_remove_background(
     // ---- ① 模型 ----
     let model_path = ctx.engines.model_path(&model_id).ok_or_else(|| {
         ToolforgeError::not_found(format!("模型 {model_id} 不在引擎目录里登记"))
-            .with_detail("可用的抠图模型：u2netp（最快）、u2net、isnet-general。")
+            .with_detail("可用的抠图模型：u2netp（最快）、u2net、isnet-general、modnet-portrait、birefnet-general。")
     })?;
     if !model_path.is_file() {
         return Err(ToolforgeError::not_found(format!(
@@ -1722,6 +1746,10 @@ async fn image_remove_background(
                 .to_string(),
         ));
     }
+
+    // 归一化方式**按模型来**，喂错了不会报错、只会得到一张糊掉的蒙版
+    // （见 `py/rembg.py` 模块文档第 2 条），所以这里显式查表而不是让脚本猜。
+    let normalize = rembg_normalize_for(&model_id);
 
     ctx.job.progress_now(toolforge_core::job::JobProgress::indeterminate(
         format!("抠图 {}", file_label(&src)),
@@ -1750,6 +1778,8 @@ async fn image_remove_background(
         threshold.to_string(),
         "--feather".into(),
         feather.to_string(),
+        "--normalize".into(),
+        normalize.to_string(),
     ];
     // `--mode color` 之外时背景色没有意义，去掉免得用户以为它生效了
     if mode != "color" {
@@ -1819,16 +1849,31 @@ async fn image_remove_background(
         .get("coveragePercent")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0);
+    // 脚本实际用的输入尺寸与归一化方式。**两个都必须写进日志**：
+    // 它们现在都是"按模型决定"的（尺寸问模型自己、归一化查表），
+    // 出问题时（蒙版糊了、边缘不对）这是首先要确认的东西 ——
+    // 没有这两项就只能去翻脚本源码猜。
+    let input_size = report
+        .get("inputSize")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let normalize = report
+        .get("normalize")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+
     // 前景占比异常时给一条提示：这几乎是"用户选错了模型或图里没有主体"的
     // 唯一可观测信号，不说的话用户只会觉得"抠得不对"。
     if coverage < 1.0 {
         ctx.job.warn(format!(
-            "U²-Net 几乎没找到前景（占比 {coverage:.1}%）—— 可能是图里没有明显主体，\
-             或者这张图不适合这个模型（人像试试 isnet-general）。"
+            "这个模型几乎没找到前景（占比 {coverage:.1}%）—— 可能是图里没有明显主体，\
+             或者这张图不适合这个模型（人像试试 isnet-general 或 modnet-portrait）。"
         ));
     } else if coverage > 99.0 {
         ctx.job.warn(format!(
-            "U²-Net 把整张图都当成了前景（占比 {coverage:.1}%）—— \
+            "这个模型把整张图都当成了前景（占比 {coverage:.1}%）—— \
              可能是背景与主体对比度太低。"
         ));
     }
@@ -1836,7 +1881,8 @@ async fn image_remove_background(
     ctx.job.log(
         toolforge_core::job::LogLevel::Debug,
         format!(
-            "image.remove-background：模型 {model_id}；前景占比 {coverage:.2}%；输出 {mode}"
+            "image.remove-background：模型 {model_id}；输入 {input_size}（归一化 {normalize}）；\
+             前景占比 {coverage:.2}%；输出 {mode}"
         ),
     );
 
@@ -1844,6 +1890,8 @@ async fn image_remove_background(
         .with_value("path", dst.display().to_string())
         .with_value("model", model_id)
         .with_value("backend", "onnx-python")
+        .with_value("inputSize", input_size)
+        .with_value("normalize", normalize)
         .with_value("coveragePercent", format!("{coverage:.2}")))
 }
 
@@ -3446,6 +3494,36 @@ fn file_label(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **漂移守卫**：引擎目录里每个"服务于抠图"的模型，都必须在归一化表里有交代。
+    ///
+    /// 这条守的失败形态是**静默的**：新加一个模型、归一化没跟上，模型照常推理、
+    /// 任务照常成功，只是蒙版糊了。所以这里对"目前是不是恰好落进 default 分支"
+    /// 做不出判断，但至少能保证**每加一个模型都有人看一眼这张表** ——
+    /// 新增模型时这条测试会失败，逼着作者确认归一化方式。
+    #[test]
+    fn every_rembg_model_has_a_normalization_decision() {
+        let models: Vec<String> = toolforge_core::engine::engine_catalog()
+            .into_iter()
+            .flat_map(|e| e.models)
+            .filter(|m| m.used_by.iter().any(|u| u == "image.remove-background"))
+            .map(|m| m.id)
+            .collect();
+        assert!(!models.is_empty(), "目录里应当有抠图模型");
+
+        // 目前只有 MODNet 用 pm1；其它都是 ImageNet 统计量。
+        // 新增一个"既不是 MODNet 也不是 ImageNet 族"的模型时，这条断言会失败。
+        for id in &models {
+            let n = rembg_normalize_for(id);
+            assert!(
+                n == "imagenet" || n == "pm1",
+                "模型 {id} 的归一化方式是 `{n}`，不是脚本支持的两种之一"
+            );
+            if id == "modnet-portrait" {
+                assert_eq!(n, "pm1", "MODNet 必须用 [-1,1]，喂 ImageNet 统计量不会报错但会糊");
+            }
+        }
+    }
 
     #[test]
     fn format_parsing_covers_documented_set() {

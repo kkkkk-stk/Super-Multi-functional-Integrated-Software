@@ -340,6 +340,9 @@ EngineModel {
 | `realesr-general-x4v3` | Real-ESRGAN general x4v3 | 通用 4 倍超分（轻量）。**输入尺寸动态**，不需要切块补边；**默认选它** | 约 5 MB（实测 4.87 MB） | `BSD-3-Clause` | 是 | `https://huggingface.co/Heliosoph/realesrgan-onnx/resolve/main/realesr-general-x4v3.onnx` | `09b757accd747d7e423c1d352b3e8f23e77cc5742d04bae958d4eb8082b76fa4` |
 | `realesrgan-anime6b` | Real-ESRGAN anime 6B | 动漫 / 插画 4 倍超分（6 个残差块，完整版 23 个），输入尺寸同样动态 | 约 18 MB（实测 18.35 MB） | `BSD-3-Clause` | 是 | `https://huggingface.co/RekluzLabs/realesrgan_anime6b.onnx/resolve/main/realesrgan_anime6b.onnx` | `45bd54934aeabe8df744c8fdacb9e8846c9b55cb4e60c499db77405d1625a667` |
 | `realesrgan-x4plus` | Real-ESRGAN x4plus | 完整版通用超分，质量最好的一档。**输入尺寸固定 256×256**，走"补齐 → 推理 → 裁回" | 约 67 MB（实测 66,993,533 字节） | `BSD-3-Clause` | 是 | ✅ **有下载源**（`279da294…`，真实下载后核对） | 同上 |
+| `modnet-portrait` | MODNet Portrait | 人像专用抠图。**动态输入尺寸** + **[-1,1] 归一化**（与其它模型不同） | 约 25 MB（实测 25,888,640 字节） | `Apache-2.0`（代码）/ 学术用途权重 | **否**（需确认） | ✅ **有下载源**（`07c308cf…`，应用内下载 + 哈希校验通过；社区镜像，**会抖**，失败重试一次通常就过） | 同上 |
+| `birefnet-lite` | BiRefNet lite | BiRefNet 的轻量版（swin_v1_tiny）。**输入固定 1024×1024** | 约 214 MB（实测 224,005,088 字节） | `MIT` | 是 | ✅ **有下载源**（`5600024376…`，GitHub rembg release；与 HF 上 `onnx-community/BiRefNet_lite-ONNX` 逐字节相同） | 同上 |
+| `birefnet-general` | BiRefNet（完整版） | 质量最好的一档，但 927 MB、CPU 单张十几秒 | 约 928 MB（实测 972,666,916 字节） | `MIT`（代码）/ 权重另有条款 | **否**（需确认） | ⚠️ **有下载源且哈希已核对，但本机没验完**：哈希来自一次完整下载（`58f621f0…`），但**下载链路与推理都没有实测记录** —— 927 MB 在当前这条降级线路上把应用和 curl 都拖垮了 | 同上 |
 
 > ✅ **`realesrgan-x4plus` 现在有下载源了（这一条保留历史，因为它的动机与另外两个完全不同）**：`birefnet-general` / `modnet-portrait` 缺的是"还没核对过的哈希"，而这一个当初缺的是**能用的 ONNX 导出** —— 找到的每一份 x4plus 导出都是**固定输入尺寸**，要先补上「补齐到固定尺寸 → 推理 → 裁回去」。三件事现在都做完了：
 > 1. **补边逻辑**：`py/upscale.py` 读会话的输入形状，固定尺寸时用 `np.pad(mode="edge")`（边缘像素，比补黑边干净）补到 256×256，推理后裁回；
@@ -557,11 +560,11 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 - ~~见第 1.3 节：`engine_catalog()` 中 6 个模型的 `url` 与 `sha256` 全部为 `None`。~~
   > ✅ **已修正**：**5 个**权重现在有**真实下载后自己算出来的** SHA-256 与固定直链 —— 三个 rembg 抠图权重（`u2net` / `u2netp` / `isnet-general`，`https://github.com/danielgatis/rembg/releases/download/v0.0.0/`，tag 字面就是 `v0.0.0`）与两个 Hugging Face 超分权重（`realesr-general-x4v3` / `realesrgan-anime6b`）。它们都有独立的 `file_name` 字段（资产名与模型 id 可能不一致，如 `isnet-general` → `isnet-general-use.onnx`）。文件落在 `<data_dir>/models/<model_id>/<file_name>`。三条 IPC 也已补齐：`models_list` / `models_install` / `models_remove`。
   > **哈希不匹配即删文件**：`registry.rs::install_model` 用 `remove_file` + `IntegrityCheckFailed`，不保留没校验过的产物。
-  > **还有两个（`birefnet-general` / `modnet-portrait`）刻意没有 url/hash**：缺的是"还没核对过的哈希"。与其放一个"点了必然失败"的下载按钮，不如让 UI 显示「无下载源」并把按钮置灰。单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name 三者全有或全无、哈希为 64 位小写十六进制、`file_name` 不重复、URL 以 `file_name` 结尾。
+  > **还剩一个没有下载源**：`birefnet-general` 有源也有哈希，但见上表 —— 927 MB 在当前线路上没能跑完"下载 → 推理"这条验证，所以它的状态是"可下、未实测"，不是"已验收"。单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name 三者全有或全无、哈希为 64 位小写十六进制、URL 以 `file_name` 结尾。
   > **注意**：上一段关于"模型权重仍全部为 `null`"的旧结论已经不成立。
 - ~~另外 `engine-sources.json` 中 5 个引擎的候选 URL 虽然存在，但**每条 `sha256` 均为 `null`**，因此没有任何一个引擎具备可用的自动安装来源。~~
   > ✅ **已修正**：`engine-sources.json` 已回填 **7 条**带真实核对哈希 + 版本固定直链的来源（`ffmpeg@windows`、`libvips@windows`、`pandoc@windows/linux`、`python@windows/linux`，以及本轮新增的 **`imagemagick@windows`**）。因此 Windows 上的这 5 个引擎与 Linux 上的 2 个**现在可以自动安装**；macOS 四条与 `ffmpeg@linux` 仍为 `null`。详见 `docs/ROADMAP.md` §3 与 3.2。
-- 处理方式：**还剩两个模型待补齐来源**（补哈希必须先在真实环境下载核对，不能凭推测填写）。
+- 处理方式：**模型权重现在全部有下载源**（8 个），其中 6 个有真实下载后核对的哈希；`birefnet-general` 的哈希也有，但"下载 + 推理"这条链路没在本机跑完（见第 4 节的表）。剩下的未核对项是 **macOS 的四条引擎下载源**（没有 macOS 环境）。
   > ✅ **另一件事已经不再成立**：这条原来说「依赖模型的节点执行器仍未实现，所以 v0.1 仍用不上模型」—— **抠图与超分两个执行器都已实现并真机跑通**（`image_remove_background` / `ai_upscale`：下权重 → 独立 venv 装 `onnxruntime` → ONNX 推理 → 出结果），所以模型现在**真的被用上了**。本轮新填的两个超分权重（`realesr-general-x4v3` / `realesrgan-anime6b`）就是为 `ai.upscale` 服务的。
 
 **下载链路上后来加的几件事（都是实测逼出来的）：**

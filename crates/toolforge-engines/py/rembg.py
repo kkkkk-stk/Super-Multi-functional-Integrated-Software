@@ -1,4 +1,4 @@
-"""U2Net 抠图推理脚本（ToolForge 内置节点 image.remove-background 的 Python 侧）。
+"""抠图推理脚本（ToolForge 内置节点 `image.remove-background` 的 Python 侧）。
 
 ## 为什么这段代码是 Python 而不是 Rust
 
@@ -11,20 +11,33 @@
 
 由 Rust 侧以子进程方式调用，**只通过命令行参数与文件交换数据**：
 
-    python rembg.py --model <u2netp.onnx> --input <in.png> --output <out.png>
+    python rembg.py --model <model.onnx> --input <in.png> --output <out.png>
+                    [--normalize imagenet|pm1] [--size 0]
                     [--mode alpha|color] [--background "#RRGGBB"]
                     [--threshold 0] [--feather 0]
 
 成功时 stdout 只打印一行 JSON（供宿主解析），失败时退出码非 0 且
 stderr 是完整回溯 —— 宿主会把它原样带给用户，所以**不要**吞异常。
 
-## 关于 U2Net 的输入输出（很容易写错的地方）
+## 三个"必须按模型来"的地方（写错任意一个都不会报错，只会出垃圾）
 
-* 输入固定 **320x320**、归一化方式为 `(x / max) - mean) / std`，
-  `mean=std=(0.485,0.456,0.406)`（ImageNet 统计量）。**不是** 0~1 直接送进去。
-* 输出是 **7 个**同尺寸的显著性图（`d0`..`d6`），只用 `d0`（最终融合结果）。
-* `d0` 的范围**不是** 0~1（也不是 0~255），必须自己做 min-max 归一化 ——
-  直接 clip(0,1) 会得到一张几乎全黑或全白的蒙版。
+1. **输入尺寸**：U2Net 系列固定 320×320；MODNet 是动态尺寸但要求是 32 的倍数；
+   BiRefNet 固定 **1024×1024**。脚本现在**问模型自己**（读 `get_inputs()[0].shape`），
+   固定尺寸就照它来，动态才退回 320。以前是硬编 320 —— 换一个固定 1024 的模型
+   会直接报形状不匹配（那是好事），但换一个**动态**模型时 320 往往偏小、边缘更糊。
+2. **归一化**：U2Net / ISNet / BiRefNet 用 ImageNet 统计量
+   `(x/255 - mean) / std`；**MODNet 用 `(x/255 - 0.5) / 0.5`**（即拉到 [-1, 1]）。
+   喂错了**不会报错**，只会给出一张糊掉的蒙版 —— 所以它由宿主按模型显式传进来
+   （`--normalize`），而不是猜。
+3. **输出语义**：U2Net 输出 7 个同尺寸显著性图（只用 `d0`），而且 `d0` 的范围
+   **不是** 0~1，必须自己做 min-max 归一化；直接 clip 会得到几乎全黑或全白的蒙版。
+   MODNet / BiRefNet 输出单个 alpha 图，同样做 min-max —— 对它们来说是幂等的。
+
+## 形状检查
+
+输出必须是**单通道的二维图**。这一条是硬性的：`ai.upscale` 曾经因为模型挑错
+（拿抠图权重去超分）而"尺寸断言全过、结果是垃圾"，所以这里对形状挑剔一点，
+错的东西宁可当场拒绝。
 """
 
 from __future__ import annotations
@@ -53,7 +66,7 @@ def parse_hex_color(text: str):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="U2Net 背景移除")
+    p = argparse.ArgumentParser(description="背景移除（U2Net / ISNet / MODNet / BiRefNet）")
     p.add_argument("--model", required=True)
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
@@ -61,6 +74,11 @@ def main() -> None:
     p.add_argument("--background", default="#FFFFFF")
     p.add_argument("--threshold", type=int, default=0)
     p.add_argument("--feather", type=int, default=0)
+    # 归一化方式由宿主按模型传进来（见模块文档第 2 条）。默认给 ImageNet ——
+    # 那是这一族里最常见的，而且 U2Net / ISNet / BiRefNet 都用它。
+    p.add_argument("--normalize", default="imagenet", choices=["imagenet", "pm1"])
+    # 0 = 自动（固定尺寸的模型照它自己声明的来，动态模型用 320）
+    p.add_argument("--size", type=int, default=0)
     args = p.parse_args()
 
     # 依赖缺失要给出**可操作**的提示，而不是一句 ImportError 回溯
@@ -82,34 +100,62 @@ def main() -> None:
 
     orig_w, orig_h = img.size
 
-    # ---- 预处理：320x320 + ImageNet 归一化 ----
-    size = 320
-    small = img.resize((size, size), Image.LANCZOS)
-    arr = np.asarray(small, dtype=np.float32) / max(255.0, 1.0)
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    arr = (arr - mean) / std
-    # NCHW
-    tensor = np.transpose(arr, (2, 0, 1))[None, ...].astype(np.float32)
-
     try:
         sess = ort.InferenceSession(args.model, providers=["CPUExecutionProvider"])
     except Exception as e:
         # 模型文件损坏是最常见的失败原因（下载被截断、被同步工具改写）
         fail(f"无法加载 ONNX 模型 {args.model}：{e}\n模型文件可能已损坏，请重新下载。")
 
-    input_name = sess.get_inputs()[0].name
+    spec = sess.get_inputs()[0]
+    in_shape = list(spec.shape)
+
+    # ---- 输入尺寸：问模型自己 ----
+    if len(in_shape) != 4 or not (in_shape[1] == 3 or in_shape[1] == "3"):
+        fail(
+            f"这个权重不是抠图模型：它的输入形状是 {in_shape}，"
+            "而抠图模型应当是 [N, 3, H, W]（3 通道图片）。"
+        )
+    fixed = None
+    if isinstance(in_shape[2], int) and isinstance(in_shape[3], int) and in_shape[2] > 0:
+        fixed = (in_shape[3], in_shape[2])  # PIL 要 (w, h)
+    size = (args.size, args.size) if args.size > 0 else (fixed or (320, 320))
+
+    # MODNet 这类动态尺寸模型要求边长是 32 的倍数，取整一下免得推理报错
+    if fixed is None:
+        size = (max(32, size[0] // 32 * 32), max(32, size[1] // 32 * 32))
+
+    small = img.resize(size, Image.LANCZOS)
+    arr = np.asarray(small, dtype=np.float32) / 255.0
+    if args.normalize == "imagenet":
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        arr = (arr - mean) / std
+    else:
+        # pm1 = [-1, 1]：MODNet 的官方预处理
+        arr = (arr - 0.5) / 0.5
+    # NCHW
+    tensor = np.transpose(arr, (2, 0, 1))[None, ...].astype(np.float32)
+
+    input_name = spec.name
     try:
         outputs = sess.run(None, {input_name: tensor})
     except Exception as e:
-        fail(f"推理失败：{e}")
+        fail(
+            f"推理失败（输入 {size[0]}x{size[1]}）：{e}\n"
+            "如果这是形状相关的报错，说明这个权重的输入尺寸与脚本推断的不一致 —— "
+            "请把这个权重的来源告诉我们。"
+        )
 
     # 只取第一个输出（U2Net 的 d0 是最终融合结果）
     pred = np.asarray(outputs[0])
     # 去掉 batch / channel 维度：可能是 (1,1,H,W) 或 (1,H,W) 或 (H,W)
     pred = np.squeeze(pred)
     if pred.ndim != 2:
-        fail(f"模型输出形状无法理解：{np.asarray(outputs[0]).shape}")
+        fail(
+            f"模型输出形状无法理解：{np.asarray(outputs[0]).shape}。\n"
+            "抠图模型应当输出单通道的蒙版（[1,1,H,W]）；多通道输出通常意味着"
+            "这个权重不是抠图用的。"
+        )
 
     # ---- 后处理：min-max 归一化（这是最容易漏的一步）----
     lo, hi = float(pred.min()), float(pred.max())
@@ -159,6 +205,10 @@ def main() -> None:
                 "height": orig_h,
                 "mode": args.mode,
                 "coveragePercent": round(coverage, 2),
+                # 把实际用的输入尺寸与归一化方式也报出来：出问题时这两个是
+                # 首先要确认的东西（见模块文档开头那三条）。
+                "inputSize": f"{size[0]}x{size[1]}",
+                "normalize": args.normalize,
                 "model": args.model,
             },
             ensure_ascii=False,

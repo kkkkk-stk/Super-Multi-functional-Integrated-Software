@@ -463,29 +463,60 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
                 },
                 EngineModel {
                     id: "birefnet-general".into(),
-                    name: "BiRefNet".into(),
-                    purpose: "当前抠图 SOTA，发丝级边缘".into(),
-                    approx_size_mb: 900,
+                    name: "BiRefNet（完整版）".into(),
+                    purpose: "完整版 BiRefNet，抠图质量最好的一档，但 **927 MB**、\
+                              1024×1024 输入下 CPU 单张要十几秒。除非确实需要那一点点质量差距，\
+                              否则优先用 `birefnet-lite`（213 MB）。".into(),
+                    approx_size_mb: 928,
                     license: "MIT（代码）/ 权重另有条款".into(),
                     commercial_use: false,
-                    // 没配下载源：**不是遗漏，是不敢乱填**。
-                    // 哈希必须来自真实下载，见 `verified_sources_are_pinned` 的说明。
-                    url: None,
-                    sha256: None,
-                    file_name: None,
+                    // 之前这一条**没有下载源**，理由是"哈希必须来自真实下载"。
+                    // 现在补上了（972,666,916 字节的哈希是自己下载后算的），
+                    // 并且用同一套脚本真跑过一遍 —— 见 `verify-platform.mjs`【8】。
+                    url: Some("https://hf-mirror.com/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model.onnx".into()),
+                    sha256: Some("58f621f00f5d756097615970a88a791584600dcf7c45b18a0a6267535a1ebd3c".into()),
+                    file_name: Some("model.onnx".into()),
                     installed: false,
                     used_by: vec!["image.remove-background".into()],
                 },
                 EngineModel {
                     id: "modnet-portrait".into(),
                     name: "MODNet Portrait".into(),
-                    purpose: "人像专用抠图（视频会议 / 证件照场景）".into(),
+                    purpose: "人像专用抠图（视频会议 / 证件照场景）。25 MB，CPU 上很快；\
+                              它是**动态输入尺寸**的模型，脚本会把图缩到 320×320 再推理，\
+                      且**用的是 [-1,1] 归一化**（与 U²-Net 那一族的 ImageNet 统计量不同）。"
+                        .into(),
                     approx_size_mb: 25,
                     license: "Apache-2.0（代码）/ 学术用途权重".into(),
                     commercial_use: false,
-                    url: None,
-                    sha256: None,
-                    file_name: None,
+                    // 社区镜像。**huggingface.co 直连在部分网络下不可达**，而这个镜像实测能下
+                    // （25 MB 一次成功、哈希校验通过）；但它**会抖** —— 第一次尝试时
+                    // 连接超时，重试就过了。所以失败信息里那句"重试一次"不是客套话。
+                    url: Some("https://hf-mirror.com/Xenova/modnet/resolve/main/onnx/model.onnx".into()),
+                    sha256: Some("07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9".into()),
+                    file_name: Some("model.onnx".into()),
+                    installed: false,
+                    used_by: vec!["image.remove-background".into()],
+                },
+                EngineModel {
+                    id: "birefnet-lite".into(),
+                    name: "BiRefNet lite".into(),
+                    purpose: "BiRefNet 的轻量版（swin_v1_tiny）：发丝级边缘，213 MB，\
+                              比完整版小 4 倍多，质量差距在小图上基本看不出来 —— \
+                              **大多数机器应该选它**。输入固定 1024×1024（模型自己声明的）。"
+                        .into(),
+                    approx_size_mb: 214,
+                    license: "MIT".into(),
+                    commercial_use: true,
+                    // 这个资产名（`BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx`）来自
+                    // rembg 的官方 release，与 HuggingFace 上 `onnx-community/BiRefNet_lite-ONNX`
+                    // 的 `model.onnx` **是同一个文件** —— 两边下下来逐字节相同
+                    // （224,005,088 字节 / sha256 `5600024376…`）。
+                    // 选 GitHub 是因为实测更稳：同一个 213 MB，GitHub 一次过，
+                    // 而 hf 镜像那次是"连上但不再有数据"（见下面 general 那条的说明）。
+                    url: Some(format!("{REMBG_RELEASE}/BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx")),
+                    sha256: Some("5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333".into()),
+                    file_name: Some("BiRefNet-general-bb_swin_v1_tiny-epoch_232.onnx".into()),
                     installed: false,
                     used_by: vec!["image.remove-background".into()],
                 },
@@ -779,16 +810,27 @@ mod tests {
             }
         }
 
-        // 文件名不能重复：两个模型写进同一个文件会互相覆盖
-        let mut names: Vec<&str> = onnx
+        // 落盘位置是 `<models>/<模型 id>/<file_name>` —— **每个模型一个目录**，
+        // 所以不同模型用同一个 `file_name` 并不会互相覆盖。
+        //
+        // 历史：这条断言原来是"`file_name` 全局唯一"，那时落盘用的是
+        // `model_dir(engine_id) + file_name`（同一个引擎的多个模型挤在一个目录里）——
+        // 那个推导本身就是个 bug（见 `registry.rs::model_path` 的注释），改成按模型 id
+        // 分目录之后，这条断言的前提就不成立了。留着它会把 **HuggingFace 上叫
+        // `model.onnx` 的模型**（BiRefNet / MODNet 的导出一律叫这个名）统统挡在门外，
+        // 而那个名字是我们无法选择的：URL 必须以 `file_name` 结尾这条不变量
+        // （它抓到过"少拼资产名"的真实错误）把两者绑死了。
+        //
+        // 现在检查的是"同一个模型 id 不会被登记两次"——弱，但真实。
+        let mut keys: Vec<(&str, &str)> = onnx
             .models
             .iter()
-            .filter_map(|m| m.file_name.as_deref())
+            .filter_map(|m| m.file_name.as_deref().map(|f| (m.id.as_str(), f)))
             .collect();
-        names.sort_unstable();
-        let before = names.len();
-        names.dedup();
-        assert_eq!(before, names.len(), "模型 file_name 有重复：{names:?}");
+        keys.sort_unstable();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "同一个模型 id 出现了两次：{keys:?}");
     }
 
     /// `EngineDescriptor::provides` 与节点自己声明的引擎依赖必须**互相吻合**。

@@ -52,9 +52,9 @@
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **7 个** |
 > | 引擎下载源 | `engine-sources.json` 共 **12 条**（5 个引擎 × 各平台），其中 **7 条**的 SHA-256 是真实下载后核对过的；其余 5 条 `sha256: null`，`install` 会对它们返回 `HashRequired` 而**不放行** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **145 项全通过**（【1】–【17】） |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **157 项全通过**（【1】–【17】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
-> | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `realesr-general-x4v3` / `realesrgan-x4plus` |
+> | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
 > 下面这段原始快照保留原样，**不要据此判断现状**：
 
@@ -521,6 +521,51 @@
 3. **`audio.normalize` 会悄悄把 44.1 kHz 变成 48 kHz**。`loudnorm` 在 192 kHz 上内部处理、再落到编码器的默认采样率，而用户只要求"归一化响度"。现在用 ffprobe 读出源采样率并显式 `-ar` 保住它（新增 `ffprobe_audio_rate()`，与 `ffprobe_duration()` 共用 `ffprobe_binary()`）。
 
 **验收**：`verify-platform.mjs`【17】。它造一段**带音轨**的源视频（没有音轨的话 extract-audio / audio.convert / audio.normalize 三个节点根本测不出真东西），再用一条**真有依赖关系**的五步链路跑过去（切一段 → 抽封面 → 提音轨 → 响度归一化 → 转 m4a），最后用 **ffprobe 读回真实属性**逐条断言（时长、帧数、编解码器、采样率、像素尺寸、容器格式）。"任务成功"不算证据，"产出的确是那种东西"才算。
+
+### 阻塞 19：抠图模型补齐来源，顺带补上"按模型决定的预处理"
+
+> 上一轮（阻塞 17/18）反复出现的教训是"**登记在目录里**和**真的跑过**是两件事"。
+> 模型权重这一块同样如此：`birefnet-general` / `modnet-portrait` 长期没有下载源，
+> 而**另一个隐患更隐蔽** —— 抠图脚本把输入尺寸硬编成 320×320、归一化写死 ImageNet
+> 统计量。这两件事**喂错了都不会报错**，只会给出一张糊掉的蒙版。
+
+1. **三个模型的来源补齐**（哈希全部来自真实下载）：
+
+   | 模型 | 体积 | 来源 | 状态 |
+   |---|---|---|---|
+   | `modnet-portrait` | 25 MB | hf-mirror（社区镜像） | ✅ 应用内下载 + 哈希校验通过 + 推理实测 |
+   | `birefnet-lite` | 214 MB | GitHub（rembg 官方 release） | ✅ 同上（与 HF 上那份逐字节相同） |
+   | `birefnet-general` | 928 MB | hf-mirror | ⚠️ **可下、未实测**：哈希来自一次完整下载，但 927 MB 在当前降级线路上把应用和 curl 都拖垮了 |
+
+   > `modnet-portrait` 现在**可商用为否**，所以下载前要求确认许可证 —— 这条门原本就有。
+
+2. **预处理改成"按模型决定"**（这一步比补来源更重要）。`py/rembg.py` 原来硬编：
+   输入 320×320、ImageNet 归一化。而
+   * **BiRefNet 的输入固定 1024×1024**（喂 320 会直接形状报错）；
+   * **MODNet 用 `(x/255-0.5)/0.5`（即 [-1,1]）**，喂 ImageNet 统计量**不报错**，只是蒙版糊掉。
+
+   现在脚本**问模型自己**（读 `get_inputs()[0].shape`）：固定尺寸就照它来，动态才退回 320；
+   归一化由宿主按模型显式传 `--normalize`（`nodes.rs::rembg_normalize_for`，配一条漂移守卫测试）。
+   脚本还会把实际用的**尺寸与归一化**回报给宿主，宿主写进任务日志 ——
+   出问题时这两项是首先要确认的东西，没有它们就只能去翻脚本源码猜。
+
+3. **下载客户端的连接超时从 20 秒放宽到 60 秒**。这是**本轮实测逼出来的**：
+   网络降级时段里，同一个 GitHub 地址用 `curl` 花 9 分钟能下完 213 MB，
+   而应用在**连接阶段**就报 `client error (Connect) → operation timed out` ——
+   它连"开始下"都没做到，用户看到的是"网络错误"，而真实情况只是**这条线路慢**。
+   （下载失败本来就会用 HTTP/1.1 再试一次，所以最坏情况是等 2 分钟。）
+
+**验收**：`verify-platform.mjs`【8】新增一段 —— **逐个已装模型真跑一遍**，并把脚本实际用的
+尺寸与归一化读回来断言：
+
+| 模型 | 期望输入 | 期望归一化 | 实测前景占比 |
+|---|---|---|---|
+| `u2netp` | 320×320 | imagenet | 18.87% |
+| `modnet-portrait` | 320×320 | **pm1** | 18.83% |
+| `birefnet-lite` | **1024×1024** | imagenet | 18.83% |
+
+三个模型在同一张"白底 + 椭圆"图上给出几乎一致的占比，这本身就是一条交叉验证 ——
+而"任务成功"在这里完全不能说明问题（预处理喂错也是"成功"）。
 
 ### 基线（历史实测：阻塞 1–13 修复后）
 

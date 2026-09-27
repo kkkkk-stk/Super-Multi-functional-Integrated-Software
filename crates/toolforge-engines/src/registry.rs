@@ -977,7 +977,16 @@ pub async fn download(
 fn build_download_client(http1_only: bool) -> ToolforgeResult<reqwest::Client> {
     let mut b = reqwest::Client::builder()
         .user_agent(concat!("ToolForge/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(20))
+        // 60 秒，而不是原来的 20 秒。**这是实测调出来的**：在网络降级的那段时间里，
+        // 同一个 GitHub 地址用 `curl` 花 9 分钟能下完 213 MB，而应用在**连接阶段**
+        // 就报 `client error (Connect) → operation timed out` —— 它连"开始下"都没做到。
+        // 用户看到的是"网络错误"，而真实情况只是**这条线路慢**。
+        //
+        // 注意这个界只覆盖连接阶段（DNS + TCP + TLS）；一旦开始收数据，就由
+        // `STALL_TIMEOUT`（60 秒没有新字节）和 `total_download_timeout()` 接管。
+        // 下载失败时本来就会用 HTTP/1.1 再试一次，所以最坏情况是等 2 分钟 ——
+        // 对 "105 MB 的引擎" 这种体量来说，"多等一会儿"远比"根本没开始下"好。
+        .connect_timeout(Duration::from_secs(60))
         .timeout(total_download_timeout());
     if http1_only {
         b = b.http1_only();
