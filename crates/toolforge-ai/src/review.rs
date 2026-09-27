@@ -479,6 +479,40 @@ runtime:
         assert!(r.parse_error.is_some());
     }
 
+    /// 装饰品参数（声明了但没有任何步骤会读到它）必须出现在**用户看得见的**审核报告里。
+    ///
+    /// 为什么要在这里钉一条：`validate_param_reachability` 只在 Rust 侧报了一个 warning，
+    /// 而"用户到底看不看得见"取决于 [`review_draft`] 有没有把校验问题**逐条**映射成
+    /// findings。少了这条，检查再准也只是躺在日志里。
+    /// 这一条同时钉住了两件事：① 它进了 findings；② 它的等级是 Medium（**不是** Critical，
+    /// 不该把一个不影响运行的参数问题渲染成"高危"）。
+    #[test]
+    fn decorative_param_shows_up_as_a_medium_finding() {
+        // 在 `GOOD_L1` 上加一个 `magic` 参数，而没有任何步骤会读到它
+        let yaml = GOOD_L1.replace(
+            "permissions:",
+            "io:\n  params:\n    - id: magic\n      label: 魔法开关\n      type: text\npermissions:",
+        );
+        let r = review_draft(&draft_with(&yaml));
+        assert!(r.parseable, "{:?}", r.parse_error);
+        let f = r
+            .findings
+            .iter()
+            .find(|f| f.code == "PARAM_NEVER_USED")
+            .unwrap_or_else(|| panic!("审核报告里没有 PARAM_NEVER_USED：{:?}", r.findings));
+        assert_eq!(f.severity, RiskLevel::Medium, "不该渲染成高危：{f:?}");
+        assert!(
+            f.message.contains("magic"),
+            "信息要点出是哪个参数：{}",
+            f.message
+        );
+        assert!(
+            r.recommended,
+            "装饰品参数不该拦住草稿进入用户确认环节：{:?}",
+            r.findings
+        );
+    }
+
     #[test]
     fn unknown_node_yields_error_finding() {
         let bad = GOOD_L1.replace("image.resize", "image.magic");

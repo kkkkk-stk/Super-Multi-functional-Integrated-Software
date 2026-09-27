@@ -348,6 +348,114 @@ impl PipelineDef {
         }
     }
 
+    /// 声明的参数**有没有可能影响行为**。
+    ///
+    /// # 为什么这条要单独补出来
+    ///
+    /// [`Self::validate_template_refs`] 管的是"引用了不存在的参数"（会**炸**），
+    /// 这条管的是它的反面：**声明了却没人读**（不会炸，只是**静默无效**）。
+    /// 后者更难被发现，因为它不产生任何错误 —— 界面照常渲染出那个控件，
+    /// 用户改了、看着像生效了、跑完发现文件一点变化都没有。
+    ///
+    /// 这不是理论问题，是**同一个缺陷撞到过两次**：
+    ///
+    /// | 插件 | 参数 | 当时的真相 |
+    /// |---|---|---|
+    /// | `doc.to-pdf` | `format` | 节点早就改成固定 PDF 了，那个下拉框纯装饰 |
+    /// | `video.transcode` | `container` | 输出扩展名其实由 `format` 决定，`container` 只是个摆设 |
+    ///
+    /// # 判据：L1 插件的参数只有三条通道能影响行为
+    ///
+    /// | 通道 | 形态 | 例子 |
+    /// |---|---|---|
+    /// | ① 同名 `with` 键 | `with: { quality: 80 }` | 字面量直接透传给节点 |
+    /// | ② 模板引用 | `with: { index: "${params.indexMode}" }` | **插件参数名可以与节点参数名不同** |
+    /// | ③ 节点按名读取 | `with` 里什么都不写 | 节点 `param_str("format")` 会回退到用户参数（见 `NodeCtx::arg_scope`） |
+    ///
+    /// 三条都不沾 → 这个参数没有任何路径能到达执行器。
+    ///
+    /// ## 判据为什么必须带 ③（一个真实的反例）
+    ///
+    /// 只按"`with` 里有没有"来判，会把内置 `image-convert` 的 `format` / `quality`
+    /// 判成装饰品 —— 那两个恰恰是**靠 ③ 生效**的（【6】【22】真机验过：选 webp 出 WebP、
+    /// 宽 400 出 400×300）。判据每放宽一次，背后都是一个真实反例。
+    ///
+    /// ## 已知的**假阴性**（说清楚，免得被当成完备性证明）
+    ///
+    /// ③ 用的是节点**声明的**参数表（`NodeDescriptor::params`），不是"节点源码里真的读了哪些键"。
+    /// 于是"节点声明了 `format` 但其实没读"这种情况查不出来。要查出它得做源码级分析
+    /// 或逐节点打桩，代价与收益不成比例 —— 但**假阳性必须是零**，否则这条检查会被
+    /// 当成噪音关掉，那才是真的什么都没守住。
+    ///
+    /// 报成 `warning` 而不是 `error`：参数没人读不会让任务失败，它只是让一个 UI 控件
+    /// 变成谎言。装得上、也跑得动，所以不该拦住安装。
+    pub fn validate_param_reachability(
+        &self,
+        io: &crate::plugin::PluginIo,
+        issues: &mut Vec<ValidationIssue>,
+    ) {
+        if io.params.is_empty() {
+            return;
+        }
+        // 一次性把"本流水线用到的节点各声明了哪些参数"收集起来
+        // （收集 `String` 而不是 `&str`：`builtin_nodes()` 每次返回的是**新建的**描述符，
+        //   借它的字段会立刻悬空）
+        let mut node_param_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for step in &self.steps {
+            for node in builtin_nodes() {
+                if node.name == step.uses {
+                    for p in &node.params {
+                        node_param_ids.insert(p.id.clone());
+                    }
+                }
+            }
+        }
+
+        for (idx, param) in io.params.iter().enumerate() {
+            let id = param.id.as_str();
+            let mut reachable = node_param_ids.contains(id);
+
+            if !reachable {
+                for step in &self.steps {
+                    // ① 同名 with 键
+                    if step.with.contains_key(id) {
+                        reachable = true;
+                        break;
+                    }
+                    // ② 值里引用 `${params.<id>}` 或 `${<id>}`
+                    let referenced = step.with.values().any(|val| {
+                        extract_vars(val)
+                            .iter()
+                            .any(|v| v == id || *v == format!("params.{id}"))
+                    });
+                    if referenced {
+                        reachable = true;
+                        break;
+                    }
+                }
+            }
+
+            if !reachable {
+                issues.push(
+                    ValidationIssue::warning(
+                        "PARAM_NEVER_USED",
+                        format!(
+                            "参数 `{id}` 声明了，但**没有任何步骤会读到它** —— 界面上会出现这个控件，\
+                             用户改了它不会有任何效果。\n\
+                             L1 插件的参数只有三条通道能到达执行器：\
+                             ① 某个步骤的 `with` 里有**同名键**（如 `with: {{ {id}: 值 }}`）；\
+                             ② 某个步骤的 `with` **值**里引用了它（如 `with: {{ 节点参数名: \"${{params.{id}}}\" }}`）；\
+                             ③ 某个步骤用到的**节点自己声明了同名参数**（节点会回退到用户参数）。\n\
+                             三条都不沾，说明这个参数是装饰品：要么把它接到某个步骤上，\
+                             要么删掉它（内置的 `doc-to-pdf` 与 `video.transcode` 都栽在这上面）。"
+                        ),
+                    )
+                    .at(format!("io.params[{idx}]")),
+                );
+            }
+        }
+    }
+
     /// 返回流水线所有步骤**依赖**的引擎（去重）
     pub fn required_engines(&self) -> Vec<String> {
         let catalog = builtin_nodes();
@@ -1769,6 +1877,165 @@ runtime:
         assert!(!report.ok, "有 error 级问题时 report.ok 必须是 false（AI 流程靠它放行）");
     }
 
+    // ------------------------------------------------------------------
+    // 参数能不能到达执行器（`validate_param_reachability`）
+    //
+    // 这一组的每一条都对应一个**真实缺陷的形态**，不是凭空想的边界：
+    //   * 惰性参数 = `doc.to-pdf` 的 `format`、`video.transcode` 的 `container`；
+    //   * 通道 ② = `batch-rename` 的 `indexMode`（插件参数名 ≠ 节点参数名）；
+    //   * 通道 ③ = `image-convert` 的 `format` / `quality`（`with` 里一个字都没写）。
+    // ------------------------------------------------------------------
+
+    /// 一条自带 `with` 的流水线（节点名可控，用来分别打中三条通道）。
+    fn pipeline_with(uses: &str, with: &[(&str, &str)]) -> PipelineDef {
+        PipelineDef {
+            steps: vec![PipelineStep {
+                id: "s1".into(),
+                uses: uses.into(),
+                with: with
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                label: None,
+                when: None,
+                on_error: None,
+                retry: 0,
+                timeout_ms: None,
+                position: None,
+                depends_on: vec![],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// ★ 装饰品参数的形态：声明了、界面上有控件、**没有任何步骤会读到它**。
+    #[test]
+    fn param_declared_but_never_read_is_flagged() {
+        // `doc.to-pdf` 当年的样子：节点根本不读 `format`，而参数表里有它。
+        let p = pipeline_with("doc.to-pdf", &[("src", "${src}"), ("dst", "${output.dst}")]);
+        let mut issues = Vec::new();
+        p.validate_param_reachability(&io_with(&["src"], &["dst"], &["format"]), &mut issues);
+        let flagged: Vec<String> = issues
+            .iter()
+            .filter(|i| i.code == "PARAM_NEVER_USED")
+            .map(|i| i.path.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(flagged, vec!["io.params[0]".to_string()], "装饰品参数必须被点名：{issues:?}");
+        assert!(
+            issues[0].message.contains('`') && issues[0].message.contains("format"),
+            "信息里要点出是哪个参数：{}",
+            issues[0].message
+        );
+        // 报 warning 而不是 error：参数没人读不会让任务失败，不该拦住安装
+        assert!(
+            !issues.iter().any(|i| i.severity == crate::plugin::Severity::Error),
+            "不该升级成 error：{issues:?}"
+        );
+        // 报错信息必须直接告诉作者三条通道长什么样，否则他只知道"有问题"、不知道怎么改
+        let msg = &issues[0].message;
+        assert!(msg.contains("with") && msg.contains("${params.format}"), "信息要可操作：{msg}");
+    }
+
+    /// 通道 ①：`with` 里有**同名键**（字面量直接透传）。
+    #[test]
+    fn param_reaches_the_node_through_a_same_named_with_key() {
+        let p = pipeline_with("image.convert", &[("quality", "80")]);
+        let mut issues = Vec::new();
+        p.validate_param_reachability(&io_with(&[], &[], &["quality"]), &mut issues);
+        assert!(issues.is_empty(), "同名 with 键就是一条通道，不该报：{issues:?}");
+    }
+
+    /// 通道 ②：`with` 的**值**里引用了它 —— 而且**键名可以不一样**。
+    ///
+    /// 这一条是"判据过紧会误报"的实证：`batch-rename` 的 `indexMode` 是
+    /// `index: "${params.indexMode}"` 注入的（插件参数 `indexMode` → 节点参数 `index`）。
+    /// 只比键名的话，一个**正在正常工作**的参数会被判成装饰品。
+    #[test]
+    fn param_reaches_the_node_through_a_template_reference_with_a_different_key() {
+        let p = pipeline_with("name.build", &[("index", "${params.indexMode}")]);
+        let mut issues = Vec::new();
+        p.validate_param_reachability(&io_with(&[], &[], &["indexMode"]), &mut issues);
+        assert!(issues.is_empty(), "模板注入（键名不同）也是通道，不该报：{issues:?}");
+    }
+
+    /// 通道 ③：`with` 里**什么都不写**，但节点自己声明了同名参数。
+    ///
+    /// `image-convert` 就是这个形态：`with` 只有 src/dst，`format`/`quality` 靠
+    /// `NodeCtx::arg_scope` 回退到用户参数。真机验过（选 webp 出 WebP、宽 400 出 400×300），
+    /// 所以判据里必须有这一条，否则会把**正在正常工作**的参数报成装饰品。
+    #[test]
+    fn param_reaches_the_node_through_the_arg_scope_fallback() {
+        // `image.convert` 的节点描述符里声明了 format / quality
+        let p = pipeline_with("image.convert", &[("src", "${src}")]);
+        let mut issues = Vec::new();
+        p.validate_param_reachability(&io_with(&["src"], &["dst"], &["format", "quality"]), &mut issues);
+        assert!(issues.is_empty(), "节点按名读取也是通道，不该报：{issues:?}");
+    }
+
+    /// 没有参数时不做任何事（也别去建那张节点参数表）。
+    #[test]
+    fn no_params_means_no_issues() {
+        let p = pipeline_with("image.convert", &[("src", "${src}")]);
+        let mut issues = Vec::new();
+        p.validate_param_reachability(&io_with(&["src"], &["dst"], &[]), &mut issues);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    /// 端到端：**`PluginManifest::validate()` 必须把这条检查接上**，而且它**不能**让
+    /// `report.ok` 变 false（否则一个装饰品参数会让插件装不上，那是过度惩罚）。
+    #[test]
+    fn manifest_validate_wires_in_the_param_reachability_check() {
+        let text = r#"
+apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: com.example.decorative
+  name: 带装饰品参数的插件
+  version: 1.0.0
+io:
+  inputs:
+    - id: src
+      label: 输入
+      type: file
+  outputs:
+    - id: dst
+      label: 输出
+      type: file
+  params:
+    - id: quality
+      label: 质量
+      type: int
+      default: { kind: int, value: 90 }
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+runtime:
+  kind: pipeline
+  pipeline:
+    steps:
+      - id: s1
+        uses: doc.to-pdf
+        with:
+          src: "${src}"
+          dst: "${output.dst}"
+"#;
+        let manifest: crate::plugin::PluginManifest = serde_yaml::from_str(text).unwrap();
+        let report = manifest.validate();
+        assert!(
+            report.issues.iter().any(|i| i.code == "PARAM_NEVER_USED"),
+            "`validate()` 必须报出装饰品参数，实际：{:?}",
+            report.issues.iter().map(|i| i.code.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            report.ok,
+            "装饰品参数是 warning，不该让插件装不上：{:?}",
+            report.issues.iter().map(|i| i.code.clone()).collect::<Vec<_>>()
+        );
+    }
+
     /// 遍历**仓库里真实的内置插件清单**，确保新校验没有误报。
     ///
     /// 这条比任何手写用例都重要：误报会让合法插件装不上（而且是在安装阶段才炸）。
@@ -1796,7 +2063,9 @@ runtime:
             let bad: Vec<&str> = report
                 .issues
                 .iter()
-                .filter(|i| i.code.starts_with("TEMPLATE_"))
+                .filter(|i| {
+                    i.code.starts_with("TEMPLATE_") || i.code == "PARAM_NEVER_USED"
+                })
                 .map(|i| i.code.as_str())
                 .collect();
             assert!(
@@ -1806,7 +2075,9 @@ runtime:
                 report
                     .issues
                     .iter()
-                    .filter(|i| i.code.starts_with("TEMPLATE_"))
+                    .filter(|i| {
+                        i.code.starts_with("TEMPLATE_") || i.code == "PARAM_NEVER_USED"
+                    })
                     .map(|i| i.message.clone())
                     .collect::<Vec<_>>()
                     .join("\n")

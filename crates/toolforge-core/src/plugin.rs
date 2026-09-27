@@ -505,6 +505,13 @@ impl PluginManifest {
         // AI 生成的草稿最常见的错法就是引用了没声明的输出端口，而它此前**能装上、跑起来才报**。
         if let PluginRuntime::Pipeline { pipeline } = &self.runtime {
             pipeline.validate_template_refs(&self.io, &mut issues);
+
+            // --- 参数是否真的能到达执行器 ---
+            // 反面情况（"声明了但没人读"）不会让任何东西变红：界面照常出现那个控件、
+            // 用户改了没效果、任务照样成功。内置插件上已经撞到过两次
+            // （`doc.to-pdf` 的 `format`、`video.transcode` 的 `container`），
+            // 详见 `validate_param_reachability` 的文档。
+            pipeline.validate_param_reachability(&self.io, &mut issues);
         }
 
         // --- IO 自洽性 ---

@@ -4472,6 +4472,180 @@ main()
   }
 }
 
+// ============================================================================
+// 【28】插件参数**到底能不能到达执行器**
+// ============================================================================
+//
+// 同一个缺陷在这个项目里撞到过两次：
+//   * `doc-to-pdf` 声明了 `format`，而 `doc.to-pdf` 节点早就不读它了 —— 用户选了半天，没变化；
+//   * `video.transcode` 声明了 `container`，而输出扩展名其实由 `format` 决定。
+// 两次都是**声明与行为不一致**：构建不红、界面不报错、任务照样成功，
+// 只有真去比对产出文件才发现那个控件是个摆设。
+//
+// 现在 `PluginManifest::validate()` 会报 `PARAM_NEVER_USED`（warning 级）。
+// 这一节验的不是"那个函数写对了"（`toolforge-core` 里已有 6 条单测），
+// 而是**它在这个 exe 里真的接上了、而且判据不过严**。
+//
+// 判据是三条通道（L1 插件的参数只有这三条路能到达执行器），这一节把三条**逐条验一遍** ——
+// 少验一条就可能把正在正常工作的参数误报成装饰品，而误报比漏报更糟：
+// 它会让一个**好插件**在安装时报出一条看不懂的警告。
+c.section('【28】插件参数能不能到达执行器（"装饰品参数"检测是不是真的在跑）');
+{
+  /** 造一份最小 L1 清单：`params` 与步骤 `with` 由参数决定 */
+  const manifest = (id, paramsYaml, withYaml, uses = 'image.convert') =>
+    `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${id}
+  name: 参数通道验证插件
+  version: 1.0.0
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 输入
+      type: file
+      required: true
+  outputs:
+    - id: dst
+      label: 输出
+      type: file
+      required: false
+  params:
+${paramsYaml}
+runtime:
+  kind: pipeline
+  pipeline:
+    steps:
+      - id: s1
+        uses: ${uses}
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+${withYaml}
+`;
+
+  const param = (id) =>
+    `    - id: ${id}
+      label: ${id}
+      type: text
+      required: false
+`;
+
+  /** 校验一份清单，回报它的 issue 列表 */
+  const validateYaml = async (id, paramsYaml, withYaml, uses) => {
+    const res = await client.invoke('plugins_validate', {
+      req: { source: { kind: 'manifest', yaml: manifest(id, paramsYaml, withYaml, uses) } },
+    });
+    return res?.validation ?? {};
+  };
+  const codesOf = (v) => (v.issues ?? []).map((i) => i.code);
+  const flagged = (v) => (v.issues ?? []).filter((i) => i.code === 'PARAM_NEVER_USED');
+
+  const PROBE_ID = 'com.verify.param-channel';
+  try {
+    // ---- ① 三条通道都不沾 → 必须被点名 ----
+    const decorative = await validateYaml(PROBE_ID, param('magic'), '');
+    console.log(`   装饰品参数：ok=${decorative.ok} issues=${JSON.stringify(codesOf(decorative))}`);
+    c.check(
+      flagged(decorative).length === 1,
+      '★ ① 声明了却没有任何步骤会读到的参数被点名（`PARAM_NEVER_USED`）',
+      JSON.stringify(codesOf(decorative))
+    );
+    c.check(
+      flagged(decorative)[0]?.severity === 'warning',
+      '①b 它是 **warning** 而不是 error —— 参数没人读不会让任务失败，不该拦住安装',
+      flagged(decorative)[0]?.severity ?? '(没有这条 issue)'
+    );
+    c.check(
+      (flagged(decorative)[0]?.message ?? '').includes('magic'),
+      '①c 报错信息里点出了是哪个参数（否则作者只知道"有问题"）',
+      (flagged(decorative)[0]?.message ?? '').slice(0, 60)
+    );
+
+    // ---- ② 通道①：`with` 里同名键 ----
+    const sameKey = await validateYaml(PROBE_ID, param('quality'), '          quality: "80"');
+    c.check(
+      flagged(sameKey).length === 0,
+      '★ ② 通道①（`with` 里有同名键）不被误报',
+      JSON.stringify(codesOf(sameKey))
+    );
+
+    // ---- ③ 通道②：模板注入，且**键名与参数名不同** ----
+    //
+    // 这一条是"判据过紧就会误报"的实证：内置 `batch-rename` 的 `indexMode`
+    // 是 `index: "${params.indexMode}"` 注入的，只比键名会把它判成装饰品。
+    const injected = await validateYaml(
+      PROBE_ID,
+      param('indexMode'),
+      '          index: "${params.indexMode}"',
+      'name.build'
+    );
+    c.check(
+      flagged(injected).length === 0,
+      '★ ③ 通道②（`${params.x}` 注入到**不同名**的节点参数上）不被误报',
+      JSON.stringify(codesOf(injected))
+    );
+
+    // ---- ④ 通道③：`with` 里一个字都不写，靠节点按名回退 ----
+    //
+    // 内置 `image-convert` 就是这个形态（`with` 只有 src/dst，靠 `NodeCtx::arg_scope`
+    // 回退到用户参数）。【6】【22】已经真机验过它**确实生效**，所以这里必须不报。
+    const byNode = await validateYaml(PROBE_ID, param('format') + param('quality'), '');
+    c.check(
+      flagged(byNode).length === 0,
+      '★ ④ 通道③（节点自己声明了同名参数，`with` 留空）不被误报 —— 内置 image-convert 就长这样',
+      JSON.stringify(codesOf(byNode))
+    );
+
+    // ---- ⑤ warning 不该拦住安装（判据的"代价"必须为零） ----
+    const dir = join(REPO_ROOT, '.tools', 'smoke', 'out-param-channel');
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'plugin.yaml'),
+      manifest(PROBE_ID, param('magic'), ''),
+      'utf8'
+    );
+    const existing = await client.invoke('plugins_get', { pluginId: PROBE_ID }).catch(() => null);
+    if (existing) {
+      await client.invoke('plugins_set_enabled', { pluginId: PROBE_ID, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: PROBE_ID }).catch(() => {});
+    }
+    const install = await client
+      .invoke('plugins_install', {
+        req: {
+          source: { kind: 'directory', path: dir },
+          overwrite: true,
+          permissionsAcknowledged: true,
+          executableCodeAcknowledged: false,
+        },
+      })
+      .then(() => true)
+      .catch((e) => e);
+    c.check(
+      install === true,
+      '★ ⑤ 带装饰品参数的插件**仍然装得上**（warning 不能变成一道安装闸门，否则是在惩罚用户）',
+      install === true ? '已安装' : String(install).slice(0, 120)
+    );
+    await client.invoke('plugins_set_enabled', { pluginId: PROBE_ID, enabled: false }).catch(() => {});
+    await client.invoke('plugins_uninstall', { pluginId: PROBE_ID }).catch(() => {});
+    c.check(
+      (await client.invoke('plugins_get', { pluginId: PROBE_ID }).catch(() => null)) === null,
+      '⑤b 验证用的插件已卸载干净（这一节不留副作用）',
+      PROBE_ID
+    );
+  } finally {
+    await client.invoke('plugins_set_enabled', { pluginId: PROBE_ID, enabled: false }).catch(() => {});
+    await client.invoke('plugins_uninstall', { pluginId: PROBE_ID }).catch(() => {});
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

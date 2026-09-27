@@ -52,8 +52,8 @@
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
-> | 运行时测试总数 | `cargo test --workspace` **269 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **293 项全通过**（【1】–【27】） |
+> | 运行时测试总数 | `cargo test --workspace` **276 passed / 0 failed** |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **301 项全通过**（【1】–【28】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -641,7 +641,7 @@ pnpm build          # tsc --noEmit && vite build
 ### 基线再更新（**当时的值**，保留作历史）
 
 > ⚠️ 下面这组数是**当时**取的，**不是现状**。当前值见本文档开头的「实测数据」表
-> （`cargo test --workspace` **269 passed / 0 failed**、`verify-platform.mjs` **293 项**）。
+> （`cargo test --workspace` **276 passed / 0 failed**、`verify-platform.mjs` **301 项**）。
 > 留在这里是为了保留"那一轮到底测到了什么"。
 
 阻塞 14、15 修复后重新取的一组数（上面那组保留为历史，**不要把两组混用**）：
@@ -795,7 +795,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 >
 > - `image.convert`、`image.resize`、`image.crop`、`image.rotate` **四个节点会真的按 `libvips → ImageMagick → 纯 Rust` 挑后端**，把结果报在节点输出的 **`backend`**（`"libvips"` / `"imagemagick"` / `"rust"`）与一条 debug 日志里。后端可观测是刻意的：不看日志就只能靠猜，而这个项目已经被"文档说有、实际没有"坑过好几次。
 > - `image.rotate` 的任意角度不再是"直接报缺 ImageMagick"：libvips 可用时走 `vips similarity --angle N`，ImageMagick 可用时走 `-rotate N`，**只有纯 Rust 可用时才返回 `EngineMissing`** —— 仍然**不会静默取整**（取整会让用户以为转了 45°，实际拿到没转的图）。
-> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错，【12】号检查把 `engines/libvips` 临时藏起来、断言后端真的切到 ImageMagick。**写下这一条时**整个脚本是 **82 项检查全通过**（【1】–【13】）；当前共 **293 项**（【1】–【27】），见本文档开头的「实测数据」表。
+> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错，【12】号检查把 `engines/libvips` 临时藏起来、断言后端真的切到 ImageMagick。**写下这一条时**整个脚本是 **82 项检查全通过**（【1】–【13】）；当前共 **301 项**（【1】–【28】），见本文档开头的「实测数据」表。
 > - **收益要说准**：libvips 档位带来的是**按质量换体积的能力**（WebP/JPEG 有损编码），纯 Rust 后端的 WebP 只能无损。**但"有损一定更小"是错的**，实测 320×200 合成渐变图：无损 508 字节 vs 有损 1808 字节（所以【6】只断言"确实走了有损编码"，不断言体积）。
 >
 > **本条原来还剩两件事，现在都做完了**：
@@ -999,6 +999,52 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   * 而 ③a 一旦成立，"就地编辑"这条路**根本到不了删除那一步**（插件写不回自己的输入路径）—— 于是"产出里出现的路径绝不删"这条规则反而失去了端到端覆盖。补 **③b**：一个 **L3 直通插件**（校验 PNG 头后把**输入路径本身**报成产出、一个字节都不写）真的走到 `produced == src`，断言产出还在、且日志里**没有**删除记录。
   * 但"日志里**没有**删除记录"这种**只断言"没发生"**的检查天生可疑（删除机制整体坏掉同样能过），所以再加 **③d 正向对照**：同一个插件、同一份输入、同一个设置，只把要报的产出换成输出目录里的一份副本 —— 源文件就**必须**被删。两条一起看，才能把"认出来了"与"压根没跑"分开。
 
+### 3.11 「声明与行为不一致」的第三次普查：参数与设置的**读取点**（本轮）
+
+§3.10 修掉 `keep_original` 之后，很自然的下一个问题不是"还有没有别的设置是惰性的"，而是**怎么才能不靠运气发现它们**。本轮把"声明了但没人读"当成一个可以**机械对账**的性质，做了两件事。
+
+**① 设置字段普查：10 个字段全部有真实读取者。**
+
+方法就是 §3.10 结尾记下的那条：**对每一个设置字段 grep 一遍它的读取点**（Rust 侧 snake_case、前端侧 camelCase，两边都要看）。
+
+| 字段 | 读取者 | 结论 |
+|---|---|---|
+| `concurrency` | `state.rs` 建队列时用；`settings_patch` 立刻 `queue.set_concurrency()` | ✅ 而且**改动即刻生效**（不是"下次启动才生效"） |
+| `default_output_dir` | `commands.rs::resolve_output_dir`（任务没显式给输出目录时） | ✅ |
+| `keep_original` | 上一轮才接上（§3.10） | ✅ 原本是唯一的惰性字段 |
+| `probe_engines_on_startup` | `lib.rs` 启动路径 | ✅ 语义就是"启动时" |
+| `theme` / `accent` / `ambient_effects` | 前端 `theme.ts` / `ui-store.ts` / `aurora-background.tsx` | ✅ 纯前端设置，后端本来就不该读 |
+| `ai.provider` / `base_url` / `model` / `temperature` | `state.rs::rebuild_ai_client` + `provider.rs` 请求体 | ✅ 改完立刻重建客户端，不是"下次启动生效" |
+| `ai.persist_api_key` | `state.rs` 的 Key 落盘策略 | ✅ |
+
+> 这张表的价值不在"全都 ✅"，而在于**它是可复算的**：将来加字段时，同一个动作就能查出"声明了没人读"。
+
+**② 插件参数普查：把判据写进校验器，而不是靠人记得查。**
+
+内置插件上，"参数是装饰品"这个缺陷已经撞到过**两次**：`doc.to-pdf` 的 `format`（节点早就不读它了）、`video.transcode` 的 `container`（输出扩展名其实由 `format` 决定）。两次都是**声明与行为不一致**：控件在界面上、用户调了、文件一点没变、任务照样"成功"。
+
+现在 `PipelineDef::validate_param_reachability()`（`crates/toolforge-core/src/pipeline.rs`）会报 `PARAM_NEVER_USED`。判据是 **L1 插件的参数只有三条通道能到达执行器**：
+
+| 通道 | 形态 | 真实例子 |
+|---|---|---|
+| ① 同名 `with` 键 | `with: { quality: "80" }` | 字面量直接透传 |
+| ② 模板注入 | `with: { index: "${params.indexMode}" }` | **插件参数名可以与节点参数名不同** —— 内置 `batch-rename` 的 `indexMode` 就是这样 |
+| ③ 节点按名读取 | `with` 里一个字都不写 | 节点 `param_str("format")` 回退到用户参数（`NodeCtx::arg_scope`）—— 内置 `image-convert` 的 `format` / `quality` 就是这样 |
+
+★ **判据的两次收紧，都是被真实反例逼出来的，这一段值得留着**：
+* 第一版只比 **`with` 的键名**。它把内置 `image-convert` 的 `format` / `quality` 判成了装饰品 —— 而那两个**正在正常工作**（【6】【22】真机验过：选 webp 出 WebP、宽 400 出 400×300）。于是补上通道 ③。
+* 第二版把通道 ③ 加上，又轮到 `batch-rename` 的 `indexMode` 被误报 —— 它是 `index: "${params.indexMode}"` 注入的，**键名与参数名不同**。于是补上通道 ②。
+
+教训写清楚：**误报比漏报更糟**。漏报只是少发现一个缺陷；误报会让一个**好插件**在安装时报出一条用户和作者都看不懂的警告，然后这条检查就会被当成噪音关掉 —— 那时才是真的什么都没守住。所以判据的**假阳性必须是零**，代价是接受一个**已知的假阴性**：
+
+> ⚠️ 通道 ③ 用的是节点**声明的**参数表（`NodeDescriptor::params`），不是"节点源码里真的读了哪些键"。所以"节点声明了 `format` 但其实没读"这种情况查不出来。要查出它得做源码级分析或逐节点打桩 —— 代价与收益不成比例。这是**明说的边界**，不是"已经完备"。
+
+- **它是 warning，不是 error**：参数没人读不会让任务失败，它只是让一个 UI 控件变成谎言 —— 装得上、跑得动，不该拦住安装。
+- **用户在哪看得见**：安装确认页（`plugin-sources.tsx` 把 `ValidationReport` 的每条 issue 都渲染出来）与 AI 工作室的审核面板（`review.rs` 把每条校验问题**逐条**映射成 finding，warning → Medium）。两条路都不需要新 UI。
+- **单测 6 条 + 审核映射 1 条**：三条通道各一条（防误报）、全不沾一条（防漏报）、"没有参数时什么也不做"一条、`validate()` 真的接上它一条（**一个没被调用的检查函数等于没有检查** —— 本项目踩过）；`toolforge-ai` 那条钉住"装饰品参数进得了审核报告、等级是 Medium、而且不会把草稿挡在用户确认环节之外"。
+- **反证**：给内置 `doc-to-pdf` 临时加一个 `format` 参数（正好复刻当初那个真实缺陷），`bundled_plugin_manifests_pass_the_new_template_check` 立刻变红并**点名到文件与参数**；随后原样还原。
+- **对 8 个内置插件的普查结果**：32 个声明参数，**装饰品 0 个**。也就是说这次没有抓到一个现存缺陷 —— 但它把"以后不会再出现这一类"变成了构建期的事，而不再依赖某个人想起来去查。
+
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
 - `crates/toolforge-core/src/engine.rs` 里为每个引擎与模型都提供了 `license`、`license_note`、`requires_license_ack`，并且有测试在守护这些字段非空。
@@ -1126,7 +1172,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 ### 验收标准
 
 1. `cargo test --workspace` 全绿，且 `cargo test -p toolforge-core` 恰好 **61 个测试通过、0 失败**。
-   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **269 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
+   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace` 合计 **276 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
 2. `cargo clippy --workspace -- -D warnings` 与 `cargo fmt --check` 无输出（零告警、零格式差异）。
 3. `cargo check --workspace --all-targets` 成功（即 `pnpm check:rust` 通过），且 `Cargo.lock` 已生成并入库。
 4. `pnpm check:all` 退出码为 0。
@@ -1244,7 +1290,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   - **实测数据（真机，非推断）**：托管 Python **3.11.16 / 145.2 MB / tar.gz 路径**（此前只跑过 zip 路径）；venv 自动装上 `onnxruntime-1.30.0`、`numpy-2.4.6`、`pillow-12.3.0`；对一张 **400×300**（白底 + 一个红椭圆）的测试图输出 **RGBA PNG（colorType 6）、400×300、椭圆中心 alpha 254、角落 alpha 0、前景覆盖 18.87%**（与椭圆真实面积吻合）；**运行时就绪后单张推理约 0.7 秒**（首次含 pip 约 32 秒）。
   - **测试方法上的一个坑**：**显著性模型不能用渐变图测** —— 在没有明显主体的渐变图上，模型正确报告约 0% 覆盖并让节点发一条警告。验收脚本因此改用**有真实主体**的图。
   - 参数现在是 `model` / `mode`（`alpha` | `color`）/ `background` / `threshold` / `feather`；**旧的 `alphaMatting` 已被删除**（它从登记起就没有实现，是个**假参数**）。默认模型从 `u2net`（168 MB）改成 **`u2netp`（4.4 MB）** —— "先让它跑起来"比"一上来就要下 168 MB"重要得多。
-  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（**写下这一条时**整个脚本是 **82 项检查全通过**；当前共 **293 项**，见本文档开头的「实测数据」表）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
+  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（**写下这一条时**整个脚本是 **82 项检查全通过**；当前共 **301 项**，见本文档开头的「实测数据」表）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
   - **配套修掉的一个引擎层缺陷**：`probe()` 原来只对 `install_modes == [Remote]` 的引擎特判，而 `onnx-models` **没有可执行文件**（它只是权重文件的宿主），于是永远探测为 `Missing` —— 结果是这个节点**永远显示不可用，哪怕用户已经把权重下好了**。现在 `probe()` 对它单独判：**至少有一个权重已安装 = 可用**。另外 `EngineInstallRequest` 新增 **`force`** 标志 + 引擎卡片上的「另外安装应用托管版本」按钮：系统 Python 3.14 会被探到、显示可用，却跑不了 `onnxruntime` —— **"探测到可用"不等于"满足这个节点的要求"**。
 - [x] ✅ **AI 超分（`ai.upscale`）—— 已实现，真机跑通**
   - 以前的写法是「🚧 AI 超分（`ai.upscale`，当前 `not_implemented`）」。它曾经是"最有可能接着做的一个"，因为可以照抄抠图那条"模型 + 推理"链 —— 这一轮正是这么做的。
@@ -1399,13 +1445,13 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 检查点 | 命令/动作 | 期望 |
 | --- | --- | --- |
 | 领域层健康 | `cargo test -p toolforge-core` | 61 通过 / 0 失败（**写本文档时的目标值**；当前全仓合计见下一行，不再逐 crate 维护） |
-| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 269 passed / 0 failed** |
+| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 276 passed / 0 failed** |
 | 全目标检查 | `cargo check --workspace --all-targets` | 退出码 0 |
 | 静态质量 | `cargo clippy --workspace -- -D warnings`、`cargo fmt --check` | 无输出 |
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | 退出码 0（需前端工程先落地） |
 | 聚合 | `pnpm check:all` | 退出码 0 |
 | 类型桥 | `pnpm bindings` 连续两次 | 第二次后 `git status` 干净（该命令同时跑 4 项守卫，含 `COMMAND_NAMES` 与注册命令的逐条核对） |
-| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **当前实测 293 项检查全通过**（【1】–【27】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】、**中间档 ImageMagick 后端切换**【12】、**纯 Rust 兜底档**【13】、音视频真实属性【17】、压缩包标准归档【18】、Office → PDF【19】、一句话生成插件闭环【20】、任务取消无孤儿【21】、画布导出跑通【22】、SDK 节点表对账【23】、API Key 生命周期与脱敏【24】、许可证确认与记录【25】、前端能力边界【26】、**「保留源文件」真的在删文件**【27】；【8】【9】【11】【12】【13】在缺权重 / 缺运行时（或没有可临时藏起的托管引擎）时会显式记为"跳过"而不是"通过"） |
+| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **当前实测 301 项检查全通过**（【1】–【28】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】、**中间档 ImageMagick 后端切换**【12】、**纯 Rust 兜底档**【13】、音视频真实属性【17】、压缩包标准归档【18】、Office → PDF【19】、一句话生成插件闭环【20】、任务取消无孤儿【21】、画布导出跑通【22】、SDK 节点表对账【23】、API Key 生命周期与脱敏【24】、许可证确认与记录【25】、前端能力边界【26】、**「保留源文件」真的在删文件**【27】、**插件参数能不能到达执行器**【28】；【8】【9】【11】【12】【13】在缺权重 / 缺运行时（或没有可临时藏起的托管引擎）时会显式记为"跳过"而不是"通过"） |
 | 最小闭环 | `pnpm tauri:dev` → 图片转换任务 | 任务完成、输出存在 |
 | 引擎 | `pnpm engines:list` / `engines:install` | 能探测、能安装并通过 SHA-256 校验；**libvips 与 imagemagick 都已实测装成功**（哈希回填的 **7 条**仍限 Windows / Linux；FFmpeg 因本机 `www.gyan.dev` 不可达而未装成，见 §3） |
 | 图标 | `pnpm icons` | 成功（需先补 `assets/icon-source.png`） |
