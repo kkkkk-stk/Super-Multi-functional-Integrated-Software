@@ -3708,6 +3708,208 @@ c.section('【24】设置的落盘、API Key 的保存/清除与脱敏');
   }
 }
 
+// ============================================================================
+// 【25】许可证确认是不是**真的发生了**，以及它有没有**留下记录**
+// ============================================================================
+//
+// 两件事必须分开验：
+//
+// 1. **确认真的发生了**（而不是被代码替用户点了）。模型那一侧此前有个真缺陷：
+//    `model-panel.tsx` 对**不可商用**的权重自动发 `licenseAccepted: true`
+//    （`licenseAccepted: !m.commercialUse`），于是后端那道硬门永远走不到 ——
+//    注释写着"需要用户显式点头"，代码做的正好相反。
+// 2. **确认留下了记录**。原来那份确认只是一次布尔参数，装完就没了：
+//    对合规审查拿不出证据链（谁在什么时候接受了哪份许可证），用户每次重装还得再勾一次。
+//    现在落盘到 `<data>/license-acks.json` + 一条 `LicenseAccepted` 审计事件。
+//
+// 这一节对**后端契约**做逐条断言；前端那两个勾选框由 `tsc`/`vite` 与人工审阅覆盖
+// （本机所有需要确认的引擎与权重都已装好，界面上不会出现"安装"按钮，
+//  所以点不出一条真实路径 —— 这条边界如实写在文档里）。
+c.section('【25】许可证确认：硬门有效、并且留下可追溯的记录');
+{
+  /**
+   * 从 CDP 抛出的异常文本里抠出 ToolForge 的错误码。
+   *
+   * 两种形状都要认：
+   *  * `..."code":"PERMISSION_DENIED"...`（异常值被完整序列化时）
+   *  * `"name":"code","type":"string","value":"PERMISSION_DENIED"`（CDP 的预览形式，
+   *    值被截断时走这条）
+   * 不认的话，检查失败时那一行日志会是一团 JSON —— 而"失败信息可读"本身
+   * 就是这些检查的价值之一。
+   */
+  const extractErrorCode = (text) =>
+    /"code"\s*:\s*"([A-Z_]+)"/.exec(text ?? '')?.[1] ??
+    /"name":"code"[^}]*?"value":"([A-Z_]+)"/.exec(text ?? '')?.[1] ??
+    '';
+
+  const dataDir = (await client.invoke('app_paths'))?.entries?.find((e) => e.label === '数据目录')?.path;
+  const acksFile = dataDir ? join(dataDir, 'license-acks.json') : null;
+
+  if (!acksFile) {
+    c.note('（拿不到数据目录，跳过）');
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    // 从一个**干净状态**开始：删掉记录文件，确认目录里本来也没有别的确认
+    rmSync(acksFile, { force: true });
+
+    // 挑一个「需要确认许可证」且**已经装好**的引擎：这样确认会被记下来，
+    // 而安装本身会走 `AlreadyAvailable` 短路，不会真的去下 184 MB。
+    const catalog = await client.invoke('engines_catalog');
+    const subject = catalog.find(
+      (e) => e.descriptor.requiresLicenseAck && e.managedAvailable
+    );
+    if (!subject) {
+      c.note('（本机没有"需要确认许可证且有下载源"的引擎，跳过）');
+      c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+    } else {
+      const engineId = subject.descriptor.id;
+      console.log(`   用 ${engineId} 做验证（requiresLicenseAck=true，已安装，安装会短路）`);
+
+      c.check(
+        subject.licenseAcknowledged === false,
+        '① 干净状态下 `licenseAcknowledged` 是 false（记录文件已删除）',
+        String(subject.licenseAcknowledged)
+      );
+
+      // ---- ② 不勾确认 → 必须被拒，而且**不能留下任何记录** ----
+      let denied = null;
+      try {
+        await client.invoke('engines_install', {
+          req: { engineId, licenseAccepted: false, allowUnverified: false, force: false },
+        });
+      } catch (e) {
+        denied = String(e?.message ?? e);
+      }
+      const deniedCode = extractErrorCode(denied);
+      c.check(Boolean(denied), '★ ② 不带 `licenseAccepted` 时安装被**拒绝**', deniedCode || String(denied).slice(0, 80));
+      c.check(
+        !existsSync(acksFile),
+        '★ ②b 被拒绝的尝试**没有留下确认记录**（否则"确认过一次"里会混进"用户其实没同意"的路径，那份记录就不再是证据）',
+        acksFile
+      );
+
+      // ---- ③ 勾了确认 → 记录落盘（并写审计）----
+      const jobId = await client.invoke('engines_install', {
+        req: { engineId, licenseAccepted: true, allowUnverified: false, force: false },
+      });
+      const job = await client.waitJob(jobId, 120, 500);
+      console.log(`   安装任务：${job.status}${job.error ? ` — ${job.error.code}` : ''}`);
+
+      const raw = existsSync(acksFile) ? readFileSync(acksFile, 'utf8') : '';
+      let parsed = null;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        /* 下面直接断言失败 */
+      }
+      const entry = parsed?.entries?.[engineId];
+      c.check(Boolean(entry), '★ ③ 确认被记到了 `license-acks.json`', Object.keys(parsed?.entries ?? {}).join(', '));
+      c.check(
+        entry?.fingerprint?.length === 16 && /^[0-9a-f]{16}$/.test(entry?.fingerprint ?? ''),
+        '③b 记录里有 16 位十六进制的**许可证指纹**（条款一变就自动失效，靠的就是它）',
+        String(entry?.fingerprint)
+      );
+      c.check(
+        entry?.license === subject.descriptor.license,
+        '③c 记录里存了当时的许可证原文（便于合规审查时回看）',
+        String(entry?.license).slice(0, 40)
+      );
+      c.check(
+        Boolean(entry?.acceptedAt) && !Number.isNaN(Date.parse(entry.acceptedAt)),
+        '③d 记录里有可解析的时间戳',
+        String(entry?.acceptedAt)
+      );
+
+      // ---- ④ 目录接口把"已确认"如实报出来 ----
+      const after = await client.invoke('engines_catalog');
+      const e2 = after.find((x) => x.descriptor.id === engineId);
+      c.check(
+        e2?.licenseAcknowledged === true && Boolean(e2?.licenseAcknowledgedAt),
+        '★ ④ `engines_catalog` 报出 `licenseAcknowledged: true` + 确认时间（界面靠它预先勾上）',
+        `${e2?.licenseAcknowledged} / ${e2?.licenseAcknowledgedAt}`
+      );
+
+      // ---- ⑤ 审计里有这一条 ----
+      const snap = await client.invoke('plugins_audit', { limit: 60 });
+      const kinds = (snap?.events ?? []).map((ev) => String(ev.kind ?? ''));
+      c.check(
+        kinds.some((k) => k.toLowerCase().includes('licenseaccepted')),
+        '⑤ 写了一条 `LicenseAccepted` 审计事件（合规证据链）',
+        kinds.filter((k) => k.toLowerCase().includes('license')).join(', ') || `最近 ${kinds.length} 条里没有`
+      );
+
+      // ---- ⑥ 状态是**从磁盘读的**，不是内存里的缓存 ----
+      rmSync(acksFile, { force: true });
+      const afterDelete = await client.invoke('engines_catalog');
+      const e3 = afterDelete.find((x) => x.descriptor.id === engineId);
+      c.check(
+        e3?.licenseAcknowledged === false,
+        '★ ⑥ 删掉记录文件之后立刻变回"未确认"（说明每次重新读盘，不会拿着缓存撒谎）',
+        String(e3?.licenseAcknowledged)
+      );
+
+      // 恢复：把这一次真实验证留下的记录删干净，别污染后续检查
+      rmSync(acksFile, { force: true });
+    }
+
+    // ---- ⑦ 模型那一侧：同类硬门 + 同类记录 ----
+    const models = await client.invoke('models_list');
+    const target = (models ?? []).find((m) => !m.commercialUse && m.installed);
+    if (!target) {
+      c.note('（本机没有"已安装且不可商用"的权重，跳过模型侧的确认验证）');
+    } else {
+      const before = await client.invoke('models_list');
+      const t0 = before.find((m) => m.id === target.id);
+      c.check(
+        t0?.licenseAcknowledged === false,
+        '⑦ 干净状态下权重的 `licenseAcknowledged` 是 false',
+        String(t0?.licenseAcknowledged)
+      );
+
+      let denied = null;
+      try {
+        await client.invoke('models_install', {
+          req: { modelId: target.id, licenseAccepted: false },
+        });
+      } catch (e) {
+        denied = String(e?.message ?? e);
+      }
+      c.check(
+        Boolean(denied),
+        '★ ⑧ 不可商用的权重不带确认时被拒绝',
+        extractErrorCode(denied) || String(denied).slice(0, 80)
+      );
+      c.check(!existsSync(acksFile), '⑧b 同样没有留下记录', acksFile);
+
+      // 勾了确认 → 记录落盘；这个权重已经装好，`install_model` 会先核对本地哈希后短路
+      const jobId2 = await client.invoke('models_install', {
+        req: { modelId: target.id, licenseAccepted: true },
+      });
+      const job2 = await client.waitJob(jobId2, 180, 1000);
+      console.log(`   权重任务：${job2.status}${job2.error ? ` — ${job2.error.code}: ${job2.error.message}` : ''}`);
+      const raw2 = existsSync(acksFile) ? readFileSync(acksFile, 'utf8') : '';
+      let parsed2 = null;
+      try {
+        parsed2 = JSON.parse(raw2);
+      } catch {
+        /* 断言会失败 */
+      }
+      c.check(
+        Boolean(parsed2?.entries?.[target.id]),
+        '★ ⑨ 权重的确认同样被记下来（与引擎共用一份记录）',
+        Object.keys(parsed2?.entries ?? {}).join(', ')
+      );
+      const after2 = await client.invoke('models_list');
+      c.check(
+        after2.find((m) => m.id === target.id)?.licenseAcknowledged === true,
+        '⑨b `models_list` 如实报出已确认',
+        String(after2.find((m) => m.id === target.id)?.licenseAcknowledged)
+      );
+      rmSync(acksFile, { force: true });
+    }
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 

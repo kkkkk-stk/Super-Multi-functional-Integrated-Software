@@ -13,7 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { formatMegabytes } from "@/lib/format";
+import { formatDateTime, formatMegabytes } from "@/lib/format";
 import { openExternal } from "@/lib/system";
 import type { EngineEntry } from "@/types/domain";
 
@@ -52,13 +52,16 @@ export function EngineInstallDialog({
   const [licenseAccepted, setLicenseAccepted] = React.useState(false);
   const [allowUnverified, setAllowUnverified] = React.useState(false);
 
-  // 每次换引擎都重置勾选：上一次的同意不能自动延续到另一个引擎
+  // 每次换引擎都重置勾选：上一次的同意不能自动延续到另一个引擎。
+  // 但**已经确认过这份许可证**的引擎要预先勾上 —— 记录在
+  // `<data>/license-acks.json`，按**许可证原文的指纹**存，所以条款一变
+  // `licenseAcknowledged` 就是 false，勾选框自动回到未勾选。
   React.useEffect(() => {
     if (open) {
-      setLicenseAccepted(false);
+      setLicenseAccepted(Boolean(entry?.licenseAcknowledged));
       setAllowUnverified(false);
     }
-  }, [open, entry?.descriptor.id]);
+  }, [open, entry?.descriptor.id, entry?.licenseAcknowledged]);
 
   if (!entry) return null;
   const { descriptor } = entry;
@@ -113,6 +116,18 @@ export function EngineInstallDialog({
                     该引擎要求在使用前确认许可证。若你的用途涉及闭源分发或商业销售，
                     请先按上面的说明完成合规判断。
                   </span>
+                  {/*
+                    ✅ 确认过一次就把勾选框**预先勾上**，并显示确认时间。
+                    这只是省掉重复点击，**不是**跳过确认 —— 后端那道硬门仍然要求
+                    请求里带 `licenseAccepted: true`，而这条记录是按
+                    **许可证原文的指纹**存的：条款一改，它自动失效、勾选框回到未勾选。
+                  */}
+                  {entry.licenseAcknowledged && entry.licenseAcknowledgedAt && (
+                    <span className="mt-1 block text-[11px] text-muted-foreground">
+                      你已于 {formatDateTime(entry.licenseAcknowledgedAt)} 确认过这份许可证
+                      （原文未变，因此已为你勾上；条款一旦变更会自动失效）。
+                    </span>
+                  )}
                 </span>
               </label>
             )}

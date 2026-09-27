@@ -32,6 +32,7 @@ use toolforge_plugins::l1::{PipelineRunRequest, StepResult};
 use toolforge_plugins::runtimes::PluginCallRequest;
 
 use crate::ipc::*;
+use crate::license_acks;
 use crate::state::AppState;
 
 // ============================================================================
@@ -242,6 +243,9 @@ pub async fn jobs_stats(state: State<'_, Arc<AppState>>) -> ToolforgeResult<JobS
 #[specta::specta]
 pub async fn engines_catalog(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Vec<EngineEntry>> {
     let nodes = builtin_nodes();
+    // 确认记录**每次调用都重新读盘**（见 `license_acks` 的模块文档：
+    // 不缓存就不会在"用户手工删掉文件"之后继续撒谎）
+    let acks = license_acks::LicenseAcks::load(&state.paths);
     let mut out = Vec::new();
     for d in engine_catalog() {
         let used_by: Vec<String> = nodes
@@ -254,6 +258,8 @@ pub async fn engines_catalog(state: State<'_, Arc<AppState>>) -> ToolforgeResult
         let status = state.engines.status(&d.id).await;
         let managed_available = state.engines.has_download_source(&d.id);
         out.push(EngineEntry {
+            license_acknowledged: acks.is_acknowledged(&d.id, &d.license),
+            license_acknowledged_at: acks.acknowledged_at(&d.id, &d.license),
             descriptor: d,
             status,
             used_by_nodes: used_by,
@@ -308,6 +314,13 @@ pub async fn engines_install(
             descriptor.name
         ))
         .with_detail(format!("{}：{}", descriptor.license, descriptor.license_note)));
+    }
+
+    // 确认过了就**记下来**（落盘 + 审计）。位置刻意放在硬门**之后**：
+    // 被拒绝的那次尝试不产生任何记录 —— 否则"确认过一次"会包含"用户其实没同意"的路径，
+    // 那份记录也就不再是证据了。
+    if descriptor.requires_license_ack && license_accepted {
+        record_license_ack(&state, &engine_id, &descriptor.name, &descriptor.license);
     }
 
     let job = state.queue.create(
@@ -371,6 +384,9 @@ pub async fn models_list(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Vec
         .map(|m| (m.id.clone(), m))
         .collect();
 
+    // 同 `engines_catalog`：确认记录每次重新读盘
+    let acks = license_acks::LicenseAcks::load(&state.paths);
+
     let mut out = Vec::new();
     for desc in engine_catalog() {
         for m in desc.models {
@@ -402,6 +418,8 @@ pub async fn models_list(state: State<'_, Arc<AppState>>) -> ToolforgeResult<Vec
                 downloadable: registered_spec.is_some() && m.sha256.is_some(),
                 used_by_nodes,
                 engine_id: desc.id.clone(),
+                license_acknowledged: acks.is_acknowledged(&m.id, &m.license),
+                license_acknowledged_at: acks.acknowledged_at(&m.id, &m.license),
             });
         }
     }
@@ -434,6 +452,9 @@ pub async fn models_install(
             spec.name
         ))
         .with_detail(format!("{}：{}", spec.license, spec.purpose)));
+    }
+    if !spec.commercial_use && license_accepted {
+        record_license_ack(&state, &model_id, &spec.name, &spec.license);
     }
 
     // 没有下载源就**当场拒绝**，不要排一个注定失败的下载任务
@@ -1266,6 +1287,36 @@ pub async fn ai_review_draft(
 // ============================================================================
 // 内部辅助
 // ============================================================================
+
+/// 记下一次许可证确认：落盘 + 写审计。
+///
+/// **调用点必须放在硬门之后**（见两处调用点的注释）—— 被拒绝的尝试不该留下记录，
+/// 否则"确认过一次"里会混进"用户其实没同意"的路径，那份记录就不再是证据。
+///
+/// 落盘失败**只记日志、不打断安装**：用户已经明确点了"我接受"，因为写不了
+/// 一个辅助文件而让安装失败是本末倒置。但日志里必须留下痕迹 ——
+/// 静默失败会让"合规证据链"变成一句空话。
+fn record_license_ack(state: &AppState, subject: &str, name: &str, license: &str) {
+    let mut acks = license_acks::LicenseAcks::load(&state.paths);
+    match acks.record(&state.paths, subject, license) {
+        Ok(ack) => {
+            state.plugins.audit().record(
+                toolforge_plugins::AuditEvent::new(
+                    toolforge_plugins::audit::AuditEventKind::LicenseAccepted,
+                    format!("已确认 {name} 的许可证条款"),
+                )
+                .detail(license_acks::audit_detail(&ack, name)),
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                subject,
+                err = %e.message,
+                "许可证确认记录落盘失败（安装继续，但合规证据链里会缺这一条）"
+            );
+        }
+    }
+}
 
 fn resolve_output_dir(state: &AppState, req: &RunPluginRequest) -> ToolforgeResult<PathBuf> {
     if !req.output_dir.trim().is_empty() {

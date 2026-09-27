@@ -420,7 +420,9 @@ export type AuditEventKind =
 /**  AI 生成的插件通过审核并落盘 */
 "aiDraftAccepted" | 
 /**  AI 生成的插件被拒绝 */
-"aiDraftRejected";
+"aiDraftRejected" | 
+/**  用户确认了某个引擎/权重的许可证条款（合规证据链） */
+"licenseAccepted";
 
 export type AuditEvent_Deserialize = {
 	/**  ISO-8601 */
@@ -648,6 +650,16 @@ export type EngineEntry_Deserialize = {
 	 *  "当前平台没有配置下载源"，那是白白浪费一次点击。
 	 */
 	managedAvailable: boolean,
+	/**
+	 *  用户是否**已经确认过这份许可证**（记录在 `<data>/license-acks.json`）。
+	 * 
+	 *  界面用它把安装对话框里的确认勾选框**预先勾上**并显示确认时间。
+	 *  ⚠️ 这只是"省一次重复点击"，**不是**"跳过确认"：请求里仍然必须带
+	 *  `licenseAccepted: true`，硬门在命令层，不因为这条记录而放松。
+	 */
+	licenseAcknowledged?: boolean,
+	/**  已确认的时间（RFC3339）；没确认过、或条款变了时为 `None` */
+	licenseAcknowledgedAt?: string | null,
 };
 
 /**  引擎目录项 = 静态描述 + 运行时状态。 */
@@ -664,6 +676,16 @@ export type EngineEntry_Serialize = {
 	 *  "当前平台没有配置下载源"，那是白白浪费一次点击。
 	 */
 	managedAvailable: boolean,
+	/**
+	 *  用户是否**已经确认过这份许可证**（记录在 `<data>/license-acks.json`）。
+	 * 
+	 *  界面用它把安装对话框里的确认勾选框**预先勾上**并显示确认时间。
+	 *  ⚠️ 这只是"省一次重复点击"，**不是**"跳过确认"：请求里仍然必须带
+	 *  `licenseAccepted: true`，硬门在命令层，不因为这条记录而放松。
+	 */
+	licenseAcknowledged: boolean,
+	/**  已确认的时间（RFC3339）；没确认过、或条款变了时为 `None` */
+	licenseAcknowledgedAt?: string | null,
 };
 
 /**  引擎的安装/获取方式 */
@@ -1199,6 +1221,10 @@ export type ModelEntry_Deserialize = {
 	usedByNodes: string[],
 	/**  模型所属的引擎（通常是虚拟引擎 `onnx-models`） */
 	engineId: string,
+	/**  用户是否已经确认过这个权重的许可证（同 [`EngineEntry::license_acknowledged`]） */
+	licenseAcknowledged?: boolean,
+	/**  已确认的时间（RFC3339） */
+	licenseAcknowledgedAt?: string | null,
 };
 
 /**
@@ -1226,6 +1252,10 @@ export type ModelEntry_Serialize = {
 	usedByNodes: string[],
 	/**  模型所属的引擎（通常是虚拟引擎 `onnx-models`） */
 	engineId: string,
+	/**  用户是否已经确认过这个权重的许可证（同 [`EngineEntry::license_acknowledged`]） */
+	licenseAcknowledged: boolean,
+	/**  已确认的时间（RFC3339） */
+	licenseAcknowledgedAt?: string | null,
 };
 
 /**  模型下载请求。 */

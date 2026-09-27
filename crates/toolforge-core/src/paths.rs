@@ -99,6 +99,15 @@ impl AppPaths {
         self.root.join("settings.broken.json")
     }
 
+    /// 许可证确认记录（引擎与模型的"我已阅读并接受"）。
+    ///
+    /// 它**不是**机密：里面是公开的许可证标识、一段许可证原文的摘要，
+    /// 以及确认时间。放在这里是为了合规审查时拿得出证据链 ——
+    /// 见 `apps/desktop/src-tauri/src/license_acks.rs`。
+    pub fn license_acks_file(&self) -> PathBuf {
+        self.root.join("license-acks.json")
+    }
+
     pub fn audit(&self) -> PathBuf {
         self.root.join("audit")
     }

@@ -1,8 +1,10 @@
+import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { SkeletonCard } from "@/components/ui/skeleton";
+import * as React from "react";
 import { useInstallModel, useModels, useRemoveModel } from "@/hooks/use-engines";
-import { formatBytes } from "@/lib/format";
+import { formatBytes, formatDateTime } from "@/lib/format";
 import { toToolforgeError } from "@/lib/ipc";
 import { useUiStore } from "@/stores/ui-store";
 import type { ModelEntry } from "@/types/domain";
@@ -83,11 +85,10 @@ export function ModelPanel() {
               (install.isPending && install.variables?.modelId === m.id) ||
               (remove.isPending && remove.variables === m.id)
             }
-            onInstall={() =>
+            onInstall={(licenseAccepted) =>
               install.mutate({
                 modelId: m.id,
-                // 不可商用的权重需要用户显式点头；可商用的直接下，别多一步
-                licenseAccepted: !m.commercialUse,
+                licenseAccepted,
               })
             }
             onRemove={() => remove.mutate(m.id)}
@@ -106,11 +107,31 @@ function ModelCard({
 }: {
   model: ModelEntry;
   busy: boolean;
-  onInstall: () => void;
+  onInstall: (licenseAccepted: boolean) => void;
   onRemove: () => void;
 }) {
   // 下载进度与引擎安装共用一条通道（后端只有一种下载事件）
   const download = useUiStore((s) => s.engineDownloads[model.id]);
+
+  // ⚠️ **不可商用的权重必须由用户自己点头，不能替他点。**
+  //
+  // 这里此前写的是 `licenseAccepted: !m.commercialUse` —— 也就是**对不可商用的
+  // 模型自动发 `true`**，于是后端那道硬门（`!commercial_use && !license_accepted`
+  // 才拒绝）永远走不到，用户从头到尾没看见任何确认。注释写的是"需要用户显式点头"，
+  // 代码做的正好相反。这类"注释与代码相反"的缺陷不会让构建变红，也不会有人报错，
+  // 只是那份确认从来没发生过。
+  //
+  // 现在的规则：不可商用 + 未安装 → 必须勾选才能点「下载」；
+  // 已经确认过（`licenseAcknowledged`，按许可证原文的指纹存）就预先勾上。
+  const needsConsent = !model.commercialUse && !model.installed;
+  const [licenseAccepted, setLicenseAccepted] = React.useState(
+    Boolean(model.licenseAcknowledged)
+  );
+  React.useEffect(() => {
+    setLicenseAccepted(Boolean(model.licenseAcknowledged));
+  }, [model.id, model.licenseAcknowledged]);
+
+  const consentBlocked = needsConsent && !licenseAccepted;
 
   const sizeLabel = model.installed
     ? `${(model.installedSizeMb ?? 0).toFixed(1)} MB`
@@ -169,6 +190,30 @@ function ModelCard({
         </div>
       )}
 
+      {/* 不可商用的权重：必须由用户显式勾选，勾了才能下载 */}
+      {needsConsent && (
+        <label className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-2">
+          <Checkbox
+            checked={licenseAccepted}
+            onCheckedChange={setLicenseAccepted}
+            label="我已了解该权重不可用于商业用途"
+            className="mt-0.5"
+          />
+          <span className="text-[11px]">
+            <span className="font-medium">我已了解该权重不可用于商业用途</span>
+            <span className="mt-0.5 block text-muted-foreground">
+              <span className="font-mono">{model.license}</span>
+              {model.licenseAcknowledged && model.licenseAcknowledgedAt && (
+                <>
+                  {" "}
+                  · 你已于 {formatDateTime(model.licenseAcknowledgedAt)} 确认过（许可条款未变）
+                </>
+              )}
+            </span>
+          </span>
+        </label>
+      )}
+
       <div className="mt-auto flex items-center gap-2 pt-1">
         {model.installed ? (
           <Button
@@ -184,13 +229,15 @@ function ModelCard({
           <Button
             size="sm"
             className="h-7 text-xs"
-            disabled={busy || !model.downloadable}
+            disabled={busy || !model.downloadable || consentBlocked}
             title={
-              model.downloadable
-                ? undefined
-                : "这个模型还没有配置可校验的下载源，装不了"
+              !model.downloadable
+                ? "这个模型还没有配置可校验的下载源，装不了"
+                : consentBlocked
+                  ? "请先勾选上方的许可条款确认"
+                  : undefined
             }
-            onClick={onInstall}
+            onClick={() => onInstall(licenseAccepted)}
           >
             下载
           </Button>

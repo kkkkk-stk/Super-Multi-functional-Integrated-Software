@@ -22,6 +22,7 @@
 
 pub mod commands;
 pub mod ipc;
+pub mod license_acks;
 pub mod settings_store;
 pub mod state;
 

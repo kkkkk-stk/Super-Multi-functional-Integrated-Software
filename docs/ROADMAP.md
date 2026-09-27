@@ -52,8 +52,8 @@
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
-> | 运行时测试总数 | `cargo test --workspace` **260 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **252 项全通过**（【1】–【24】） |
+> | 运行时测试总数 | `cargo test --workspace` **264 passed / 0 failed** |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **267 项全通过**（【1】–【25】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -946,7 +946,19 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 
 
 
-### 4. 许可证确认：**闸门已经有了，记录仍然没有**
+### 3.8 许可证确认：闸门原来有，**记录原来没有**（本轮补上），顺带修掉一处"替用户点头"
+
+- **原状**（就是下面 §4 里那条"仍然没做的那一半"）：引擎与模型的许可证确认只是一次**布尔参数**。门是有效的（`engines_install` / `models_install` 里不满足就拒绝），但确认**不留任何痕迹**：对合规审查拿不出证据链（谁在什么时候接受了哪份许可证），用户每次重装还得再勾一次。
+- **补上记录**：新增 `license-acks.json`（`apps/desktop/src-tauri/src/license_acks.rs`），每条记 `{ subject, license, fingerprint, acceptedAt }`，同时写一条 `LicenseAccepted` 审计事件。
+  * **记的是"许可证原文的指纹"（sha256 前 16 位），不是"确认过这个 id"**：用户同意的是**那一段文字**。只按 id 记的话，上游把许可证从 LGPL 收紧成 GPL 之后，旧同意会**自动延续**到一份用户从没见过的条款上 —— 那正好是确认流程要防的事。条款一变，指纹对不上，确认自动失效（有专门的单元测试）。
+  * **落盘失败只记日志、不打断安装**：用户已经明确点了"我接受"，因为写不了一个辅助文件而让安装失败是本末倒置；但日志里必须留痕，否则"合规证据链"就成了空话。
+  * **每次调用重新读盘，不缓存**：缓存会带来一个很难查的形态 —— 用户手工删掉/改过文件之后，应用里的状态与磁盘不一致。删掉文件立刻变回"未确认"这条行为有运行时断言（【25】⑥）。
+  * 界面侧：引擎安装对话框**预先勾上**并显示确认时间（只是省一次重复点击，**不是跳过确认** —— 请求里仍必须带 `licenseAccepted: true`，硬门不因为这条记录而放松）。
+- ★ **顺带发现并修掉一处"替用户点头"**：`model-panel.tsx` 原来对**不可商用**的权重写的是 `licenseAccepted: !m.commercialUse` —— 也就是**自动发 `true`**，于是后端那道门永远走不到，用户从头到尾没看见任何确认。而旁边的注释写的正是"不可商用的权重需要用户显式点头"。**注释与代码相反**，构建不会红、运行不报错，只是那份确认从来没发生过。现在：不可商用且未安装 → 必须勾选才能点「下载」；确认过就预先勾上。
+- **【25】（15 项）验的是后端契约**：不带 `licenseAccepted` → `PERMISSION_DENIED` **且不留下任何记录**（被拒绝的尝试不能进证据链）；带了 → 记录落盘（含指纹/原文/时间）+ `LicenseAccepted` 审计；`engines_catalog` / `models_list` 如实报出 `licenseAcknowledged` 与时间；删掉记录文件立刻变回未确认。
+  > ⚠️ **这条边界要写清楚**：前端那两个勾选框本身**没有做点击穿透验证** —— 本机所有需要确认的引擎与权重都已安装，界面上不会出现"安装/下载"按钮，点不出一条真实路径。它目前由 `tsc` + `vite` + 人工审阅覆盖；要补上得有一台装有"未安装的不可商用权重"的机器。
+
+### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
 - `crates/toolforge-core/src/engine.rs` 里为每个引擎与模型都提供了 `license`、`license_note`、`requires_license_ack`，并且有测试在守护这些字段非空。
 - ⚠️ **本条原文（"registry.rs 对 `requires_license_ack` 零引用——没有任何安装前确认流程"）已经过期**。闸门**已经接上了**，只是位置不在 `registry.rs`，而在**命令层**（`apps/desktop/src-tauri/src/commands.rs`）：
@@ -954,7 +966,8 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   * `models_install`：模型那边更严 —— `if !spec.commercial_use && !license_accepted { … }`（不可商用的权重**必须**逐次确认，与 `requires_license_ack` 无关）。
 - **为什么放在命令层而不是 `registry.rs`**：那道门的目的是"挡住一个被攻陷/越权的前端悄悄装东西"，属于**宿主边界**；`EngineRegistry::install()` 是宿主内部 API，调用它的人已经在门内了（`engines:install` 那个 CLI 也是用户自己的 shell）。
   **代价要说清楚**：这意味着"任何人只要拿到 `EngineRegistry` 就能绕过确认"——将来新增调用方时**必须自己记得传 `license_accepted`**。目前没有第二条调用路径（一条命令 + 一个 CLI），所以没有实际缺口，但这是一条靠纪律维持的不变量，不是靠类型系统。
-- **仍然没做的那一半**：确认结果**没有落盘**。没有审计事件、没有"我已确认过 X 的许可证"的持久记录，所以每次重装都要重新勾一次（对合规审查来说也拿不出证据链）。这一条保持不变，仍是 v0.2 的事。
+- ~~**仍然没做的那一半**：确认结果**没有落盘**。没有审计事件、没有"我已确认过 X 的许可证"的持久记录，所以每次重装都要重新勾一次（对合规审查来说也拿不出证据链）。这一条保持不变，仍是 v0.2 的事。~~
+  > ✅ **已补上（见 §3.8）**：`license-acks.json` + `LicenseAccepted` 审计事件 + 界面预先勾上。留在这里是为了保留"当时确实没有"这个事实。
 - 另有一处**语义**要对齐：`requires_license_ack` 是"装之前要确认"，而 `commercial_use == false` 是"不许商用"。两者混在一个 `license_accepted` 标志上，对**不可商用**的模型来说，勾一次框并不能让它变得可商用 —— UI 文案必须说清这个区别（见 `docs/ENGINE-MATRIX.md` 的模型表）。
 
 ### 5. `package.json` 的 `bindings` 脚本指向不存在的包名 ✅ 已修复

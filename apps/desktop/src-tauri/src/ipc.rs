@@ -211,6 +211,16 @@ pub struct EngineEntry {
     /// （如 7-Zip、tesseract、calibre）显示这个按钮，用户点了只会得到一句
     /// "当前平台没有配置下载源"，那是白白浪费一次点击。
     pub managed_available: bool,
+    /// 用户是否**已经确认过这份许可证**（记录在 `<data>/license-acks.json`）。
+    ///
+    /// 界面用它把安装对话框里的确认勾选框**预先勾上**并显示确认时间。
+    /// ⚠️ 这只是"省一次重复点击"，**不是**"跳过确认"：请求里仍然必须带
+    /// `licenseAccepted: true`，硬门在命令层，不因为这条记录而放松。
+    #[serde(default)]
+    pub license_acknowledged: bool,
+    /// 已确认的时间（RFC3339）；没确认过、或条款变了时为 `None`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license_acknowledged_at: Option<String>,
 }
 
 /// 引擎安装请求。
@@ -263,6 +273,12 @@ pub struct ModelEntry {
     pub used_by_nodes: Vec<String>,
     /// 模型所属的引擎（通常是虚拟引擎 `onnx-models`）
     pub engine_id: String,
+    /// 用户是否已经确认过这个权重的许可证（同 [`EngineEntry::license_acknowledged`]）
+    #[serde(default)]
+    pub license_acknowledged: bool,
+    /// 已确认的时间（RFC3339）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license_acknowledged_at: Option<String>,
 }
 
 /// 模型下载请求。

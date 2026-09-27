@@ -55,6 +55,8 @@ pub enum AuditEventKind {
     AiDraftAccepted,
     /// AI 生成的插件被拒绝
     AiDraftRejected,
+    /// 用户确认了某个引擎/权重的许可证条款（合规证据链）
+    LicenseAccepted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

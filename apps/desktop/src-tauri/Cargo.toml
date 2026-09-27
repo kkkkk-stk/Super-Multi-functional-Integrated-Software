@@ -57,6 +57,11 @@ parking_lot = { workspace = true }
 dirs = { workspace = true }
 uuid = { workspace = true }
 
+# 许可证确认记录的指纹（`license_acks.rs`）：只用到 sha256 与 hex 编码。
+# 这两个 crate 本来就在 workspace 里（引擎的下载校验在用），不引入新依赖树。
+sha2 = { workspace = true }
+hex = { workspace = true }
+
 [features]
 default = []
 updater = ["dep:tauri-plugin-updater"]
