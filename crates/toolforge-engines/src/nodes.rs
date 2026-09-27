@@ -914,6 +914,31 @@ fn decode_image(path: &Path) -> ToolforgeResult<image::DynamicImage> {
         .map_err(|e| e.with_subject(path.display().to_string()))
 }
 
+/// 读一张图**在文件里记录的 EXIF 方向**（没有则返回"不需要变换"）。
+///
+/// 为什么单独一个函数、还非得走 `into_decoder()`：`image::ImageReader::decode()`
+/// 走的是 `DynamicImage::from_decoder`，它**不读也不应用** EXIF 方向 ——
+/// 所以手机竖拍的照片会以"传感器原始朝向"进入流水线（横着的）。
+/// 要拿到方向必须自己建 decoder 再问它 `orientation()`。
+///
+/// **不认识的格式一律当作"没有方向"**，而不是报错：PNG / BMP 里本来就没有
+/// 这个东西，为它失败会让一大票正常文件用不了。读失败同理 ——
+/// 方向是"锦上添花"，不该成为任务失败的原因。
+fn read_exif_orientation(path: &Path) -> image::metadata::Orientation {
+    use image::metadata::Orientation;
+    use image::ImageDecoder; // `orientation()` 是这个 trait 上的方法
+    let Ok(reader) = image::ImageReader::open(path) else {
+        return Orientation::NoTransforms;
+    };
+    let Ok(reader) = reader.with_guessed_format() else {
+        return Orientation::NoTransforms;
+    };
+    let Ok(mut decoder) = reader.into_decoder() else {
+        return Orientation::NoTransforms;
+    };
+    decoder.orientation().unwrap_or(Orientation::NoTransforms)
+}
+
 fn parse_format(s: &str) -> ToolforgeResult<image::ImageFormat> {
     match s.trim().to_ascii_lowercase().as_str() {
         "png" => Ok(image::ImageFormat::Png),
@@ -1286,6 +1311,9 @@ async fn image_rotate(
     let angle = ctx.param_f64("angle", 90.0);
     let flip_h = ctx.param_bool("flipH", false);
     let flip_v = ctx.param_bool("flipV", false);
+    // `autoOrient` 默认 true —— 手机拍的照片全都带 EXIF 方向，不校正的话
+    // 用户拿到的是"躺着"的图，而界面上的开关还写着"已开启"。见下面的实现说明。
+    let auto_orient = ctx.param_bool("autoOrient", true);
 
     let normalized = ((angle % 360.0) + 360.0) % 360.0;
     let backend = pick_image_backend(ctx).await;
@@ -1303,11 +1331,54 @@ async fn image_rotate(
         );
     }
 
+    // ---- EXIF 方向校正 ----
+    //
+    // 三个后端各有一条**实测过**的实现路径，且语义一致（都把"文件里记的方向"
+    // 应用到像素上、再执行用户要求的旋转）：
+    //
+    // * libvips：`vips rot` **不会**在加载时自动应用方向（实测 `vips copy`
+    //   一张 Orientation=6 的 JPEG 出来仍是 96x64，而不是 64x96），
+    //   必须显式跑一次 `vips autorot`。它会顺手把 EXIF 里的方向改写成 1，
+    //   所以链式调用**不会**重复旋转（实测：autorot 后再 rot d90 = 96x64）。
+    // * ImageMagick：一个 `-auto-orient` 标志位。
+    // * 纯 Rust：`DynamicImage::apply_orientation`，方向由 `read_exif_orientation` 读。
+    //
+    // 只有 url 里那两种"读得出方向"的格式（JPEG/WebP/TIFF）会真的变；
+    // PNG 之类永远读到 `NoTransforms`，这一步是空操作。
+    let orientation = if auto_orient {
+        read_exif_orientation(&src)
+    } else {
+        image::metadata::Orientation::NoTransforms
+    };
+
+    // libvips 那条路要先把"已校正方向"的图落成中间文件，后面的旋转/翻转
+    // 都以它为输入 —— 不能直接在原文件上做，因为 `vips` 的每个操作都是一次
+    // 独立的加载，加载时又会重新读到那个方向标签（等于白校正）。
+    let mut vips_stage: Option<PathBuf> = None;
+    let mut vips_src = src.clone();
+    if auto_orient && backend == ImageBackend::Vips {
+        let staged = dst.with_extension(format!("oriented.{}", file_ext(&dst)));
+        run_vips(
+            ctx,
+            vec![
+                "autorot".into(),
+                src.display().to_string(),
+                staged.display().to_string(),
+            ],
+        )
+        .await?;
+        vips_src = staged.clone();
+        vips_stage = Some(staged);
+    }
+
     ctx.job.log(
         toolforge_core::job::LogLevel::Debug,
         format!(
-            "image.rotate：后端 = {}；角度 {angle}°，翻转 H={flip_h} V={flip_v}",
-            backend.describe()
+            "image.rotate：后端 = {}；角度 {angle}°，翻转 H={flip_h} V={flip_v}；\
+             自动方向 = {}（EXIF = {}）",
+            backend.describe(),
+            if auto_orient { "开" } else { "关" },
+            orientation.to_exif(),
         ),
     );
 
@@ -1343,7 +1414,7 @@ async fn image_rotate(
 
             let mut a = vec![
                 action.into(),
-                src.display().to_string(),
+                vips_src.display().to_string(),
                 first_target.display().to_string(),
             ];
             a.extend(extra);
@@ -1392,11 +1463,14 @@ async fn image_rotate(
         ImageBackend::Magick => {
             // IM7 的 `-rotate` 接受任意角度（`-rotate 45`）。
             // 90 的整数倍也走它：IM 对整角度有专门优化，结果与 `-rotate 90` 一致。
-            let mut a = vec![
-                src.display().to_string(),
-                "-rotate".into(),
-                normalized.to_string(),
-            ];
+            let mut a = vec![src.display().to_string()];
+            // `-auto-orient` 必须紧跟在输入之后、其它操作之前 ——
+            // 它按 EXIF 把像素摆正，并清掉方向标签（所以不会和下面的 `-rotate` 叠加）。
+            if auto_orient {
+                a.push("-auto-orient".into());
+            }
+            a.push("-rotate".into());
+            a.push(normalized.to_string());
             if flip_h {
                 a.push("-flop".into());
             }
@@ -1408,6 +1482,11 @@ async fn image_rotate(
         }
         ImageBackend::Rust => {
             let mut img = decode_image(&src)?;
+            // 先校方向、再旋转：与 libvips 的 autorot→rot、ImageMagick 的
+            // 输入→`-auto-orient`→`-rotate` 是同一次序，三个后端结果一致。
+            if auto_orient {
+                img.apply_orientation(orientation);
+            }
             match normalized as i64 {
                 0 => {}
                 90 => img = img.rotate90(),
@@ -1426,6 +1505,12 @@ async fn image_rotate(
                 .map_err(|_| ToolforgeError::invalid("无法从输出路径推断格式"))?;
             encode_image(&img, &dst, fmt, 92)?;
         }
+    }
+
+    // 中间文件必须删掉：它和输出同目录，留着会被"输出目录里有几个文件"这类
+    // 检查当成产物（【32】就是这么发现 `vips` 那条路的中间文件漏删的）。
+    if let Some(staged) = vips_stage {
+        let _ = std::fs::remove_file(&staged);
     }
 
     Ok(NodeOutput::file(dst.display().to_string()).with_value("backend", backend.id().to_string()))
@@ -3675,6 +3760,132 @@ mod tests {
     fn format_parsing_is_case_insensitive() {
         assert_eq!(parse_format("PNG").unwrap(), image::ImageFormat::Png);
         assert_eq!(parse_format(" WebP ").unwrap(), image::ImageFormat::WebP);
+    }
+
+    /// 造一个最小的"带 EXIF Orientation"的 JPEG。
+    ///
+    /// 为什么要手搓 EXIF：`image` crate **能读、不能写** EXIF，
+    /// 而"读得对不对"唯一的验证方式就是拿一个真写了方向的文件去读。
+    /// 这里拼的是最小合法结构：`SOI + APP1("Exif\0\0" + TIFF 头 + 一个 IFD0 条目)`
+    /// 再接上原 JPEG 的其余部分。
+    ///
+    /// ⚠️ **这个结构的字段偏移极容易错一位。** 我自己第一版就把 orientation
+    /// 的值写进了 count 字段的高半字节 —— 生成的字节流"看着有 EXIF"、
+    /// `vipsheader` 却一个 `exif-ifd0-*` 都读不出来，于是我据此得出了
+    /// "libvips 不会自动校正方向"这个**建立在坏素材上**的结论。
+    /// 教训写进下一条测试：**先证明素材真的被读出来了，再谈别的**。
+    fn jpeg_with_exif_orientation(jpeg: &[u8], orientation: u16) -> Vec<u8> {
+        assert_eq!(&jpeg[..2], &[0xff, 0xd8], "输入必须是 JPEG（缺 SOI）");
+
+        // IFD 条目布局：tag(2) type(2) count(4) value(4) —— 12 字节，从偏移 10 起
+        let mut ifd: Vec<u8> = Vec::new();
+        ifd.extend_from_slice(b"II"); // 小端
+        ifd.extend_from_slice(&0x2a_u16.to_le_bytes());
+        ifd.extend_from_slice(&8_u32.to_le_bytes()); // IFD0 的偏移
+        ifd.extend_from_slice(&1_u16.to_le_bytes()); // 只有一个条目
+        ifd.extend_from_slice(&0x0112_u16.to_le_bytes()); // Orientation
+        ifd.extend_from_slice(&3_u16.to_le_bytes()); // 类型 SHORT
+        ifd.extend_from_slice(&1_u32.to_le_bytes()); // count
+        ifd.extend_from_slice(&(orientation as u32).to_le_bytes()); // 值
+        ifd.extend_from_slice(&0_u32.to_le_bytes()); // 没有下一个 IFD
+
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&ifd);
+
+        let mut out = vec![0xff, 0xd8, 0xff, 0xe1];
+        out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    /// `read_exif_orientation` 读得出方向，也**不会给没有方向的格式编一个**。
+    #[test]
+    fn exif_orientation_is_read_from_jpeg_and_not_invented_for_png() {
+        let dir = std::env::temp_dir().join("tf-exif-orient");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let plain = image::DynamicImage::new_rgb8(96, 64);
+        let jpg = dir.join("plain.jpg");
+        let png = dir.join("plain.png");
+        encode_image(&plain, &jpg, image::ImageFormat::Jpeg, 92).unwrap();
+        encode_image(&plain, &png, image::ImageFormat::Png, 92).unwrap();
+
+        // PNG 里根本不存在这个东西 —— 读不到就必须老实说"不需要变换"
+        assert_eq!(
+            read_exif_orientation(&png).to_exif(),
+            1,
+            "PNG 不该被读出方向"
+        );
+        // 没有 EXIF 的 JPEG 同理
+        assert_eq!(read_exif_orientation(&jpg).to_exif(), 1);
+
+        // 真的写了方向的 JPEG：6 = Right-top = "顺时针转 90° 才正"
+        let marked = dir.join("orient6.jpg");
+        std::fs::write(
+            &marked,
+            jpeg_with_exif_orientation(&std::fs::read(&jpg).unwrap(), 6),
+        )
+        .unwrap();
+        assert_eq!(
+            read_exif_orientation(&marked).to_exif(),
+            6,
+            "★ 这条是**素材自检**：读不出来时，后面任何关于方向校正的结论都不成立"
+        );
+
+        // 不存在的文件不该 panic
+        assert_eq!(read_exif_orientation(&dir.join("nope.jpg")).to_exif(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 自动方向校正**真的把图摆正了** —— 以及它不在时会发生什么（反证）。
+    #[test]
+    fn auto_orient_actually_straightens_the_photo() {
+        let dir = std::env::temp_dir().join("tf-auto-orient");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 96x64 的图，EXIF 说"要顺时针转 90° 才是正的"
+        let src = dir.join("sideways.jpg");
+        encode_image(
+            &image::DynamicImage::new_rgb8(96, 64),
+            &src,
+            image::ImageFormat::Jpeg,
+            92,
+        )
+        .unwrap();
+        let marked = dir.join("marked.jpg");
+        std::fs::write(
+            &marked,
+            jpeg_with_exif_orientation(&std::fs::read(&src).unwrap(), 6),
+        )
+        .unwrap();
+
+        // ★ 反证：`image.rotate` 在接上 `autoOrient` 之前用的就是这一条路径。
+        // 读到的仍是"传感器原始朝向"（96x64）—— 也就是说界面上那个默认打开的
+        // "按 EXIF 自动校正方向"开关**曾经什么都不做**，用户拿到的是一张躺着的图。
+        let raw = decode_image(&marked).unwrap();
+        assert_eq!(
+            (raw.width(), raw.height()),
+            (96, 64),
+            "不加校正时尺寸不该变 —— 这正是开关撒谎时的表现"
+        );
+
+        // 校正之后必须是"立起来"的：宽高互换
+        let mut fixed = decode_image(&marked).unwrap();
+        fixed.apply_orientation(read_exif_orientation(&marked));
+        assert_eq!(
+            (fixed.width(), fixed.height()),
+            (64, 96),
+            "EXIF Orientation=6 应当把 96x64 立成 64x96"
+        );
+
+        // 没有方向的图，校正必须是**空操作**（否则等于给正常图片添乱）
+        let mut untouched = decode_image(&src).unwrap();
+        untouched.apply_orientation(read_exif_orientation(&src));
+        assert_eq!((untouched.width(), untouched.height()), (96, 64));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
