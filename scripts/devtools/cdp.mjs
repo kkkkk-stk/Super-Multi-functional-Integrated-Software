@@ -290,6 +290,103 @@ export function writeInputPng(name, width, height, seed = 0) {
   return p;
 }
 
+// ---------------------------------------------------------------------------
+// 最小 DOCX（给 `doc.to-pdf` 用的输入素材）
+// ---------------------------------------------------------------------------
+//
+// 为什么要手写一个：`doc.to-pdf` 的输入端口只收 Office 扩展名
+// （`.doc .docx .xls .xlsx .ppt .pptx .odt .ods .odp`），而仓库里**不存二进制测试素材**。
+// 之前 `ebook.convert` 那一节是用 pandoc 现造 epub 的（依赖另一个引擎），
+// 这对一条"验证 LibreOffice"的检查来说是个多余的前置条件 —— 没有 pandoc 的机器上，
+// 整节会被跳过，而它本该独立成立。
+//
+// DOCX 就是一个 ZIP，最小可用集合是三个条目：
+// `[Content_Types].xml` + `_rels/.rels` + `word/document.xml`。
+// 这里只写"存储"（不压缩）条目 —— 省掉 deflate，用系统 tar 就能验证结构。
+// CRC 复用上面 `crc32()`（PNG 分块用的同一个），不另写一份。
+
+/** 把一个 entry 列表打成 ZIP（全部用 stored，不压缩） */
+function zipStore(entries) {
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  for (const [name, content] of entries) {
+    const nameBuf = Buffer.from(name, 'utf8');
+    const data = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
+    const crc = crc32(data);
+    const local = Buffer.alloc(30 + nameBuf.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(0, 8); // stored
+    local.writeUInt16LE(0, 10);
+    local.writeUInt16LE(0x21, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28);
+    nameBuf.copy(local, 30);
+    locals.push(local, data);
+
+    const central = Buffer.alloc(46 + nameBuf.length);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt32LE(offset, 42);
+    nameBuf.copy(central, 46);
+    centrals.push(central);
+
+    offset += local.length + data.length;
+  }
+  const centralBuf = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(centrals.length, 8);
+  end.writeUInt16LE(centrals.length, 10);
+  end.writeUInt32LE(centralBuf.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, centralBuf, end]);
+}
+
+/** 生成一份最小但合法、LibreOffice 能打开的 `.docx` */
+export function makeDocx(text) {
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const paragraphs = String(text)
+    .split('\n')
+    .map((line) => `<w:p><w:r><w:t xml:space="preserve">${esc(line)}</w:t></w:r></w:p>`)
+    .join('');
+  return zipStore([
+    [
+      '[Content_Types].xml',
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`,
+    ],
+    [
+      '_rels/.rels',
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`,
+    ],
+    [
+      'word/document.xml',
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>${paragraphs}</w:body>
+</w:document>`,
+    ],
+  ]);
+}
+
 /**
  * 生成一份**最小但合法**的多页 PDF（每页一个大号字）。
  *

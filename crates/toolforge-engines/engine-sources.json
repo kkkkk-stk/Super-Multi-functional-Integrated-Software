@@ -111,6 +111,17 @@
     "note": "**为什么 stripComponents 是 1 而不是 2**：包里是 `poppler-26.09.0/Library/bin/*.exe|*.dll` + `poppler-26.09.0/Library/share/poppler/…`，而 pdftoppm 是按**可执行文件相对位置**去找 `../share/poppler` 的数据文件的。剥 2 层会把数据目录挪到 `poppler/`，二进制就找不到它了 —— 表现是渲染时报 `Couldn't find data directory`。剥 1 层保留 `Library/` 这一层，相对关系原封不动，所以 binSubdir 写成 `Library/bin`（MANAGED_LAYOUT 用同一个相对路径）。② 41.7 MB / 43,709,956 字节，sha256 是自己下载后算的：上游只有 GitHub release，**没有**发布校验和文件。③ 上游 tag 是版本固定的（v26.09.0-0），资产名里也带版本号 —— 别改成别的滚动别名。④ macOS / Linux 上请用系统包管理器（brew install poppler / apt install poppler-utils），没有配下载源。"
   },
   {
+    "id": "libreoffice",
+    "platform": "windows",
+    "url": "https://mirrors.tuna.tsinghua.edu.cn/libreoffice/libreoffice/stable/26.2.6/win/x86_64/LibreOffice_26.2.6_Win_x86-64.msi",
+    "fallbackUrl": "https://mirrors.ustc.edu.cn/tdf/libreoffice/stable/26.2.6/win/x86_64/LibreOffice_26.2.6_Win_x86-64.msi",
+    "sha256": "f9877032fd908beb9c0ddf06df4af5c2e85f419c42e14876c4cce5aae5fb2660",
+    "archive": "msi",
+    "stripComponents": 0,
+    "binSubdir": "program",
+    "note": "**为什么主源是镜像而不是上游**：TDF 自己的下载主机（`download.documentfoundation.org`）从本机**连不上** —— 那个 356 MB 的 `.msi` 请求直接超时（21 秒后 `Unable to connect`），而同一个路径下的目录列表是通的。这不是我们编的理由：该目录里就放着 `LibreOffice_26.2.6_Win_x86-64.msi.mirrorlist`，**说明 TDF 的字节分发本来就是镜像制**（官方主机只做索引与跳转）。所以这里填镜像不是「用第三方重新打包的东西」，而是走 TDF 指定的分发路径 —— 哈希能对上就是同一个文件。实测：清华 TUNA 33.3 秒下完 373,252,096 字节（**10.7 MB/s**），中科大 USTC 报的是**完全相同的 Content-Length**（373,252,096），两条互为兜底。\n\n**为什么是 `.msi` + 管理安装**（`archive: \"msi\"`，见 `extract_msi`）：LibreOffice 在 Windows 上只发安装器（`.msi` / `.exe`），没有「解压即用」的归档。而 `msiexec /a` 的管理安装**不是安装**：不写注册表、不装服务、不需要管理员权限（实测退出码 0），直接把包内容铺到 TARGETDIR。\n\n**布局是实测出来的，不是猜的**：解压后**没有 `Program Files\\LibreOffice\\` 这一层**，`TARGETDIR` 下直接就是 `program/`、`share/`、`Fonts/`、`help/`、`presets/` ⋯⋯（1,522.1 MB，213 个文件在 `program/` 下）。所以 `stripComponents` 是 0、`binSubdir` 是 `program`，而 `MANAGED_LAYOUT` 那条 `program/soffice` **正好对上**（不需要靠递归回退）。\n\n**`soffice.exe` 与 `soffice.com` 的区别（这一条踩过）**：两者都在 `program/` 下、大小一模一样（523,688 字节），但 `soffice.exe` 是 **GUI 子系统的启动器** —— 它跑 `--version` 会**挂住不返回**（本机实测 >20 秒两次、>300 秒一次），而转换任务（`--headless --convert-to pdf`）两者都能正常完成。后果是：只要探测跑 `--version`，引擎管理页就会卡满那 10 秒超时、版本永远显示「未知」。所以 Windows 上托管布局**刻意指向 `program/soffice.com`**（同一份 Exe 的控制台版本，`--version` 立刻打印 `LibreOffice 26.2.6.3 8221e31b…` 并退出）。`soffice.com` 同样是转换时的正确入口 —— 命令行场景本来就该用它。\n\n**实测过的完整链路**：MSI 管理安装 → `program/soffice.com --version` 正常 → `--headless --norestore --invisible -env:UserInstallation=… --convert-to pdf --outdir …` 把一份手写的 1,430 字节 `.docx` 转成了 56,160 字节的 PDF（`%PDF-` 头），并用 `pdftotext` 读回了里面的中文原文。"
+  },
+  {
     "id": "7zip",
     "platform": "windows",
     "url": "https://github.com/ip7z/7zip/releases/download/26.03/7z2603-x64.msi",

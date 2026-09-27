@@ -51,7 +51,11 @@ pub const ENGINE_BINARIES: &[(&str, &[&str])] = &[
     #[cfg(not(windows))]
     ("imagemagick", &["magick", "convert"]),
     ("pandoc", &["pandoc"]),
-    ("libreoffice", &["soffice"]),
+    // ⚠️ 顺序有讲究：Windows 上 `soffice.com`（控制台入口）排在 `soffice` 之前。
+    // 系统安装与托管安装里两个文件都在，而 `soffice.exe` 跑 `--version` 会挂住
+    // 不返回（GUI 子系统启动器），会让引擎探测白等满 10 秒超时。
+    // 详见 `lib.rs::MANAGED_LAYOUT_PLATFORM_OVERRIDES` 的表格。
+    ("libreoffice", &["soffice.com", "soffice"]),
     ("7zip", &["7z", "7za", "7zz"]),
     ("calibre", &["ebook-convert"]),
     ("tesseract", &["tesseract"]),
@@ -111,6 +115,18 @@ pub struct EngineSourceSpec {
     /// [`EngineRegistry::extract_msi`]。
     #[serde(default = "default_archive")]
     pub archive: String,
+    /// **备用下载地址**：主地址不通时按顺序再试这一个。
+    ///
+    /// 与 `EngineModel.fallback_url` 是同一套思路（见 [`download_with_fallback`]）：
+    /// 主地址"理论上最权威"，但**权威不等于可达**。
+    ///
+    /// 实测例子（LibreOffice）：TDF 自己的下载主机从本机**连不上**
+    /// （`download.documentfoundation.org` 上那个 356 MB 的 `.msi` 请求超时），
+    /// 而它在清华 TUNA / 中科大 USTC 的官方镜像上 33 秒就下完了（10.7 MB/s）。
+    /// 注意 TDF 的分发**本来就是镜像制**（同目录下有 `.mirrorlist`），
+    /// 所以镜像不是"第三方重新打包"，是同一个制品的另一条路 —— 哈希能对上就是同一个文件。
+    #[serde(default)]
+    pub fallback_url: Option<String>,
     #[serde(default)]
     pub strip_components: u32,
     /// 解压后需要额外加进 PATH 的相对目录（例如 `bin`）
@@ -440,8 +456,16 @@ impl EngineRegistry {
             .map(|(_, names)| *names)
             .unwrap_or(&[]);
 
-        // 优先按 MANAGED_LAYOUT 里声明的相对路径找
-        if let Some((_, rel)) = crate::MANAGED_LAYOUT.iter().find(|(id, _)| *id == engine_id) {
+        // 优先按"平台例外 → MANAGED_LAYOUT"声明的相对路径找
+        let override_rel = crate::MANAGED_LAYOUT_PLATFORM_OVERRIDES
+            .iter()
+            .find(|(id, _)| *id == engine_id)
+            .map(|(_, rel)| *rel);
+        let default_rel = crate::MANAGED_LAYOUT
+            .iter()
+            .find(|(id, _)| *id == engine_id)
+            .map(|(_, rel)| *rel);
+        for rel in [override_rel, default_rel].into_iter().flatten() {
             let p = self.paths.engine_dir(engine_id).join(rel);
             if let Some(found) = with_exe_suffix(&p) {
                 return Some(found);
@@ -654,9 +678,16 @@ impl EngineRegistry {
         std::fs::create_dir_all(self.paths.cache()).ok();
 
         job.info(format!("开始下载 {}（约 {} MB）", desc.name, desc.approx_size_mb));
-        let actual = self
-            .download_to(&src.url, &tmp, engine_id, job, expected.as_deref())
-            .await?;
+        let actual = download_with_fallback(
+            "engine",
+            &src.url,
+            src.fallback_url.as_deref(),
+            &tmp,
+            engine_id,
+            job,
+            self.tx.clone(),
+        )
+        .await?;
 
         if let Some(exp) = &expected {
             if !actual.eq_ignore_ascii_case(exp) {
@@ -899,7 +930,16 @@ impl EngineRegistry {
             }
         }
 
-        let actual = download_with_fallback(spec, &dest, model_id, job, self.tx.clone()).await?;
+        let actual = download_with_fallback(
+            "model",
+            &spec.url,
+            spec.fallback_url.as_deref(),
+            &dest,
+            model_id,
+            job,
+            self.tx.clone(),
+        )
+        .await?;
         if let Some(exp) = &expected {
             if !actual.eq_ignore_ascii_case(exp) {
                 let _ = std::fs::remove_file(&dest);
@@ -923,32 +963,35 @@ impl EngineRegistry {
 /// 只填镜像 → 所有用户都依赖第三方镜像、而且镜像本身会抖。
 /// 两个都填、按顺序试，是唯一对两边都成立的答案。
 ///
+/// 引擎归档走的是同一条路（LibreOffice：TDF 主机不可达 → 官方镜像可用）。
 /// 日志里会写明**这次是从哪儿下的** —— 用户与排查的人都需要知道
 /// "兜底到底有没有被用上"。
 async fn download_with_fallback(
-    spec: &ModelSpec,
+    subject: &str,
+    primary_url: &str,
+    fallback_url: Option<&str>,
     dest: &Path,
     label: &str,
     job: &JobCtx,
     tx: Option<tokio::sync::broadcast::Sender<AppEvent>>,
 ) -> ToolforgeResult<String> {
-    let primary = download(&spec.url, dest, label, job, tx.clone()).await;
+    let primary = download(primary_url, dest, label, job, tx.clone()).await;
     let Err(first_err) = primary else {
         return primary;
     };
 
-    let Some(fallback) = spec.fallback_url.as_deref() else {
+    let Some(fallback) = fallback_url else {
         return Err(first_err);
     };
 
     job.warn(format!(
         "主下载源（{}）失败，改用备用源重试：{}",
-        url_host(&spec.url),
+        url_host(primary_url),
         first_err.message
     ));
     tracing::warn!(
-        model = %spec.id,
-        primary = %spec.url,
+        subject,
+        primary = %primary_url,
         fallback = %fallback,
         "主下载源失败，改用备用源"
     );
@@ -968,7 +1011,7 @@ async fn download_with_fallback(
         )
         .with_detail(format!(
             "主源 {}：{}\n备用源 {}：{}",
-            url_host(&spec.url),
+            url_host(primary_url),
             first_err.message,
             url_host(fallback),
             second.message
@@ -1054,47 +1097,167 @@ pub async fn download(
     job: &JobCtx,
     tx: Option<tokio::sync::broadcast::Sender<AppEvent>>,
 ) -> ToolforgeResult<String> {
-    let client = build_download_client(false)?;
-    match send_download(&client, url).await {
-        Ok(resp) if resp.status().is_success() => {
-            return stream_to_file(resp, dest, label, job, tx, STALL_TIMEOUT).await
+    download_with_stall(url, dest, label, job, tx, STALL_TIMEOUT).await
+}
+
+/// [`download`] 的本体，`stall` 作为参数传进来**是为了能被测试**。
+///
+/// 断点续传的循环只写在这一处：测试直接调它并传一个 300 ms 的 stall，
+/// 于是"卡住 → 续传 → 完成"这条路径**跑的就是生产代码**，而不是测试里
+/// 另抄一遍的等价逻辑（抄一遍就等于没测）。
+async fn download_with_stall(
+    url: &str,
+    dest: &Path,
+    label: &str,
+    job: &JobCtx,
+    tx: Option<tokio::sync::broadcast::Sender<AppEvent>>,
+    stall: Duration,
+) -> ToolforgeResult<String> {
+    // ------------------------------------------------------------------
+    // 断点续传主循环
+    //
+    // 这个循环是被**实测**逼出来的：本机开着网络加速器时，GitHub 的 release 资产
+    // CDN（`release-assets.githubusercontent.com`）只有 **1~3 KB/s**，并且会在
+    // 收了几百 KB 之后**完全停住**。原来的行为是"卡死 → 报错 → 从头再来"，
+    // 于是一个 30 MB 的引擎下到 2.1% 就彻底失败 —— 而重来一次还是卡在同一处。
+    //
+    // 现在：卡住/中断时**保留已收到的字节**，带上 `Range` 头从断点继续，
+    // 最多 [`MAX_DOWNLOAD_ATTEMPTS`] 次。下载大文件时这是标准做法，也是
+    // "网络抖一下就要用户点第二次"和"它自己会接着下"的区别。
+    // ------------------------------------------------------------------
+    let mut received: u64 = 0;
+    let mut total: u64 = 0;
+    let mut last_err: Option<ToolforgeError> = None;
+
+    for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+        // 首次用默认客户端（HTTP/2）；一旦失败过就换成 HTTP/1.1 ——
+        // 本机 github.com 被解析到 127.0.0.1（有本地代理在做 MITM），
+        // 那种中间设备把 h2 拆坏的概率明显更高。
+        let client = build_download_client(attempt > 1)?;
+
+        match send_download(&client, url, received).await {
+            Ok(resp) => {
+                let status = resp.status();
+
+                if !status.is_success() {
+                    if is_retryable_status(status) {
+                        tracing::warn!(url, %status, "下载失败（可重试状态码）");
+                        last_err = Some(
+                            ToolforgeError::new(
+                                ErrorCode::Network,
+                                format!("下载 {label} 失败：HTTP {status}"),
+                            )
+                            .with_detail(format!("URL：{url}")),
+                        );
+                        continue;
+                    }
+                    // 4xx 之类：重试没有意义，直接给用户一个准确的结论
+                    return Err(ToolforgeError::new(
+                        ErrorCode::Network,
+                        format!("下载 {label} 失败：HTTP {status}"),
+                    )
+                    .with_detail(format!("URL：{url}")));
+                }
+
+                // 我们要了断点，服务端却从头给 —— 必须把半截文件丢掉重来，
+                // 否则会把整份内容追加到已有字节后面（产物长度翻倍、哈希必然不对）。
+                if received > 0
+                    && !(status == reqwest::StatusCode::PARTIAL_CONTENT
+                        && content_range_starts_at(&resp, received))
+                {
+                    job.warn(format!(
+                        "服务端不支持断点续传（已收到 {}），改为从头重新下载",
+                        human_bytes(received)
+                    ));
+                    let _ = std::fs::remove_file(dest);
+                    received = 0;
+                }
+
+                total = resp.content_length().unwrap_or(0) + received;
+
+                match stream_to_file(resp, dest, label, job, tx.clone(), stall, received, total).await
+                {
+                    Ok(n) => {
+                        received = n;
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        // 关键：**保留**已经落盘的字节（stream_to_file 内部已 flush），
+                        // 这样才能续传。清理半截文件的责任挪到了"最终失败"那一步。
+                        received = file_len(dest);
+                        last_err = Some(e);
+                    }
+                }
+            }
+            Err(e) => {
+                last_err = Some(e);
+                received = file_len(dest);
+            }
         }
-        Ok(resp) if is_retryable_status(resp.status()) => {
-            tracing::warn!(
-                url,
-                status = %resp.status(),
-                "下载失败，改用 HTTP/1.1 重试一次"
-            );
-        }
-        Ok(resp) => {
-            return Err(ToolforgeError::new(
-                ErrorCode::Network,
-                format!("下载 {label} 失败：HTTP {}", resp.status()),
-            )
-            .with_detail(format!("URL：{url}")));
-        }
-        Err(e) => {
-            tracing::warn!(url, err = %e.message, "下载请求失败，改用 HTTP/1.1 重试一次");
+
+        if attempt < MAX_DOWNLOAD_ATTEMPTS {
+            let got = if received > 0 {
+                format!("已收到 {}", human_bytes(received))
+            } else {
+                "尚未收到数据".to_string()
+            };
+            job.warn(format!(
+                "下载中断（{got}），正在从断点续传：第 {}/{} 次重试",
+                attempt + 1,
+                MAX_DOWNLOAD_ATTEMPTS
+            ));
         }
     }
 
-    let fallback = build_download_client(true)?;
-    let resp = send_download(&fallback, url).await?;
-    if !resp.status().is_success() {
-        return Err(ToolforgeError::new(
-            ErrorCode::Network,
-            format!(
-                "下载 {label} 失败：HTTP {}（HTTP/1.1 重试后仍然失败）",
-                resp.status()
-            ),
-        )
-        .with_detail(format!(
-            "URL：{url}\n\n\
-             如果这个网络有代理 / 透明加速，请把它对本应用放行；\
-             也可以手动下载该文件后放进引擎目录。"
-        )));
+    let Some(err) = last_err else {
+        // 成功：哈希从**落盘的文件**上算。
+        //
+        // 为什么不再边下边算：断点续传会让"一份文件的字节"分几次到达，
+        // 增量 hasher 要么跨尝试持有状态、要么在续传前把半截文件重读一遍。
+        // 直接从文件算最简单，代价是多读一遍盘 —— 356 MB 的 LibreOffice 安装包
+        // 在本机实测多花不到一秒，而它换来的是"续传了多少次都不影响校验"。
+        let path = dest.to_path_buf();
+        let actual_total = received;
+        let expected_total = total;
+        let h = tokio::task::spawn_blocking(move || hash_file(&path))
+            .await
+            .map_err(|e| ToolforgeError::internal(format!("哈希任务失败：{e}")))?
+            .map_err(|e| ToolforgeError::io(format!("读取下载产物失败：{e}")))?;
+        if expected_total > 0 && actual_total != expected_total {
+            return Err(ToolforgeError::new(
+                ErrorCode::Network,
+                format!(
+                    "下载 {label} 不完整：服务端声明 {}，实际收到 {}",
+                    human_bytes(expected_total),
+                    human_bytes(actual_total)
+                ),
+            )
+            .with_detail(format!("URL：{url}\n\n请重试；反复出现说明这条链路会截断大文件。")));
+        }
+        return Ok(h);
+    };
+
+    // 最终失败：把半截文件删掉 —— 留一个 2% 的 `.zip` 在地上，用户只会以为"下过了"
+    let _ = std::fs::remove_file(dest);
+    Err(err)
+}
+
+/// 已落盘文件的大小（不存在算 0）—— 断点续传的起点
+fn file_len(p: &Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+fn human_bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = n as f64;
+    if f < K {
+        format!("{n} 字节")
+    } else if f < K * K {
+        format!("{:.0} KB", f / K)
+    } else {
+        format!("{:.1} MB", f / (K * K))
     }
-    stream_to_file(resp, dest, label, job, tx, STALL_TIMEOUT).await
 }
 
 fn build_download_client(http1_only: bool) -> ToolforgeResult<reqwest::Client> {
@@ -1163,8 +1326,17 @@ fn describe_reqwest_error(e: &reqwest::Error) -> String {
     }
 }
 
-async fn send_download(client: &reqwest::Client, url: &str) -> ToolforgeResult<reqwest::Response> {
-    client.get(url).send().await.map_err(|e| {
+async fn send_download(
+    client: &reqwest::Client,
+    url: &str,
+    resume_from: u64,
+) -> ToolforgeResult<reqwest::Response> {
+    let mut req = client.get(url);
+    if resume_from > 0 {
+        // 断点续传：告诉服务端"从第 N 个字节开始给"
+        req = req.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
+    }
+    req.send().await.map_err(|e| {
         let reason = describe_reqwest_error(&e);
         ToolforgeError::new(ErrorCode::Network, format!("请求下载地址失败：{reason}")).with_detail(
             format!(
@@ -1178,6 +1350,37 @@ async fn send_download(client: &reqwest::Client, url: &str) -> ToolforgeResult<r
         )
     })
 }
+
+/// 服务端有没有真的**按我们请求的偏移**给部分内容。
+///
+/// 只看状态码是不够的：`206` 必须配合 `Content-Range: bytes <start>-<end>/<total>`。
+/// 少了这个校验，一个"返回 206 但从 0 开始给"的服务端会让我们把整份文件**追加**到
+/// 半截文件后面 —— 得到一个长度对不上、哈希也不对的产物，而失败报告会说
+/// "哈希不匹配"，把排查方向指向校验而不是续传。
+fn content_range_starts_at(resp: &reqwest::Response, want: u64) -> bool {
+    let Some(v) = resp.headers().get(reqwest::header::CONTENT_RANGE) else {
+        return false;
+    };
+    let Ok(s) = v.to_str() else { return false };
+    // 形如 `bytes 100-999/1000`
+    let Some(rest) = s.trim().strip_prefix("bytes") else {
+        return false;
+    };
+    let Some((range, _)) = rest.trim().split_once('/') else {
+        return false;
+    };
+    let Some((start, _)) = range.split_once('-') else {
+        return false;
+    };
+    start.trim().parse::<u64>() == Ok(want)
+}
+
+/// 一次下载最多尝试几次（首次 + 续传重试）。
+///
+/// 4 是折中值：本机实测的坏链路上（GitHub 资产 CDN 在加速器下只有 1~3 KB/s、
+/// 并且会中途停住）多试几次**确实**能往前走；但如果服务端是彻底不可用，4 次也不至于
+/// 让用户干等太久 —— 每次最多再等一个 [`STALL_TIMEOUT`] 才会放弃。
+const MAX_DOWNLOAD_ATTEMPTS: usize = 4;
 
 /// 多久**一个字节都没收到**就判定为卡死。
 ///
@@ -1208,11 +1411,18 @@ fn total_download_timeout() -> Duration {
     Duration::from_secs(2 * 3600)
 }
 
-/// 把响应体流式写盘，边写边算 SHA-256。
+/// 把响应体流式写盘。返回**总共落盘的字节数**（含续传前已有的那部分）。
 ///
 /// `stall` 通过参数传入而不是直接用常量，**是为了能被测试**：
 /// 一条"卡住 60 秒才报错"的逻辑如果只能靠等 60 秒来验，就没人会去验它。
 /// 生产路径传 [`STALL_TIMEOUT`]，测试传几百毫秒。
+///
+/// ## 中断时**不删**文件（这条是断点续传的前提）
+///
+/// 以前这里一卡住就 `remove_file`，因为"留一个 2% 的文件在地上会让人以为下过了"。
+/// 现在清理挪到了调用方（[`download`]）的**最终失败**分支：中途保住字节是为了续传，
+/// 最终失败时照样删掉。两个目标不冲突，只是责任换了个地方。
+#[allow(clippy::too_many_arguments)]
 async fn stream_to_file(
     resp: reqwest::Response,
     dest: &Path,
@@ -1220,17 +1430,24 @@ async fn stream_to_file(
     job: &JobCtx,
     tx: Option<tokio::sync::broadcast::Sender<AppEvent>>,
     stall: Duration,
-) -> ToolforgeResult<String> {
-    use sha2::{Digest, Sha256};
-
-    let total = resp.content_length().unwrap_or(0);
+    resume_from: u64,
+    total: u64,
+) -> ToolforgeResult<u64> {
     let url_for_error = resp.url().to_string();
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| ToolforgeError::io(format!("创建文件 {} 失败：{e}", dest.display())))?;
+    let mut file = if resume_from > 0 {
+        // 追加模式：已有的 `resume_from` 字节要原样保留
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(dest)
+            .await
+            .map_err(|e| ToolforgeError::io(format!("打开断点文件 {} 失败：{e}", dest.display())))?
+    } else {
+        tokio::fs::File::create(dest)
+            .await
+            .map_err(|e| ToolforgeError::io(format!("创建文件 {} 失败：{e}", dest.display())))?
+    };
 
-    let mut hasher = Sha256::new();
-    let mut downloaded: u64 = 0;
+    let mut downloaded: u64 = resume_from;
     let started = std::time::Instant::now();
     let mut last_emit = std::time::Instant::now() - Duration::from_secs(1);
     let mut stream = resp.bytes_stream();
@@ -1243,7 +1460,7 @@ async fn stream_to_file(
             Ok(Some(c)) => c,
             Ok(None) => break, // 正常结束
             Err(_) => {
-                let _ = std::fs::remove_file(dest);
+                let _ = file.flush().await;
                 return Err(ToolforgeError::new(
                     ErrorCode::Network,
                     format!(
@@ -1254,9 +1471,9 @@ async fn stream_to_file(
                 .with_detail(format!(
                     "已经收到 {}，但连接不再有数据。\nURL：{url_for_error}\n\n\
                      常见原因：对方服务器限速或不可达、代理把大文件拦了。\n\
-                     可以重试一次；若反复卡在同一处，就手动下载这个文件放进引擎目录。",
+                     本应用会自动从断点续传；若反复卡在同一处，就手动下载这个文件放进引擎目录。",
                     if downloaded > 0 {
-                        format!("{} KB", downloaded / 1024)
+                        human_bytes(downloaded)
                     } else {
                         "0 字节（连接建立了但服务端没吐数据）".to_string()
                     }
@@ -1268,7 +1485,6 @@ async fn stream_to_file(
         let chunk = chunk.map_err(|e| {
             ToolforgeError::new(ErrorCode::Network, format!("下载 {label} 中断：{e}"))
         })?;
-        hasher.update(&chunk);
         file.write_all(&chunk)
             .await
             .map_err(|e| ToolforgeError::io(format!("写入失败：{e}")))?;
@@ -1276,7 +1492,7 @@ async fn stream_to_file(
 
         if last_emit.elapsed() >= Duration::from_millis(500) {
             last_emit = std::time::Instant::now();
-            let speed = downloaded as f64 / started.elapsed().as_secs_f64().max(0.001);
+            let speed = (downloaded - resume_from) as f64 / started.elapsed().as_secs_f64().max(0.001);
             if let Some(tx) = &tx {
                 let _ = tx.send(AppEvent::EngineDownloadProgress {
                     engine_id: label.to_string(),
@@ -1307,7 +1523,7 @@ async fn stream_to_file(
         .map_err(|e| ToolforgeError::io(format!("刷新文件失败：{e}")))?;
     drop(file);
 
-    Ok(hex::encode(hasher.finalize()))
+    Ok(downloaded)
 }
 
 fn human_speed(bps: f64) -> String {
@@ -1558,6 +1774,7 @@ mod tests {
             url: "https://e/x.zip".into(),
             sha256: Some("SHA256:ABCDEF".into()),
             archive: "zip".into(),
+            fallback_url: None,
             strip_components: 0,
             bin_subdir: None,
             note: None,
@@ -1573,6 +1790,7 @@ mod tests {
             url: "https://e/x.zip".into(),
             sha256: None,
             archive: "zip".into(),
+            fallback_url: None,
             strip_components: 0,
             bin_subdir: None,
             note: None,
@@ -1874,6 +2092,57 @@ mod tests {
         }
     }
 
+    /// 备用源必须指向**同一个制品**（只是另一个主机）。
+    ///
+    /// 判据：**文件名必须相同**（URL 的最后一段）。
+    ///
+    /// 为什么不是"整条路径相同"：镜像的路径布局本来就各不相同 —— 本仓库真实的一对是
+    /// 清华 TUNA 的 `/libreoffice/libreoffice/stable/…` 与中科大 USTC 的
+    /// `/tdf/libreoffice/stable/…`，文件名 `LibreOffice_26.2.6_Win_x86-64.msi` 一样、
+    /// 路径前缀不一样（写这条测试时先用整路径比，被这两个真实镜像当场判红）。
+    ///
+    /// 文件名相同这条**仍能挡住最容易犯的错**：备用源填成了另一个版本、另一个架构、
+    /// 或者干脆是另一个文件。那类错误在运行时表现为"兜底下载成功、然后哈希不匹配"，
+    /// 而用户看到的是"校验失败"，根本不会想到是备用源填错了。
+    ///
+    /// 与模型侧的 `fallback_urls_point_at_the_same_asset`（`toolforge-core`）是同一套规则。
+    #[test]
+    fn fallback_urls_point_at_the_same_asset() {
+        let list: Vec<EngineSourceSpec> = serde_json::from_str(BUILTIN_SOURCES).unwrap();
+        let file_name_of = |u: &str| -> String {
+            let path = u.split('?').next().unwrap_or(u);
+            path.rsplit('/').next().unwrap_or(path).to_string()
+        };
+        let mut with_fallback = 0;
+        for s in &list {
+            let Some(fb) = &s.fallback_url else { continue };
+            with_fallback += 1;
+            assert_ne!(
+                url_host(&s.url),
+                url_host(fb),
+                "{}@{} 的备用源和主源是同一台主机，起不到兜底作用：{}",
+                s.id,
+                s.platform,
+                fb
+            );
+            assert_eq!(
+                file_name_of(&s.url),
+                file_name_of(fb),
+                "{}@{} 的备用源文件名与主源不同 —— 备用源必须是**同一个制品**的另一条路，\
+                 否则会下载成功然后在哈希校验处失败，而错误信息会把人指向「校验」而不是「填错了地址」。\n\
+                 主源：{}\n备用源：{}",
+                s.id,
+                s.platform,
+                s.url,
+                fb
+            );
+        }
+        assert!(
+            with_fallback >= 1,
+            "一条备用源都没有了 —— 是不是误删了 LibreOffice 的镜像兜底？"
+        );
+    }
+
     /// 提示语不能把用户指错方向：有来源才说"可一键下载"。
     #[test]
     fn install_hint_only_promises_a_download_when_a_source_exists() {
@@ -1912,22 +2181,33 @@ mod tests {
     /// 因为服务端连接建立之后不再吐数据，而客户端总超时是 30 分钟。
     /// 用户看到的是一个不动的进度条和零解释。
     ///
-    /// 如果只能靠"等 60 秒"来验证它，就没人会验 —— 所以 `stream_to_file` 的
-    /// `stall` 是参数，生产传常量、测试传 300 ms。
+    /// 如果只能靠"等 60 秒"来验证它，就没人会验 —— 所以 `stall` 是参数，
+    /// 生产传 [`STALL_TIMEOUT`]、测试传 300 ms。
     ///
     /// 用一个**裸 TCP server** 而不是 mock 库：它要做的事只有一件 ——
     /// 收下请求、回一个声明了 Content-Length 的 200 头、然后**永远沉默**。
     /// 这正是真实事故的形状，而且不加任何依赖。
+    ///
+    /// ## 引入断点续传之后这条测试变了什么
+    ///
+    /// 结论没变（最终失败时错误可读、半截文件被删掉），但路径变了：
+    /// 现在客户端会先自己续传几次。所以服务端要**能接受多次连接**，
+    /// 而断言仍然只针对最后一次的结论 —— **"会重试"不能变成"错误信息变糊"**。
     #[tokio::test]
     async fn stalled_download_fails_with_a_readable_error() {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // 服务端：回响应头 → 不发 body → 挂住（连接保持打开）
+        // 每一次连接都：回响应头 → 不发 body → 挂住
         tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
+            for _ in 0..MAX_DOWNLOAD_ATTEMPTS {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
                 let _ = sock
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
@@ -1935,8 +2215,10 @@ mod tests {
                     )
                     .await;
                 let _ = sock.flush().await;
-                // 故意什么都不再做 —— 保持连接直到测试结束
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(sock);
+                });
             }
         });
 
@@ -1949,14 +2231,9 @@ mod tests {
         let queue = toolforge_core::queue::JobQueue::new(1, tx);
         let job = queue.create(toolforge_core::job::JobKind::Probe, "停滞测试", 1);
 
-        let client = build_download_client(false).unwrap();
-        let resp = send_download(&client, &format!("http://{addr}/big.bin"))
-            .await
-            .expect("连接应当成功（服务端会回响应头）");
-
         let started = std::time::Instant::now();
-        let err = stream_to_file(
-            resp,
+        let err = download_with_stall(
+            &format!("http://{addr}/big.bin"),
             &dest,
             "测试文件",
             &job,
@@ -1973,14 +2250,258 @@ mod tests {
             err.message
         );
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "必须在 stall 之后很快返回，实际用了 {:?}",
+            err.detail.as_deref().unwrap_or("").contains("断点续传"),
+            "detail 应当告诉用户「它自己会续传」，而不是让人以为只能手动下载：{:?}",
+            err.detail
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "必须在 stall 之后很快返回（含 4 次续传尝试），实际用了 {:?}",
             started.elapsed()
         );
-        // 半截文件必须被删掉：留一个 0 字节的 .zip 在那儿只会让人以为下过
-        assert!(!dest.exists(), "卡死后应当删除未完成的文件");
+        // 最终失败时半截文件必须被删掉 —— 留一个 0 字节的 .zip 在那儿只会让人以为下过。
+        // （中断**期间**保留是另一回事，见下一条测试。）
+        assert!(!dest.exists(), "最终失败后应当删除未完成的文件");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **断点续传**：第一次连接给一半就停住，第二次连接必须带 `Range` 头接着给，
+    /// 最终产物的字节与哈希都要完整正确。
+    ///
+    /// ## 这条测试盯的是三种具体的错法
+    ///
+    /// 1. **卡死直接失败**（原来的行为）：一个 30 MB 的文件收到 2% 就彻底失败，
+    ///    用户重试还是卡在同一处 —— 本机实测过（GitHub 资产 CDN 只有 1~3 KB/s
+    ///    且会停住）。
+    /// 2. **续传时没带 `Range`**：服务端从头再给一遍，产物变成"两段拼接"，
+    ///    长度和哈希都不对。所以服务端在第二条连接上**断言**必须有 Range 头。
+    /// 3. **没有校验服务端是否真的遵守了 Range**：见下一条测试。
+    ///
+    /// 断言用**逐字节比对 + 哈希**，而不是"文件存在"：拼接产物同样"存在"。
+    #[tokio::test]
+    async fn stalled_download_resumes_from_the_breakpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TOTAL: usize = 300_000;
+        const HALF: usize = TOTAL / 2;
+        let payload: Vec<u8> = (0..TOTAL as u32).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_payload = payload.clone();
+        tokio::spawn(async move {
+            for conn_no in 1..=2 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+
+                if conn_no == 1 {
+                    // 声明整份长度，但只给一半就不再吐数据
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                         Content-Length: {TOTAL}\r\n\r\n"
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&server_payload[..HALF]).await;
+                    let _ = sock.flush().await;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        drop(sock);
+                    });
+                } else {
+                    assert!(
+                        req.to_ascii_lowercase()
+                            .contains(&format!("range: bytes={HALF}-")),
+                        "第二次连接必须带 `Range: bytes={HALF}-`（请求头原文：{req:?}）"
+                    );
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\n\
+                         Content-Range: bytes {HALF}-{}/{TOTAL}\r\nContent-Length: {}\r\n\r\n",
+                        TOTAL - 1,
+                        TOTAL - HALF
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&server_payload[HALF..]).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                }
+            }
+        });
+
+        let dir = std::env::temp_dir().join("tf-resume-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.join("resumed.bin");
+        let _ = std::fs::remove_file(&dest);
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let queue = toolforge_core::queue::JobQueue::new(1, tx);
+        let job = queue.create(toolforge_core::job::JobKind::Probe, "续传测试", 1);
+
+        let hash = download_with_stall(
+            &format!("http://{addr}/big.bin"),
+            &dest,
+            "续传测试",
+            &job,
+            None,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect("卡住之后应当能从断点续传并最终成功");
+
+        let got = std::fs::read(&dest).expect("产物应当存在");
+        assert_eq!(
+            got.len(),
+            TOTAL,
+            "续传后的长度必须正好是原长度（拼接错误会让它变长）"
+        );
+        assert_eq!(got, payload, "续传后的字节必须与原始负载逐字节相同");
+
+        let want = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&payload);
+            hex::encode(h.finalize())
+        };
+        assert_eq!(hash, want, "返回的哈希必须是**整份文件**的哈希");
+        assert_eq!(hash_file(&dest).unwrap(), want);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「服务端不认 Range 却返回 200」时必须**丢弃半截文件从头来**。
+    ///
+    /// 少了这条校验，续传会把整份内容**追加**到已有字节后面 —— 产物长度翻倍、
+    /// 哈希不对，而报错会说"哈希不匹配"，把排查方向指向校验而不是续传。
+    /// 所以这条测试断言的是**长度正好是一份**（拼接会让它变成 1.5 份）。
+    #[tokio::test]
+    async fn resume_is_dropped_when_server_ignores_the_range_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TOTAL: usize = 64_000;
+        const HALF: usize = TOTAL / 2;
+        let body: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_body = body.clone();
+        tokio::spawn(async move {
+            for conn_no in 1..=2 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                // 这个服务端**永远**回 200 + 完整内容，完全不理会 Range
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                     Content-Length: {TOTAL}\r\n\r\n"
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                if conn_no == 1 {
+                    // 先给一半，然后停住
+                    let _ = sock.write_all(&server_body[..HALF]).await;
+                    let _ = sock.flush().await;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        drop(sock);
+                    });
+                } else {
+                    // 第二次连接：无视 Range，把**整份**再发一遍
+                    let _ = sock.write_all(&server_body).await;
+                    let _ = sock.flush().await;
+                    let _ = sock.shutdown().await;
+                }
+            }
+        });
+
+        let dir = std::env::temp_dir().join("tf-range-ignored-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.join("ignored.bin");
+        let _ = std::fs::remove_file(&dest);
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let queue = toolforge_core::queue::JobQueue::new(1, tx);
+        let job = queue.create(toolforge_core::job::JobKind::Probe, "Range 对照", 1);
+
+        let hash = download_with_stall(
+            &format!("http://{addr}/f.bin"),
+            &dest,
+            "Range 对照",
+            &job,
+            None,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect("丢弃半截文件之后应当能从头下完");
+
+        let got = std::fs::read(&dest).unwrap();
+        assert_eq!(
+            got.len(),
+            TOTAL,
+            "产物长度必须**正好一份** —— 变长就说明半截文件没有被丢弃"
+        );
+        assert_eq!(got, body, "内容必须逐字节相同");
+        assert_eq!(hash_file(&dest).unwrap(), hash);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows 上必须挑 **`soffice.com`**（控制台入口），不能挑 `soffice.exe`。
+    ///
+    /// 触发这条规则的是一个实测出来的现象：LibreOffice 的 Windows 包里两个文件都在、
+    /// 大小还一模一样（523,688 字节），但 `soffice.exe` 是 **GUI 子系统**的启动器 ——
+    /// 跑 `--version` 会挂住不返回（本机实测 >20 秒两次、>300 秒一次）。
+    /// 而引擎探测要跑 `--version`，于是引擎管理页会卡满 10 秒超时、版本永远「未知」。
+    ///
+    /// 转换任务两者都能跑，所以这条不是"能不能用"的问题，而是"探测要不要白等 10 秒"——
+    /// 一个只在真机上才看得见的差别。见 `lib.rs::MANAGED_LAYOUT_PLATFORM_OVERRIDES`。
+    #[test]
+    fn libreoffice_prefers_the_console_entrypoint_on_windows() {
+        let tmp = std::env::temp_dir().join("tf-managed-libreoffice");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let reg = EngineRegistry::new(AppPaths::new(&tmp));
+        let program = reg.paths().engine_dir("libreoffice").join("program");
+        std::fs::create_dir_all(&program).unwrap();
+
+        // 复刻真实的 MSI 管理安装布局：TARGETDIR 下直接是 program/（没有 Program Files 那一层）
+        #[cfg(windows)]
+        const WANT: &str = "soffice.com";
+        #[cfg(not(windows))]
+        const WANT: &str = "soffice";
+
+        #[cfg(windows)]
+        {
+            // 两个都在 —— 旧行为会挑到 soffice.exe
+            std::fs::write(program.join("soffice.exe"), b"MZ gui").unwrap();
+            std::fs::write(program.join("soffice.com"), b"MZ console").unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = program.join("soffice");
+            std::fs::write(&p, b"#!/bin/sh\n").unwrap();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+
+        let found = reg
+            .managed_binary("libreoffice")
+            .expect("托管目录里有可执行文件时必须找到");
+        assert_eq!(
+            found.file_name().and_then(|s| s.to_str()),
+            Some(WANT),
+            "Windows 上必须挑控制台入口 `soffice.com` —— \
+             `soffice.exe` 跑 --version 会挂住，探测会白等满 10 秒超时"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// 不产出可执行文件的"虚拟引擎"。
@@ -2180,9 +2701,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_only_engine_reports_not_configured_instead_of_downloading() {
-        // libreoffice 在目录里是 System-only：install 必须**明确拒绝**并给出
-        // 手动安装指引，而不是去找一个不存在的下载源、也不是静默成功。
+    async fn system_only_engines_report_not_configured_instead_of_downloading() {
+        // 没有下载源的引擎：`install` 必须**明确拒绝**并给出手动安装指引，
+        // 而不是去找一个不存在的来源、也不是静默成功。
+        //
+        // ⚠️ 这条测试原来硬编了 `libreoffice`。后来 LibreOffice 在 Windows 上有了
+        // 下载源（`.msi` + 管理安装），于是这条测试**真的去下了一个 356 MB 的安装包**
+        // —— 测试从 0.3 秒变成 120 秒，还顺手在临时目录里装了一份 LibreOffice。
+        // 单元测试不该有联网副作用（这条教训本项目已经踩过一次，见 ROADMAP §3）。
+        //
+        // 所以现在**从目录推导**"哪些引擎没有下载源"，而不是硬编一个 id：
+        // 将来谁加了下载源，测试自动跟着走，不会再变成一次静默的大文件下载。
+        let targets: Vec<String> = engine_catalog()
+            .into_iter()
+            .filter(|d| d.download_platforms.is_empty())
+            .map(|d| d.id)
+            .collect();
+        assert!(
+            !targets.is_empty(),
+            "至少要有一个只支持系统安装的引擎，否则这条测试没有意义"
+        );
+
         let tmp = std::env::temp_dir().join("tf-engine-test-systemonly");
         let _ = std::fs::remove_dir_all(&tmp);
         let paths = AppPaths::new(&tmp);
@@ -2191,23 +2730,27 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::broadcast::channel(16);
         let q = toolforge_core::queue::JobQueue::new(1, tx);
-        let ctx = q.create(
-            toolforge_core::job::JobKind::EngineInstall {
-                engine_id: "libreoffice".into(),
-            },
-            "test",
-            0,
-        );
 
-        match reg.install("libreoffice", &ctx, false, false).await.unwrap() {
-            EngineInstallOutcome::AlreadyAvailable { .. } => {}
-            EngineInstallOutcome::NotConfigured { reason } => {
-                assert!(
-                    reason.contains("系统安装") || reason.contains("手动"),
-                    "应当给出可操作的手动安装指引：{reason}"
-                );
+        for engine_id in &targets {
+            let ctx = q.create(
+                toolforge_core::job::JobKind::EngineInstall {
+                    engine_id: engine_id.clone(),
+                },
+                "test",
+                0,
+            );
+            match reg.install(engine_id, &ctx, false, false).await.unwrap() {
+                EngineInstallOutcome::AlreadyAvailable { .. } => {}
+                EngineInstallOutcome::NotConfigured { reason } => {
+                    assert!(
+                        reason.contains("系统安装")
+                            || reason.contains("手动")
+                            || reason.contains("没有配置下载源"),
+                        "`{engine_id}` 应当给出可操作的手动安装指引：{reason}"
+                    );
+                }
+                other => panic!("没有下载源的引擎不该走下载路径（{engine_id}）：{other:?}"),
             }
-            other => panic!("System-only 引擎不该走下载路径：{other:?}"),
         }
 
         let _ = std::fs::remove_dir_all(&tmp);

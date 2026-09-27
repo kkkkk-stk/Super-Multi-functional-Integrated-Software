@@ -1,0 +1,78 @@
+# ToolForge L1 插件（声明式编排，零代码）
+#
+# ── 这个插件为什么现在才有 ───────────────────────────────────────────────
+# `doc.to-pdf` 这个**节点**早就写好了（执行器也是完整的），但**没有一个内置插件用它**：
+# 其他节点族都各有一个面向用户的入口（image-convert / ebook-convert / remove-bg /
+# video-to-gif / ai-describe / image-upscale / batch-rename），只有它就那么悬着。
+#
+# 后果不是"少一个工具"，而是**它从来没有被真机跑过**：单元测试、`cargo check`、
+# 界面上的可用性判定都不会碰到它，而一次真实转换都没发生过。直到 2026 年这一轮
+# 把 LibreOffice 打通（Windows 用官方 `.msi` 的管理安装）才第一次跑出 PDF。
+# `verify-platform.mjs`【19】盯着这条链路。
+#
+# ── 为什么只做 PDF ───────────────────────────────────────────────────────
+# 节点的名字就是 `doc.to-pdf`，描述写的是"把 Word / Excel / PPT 转 PDF"。
+# 它此前还声明过一个 `format` 参数（pdf / pdf-a / html / txt），但**执行器完全没读它** ——
+# 那是个装饰性参数，而且危险：真按 html 输出的话，宿主按输出端口声明的扩展名给文件
+# 命名，用户会拿到一个**叫 .pdf 的 HTML**。这正是本仓库在 `ebook.convert` 上
+# 已经打过一次的坑（pandoc 遇到不认识的扩展名会"成功"地写出一个扩展名骗人的文件）。
+# 所以那个参数被删掉了；要做 HTML/TXT 输出，得先把"输出扩展名跟着格式走"这件事
+# 在宿主层解决，那是另一个改动。
+#
+# ── 引擎依赖不是权限 ─────────────────────────────────────────────────────
+# `requiresEngines: ["libreoffice"]` 由节点自己声明，缺失时界面把节点标灰并引导安装；
+# 插件**不需要**为此申请任何能力（申请了反而是多余的扩权）。
+apiVersion: toolforge/v1
+kind: Plugin
+
+metadata:
+  id: com.toolforge.builtin.doc-to-pdf
+  name: 转 PDF（Office）
+  version: 0.1.0
+  description: 用 LibreOffice headless 把 Word / Excel / PPT / ODF 文档转成 PDF。离线完成，文件不外传。
+  author: ToolForge
+  license: MIT
+  icon: file-text
+  category: document
+  tags: [PDF, Office, Word, Excel, PPT, LibreOffice, 文档转换]
+
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+
+io:
+  inputs:
+    - id: src
+      label: Office 文档
+      type: file
+      # 与 `doc.to-pdf` 节点 inputs 的 accept 列表逐字一致 —— 两处漂移的话，
+      # 界面允许用户选的文件会在执行时被节点拒绝，提示语还指不到原因上。
+      accept: [".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp"]
+      multiple: false
+      required: true
+      description: 需要安装 LibreOffice（约 420 MB，Windows 可在「引擎管理」里一键安装）。
+  outputs:
+    - id: dst
+      label: PDF
+      type: file
+      accept: [".pdf"]
+      required: true
+  params: []
+
+runtime:
+  kind: pipeline
+  pipeline:
+    description: 单节点流水线：一次调用完成转换。
+    onError: fail
+    # LibreOffice 冷启动 2~5 秒；大文档（几十页 PPT）留足 10 分钟
+    timeoutMs: 600000
+    steps:
+      - id: topdf
+        uses: doc.to-pdf
+        label: 转 PDF
+        with:
+          src: "${src}"
+          dst: "${output.dst}"

@@ -997,7 +997,14 @@ pub fn builtin_nodes() -> Vec<NodeDescriptor> {
         optional_engines: vec![],
         inputs: vec![in_file("src", "Office 文档", &[".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp"])],
         outputs: vec![out_file("dst", "PDF")],
-        params: vec![enum_param("format", "目标格式", "pdf", &["pdf", "pdf/a", "html", "txt"])],
+        // ⚠️ 这里原来还有一个 `format` 参数（pdf / pdf-a / html / txt），**执行器从来没读过它** ——
+        // `libreoffice_to_pdf` 里写死的是 `--convert-to pdf`。也就是说它是个纯装饰的参数，
+        // 而且是个危险的装饰：真按 html 输出的话，输出文件仍然由宿主按端口声明的扩展名命名，
+        // 用户会拿到一个**叫 .pdf 的 HTML 文件**。这正是 `ebook.convert` 上已经打过一次的坑
+        // （pandoc 遇到不认识的输出扩展名会"成功"地写出扩展名骗人的文件）。
+        // 节点的名字就是 `doc.to-pdf`，所以正确的做法是把参数删掉，而不是让它看起来可选。
+        // 要做 HTML / TXT 输出，得先让"输出扩展名跟着格式走"在宿主层成立 —— 那是另一个改动。
+        params: vec![],
     });
     n.push(NodeDescriptor {
         name: "doc.ocr".into(),

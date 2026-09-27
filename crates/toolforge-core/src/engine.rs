@@ -399,10 +399,23 @@ pub fn engine_catalog() -> Vec<EngineDescriptor> {
             core: false,
             provides: vec!["doc.to-pdf".into()],
             platforms: all_platforms(),
-            install_modes: vec![EngineInstallMode::System],
-            // 上游只发 `.msi` / `.dmg` / `.deb` 安装器，没有"解压即用"的归档，
-            // 所以没有可管理的下载源。
-            download_platforms: vec![],
+            // **Windows 现在能一键装了（本轮新增）**：`.msi` + 管理安装。
+            // 历史注记写着"上游只发 `.msi`/`.dmg`/`.deb` 安装器，没有解压即用的归档，
+            // 所以没有可管理的下载源" —— 前半句是事实，结论**不对**：
+            // `msiexec /a` 的**管理安装不是安装**（不写注册表、不装服务、不需要管理员），
+            // 它就是把包内容铺到目录里，正好是我们要的"解包"。7-Zip 走同一条路。
+            //
+            // 还有两条实测出来的细节，写在 engine-sources.json 的 note 里：
+            // ① 解压后**没有** `Program Files\LibreOffice\` 这一层，TARGETDIR 下直接是
+            //    `program/`、`share/`……（1.5 GB），所以 MANAGED_LAYOUT 那条
+            //    `program/soffice` 正好对上；② `soffice.exe` 与 `soffice.com` 是
+            //    **两个不同的入口**：前者跑 `--version` 会挂住不返回，后者正常 ——
+            //    Windows 上托管布局因此刻意指向 `soffice.com`（见 lib.rs 的平台覆盖表）。
+            //
+            // macOS / Linux 仍然没有来源：上游对这两个平台也只发安装器（.dmg/.deb），
+            // 而且解开 `.dmg` 需要 macOS 的 `hdiutil`，那是另一个平台的事。
+            install_modes: vec![EngineInstallMode::System, EngineInstallMode::Download],
+            download_platforms: vec!["windows".into()],
             requires_license_ack: true,
             models: vec![],
         },

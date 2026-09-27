@@ -40,8 +40,8 @@
 有两点必须讲清楚：
 
 1. **本文档最早写作时没有运行过 `cargo build` / `cargo test`**，因此当时不对「当前能否构建成功」下结论。可以确认的是：根 `Cargo.toml` 的 `members = ["crates/*", "apps/desktop/src-tauri"]` 现在都有对应目录。
-   > ✅ **已更新（现在有实测数据了）**：`cargo test --workspace` 的 Rust 测试为 **246 passed / 0 failed**；`scripts/devtools/verify-platform.mjs`（`scripts/devtools/run.mjs` 里的第 5 个脚本）**172 项检查全通过**（覆盖【1】–【18】），其中【6】号检查就是盯着"图片后端到底有没有真的被调用"、【7】号检查盯着任意角度旋转会不会静默取整、【8】号检查盯着**抠图这条 ONNX 链路能不能真的出透明背景**、【9】号盯着电子书转换的降级与拦停、【10】号用假 AI 端点验证图像描述的请求形状、【11】号盯着超分是不是真的按倍数放大、【12】号把 `libvips` 目录临时藏起来、断言后端真的切到 ImageMagick 再在 `finally` 里还原（【12】只在 libvips 与 imagemagick **都装了**时才跑，否则显式记为"跳过"）、【13】号把两个引擎的**托管目录都**藏起来、断言兜底档真的接得住（后端 = 纯 Rust image crate、任务仍然成功、产出无损 VP8L、并如实提示「只有无损模式」，同样在 `finally` 里还原）、【18】号验证压缩包节点真的产出**标准 zip**（并用系统 tar 独立解回来逐字节比对，见 3.4）。
-   > 上面这句话里的"218 passed / 82 项 / 【1】–【13】"是本条最初写下时的值，**保留作为历史**；当前值是 **246 / 172 / 【1】–【18】**。
+   > ✅ **已更新（现在有实测数据了）**：`cargo test --workspace` 的 Rust 测试为 **252 passed / 0 failed**；`scripts/devtools/verify-platform.mjs`（`scripts/devtools/run.mjs` 里的第 5 个脚本）**178 项检查全通过**（覆盖【1】–【19】），其中【6】号检查就是盯着"图片后端到底有没有真的被调用"、【7】号检查盯着任意角度旋转会不会静默取整、【8】号检查盯着**抠图这条 ONNX 链路能不能真的出透明背景**、【9】号盯着电子书转换的降级与拦停、【10】号用假 AI 端点验证图像描述的请求形状、【11】号盯着超分是不是真的按倍数放大、【12】号把 `libvips` 目录临时藏起来、断言后端真的切到 ImageMagick 再在 `finally` 里还原（【12】只在 libvips 与 imagemagick **都装了**时才跑，否则显式记为"跳过"）、【13】号把两个引擎的**托管目录都**藏起来、断言兜底档真的接得住（后端 = 纯 Rust image crate、任务仍然成功、产出无损 VP8L、并如实提示「只有无损模式」，同样在 `finally` 里还原）、【18】号验证压缩包节点真的产出**标准 zip**（并用系统 tar 独立解回来逐字节比对，见 3.4）、【19】号验证 `doc.to-pdf` 真的转出内容正确的 PDF（见 3.3）。
+   > 上面这句话里的"218 passed / 82 项 / 【1】–【13】"是本条最初写下时的值，**保留作为历史**；当前值是 **252 / 178 / 【1】–【19】**。
    > **节点层面已经没有"未实现"这回事了**：`builtin_nodes()` 登记 32 个，`nodes.rs::run()` 的 32 个分发臂全都指向真实实现，`UNIMPLEMENTED_NODES` 是**空数组**。第 5 节的降级矩阵里，图像域的四行、抠图、电子书、超分、OCR、图像描述都已有实测或明确的失败路径；其余各行仍然只是 `builtin_nodes()` 声明的引擎依赖关系，不是经测试验证的运行时行为。（相关实测结论见 `docs/ROADMAP.md` 的「当前阻塞项」与「基线再更新」。）
    > ✅ **中间档的环境基线已不再是空白**：以前这里写着"本机没有 ImageMagick，'仅 ImageMagick'这一档始终没有单独的环境基线"。现在它有了 —— 把 `engines/libvips` 临时改名后 `image.convert` 的后端日志变成 `后端 = ImageMagick（格式最全）`，并产出有损 VP8 WebP（见 3.2）；`verify-platform.mjs`【12】把这次验证固化进了套件。**三档现在都有证据：libvips ✓（【6】）、ImageMagick ✓（【12】）、纯 Rust ✓（【13】）。** 仍然没有基线的只有 macOS 本身（那需要一个 macOS 环境）；它的下载源**已经不再是空白** —— 13/14 条带真实哈希，只剩 `ffmpeg@macos` 是 `null`（见 1.3）。`7zip` 的三平台也补上了，压缩包节点现在有真机基线（【18】，见 3.4）。
 2. 本文档因此同时承担两个角色：**引擎层规格说明**（现在就能定下来的接口契约：有哪些引擎、能力边界、许可证约束、降级规则）与**待实现清单**（第 6 节列出尚未落地的部分与已知的数据不一致）。
@@ -129,7 +129,8 @@ EngineModel {
 ### 2.1 总表读法
 
 - **核心引擎共 3 个**：`ffmpeg`、`pandoc`、`7zip`。它们在名称后标注了「（核心引擎）」。缺失时应用**仍然能启动**，但依赖它们的节点不可用：`ffmpeg` 缺失 → 5 个 `video.*` 与 2 个 `audio.*` 节点不可用；`pandoc` 缺失 → `doc.convert` 不可用，并且 `ebook.convert` 失去唯一的纯文档转换后端；`7zip` 缺失 → `archive.pack` / `archive.unpack` 不可用。
-- **只有 `System` 一种安装方式的引擎共 3 个**：`libreoffice`（约 420 MB）、`calibre`（约 180 MB）、`tesseract`（约 60 MB）。这三个都只探测系统安装、不提供应用内下载，原因是**上游只发安装器**（`.msi` / `.dmg` / `.deb` / `.exe`），没有"解压即用"的归档 —— 这一点现在写在各自的 `download_platforms: []` 旁边。
+- **只有 `System` 一种安装方式的引擎只剩 2 个**：`calibre`（约 180 MB）、`tesseract`（约 60 MB）—— 这两个上游只发安装器，没有可解包的归档。
+  > 📌 **`libreoffice` 本轮从这一组移出**：它的历史注记写着"上游只发 `.msi`/`.dmg`/`.deb` 安装器，没有解压即用的归档，所以没有可管理的下载源"。前半句是事实，**结论不对** —— `msiexec /a` 的**管理安装不是安装**（不写注册表、不装服务、不需要管理员权限），它就是把包内容铺到目录里。7-Zip 走同一条路（见 1.3、3.4 与本节的 3.3）。
   > 📌 **`7zip` 曾经在这一组，现在不在**：它是 `System` + `Download` 双模式、且**三平台都能装**（Windows 走 `.msi` 管理安装、Linux/macOS 走上游的完整 tar.xz）。历史注记给的理由（"`.7z` 需要先有 7-Zip 才能解压"）**是错的** —— Windows 自带的 bsdtar 读得懂 7z；真正的原因只是那条 URL 过期。见 1.3 与 3.4。
   > 📌 **`poppler` 也不在这一组**：它是 `Download` + `System` 双模式（Windows 有一键下载，macOS/Linux 走系统包管理器）。它的 `MANAGED_LAYOUT` 是 `Library/bin/pdftoppm` —— 那两层目录不能省，因为 pdftoppm 是按**自己所在目录的相对位置**去找 `../share/poppler` 的数据文件的（`engine-sources.json` 里把这条写进了 note）。
 - **只有 `Download` 一种安装方式的引擎共 2 个**：`python`、`onnx-models`。
@@ -240,7 +241,13 @@ EngineModel {
 
 - **主页**：https://www.libreoffice.org/
 - **提供的节点（1 个）**：`doc.to-pdf`。
-- **缺失时会发生什么**：`doc.to-pdf` **不可用**，无降级路径（`requiresEngines: ["libreoffice"]`）。UI 应说明这是「仅探测系统已安装」的引擎，即**必须由用户自行安装 LibreOffice**，应用不提供下载。考虑到约 420 MB 的体积与冷启动 2~5 秒的开销，UI 提示里应明确这一点。
+- **缺失时会发生什么**：`doc.to-pdf` **不可用**，无降级路径（`requiresEngines: ["libreoffice"]`）。冷启动 2~5 秒，体积 420 MB 起 —— UI 要提前说明。
+- ✅ **Windows 现在能一键装了（本轮），并且有了第一条真机基线**。历史注记在这里写的是「仅探测系统已安装，**应用不提供下载**」，理由是"上游只发 `.msi`/`.dmg`/`.deb` 安装器，没有解压即用的归档" —— 前半句是事实，**结论不对**：`msiexec /a` 的**管理安装不是安装**（不写注册表、不装服务、不需要管理员权限），它就是把包内容铺到目录里，正好是我们需要的"解包"。7-Zip 用的是同一条路（见 1.3 与 3.4）。
+  - **来源用镜像，理由是实测的**：TDF 自己的下载主机（`download.documentfoundation.org`）从本机**连不上**（356 MB 的 `.msi` 请求 21 秒后 `Unable to connect`），而它同目录里就放着 `…msi.mirrorlist` —— **TDF 的字节分发本来就是镜像制**。清华 TUNA 实测 **10.6 MB/s（33 秒）**，中科大 USTC 报的是完全相同的 Content-Length，两条互为兜底（`fallbackUrl` 本轮从"只有模型有"扩展到引擎来源表）。
+  - **实测的完整链路**（应用内一键安装）：下载 356 MB → SHA-256 通过 → 管理安装 → 探测 `installed`，路径 `…\engines\libreoffice\program/soffice.com`，版本 `LibreOffice 26.2.6.3`，**全程 76.7 秒**。解压后**没有 `Program Files\LibreOffice\` 那一层**，所以 `MANAGED_LAYOUT` 的 `program/soffice` 正好对上（1,522 MB）。
+  - ⚠️ **`soffice.exe` 与 `soffice.com` 是两个不同的入口，选错会"沉默挂起"**：两者都在 `program/` 下、大小相同（523,688 字节），但 `soffice.exe` 是 GUI 子系统启动器 —— 跑 `--version` **不返回**（实测 >20 秒两次、>300 秒一次），于是探测会卡满 10 秒超时、版本永远「未知」。Windows 上托管布局因此刻意指向 `soffice.com`（见 `lib.rs::MANAGED_LAYOUT_PLATFORM_OVERRIDES`）。
+  - ⚠️ **`-env:UserInstallation` 必须是合法 URL**：原来拼的是 `file:///{}` + `profile.display()`，Windows 上得到 `file:///C:\Users\…`（反斜杠）—— LibreOffice 的反应是**挂住**，不是报错（实测正斜杠 3 秒出 PDF、反斜杠 60 秒无输出）。已修为 `file_url()`（斜杠归一 + 最小百分号编码），有纯字符串回归测试。
+  - ⚠️ **LibreOffice 对坏输入极其宽容**（按内容嗅探格式）：一段普通文本改名成 `.docx` 能正常转出 PDF；**4 KB 随机二进制**也"成功"（产出 781 KB 的 PDF）；**0 字节空文件**同样"成功"（6.5 KB）。所以"拒绝坏输入"不是这个节点能承担的责任，扩展名把关在插件/节点的 `accept` 列表那一层。`verify-platform.mjs`【19】因此把反证改成盯**我们自己的**不变量：绝不产出 0 字节的 PDF 冒充成功。
 - **许可证与分发注意点**：`MPL-2.0`，文件级 copyleft，独立进程调用无传染风险。`requiresLicenseAck: true`。
 
 #### Tesseract OCR（`tesseract`）
@@ -478,7 +485,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 | `audio.convert` | 音频转码 | `ffmpeg`（必需） | **无降级路径** | 节点完全不可用。同上提示 |
 | `audio.normalize` | 音量归一化 | `ffmpeg`（必需） | **无降级路径** | 节点完全不可用。同上提示 |
 | `doc.convert` | 文档格式转换 | `pandoc`（必需） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 Pandoc」并提供下载入口 |
-| `doc.to-pdf` | Office 文档转 PDF | `libreoffice`（必需） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 LibreOffice (headless)」，且必须说明该引擎**只有系统安装模式**，需用户自行安装（约 420 MB） |
+| `doc.to-pdf` | Office 文档转 PDF | `libreoffice`（必需） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 LibreOffice (headless)」（约 420 MB / 1.5 GB 解压后）；**Windows 现在可一键安装**，macOS / Linux 需自行安装。**✅ 已有真机基线**（【19】，见 3.3） |
 | `archive.pack` | 打包压缩 | `7zip`（必需） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 7-Zip」；**三平台都提供一键下载**（Windows 走 `.msi` 管理安装，Linux/macOS 走上游 tar.xz），系统安装仍然可用 |
 | `archive.unpack` | 解压 | `7zip`（必需） | **无降级路径** | 节点完全不可用。同上提示 |
 | `ai.upscale` | 图像超分辨率放大 | `python` + `onnx-models`（**均为必需**） | **无降级路径** | 节点完全不可用。UI 显示「需要安装 Python 运行时」与「需要安装 ONNX 模型包」 |
@@ -508,7 +515,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 | 7-Zip 的 unRAR 条款 | `7zip.licenseNote`：unRAR 代码禁止用于开发 RAR 压缩器；解压用途不受影响 | 只要产品只做**解压**（`archive.unpack` 的定位），不受该条款影响；但**不得**基于它实现 RAR 压缩能力。这条限制与 GPL 无关，容易在合规检查中被漏掉 |
 | ONNX 权重（学术 / 训练集条款）+ 闭源商用产品 | `onnx-models.licenseNote`：代码许可与权重许可是两回事；第 4.1 节列出 `birefnet-general` 与 `modnet-portrait` 为 `commercialUse: false` | 这是「代码许可证看起来没问题、权重许可证有问题」的典型组合。**必须按模型逐个校验**，不能因为 ONNX Runtime 或推理脚本的许可证宽松就认为权重也可商用 |
 | Python 运行时（PSF-2.0）+ 第三方 wheel | `python.licenseNote`：宽松许可；注意随包分发的第三方 wheel 各自的许可证 | 运行时本身宽松，但 L3 插件依赖的 wheel 各自带许可证，其中可能含 GPL / 学术条款。随包分发前需要清点实际打进去的 wheel 清单 |
-| LibreOffice（MPL-2.0）+ Calibre（GPL-3.0） | `libreoffice.licenseNote`：MPL 是文件级 copyleft，独立进程调用无传染风险；`calibre.licenseNote` | 不存在额外传染风险，但两者都**只有系统安装模式**，所以产品实际上不会分发它们，只需要在 UI 里把「请自行安装」讲清楚，并避免暗示应用自带这些组件 |
+| LibreOffice（MPL-2.0）+ Calibre（GPL-3.0） | `libreoffice.licenseNote`：MPL 是文件级 copyleft，独立进程调用无传染风险；`calibre.licenseNote` | 不存在额外传染风险。**注意两者现在不再同类**：LibreOffice 在 Windows 上有下载源了，但**应用不随包分发它** —— 用户按需下载，应用只是指向 TDF 指定的镜像地址（`download_platforms`），所以"由用户安装"这个前提仍然成立。`calibre` 依旧是**只有系统安装模式**，UI 里要把「请自行安装」讲清楚，避免暗示应用自带 |
 | `ai-provider`（依服务商条款）+ 用户数据出境 | `ai-provider.licenseNote`：API Key 只存在本机加密存储中，不会随插件或日志外泄（⚠️ 这句原文与实现不符，见 3.6） | 许可证取决于用户接的服务商，产品无法代为保证。实现上必须保证：API Key **不写入插件、不写入日志**（`AiProviderConfig::api_key` 带 `skip_serializing`，审计写入点也不含凭据）。**注意别再把"加密存储"当成事实**：当前既没有加密存储也没有钥匙串，默认只存在内存；用户可选的 `ai.persistApiKey` 是**明文**落盘，属于能力降级 |
 
 **通用结论：** `requiresLicenseAck: true` 的 5 个引擎（`ffmpeg`、`pandoc`、`libreoffice`、`calibre`、`onnx-models`）覆盖了本文档第 5 章几乎所有高风险项。UI 在用户点击「下载 / 安装」之前必须先展示许可证与注意事项，这是 `EngineDescriptor` 中 `licenses`、`licenseNote`、`requiresLicenseAck` 三个字段共同的设计意图。
@@ -655,7 +662,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 
 > **状态更新**：本条最初写作时 `apps/desktop/src-tauri/src/`、`crates/toolforge-ai` 与 `apps/desktop/src/` 都还不存在，随后被并行开发补齐。以下保留原判断并标注最新观察结果。
 >
-> ⚠️ **下面"没有运行过 `cargo test`、第 5 章未经过测试回归验证"这句已经过期**（保留作为历史）。当前有可复核的实测数据：`cargo test --workspace` **246 passed / 0 failed**、`scripts/devtools/verify-platform.mjs` **172 项检查全通过**（【1】–【18】，其中【8】抠图、【9】电子书、【10】AI 视觉、【11】超分、【12】中间档后端切换、【13】纯 Rust 兜底档、【17】音视频真实属性、【18】压缩包标准归档）、一次真实的 libvips 一键安装、一次真实的 ImageMagick 一键安装、一次真实的 FFmpeg / Poppler / **7-Zip** 一键安装（见 3.2、3.4）、以及抠图/超分整条链路的真机验证（见 1.3、3.2、5.1）。不过要分清范围：**测试全绿 ≠ 第 5 章每一行都验证过** —— 图像域那 4 个节点的后端选择有【6】、【7】两条运行时检查，中间档有【12】，兜底档有【13】，抠图有【8】，音视频有【17】，压缩包有【18】，其余各行仍然没有专门的运行时检查（macOS 始终没有环境基线）。
+> ⚠️ **下面"没有运行过 `cargo test`、第 5 章未经过测试回归验证"这句已经过期**（保留作为历史）。当前有可复核的实测数据：`cargo test --workspace` **252 passed / 0 failed**、`scripts/devtools/verify-platform.mjs` **178 项检查全通过**（【1】–【19】，其中【8】抠图、【9】电子书、【10】AI 视觉、【11】超分、【12】中间档后端切换、【13】纯 Rust 兜底档、【17】音视频真实属性、【18】压缩包标准归档、【19】Office → PDF）、一次真实的 libvips 一键安装、一次真实的 ImageMagick 一键安装、一次真实的 FFmpeg / Poppler / **7-Zip** / **LibreOffice** 一键安装（见 3.2、3.3、3.4）、以及抠图/超分整条链路的真机验证（见 1.3、3.2、5.1）。不过要分清范围：**测试全绿 ≠ 第 5 章每一行都验证过** —— 图像域那 4 个节点的后端选择有【6】、【7】两条运行时检查，中间档有【12】，兜底档有【13】，抠图有【8】，音视频有【17】，压缩包有【18】，Office → PDF 有【19】，其余各行仍然没有专门的运行时检查（macOS 始终没有环境基线）。
 
 - 根 `Cargo.toml` 的 `members = ["crates/*", "apps/desktop/src-tauri"]`：两个模式都有对应目录。`apps/desktop/src-tauri/src/` 已存在（`main.rs` / `lib.rs` / `commands.rs` / `ipc.rs` / `state.rs` / `settings_store.rs` / `bin/`）。
 - ✅ **前端 `apps/desktop/src/` 现在存在**（React 18 + TS + Vite，含 `package.json`、生成的 `bindings.ts`），根 `package.json` 里指向 `@toolforge/desktop` 的脚本因此可以解析。本条原文说"仍不存在"是当时的快照。
@@ -680,7 +687,7 @@ libvips（快、省内存）  ──缺失──►  ImageMagick（格式最全�
 | `crates/toolforge-process/src/exec.rs` | 子进程执行：`resolve_program()`（裸名字走 PATH、显式路径不回退）、`ExecOptions::quiet` 的"只留尾部"语义、`ExecResult` 的输出裁剪；见第 1.3 节 |
 | `crates/toolforge-engines/engine-sources.json` | 下载来源清单：**14 条，其中 13 条**带真实核对哈希 + 版本固定直链（Windows 7 / Linux 4 / macOS 3），唯一没有哈希的是 `ffmpeg@macos`（安装时返回 `HashRequired`）。**没有占位条目**：`libvips@macos`（404 的编造地址）与 `pandoc@macos`（`.pkg` 装不上）两条已删除，解释挪进本文档 1.3 与 3.4。见第 1.3 与 6.5 节 |
 | `crates/toolforge-process/` | 外部进程调用（执行、RPC、进程监管），是引擎被真正调用的下层 |
-| `scripts/devtools/verify-platform.mjs` | 真机运行时验收脚本（`scripts/devtools/run.mjs` 的第 5 个），**当前 172 项检查**（【1】–【18】）。本文档引用得最多的是这几条：【6】验证"图片后端与引擎状态一致"、【7】验证任意角度旋转不静默取整、【8】验证抠图整条 ONNX 链路真的出透明背景（并逐个已装模型核对**推理脚本实际用的输入尺寸与归一化**）、【9】验证电子书转换的降级与拦停、【10】验证图像描述的请求形状、【11】验证超分真的按倍数放大、【12】藏掉 libvips 目录后验证后端真的切到 ImageMagick（`finally` 里还原）、【13】把两个引擎的托管目录都藏掉后验证纯 Rust 兜底档接得住（产出无损 VP8L + 如实提示「只有无损模式」，`finally` 里逐个还原）、【14】验证 `video-to-gif` 内置插件（`${output.<端口>}` 解析 + 路径逃逸那两处修复）、【15】验证扫描件 PDF 的逐页 OCR、【16】逐个核对 32 个节点的"可用"与真实引擎/权重状态一致、【17】用 ffprobe 读回真实媒体属性（时长/帧数/编解码器/采样率/容器）、【18】验证压缩包节点真的产出**标准归档**（见 3.4）。历史注记里写的"82 项（【1】–【13】）"是当时的值 |
+| `scripts/devtools/verify-platform.mjs` | 真机运行时验收脚本（`scripts/devtools/run.mjs` 的第 5 个），**当前 178 项检查**（【1】–【19】）。本文档引用得最多的是这几条：【6】验证"图片后端与引擎状态一致"、【7】验证任意角度旋转不静默取整、【8】验证抠图整条 ONNX 链路真的出透明背景（并逐个已装模型核对**推理脚本实际用的输入尺寸与归一化**）、【9】验证电子书转换的降级与拦停、【10】验证图像描述的请求形状、【11】验证超分真的按倍数放大、【12】藏掉 libvips 目录后验证后端真的切到 ImageMagick（`finally` 里还原）、【13】把两个引擎的托管目录都藏掉后验证纯 Rust 兜底档接得住（产出无损 VP8L + 如实提示「只有无损模式」，`finally` 里逐个还原）、【14】验证 `video-to-gif` 内置插件（`${output.<端口>}` 解析 + 路径逃逸那两处修复）、【15】验证扫描件 PDF 的逐页 OCR、【16】逐个核对 32 个节点的"可用"与真实引擎/权重状态一致、【17】用 ffprobe 读回真实媒体属性（时长/帧数/编解码器/采样率/容器）、【18】验证压缩包节点真的产出**标准归档**（见 3.4）、【19】验证 `doc.to-pdf` 真的产出内容正确的 PDF（用 Poppler 的 `pdftotext` 读回文字做跨引擎交叉验证，见 3.3）。历史注记里写的"82 项（【1】–【13】）"是当时的值 |
 | `scripts/devtools/mock-openai.mjs` | **假 OpenAI 兼容端点**，只服务于验收脚本：`verify-platform.mjs`【10】把应用的 AI 设置临时指向它（provider 选 `ollama` —— 本地提供方，因此不需要 API Key），跑一次 `ai.describe`，然后断言**我们自己可控的那部分**：恰好收到 1 次请求、请求里恰好 1 张图、以**内联 data URL** 发送（不是 multipart 也不是外链）、MIME 是 `image/jpeg`（说明本地确实重新编码过）、体积落在 1 KB ~ 200 KB 的合理区间（实测约 6.9 KB）、带系统提示词、用户提示词原样送达、`stream: false`，最后还验证描述真的流到了下游（净化 → 拼名 → 改名，产出 1 个文件且文件名里没有标点）。跑完会把**用户的 AI 设置恢复原状**。这个假端点**永远不会看到真实用户图片** —— 它是"不依赖 API Key 也能验证 AI 节点"的办法，见 `docs/SECURITY.md` |
 | `docs/ROADMAP.md` | `nodes.rs` 的 `not_implemented()` 错误提示所指向的实现进度文档（本文档未引用其内容，也不与其重复记录进度） |
 | `Cargo.toml`（根） | workspace 成员与依赖声明，见第 1.2 与 6.8 节 |

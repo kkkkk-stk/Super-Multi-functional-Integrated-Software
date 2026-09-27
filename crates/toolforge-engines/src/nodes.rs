@@ -3299,6 +3299,14 @@ async fn libreoffice_to_pdf(
 
     // 注意：-env:UserInstallation 必须指向一个独立目录，
     // 否则当用户自己开着 LibreOffice 时，headless 实例会连不上而静默失败。
+    //
+    // ⚠️ **必须是合法的 `file:///` URL，不能直接把 Windows 路径拼进去。**
+    // 原来是 `format!("file:///{}", profile.display())`：在 Windows 上 `display()`
+    // 给出的是**反斜杠**路径，于是拼出 `file:///C:\Users\…\toolforge-lo-1234`。
+    // 后果不是报错，而是 **LibreOffice 直接挂住**（本机实测：
+    // 同一个命令，正斜杠 3 秒出 PDF，反斜杠 60 秒还没有任何输出、进程一直留着）。
+    // 而且因为宿主给这个子进程设了 600 秒超时，用户看到的是"转了十分钟然后超时"，
+    // 唯一能查到的线索是"LibreOffice 卡住了"—— 完全指不到参数格式上。
     let profile = std::env::temp_dir().join(format!("toolforge-lo-{}", std::process::id()));
     let r = exec(
         ExecOptions::new(soffice)
@@ -3306,7 +3314,7 @@ async fn libreoffice_to_pdf(
                 "--headless".into(),
                 "--norestore".into(),
                 "--invisible".into(),
-                format!("-env:UserInstallation=file:///{}", profile.display()),
+                format!("-env:UserInstallation={}", file_url(&profile)),
                 "--convert-to".into(),
                 "pdf".into(),
                 "--outdir".into(),
@@ -3344,6 +3352,42 @@ async fn libreoffice_to_pdf(
         )));
     }
     Ok(NodeOutput::file(dst.display().to_string()))
+}
+
+/// 把本地路径转成 `file:///` URL。
+///
+/// # 为什么不能直接拼 `path.display()`
+///
+/// Windows 的路径是**反斜杠**的，`format!("file:///{}", p.display())` 会拼出
+/// `file:///C:\Users\…\toolforge-lo-1234` —— 一个不合法的 URL。LibreOffice 对它的
+/// 反应不是报错而是**挂住**：本机实测同一个转换命令，正斜杠 3 秒出 PDF、
+/// 反斜杠 60 秒仍然没有任何输出且进程不走。因为宿主给子进程设了 600 秒超时，
+/// 用户看到的是"转了十分钟然后超时"，排查时完全指不到参数格式上。
+///
+/// 顺带把 URL 里必须转义的字符处理掉（空格是最常见的：用户名带空格时临时目录就带空格）。
+/// 这里只做**最小必要**的百分号编码：`%` 先编码（否则会与后面产生的 `%20` 混淆），
+/// 再处理空格与 `#` / `?`（它们在 URL 里分别开启 fragment 与 query，会把路径截断）。
+fn file_url(p: &Path) -> String {
+    let mut s = String::with_capacity(64);
+    s.push_str("file://");
+    let mut first = true;
+    for ch in p.display().to_string().chars() {
+        // Windows 的盘符路径（`C:/…`）要在 `file://` 之后补一个斜杠才凑成三条，
+        // 而类 Unix 的 `/tmp/…` 本身就带前导斜杠 —— 无脑拼 `file:///` 会得到四条斜杠。
+        if first && ch != '/' {
+            s.push('/');
+        }
+        first = false;
+        match ch {
+            '\\' => s.push('/'),
+            ' ' => s.push_str("%20"),
+            '%' => s.push_str("%25"),
+            '#' => s.push_str("%23"),
+            '?' => s.push_str("%3F"),
+            _ => s.push(ch),
+        }
+    }
+    s
 }
 
 fn sevenzip_args_for_format(format: &str) -> (&'static str, &'static str) {
@@ -3581,6 +3625,30 @@ mod tests {
         assert_eq!(sevenzip_args_for_format("tar").0, "-ttar");
         // 未知格式退化为 zip 而不是报错
         assert_eq!(sevenzip_args_for_format("rar").0, "-tzip");
+    }
+
+    /// `-env:UserInstallation` 的 URL 里**不能出现反斜杠**。
+    ///
+    /// 这条测试守着一个"沉默的挂起"：LibreOffice 收到
+    /// `file:///C:\Users\…` 这样的 URL 时**不报错、直接挂住**
+    /// （本机实测：正斜杠 3 秒出 PDF，反斜杠 60 秒无输出且进程不走）。
+    /// 那种失败在真机上表现为"转了十分钟超时"，排查完全指不到参数格式上 ——
+    /// 所以宁可在这里用一条纯字符串断言的测试把它钉死。
+    #[test]
+    fn libreoffice_profile_url_has_no_backslashes() {
+        let u = file_url(Path::new(r"C:\Users\Foo Bar\AppData\Local\Temp\toolforge-lo-1234"));
+        assert!(!u.contains('\\'), "URL 里不能有反斜杠：{u}");
+        assert_eq!(
+            u, "file:///C:/Users/Foo%20Bar/AppData/Local/Temp/toolforge-lo-1234",
+            "反斜杠要换成斜杠，空格要百分号编码"
+        );
+        // `%` 必须先编码，否则会与后面产生的 `%20` 混淆
+        let v = file_url(Path::new("/tmp/a%b c#d?e"));
+        assert_eq!(v, "file:///tmp/a%25b%20c%23d%3Fe");
+
+        // 类 Unix 的路径原样保留（只有前导的 file:/// 是固定的）
+        let w = file_url(Path::new("/tmp/toolforge-lo-1"));
+        assert_eq!(w, "file:///tmp/toolforge-lo-1");
     }
 
     #[test]

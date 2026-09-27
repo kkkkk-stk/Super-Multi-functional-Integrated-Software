@@ -56,6 +56,30 @@ pub const MANAGED_LAYOUT: &[(&str, &str)] = &[
     ("python", "python"),
 ];
 
+/// 上面那张表的**平台例外**：同一个引擎在某个平台上要挑另一个可执行文件。
+///
+/// # 为什么需要这个（而不是直接改 [`MANAGED_LAYOUT`]）
+///
+/// `MANAGED_LAYOUT` 是**跨平台**的默认值，而"该用哪个可执行文件"在 Windows 上
+/// 可能是另一件事。当前只有一条：
+///
+/// | 引擎 | 平台 | 默认 | 这个平台上改成 | 为什么 |
+/// |---|---|---|---|---|
+/// | `libreoffice` | Windows | `program/soffice` | `program/soffice.com` | `.exe` 是 GUI 启动器，`--version` 会**挂住** |
+///
+/// LibreOffice 的 Windows 包里 `soffice.exe` 与 `soffice.com` 都有一份、大小相同，
+/// 但 `soffice.exe` 属于 **GUI 子系统**：它跑 `--version` 不返回
+/// （本机实测 >20 秒两次、>300 秒一次），于是引擎探测会卡满那 10 秒超时、
+/// 版本永远显示「未知」。`.com` 是同一份程序的控制台入口，`--version` 立刻打印
+/// `LibreOffice 26.2.6.3 8221e31b…` 并退出，转换任务两者都能跑。
+/// **命令行场景本来就该用 `.com`** —— 这不是绕过，是选对了入口。
+///
+/// 探测顺序是：平台例外 → [`MANAGED_LAYOUT`] → 按文件名在托管目录里递归找。
+pub const MANAGED_LAYOUT_PLATFORM_OVERRIDES: &[(&str, &str)] = &[
+    #[cfg(windows)]
+    ("libreoffice", "program/soffice.com"),
+];
+
 /// 引擎的版本探测参数（拿版本用的命令行参数）。
 ///
 /// **空数组是有含义的取值**：它表示"不带参数跑一次"。目前只有 `7zip` 用它 ——

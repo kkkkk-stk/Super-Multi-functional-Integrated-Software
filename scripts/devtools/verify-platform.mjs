@@ -43,7 +43,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
 
-import { Checker, connect, makePng, REPO_ROOT, sleep, webpInfo, writeInputPdf } from './cdp.mjs';
+import { Checker, connect, makeDocx, makePng, REPO_ROOT, sleep, webpInfo, writeInputPdf } from './cdp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -2462,6 +2462,151 @@ runtime:
         ids.filter((x) => /archive-(pack|unpack)/.test(String(x))).join(', ')
       );
     }
+  }
+}
+
+// ============================================================================
+// 【19】`doc.to-pdf`：Office 文档 → PDF 是不是真的转出来了
+// ============================================================================
+//
+// 为什么这一节直到现在才写：`libreoffice` 是三个核心引擎之外**唯一一个
+// 从来没有过真机基线**的引擎 —— 它的体积是 420 MB 起，而且在
+// `engine_catalog()` 里的安装方式是「仅系统安装」，本机从来没装过。
+// 于是 `doc.to-pdf` 这个节点从写出来那天起，**一次都没有被执行过**：
+// 单元测试、`cargo check`、界面上的可用性判定全都不会碰它。
+//
+// 本轮把它打通了（Windows 用官方 `.msi` 的**管理安装**，见起点的 note），
+// 于是有了这一节。它验证的是"节点真的产出了内容正确的 PDF"，而不是"任务成功了"：
+//
+//   1. 用**手写的最小 DOCX**（`cdp.mjs::makeDocx`，纯 Node 造的合法 OOXML）当输入 ——
+//      不依赖 pandoc 之类的另一个引擎来造素材，否则没有 pandoc 的机器上整节会被跳过；
+//   2. 产出必须是 `%PDF-` 开头、体积合理；
+//   3. ★ 用 **Poppler 的 `pdftotext`** 把 PDF 里的文字读回来，断言里面有我们写进去的
+//      那些词 —— "文件非空"证明不了内容对，这一步才是。它同时是**跨引擎**的交叉验证：
+//      PDF 是 LibreOffice 写的，读它的是另一个项目写的工具。
+//      （断言**逐词存在**而不是整句连续匹配：LibreOffice 输出的文字流顺序会变，
+//       整句匹配会因为排版顺序判红，那是把断言绑死在排版实现上。）
+//   4. 版本探测**没有挂住**：LibreOffice 的 `soffice.exe` 跑 `--version` 会挂住
+//      （GUI 子系统启动器），所以托管布局在 Windows 上刻意指向 `soffice.com`。
+//      这条断言盯着那个选择 —— 版本号非空且探测很快。
+//   5. 输入是垃圾时，**我们自己这一侧**的不变量：绝不产出一个 0 字节的 PDF 冒充成功。
+//      （原本这里想写"假 docx 必须失败"，但实测推翻了那个假设 —— 见下文 ⑥ 的注释。）
+c.section('【19】`doc.to-pdf`：Office 文档 → PDF 是否真的转出来了（LibreOffice）');
+{
+  const engines = await client.invoke('engines_probe_all');
+  const lo = engines.find((e) => e.descriptor.id === 'libreoffice');
+  const loUsable = Boolean(lo && (lo.status.state === 'detected' || lo.status.state === 'installed'));
+
+  if (!loUsable) {
+    c.note('跳过：本机没有可用的 LibreOffice（Windows 可在「引擎管理」一键安装，约 356 MB）');
+    c.check(true, '前置条件不满足，已显式记为跳过（不是"通过"）');
+  } else {
+    console.log(`   LibreOffice: ${lo.status.path}`);
+    console.log(`   版本: ${lo.status.version ?? '(未知)'}`);
+
+    // ---- 检查 ①：版本探测不该挂住（这条盯着 soffice.com / soffice.exe 的选择）----
+    c.check(
+      Boolean(lo.status.version) && String(lo.status.version).includes('LibreOffice'),
+      '① 版本探测有结果且没挂住（`soffice.exe` 跑 --version 会挂住，必须用控制台入口）',
+      String(lo.status.version ?? '(空)')
+    );
+
+    // ---- 素材：手写的最小 DOCX ----
+    const work = join(REPO_ROOT, '.tools', 'smoke', 'out-topdf');
+    rmSync(work, { recursive: true, force: true });
+    mkdirSync(work, { recursive: true });
+    const marker = 'ToolForge 转 PDF 验证标记';
+    const docxPath = join(work, 'verify.docx');
+    writeFileSync(docxPath, makeDocx(`${marker}\n第二段中文正文 with ASCII text.`));
+    console.log(`   输入 docx: ${docxPath}（${readFileSync(docxPath).length} 字节，纯 Node 手写）`);
+
+    // Poppler 的 pdftotext —— 用来把 PDF 里的文字读回来（跨引擎交叉验证）
+    const poppler = engines.find((e) => e.descriptor.id === 'poppler');
+    const pdftoppm = poppler?.status?.path;
+    const pdftotext = pdftoppm ? join(dirname(pdftoppm), 'pdftotext.exe') : null;
+    const canReadPdf = Boolean(pdftotext && existsSync(pdftotext));
+
+    const outDir = join(work, 'out');
+    mkdirSync(outDir, { recursive: true });
+    const sub = await client.invoke('plugins_run', {
+      req: { pluginId: 'com.toolforge.builtin.doc-to-pdf', inputs: { src: [docxPath] }, params: {}, outputDir: outDir },
+    });
+    const job = await client.waitJob(sub.jobId, 300, 1000);
+    console.log(`   转换任务: ${job.status}`);
+    if (job.error) console.log(`   错误: ${job.error.code} — ${job.error.message}`);
+    c.check(job.status === 'succeeded', '② docx → pdf 任务成功', job.error?.message ?? job.status);
+
+    const produced = existsSync(outDir) ? readdirSync(outDir) : [];
+    const pdfPath = produced.length ? join(outDir, produced.find((f) => f.endsWith('.pdf')) ?? produced[0]) : null;
+    if (pdfPath && existsSync(pdfPath)) {
+      const buf = readFileSync(pdfPath);
+      c.check(
+        buf.subarray(0, 5).toString('latin1') === '%PDF-',
+        '③ 产出是真正的 PDF（`%PDF-` 头）',
+        buf.subarray(0, 8).toString('latin1')
+      );
+      c.check(buf.length > 1024, '④ 产物体积合理（不是空壳）', `${buf.length} 字节`);
+      console.log(`   PDF: ${pdfPath}（${buf.length} 字节）`);
+
+      // ★ 内容断言：把 PDF 的文字读回来
+      if (canReadPdf) {
+        const txtPath = join(work, 'out.txt');
+        let text = '';
+        try {
+          execFileSync(pdftotext, [pdfPath, txtPath], { windowsHide: true });
+          text = readFileSync(txtPath, 'utf8');
+        } catch (e) {
+          c.note(`pdftotext 提取失败：${String(e.message).slice(0, 120)}`);
+        }
+        console.log(`   pdftotext 读回 ${text.trim().length} 个字符：${text.trim().replace(/\s+/g, ' ').slice(0, 70)}`);
+        // ⚠️ 断言**逐词存在**而不是整句连续匹配：LibreOffice 输出的文字流顺序会变
+        // （实测读回来是「转 PDF 验证标记 第二段中文正文 with ASCII text. ToolForge」——
+        //  "ToolForge" 被排到了行尾）。整句匹配会**因为排版顺序**判红，
+        // 那是把"文字在不在"这条断言绑死在排版实现上。
+        const tokens = marker.split(/\s+/).filter(Boolean);
+        const missing = tokens.filter((t) => !text.includes(t));
+        c.check(
+          missing.length === 0,
+          '★ ⑤ PDF 里真的能读出写进去的每个词（跨引擎交叉验证：LibreOffice 写、Poppler 读）',
+          missing.length ? `缺：${missing.join(' / ')}` : `全部 ${tokens.length} 个词都在`
+        );
+      } else {
+        c.note('（没有 Poppler 的 pdftotext，跳过"读回文字"这条内容断言）');
+      }
+    } else {
+      c.check(false, '③ 产出了 PDF 文件', produced.join(', ') || '(输出目录为空)');
+    }
+
+    // ---- ⑥ 输入是垃圾时，我们自己这一侧的不变量 ----
+    //
+    // 这条一开始想写的是"假 docx 必须失败"。**实测把这个假设推翻了**：
+    // LibreOffice 是**按内容嗅探**格式的，宽容得超出预期 ——
+    //   * 一段普通文本改名成 `.docx` → 正常转出 PDF（内容是那段文本）；
+    //   * 4 KB 随机二进制改名成 `.docx` → 也"成功"，产出一个 **781 KB** 的 PDF；
+    //   * **0 字节**的空文件 → 也是"成功"，产出 6.5 KB 的 PDF。
+    // 也就是说"拒绝坏输入"这件事 LibreOffice 不做，`doc.to-pdf` 也不该假装能做 ——
+    // 输入扩展名的把关在插件/节点的 `accept` 列表那一层，内容层面挡不住。
+    //
+    // 所以这条改成盯**我们自己的不变量**：无论输入多离谱，都**不能产出一个 0 字节的 PDF**
+    // 冒充成功（那才是最难查的失败形态）。
+    const emptyPath = join(work, 'empty.docx');
+    writeFileSync(emptyPath, Buffer.alloc(0));
+    const emptyDir = join(work, 'out-empty');
+    mkdirSync(emptyDir, { recursive: true });
+    const emptySub = await client.invoke('plugins_run', {
+      req: { pluginId: 'com.toolforge.builtin.doc-to-pdf', inputs: { src: [emptyPath] }, params: {}, outputDir: emptyDir },
+    });
+    const emptyJob = await client.waitJob(emptySub.jobId, 180, 1000);
+    const emptyOut = existsSync(emptyDir) ? readdirSync(emptyDir) : [];
+    const producedBytes = emptyOut.length ? readFileSync(join(emptyDir, emptyOut[0])).length : 0;
+    console.log(
+      `   0 字节输入: 任务 ${emptyJob.status}，产出 ${emptyOut.join(', ') || '(无)'} ${producedBytes} 字节`
+    );
+    c.check(
+      emptyJob.status === 'failed' || producedBytes > 0,
+      '⑥ 垃圾输入不会"成功"地留下一个 0 字节的 PDF（LibreOffice 对坏输入是宽容的，但空壳不能冒充成功）',
+      emptyJob.status === 'failed' ? '任务失败（正确）' : `${producedBytes} 字节`
+    );
   }
 }
 

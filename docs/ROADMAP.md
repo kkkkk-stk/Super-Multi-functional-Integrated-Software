@@ -50,10 +50,10 @@
 > | `Cargo.lock` | **已存在并入库** |
 > | IPC 命令 | **32 个**（`COMMAND_NAMES` 与生成的 `bindings.ts` 逐条对齐，由 `export_bindings` 守卫） |
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
-> | 内置示例插件 | **7 个** |
+> | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
-> | 运行时测试总数 | `cargo test --workspace` **246 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **172 项全通过**（【1】–【18】） |
+> | 运行时测试总数 | `cargo test --workspace` **252 passed / 0 failed** |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **178 项全通过**（【1】–【19】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -97,7 +97,7 @@
 
 | 项 | 状态 |
 | --- | --- |
-| `plugins/` 示例插件 | ✅ 7 个：`builtin/image-convert`、`builtin/batch-rename`、`builtin/video-to-gif`、`builtin/remove-bg`、`builtin/ebook-convert`、`builtin/ai-describe`、`builtin/image-upscale`（均为 L1）；另有 `wasm-example`（L2，含已编译的 `plugin.wasm`）与 `python-example`（L3，含 `main.py`） |
+| `plugins/` 示例插件 | ✅ 8 个内置 L1：`image-convert`、`batch-rename`、`video-to-gif`、`remove-bg`、`ebook-convert`、`ai-describe`、`image-upscale`，以及本轮新增的 **`doc-to-pdf`**（`doc.to-pdf` 这个节点此前**没有任何内置插件用它**，等于对普通用户不可达、也从未被真机跑过 —— 见 §3.2）；另有 `wasm-example`（L2，含已编译的 `plugin.wasm`）与 `python-example`（L3，含 `main.py`） |
 | 示例插件的 `permissions` 写法 | ✅ 全部使用**正确的映射形式** `permissions: { capabilities: [...] }`，并逐一通过了用当前源码编译出的 `PluginManifest::validate()`（schema 曾变过一次，见阻塞 3） |
 | `docs/ENGINE-MATRIX.md` | ✅ 已存在（439 行），引擎矩阵与降级规格 |
 | `docs/ROADMAP.md` | ✅ 本文件 |
@@ -864,6 +864,25 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   3. 再用 `archive.unpack` 解一遍做闭环，同样逐字节比对；
   4. **反证**：把一段普通文本当压缩包喂进去，必须**失败并给出可读原因**（实测 `7zip 执行失败（退出码 2）`），而不是"成功"地产出一个空目录。
 - 另一条实测教训：回填后有个单元测试**开始真的下载 104 MB 的 FFmpeg**（它原本假设"所有哈希都是 null"所以 `install` 会立刻返回 `HashRequired`）。现已改为用临时来源文件构造缺哈希场景，与真实数据解耦 —— **测试不该有联网副作用**。
+  > ⚠️ **同一个坑又踩了一次（本轮）**：那条"没有下载源的引擎必须返回 `NotConfigured`"的测试**硬编了 `libreoffice`**，而 LibreOffice 这一轮有了 Windows 下载源 —— 于是测试**真的下了一个 356 MB 的安装包**（0.3 秒 → 120 秒，还在临时目录里装了一份）。现在改成**从目录推导**"哪些引擎没有下载源"（`download_platforms.is_empty()`），将来谁加了来源，测试自动跟着走，不会再变成一次静默的大文件下载。
+
+### 3.2 LibreOffice：最后一个没有真机基线的核心节点（本轮打通）
+
+- **原状**：`doc.to-pdf` 这个节点从写出来那天起**一次都没有被执行过**。它依赖 `libreoffice`（约 420 MB、`install_modes: [System]`、本机从未安装），而且**没有任何内置插件用它** —— 对普通用户来说它根本不可达。单元测试、`cargo check`、界面的可用性判定都不会碰到它。这是三个"必需引擎"里最后一个没有基线的（FFmpeg 见阻塞 18，7-Zip 见上一轮）。
+- **打通方式**：Windows 上官方只发安装器，但 `.msi` 可以用 **`msiexec /a` 管理安装**解开（不写注册表、不装服务、不需要管理员），于是 `.msi` 成了"其实能解包"的归档 —— 与 7-Zip 走的是同一条路（`archive: "msi"`）。
+- **下载源用镜像，理由是实测的**：TDF 自己的主机（`download.documentfoundation.org`）从本机**连不上**（那个 356 MB 的文件请求 21 秒后 `Unable to connect`），而该目录里就放着 `…msi.mirrorlist` —— **TDF 的分发本来就是镜像制**。清华 TUNA 实测 **10.6 MB/s（33 秒下完 373,252,096 字节）**，中科大 USTC 报的是完全相同的 Content-Length，两条互为兜底（`fallbackUrl` 本轮新增到**引擎**来源表，此前只有模型有）。
+- **真机实测（应用内一键安装）**：`engines_install` → 下载 356 MB（**10.6 MB/s**）→ SHA-256 校验通过 → 管理安装 → 探测为 `installed`，路径 `…\engines\libreoffice\program/soffice.com`，版本 `LibreOffice 26.2.6.3 8221e31b…`，**全程 76.7 秒**。
+- **顺带抓到并修掉的四件事**：
+  1. **`soffice.exe` 跑 `--version` 会挂住**（GUI 子系统启动器，本机实测 >20 秒两次、>300 秒一次），而探测要跑 `--version` —— 结果是引擎管理页每次卡满 10 秒超时、版本永远「未知」。修法：新增 `MANAGED_LAYOUT_PLATFORM_OVERRIDES`（Windows 上指向 `program/soffice.com`，同一份程序的控制台入口），并把它排在 `ENGINE_BINARIES` 的第一位。回归测试 `libreoffice_prefers_the_console_entrypoint_on_windows` **做过反证**（去掉覆盖表，测试立刻红）。
+  2. ★ **`-env:UserInstallation` 拼的不是合法 URL —— LibreOffice 因此直接挂住**。原代码是 `format!("file:///{}", profile.display())`，在 Windows 上 `display()` 给的是**反斜杠**路径，于是拼出 `file:///C:\Users\…\toolforge-lo-1234`。这不是"参数不对会报错"，而是**沉默的挂起**：本机对照实测，同一个转换命令正斜杠 3 秒出 PDF、反斜杠 60 秒无任何输出且进程不走。因为节点给子进程设了 600 秒超时，用户看到的是"转了十分钟然后超时"，排查完全指不到参数格式上。修法：新增 `file_url()`（反斜杠→正斜杠 + 最小必要的百分号编码），并有纯字符串回归测试 `libreoffice_profile_url_has_no_backslashes`。**这个缺陷是被【19】抓出来的** —— 手工在 PowerShell 里试的时候我恰好用了正斜杠，所以它一直没暴露。
+  3. **`doc.to-pdf` 的 `format` 参数是装饰品**：执行器写死 `--convert-to pdf`，从来没读过它。而且它危险 —— 真按 html 输出的话，宿主仍按输出端口的扩展名给文件命名，用户会拿到一个**叫 `.pdf` 的 HTML**（正是 `ebook.convert` 上已经打过一次的坑）。参数已删掉，节点就是"转 PDF"。
+  4. **`doc-to-pdf` 内置插件**（`plugins/builtin/doc-to-pdf/`）：补上面向用户的入口，内置插件 7 → **8** 个。这也是让它**能被真机验证**的前提。
+- **新增运行时验收【19】（6 项，`verify-platform.mjs`，总数 172 → 178）**：`doc.to-pdf` 是否真的转出**内容正确**的 PDF。要点：
+  1. 输入用 `cdp.mjs::makeDocx` —— **纯 Node 手写的最小合法 OOXML**（ZIP + CRC32 + 三个必需条目）。理由：另一条路（用 pandoc 现造）会让"验证 LibreOffice"依赖另一个引擎，没有 pandoc 的机器上整节会被跳过；
+  2. 产出必须是 `%PDF-` 且体积合理；
+  3. ★ 用 **Poppler 的 `pdftotext`** 把文字读回来**逐词**断言 —— "文件非空"证明不了内容对，这一步才是；而且它是**跨引擎**的：PDF 由 LibreOffice 写、由另一个项目读。（断言逐词而不是整句：LibreOffice 输出的文字流顺序会变，实测读回来是「转 PDF 验证标记 第二段中文正文 with ASCII text. ToolForge」—— 整句匹配会因为**排版顺序**判红，那是把断言绑死在排版实现上。）
+  4. 版本探测有结果且没挂住（盯着 `soffice.com` / `soffice.exe` 那个选择）；
+  5. **反证被实测推翻了，于是改成了另一条**：原本想断言"假 docx 必须失败"，但 LibreOffice 是**按内容嗅探**的，宽容得超出预期 —— 普通文本改名 `.docx` 正常转换、**4 KB 随机二进制**也"成功"（产出 781 KB PDF）、**0 字节空文件**同样"成功"（6.5 KB）。所以"拒绝坏输入"不该由这个节点承担（扩展名把关在 `accept` 列表那一层），检查改成盯**我们自己的不变量**：绝不产出 0 字节的 PDF 冒充成功。
 
 ### 4. 许可证确认有数据、无强制
 
