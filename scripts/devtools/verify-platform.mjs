@@ -4646,6 +4646,412 @@ ${withYaml}
   }
 }
 
+// ============================================================================
+// 【29】许可证确认的 **UI 点击穿透**
+// ============================================================================
+//
+// 这是【25】留下的那条空白，原文写着：
+//
+//   > 前端那两个勾选框本身**没有做点击穿透验证** —— 本机所有需要确认的引擎与权重
+//   > 都已安装，界面上不会出现「安装/下载」按钮，点不出一条真实路径。
+//
+// 【25】验的是**后端契约**（不带 `licenseAccepted` → `PERMISSION_DENIED`），
+// 而那个真实缺陷恰恰在**前端**：`model-panel.tsx` 曾经写
+// `licenseAccepted: !m.commercialUse` —— 对不可商用的权重**自动发 true**，
+// 于是后端那道硬门永远走不到，用户从头到尾没看见任何确认。
+// 后端再严，前端替用户点头也拦不住。
+//
+// ## 怎么把前提造出来（两处，都不隐瞒）
+//
+// 1. **模型面板**：把 `birefnet-general` 的权重文件**同卷 rename** 挪走
+//    （= 真实的"没装"状态），卡片就会渲染出勾选框与「下载」。收尾挪回来 —— `finally` 里做。
+// 2. **引擎安装对话框**：本机 12 个引擎全都装好，所以用
+//    `Page.addScriptToEvaluateOnNewDocument` 在**页面脚本之前**挂一个 fetch 包装，
+//    把 ffmpeg 的目录状态改写成 `missing` 再整页刷新。真实的组件、事件、请求构造，
+//    合成的只有喂进去的那份目录数据 —— 要完全不合成，得有一台没装 FFmpeg 的机器。
+//
+// ## 怎么验"点下去到底发了什么"
+//
+// IPC 的传输层是 `window.fetch` → `http://ipc.localhost/<命令>`（实测确认）。
+// `__TAURI_INTERNALS__` 上那些函数全是 `writable:false, configurable:false` —— 刻意的
+// 硬化，替换不了（这一点本身值得记下来）。但 fetch 可以挂记录器：既拿到请求体，
+// 又能**拦下 install 那一发**（回一个假 jobId），从而不触发几百 MB 的真实下载。
+//
+// ⚠️ 伪造响应必须带 `Tauri-Response: ok` 头。Tauri 的 JS 侧是这么判的：
+//    `const callbackId = response.headers.get('Tauri-Response') === 'ok' ? callback : error`
+//    少了它，一次"成功"会被当成**错误**回调 —— 表现是「读取引擎目录失败 [undefined]」，
+//    而请求与响应其实完全正常（第一次就是这么栽的）。
+c.section('【29】许可证勾选框的点击穿透（前端会不会替用户点头）');
+{
+  // ---- 造前提 1：把不可商用模型的权重挪走（同卷！跨卷 rename 会报 EXDEV） ----
+  const modelDir = join(DATA_DIR, 'models', 'birefnet-general');
+  const stash = join(DATA_DIR, 'verify-stash-license-gating');
+  rmSync(stash, { recursive: true, force: true });
+  mkdirSync(stash, { recursive: true });
+  const moved = [];
+  if (existsSync(modelDir)) {
+    for (const f of readdirSync(modelDir)) {
+      if (f.endsWith('.onnx')) {
+        renameSync(join(modelDir, f), join(stash, f));
+        moved.push(f);
+      }
+    }
+  }
+  console.log(`   挪走的权重：${moved.join(', ') || '（本来就没有）'}`);
+
+  /** 页面内的 fetch 记录器。install 类命令只记录不转发；可选改写目录响应。 */
+  const recorderSource = (catalogPatch = null) => `
+(() => {
+  window.__tfIpc = [];
+  const orig = window.fetch;
+  const respond = (value) => new Response(JSON.stringify(value), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json', 'Tauri-Response': 'ok' },
+  });
+  window.fetch = async function (input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url) || String(input);
+    window.__tfIpc.push({ url, body: String((init && init.body) || '') });
+    const cmd = url.split('/').pop();
+    if (cmd === 'models_install' || cmd === 'engines_install') {
+      return respond('job-ui-probe-fake');
+    }
+    const res = await orig.apply(this, arguments);
+    ${catalogPatch ? `if (cmd === 'engines_catalog') {
+      const data = await res.clone().json();
+      return respond(data.map(${catalogPatch}));
+    }` : ''}
+    return res;
+  };
+})();
+`;
+  const installRecorder = (catalogPatch = null) => client.evaluate(recorderSource(catalogPatch));
+  const removeRecorder = () =>
+    client.evaluate(`(() => { delete window.__tfIpc; return 'removed'; })()`);
+  const ipcCalls = async () => JSON.parse(await client.evaluate('JSON.stringify(window.__tfIpc || [])'));
+  const clearIpc = () => client.evaluate('window.__tfIpc = []');
+
+  /**
+   * 找"卡片"元素。
+   *
+   * ⚠️ 判据必须锚在**目标按钮**上。用"文本最短的祖先"会挑到卡片的**头部子块**
+   * （那里只有两个图标按钮，「下载」在页脚）—— 第一次找 FFmpeg 的「下载安装」就是这么扑空的。
+   */
+  const findCard = (needle, buttonText) => `(() => {
+    const holders = [...document.querySelectorAll('*')].filter((el) => {
+      if (!(el.textContent || '').includes(${JSON.stringify(needle)})) return false;
+      return [...el.querySelectorAll('button')].some((b) => (b.textContent || '').includes(${JSON.stringify(buttonText)}));
+    });
+    holders.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+    return holders[0] || null;
+  })()`;
+
+  const readModelCard = (modelId) =>
+    client.evaluate(`(() => {
+      const id = ${JSON.stringify(modelId)};
+      const holders = [...document.querySelectorAll('*')]
+        .filter((el) => (el.textContent || '').includes(id) && el.querySelector('button'));
+      holders.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+      const card = holders[0];
+      if (!card) return { found: false };
+      const buttons = [...card.querySelectorAll('button')];
+      const download = buttons.find((b) => (b.textContent || '').trim() === '下载');
+      const box = card.querySelector('[role="checkbox"], input[type="checkbox"]');
+      return {
+        found: true,
+        hasCheckbox: !!box,
+        checkboxState: box ? (box.getAttribute('aria-checked') ?? String(box.checked)) : null,
+        hasDownload: !!download,
+        downloadDisabled: download ? download.disabled : null,
+        downloadTitle: download ? download.title : null,
+      };
+    })()`);
+
+  const clickModelCard = (modelId, what) =>
+    client.evaluate(`(() => {
+      const id = ${JSON.stringify(modelId)};
+      const what = ${JSON.stringify(what)};
+      const want = what === 'force-download' ? '下载' : what === 'checkbox' ? null : what;
+      const holders = [...document.querySelectorAll('*')].filter((el) => {
+        if (!(el.textContent || '').includes(id)) return false;
+        if (what === 'checkbox') return !!el.querySelector('[role="checkbox"], input[type="checkbox"]');
+        return [...el.querySelectorAll('button')].some((b) => (b.textContent || '').trim() === want);
+      });
+      holders.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+      const card = holders[0];
+      if (!card) return '没找到卡片';
+      if (what === 'checkbox') {
+        const box = card.querySelector('[role="checkbox"], input[type="checkbox"]');
+        if (!box) return '没找到勾选框';
+        box.click();
+        return 'ok';
+      }
+      const btn = [...card.querySelectorAll('button')].find((b) => (b.textContent || '').trim() === want);
+      if (!btn) return '没找到按钮';
+      if (what === 'force-download') {
+        // 绕开 disabled 直接调**组件自己的 onClick**：问的就是"处理器里那个值是多少"。
+        // 历史缺陷（licenseAccepted: !m.commercialUse）正藏在处理器里，而只断言
+        // "按钮禁用"是拦不住它的 —— 按钮禁用了，可处理器里那个常量还在。
+        // ⚠️ 这段代码整个嵌在 JS 模板字符串里，所以**不能出现反引号**（踩过）。
+        const key = Object.keys(btn).find((k) => k.startsWith('__reactProps'));
+        const props = key ? btn[key] : null;
+        if (props && typeof props.onClick === 'function') {
+          props.onClick({ preventDefault() {}, stopPropagation() {} });
+          return '已调用组件的 onClick（绕过 disabled）';
+        }
+        btn.disabled = false;
+        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        return '已强制点击（DOM 派发）';
+      }
+      if (btn.disabled) return '按钮是禁用的';
+      btn.click();
+      return 'ok';
+    })()`);
+
+  const navTo = async (path) => {
+    await client.evaluate(
+      `(() => { history.pushState({}, '', ${JSON.stringify(path)});
+                window.dispatchEvent(new PopStateEvent('popstate')); return location.pathname; })()`
+    );
+    await sleep(1500);
+  };
+  const boot = () => client.send('Page.reload').then(() => sleep(4500));
+
+  let preDocScript = null;
+  const patchCatalogAndBoot = async (catalogPatch) => {
+    const r = await client.send('Page.addScriptToEvaluateOnNewDocument', {
+      source: recorderSource(catalogPatch),
+    });
+    preDocScript = r.identifier;
+    await boot();
+  };
+  const undoCatalogPatch = async () => {
+    if (preDocScript) {
+      await client.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: preDocScript });
+      preDocScript = null;
+    }
+  };
+
+  try {
+    // ---- 模型面板 ----
+    //
+    // ⚠️ 挪完权重必须**整页刷新**：React Query 里那份 `models_list` 还是旧的，
+    // SPA 跳转不会重取 —— 第一次就是这么把"已安装"的卡片当成目标卡片的。
+    await boot();
+    await navTo('/settings?tab=engines');
+    await installRecorder();
+
+    // ① 对照：可商用且未安装
+    const commercial = await readModelCard('u2net');
+    console.log(`   对照 u2net：${JSON.stringify(commercial)}`);
+    c.check(commercial.found, '① 对照模型卡片存在（u2net 可商用且未安装）');
+    c.check(
+      commercial.hasCheckbox === false,
+      '★ ① 可商用的模型**没有**许可勾选框（不该无端要求确认）'
+    );
+    c.check(commercial.downloadDisabled === false, '①b 可商用且未安装 → 「下载」按钮可用');
+
+    // ② 不可商用且未安装
+    const first = await readModelCard('birefnet-general');
+    console.log(`   目标 birefnet-general：${JSON.stringify(first)}`);
+    c.check(first.found && first.hasDownload === true, '② 目标卡片存在且处于"未下载"状态');
+    c.check(first.hasCheckbox === true, '★ ② 不可商用的权重渲染出许可勾选框');
+    if (first.checkboxState === 'true') {
+      await clickModelCard('birefnet-general', 'checkbox');
+      await sleep(300);
+    }
+    const unchecked = await readModelCard('birefnet-general');
+    c.check(
+      unchecked.downloadDisabled === true,
+      '★ ③ 没勾许可时「下载」按钮**禁用** —— 这正是当初被 `licenseAccepted: !m.commercialUse` 绕过去的那道闸',
+      unchecked.downloadTitle
+    );
+
+    // ④ 勾上 → 可用 → 点下载 → 请求体里必须带 true
+    await clickModelCard('birefnet-general', 'checkbox');
+    await sleep(300);
+    const checked = await readModelCard('birefnet-general');
+    c.check(checked.checkboxState === 'true', '④ 勾上之后勾选框是选中态');
+    c.check(checked.downloadDisabled === false, '④b 勾上之后「下载」按钮可用');
+
+    await clearIpc();
+    const clicked = await clickModelCard('birefnet-general', '下载');
+    await sleep(800);
+    const installCalls = await ipcCalls();
+    const installCall = installCalls.find((x) => x.url.endsWith('/models_install'));
+    console.log(`   点下载（${clicked}）→ ${JSON.stringify(installCall?.body ?? null)}`);
+    c.check(!!installCall, '★ ⑤ 点「下载」真的发出了 models_install（走 http://ipc.localhost）');
+    c.check(
+      JSON.parse(installCall?.body || '{}')?.req?.licenseAccepted === true,
+      '★ ⑤b 请求体里 `licenseAccepted: true`（勾了才发 true）',
+      installCall?.body
+    );
+    c.check(
+      JSON.parse(installCall?.body || '{}')?.req?.modelId === 'birefnet-general',
+      '⑤c 请求指向被点的那张卡片',
+      installCall?.body
+    );
+
+    // ⑥ 未勾选：点不动，且一个请求都发不出去
+    await navTo('/settings?tab=engines');
+    const back = await readModelCard('birefnet-general');
+    if (back.checkboxState === 'true') {
+      await clickModelCard('birefnet-general', 'checkbox');
+      await sleep(300);
+    }
+    await clearIpc();
+    const blocked = await clickModelCard('birefnet-general', '下载');
+    await sleep(500);
+    const blockedCalls = await ipcCalls();
+    c.check(
+      !blockedCalls.some((x) => x.url.endsWith('/models_install')),
+      '★ ⑥ 未勾选时点「下载」一个请求都发不出去（不是"发出去了被后端拒绝"）',
+      blocked
+    );
+
+    // ⑦ 绕开 disabled 直接调处理器：负载必须是 false，不是硬编 true
+    await clearIpc();
+    const forced = await clickModelCard('birefnet-general', 'force-download');
+    await sleep(700);
+    const forcedCall = (await ipcCalls()).find((x) => x.url.endsWith('/models_install'));
+    console.log(`   绕过 disabled 调处理器（${forced}）→ ${JSON.stringify(forcedCall?.body ?? null)}`);
+    c.check(!!forcedCall, '⑦ 对照组成立：绕过 disabled 之后请求确实发出来了');
+    c.check(
+      JSON.parse(forcedCall?.body || '{}')?.req?.licenseAccepted === false,
+      '★ ⑦b 没勾选时处理器发的是 `licenseAccepted: false` —— 不是硬编的 true（历史缺陷正是硬编 true）',
+      forcedCall?.body
+    );
+
+    // ---- 引擎安装对话框（合成的目录数据驱动真实组件） ----
+    await removeRecorder();
+    await patchCatalogAndBoot(`(e) => e.descriptor.id === 'ffmpeg'
+      ? { ...e, status: { ...e.status, state: 'missing', source: 'none', path: null, version: null },
+          licenseAcknowledged: false, licenseAcknowledgedAt: null }
+      : e`);
+    await navTo('/settings?tab=engines');
+    await sleep(800);
+
+    const openEngineDialog = async () => {
+      const r = await client.evaluate(`(() => {
+        const card = ${findCard('FFmpeg', '下载安装')};
+        if (!card) {
+          const has = [...document.querySelectorAll('*')].some((el) => (el.textContent || '').includes('FFmpeg'));
+          return has ? '卡片上没有「下载安装」（目录状态没被改写？）' : '页面上没有 FFmpeg';
+        }
+        const btn = [...card.querySelectorAll('button')].find((b) => (b.textContent || '').includes('下载安装'));
+        if (!btn) return '没找到「下载安装」';
+        btn.click();
+        return 'ok';
+      })()`);
+      await sleep(700);
+      return r;
+    };
+    const readDialog = () =>
+      client.evaluate(`(() => {
+        const dlg = document.querySelector('[role="dialog"]');
+        if (!dlg) return { open: false, checks: [], confirmDisabled: null, text: '' };
+        const boxes = [...dlg.querySelectorAll('[role="checkbox"]')];
+        const confirm = [...dlg.querySelectorAll('button')].find((b) => (b.textContent || '').includes('开始下载安装'));
+        return {
+          open: true,
+          checks: boxes.map((b) => ({ label: b.getAttribute('aria-label') || '', state: b.getAttribute('aria-checked') })),
+          confirmDisabled: confirm ? confirm.disabled : null,
+          text: (dlg.innerText || '').replace(/\\s+/g, ' ').slice(0, 600),
+        };
+      })()`);
+    const clickDialog = (what) =>
+      client.evaluate(`(() => {
+        const what = ${JSON.stringify(what)};
+        const dlg = document.querySelector('[role="dialog"]');
+        if (!dlg) return '对话框没打开';
+        if (what === 'license') {
+          const box = [...dlg.querySelectorAll('[role="checkbox"]')].find((b) => (b.getAttribute('aria-label') || '').includes('许可证'));
+          if (!box) return '没找到许可证勾选框';
+          box.click();
+          return 'ok';
+        }
+        const btn = [...dlg.querySelectorAll('button')].find((b) => (b.textContent || '').includes('开始下载安装'));
+        if (!btn) return '没找到确认按钮';
+        if (btn.disabled) return '确认按钮是禁用的';
+        btn.click();
+        return 'ok';
+      })()`);
+
+    const opened = await openEngineDialog();
+    const d1 = await readDialog();
+    console.log(`   引擎对话框（${opened}）：${JSON.stringify(d1.checks)} confirmDisabled=${d1.confirmDisabled}`);
+    c.check(d1.open === true, '★ ⑧ 未安装的引擎卡片上有「下载安装」，点开是安装确认对话框', opened);
+    const lic1 = d1.checks.find((x) => (x.label || '').includes('许可证'));
+    c.check(!!lic1, '⑧b 对话框里有许可证勾选框（ffmpeg 需要确认）', JSON.stringify(d1.checks));
+    c.check(lic1?.state === 'false', '⑧c 没有确认记录时勾选框默认**未勾选**', lic1?.state);
+    c.check(d1.confirmDisabled === true, '★ ⑨ 没勾许可证时「开始下载安装」禁用');
+    c.check(!d1.text.includes('你已于'), '⑨b 没有确认记录时不显示"已于…确认过"');
+
+    await clickDialog('license');
+    await sleep(300);
+    const d2 = await readDialog();
+    c.check(d2.confirmDisabled === false, '⑩ 勾上之后确认按钮可用');
+
+    await clearIpc();
+    await clickDialog('confirm');
+    await sleep(800);
+    const engCall = (await ipcCalls()).find((x) => x.url.endsWith('/engines_install'));
+    console.log(`   点确认 → ${JSON.stringify(engCall?.body ?? null)}`);
+    c.check(!!engCall, '★ ⑪ 点确认真的发出了 engines_install');
+    c.check(
+      JSON.parse(engCall?.body || '{}')?.req?.licenseAccepted === true,
+      '★ ⑪b 引擎安装请求里带的是 `licenseAccepted: true`',
+      engCall?.body
+    );
+    c.check(
+      JSON.parse(engCall?.body || '{}')?.req?.engineId === 'ffmpeg',
+      '⑪c 请求指向被点的那个引擎',
+      engCall?.body
+    );
+
+    // ⑫ 已确认过 → 预先勾上（省一次点击，但**不是**跳过确认）
+    await undoCatalogPatch();
+    await patchCatalogAndBoot(`(e) => e.descriptor.id === 'ffmpeg'
+      ? { ...e, status: { ...e.status, state: 'missing', source: 'none', path: null, version: null },
+          licenseAcknowledged: true, licenseAcknowledgedAt: '2026-01-02T03:04:05.000Z' }
+      : e`);
+    await navTo('/settings?tab=engines');
+    await sleep(800);
+    const opened2 = await openEngineDialog();
+    const d3 = await readDialog();
+    const lic3 = d3.checks.find((x) => (x.label || '').includes('许可证'));
+    console.log(`   已确认过（${opened2}）：${JSON.stringify(d3.checks)} confirmDisabled=${d3.confirmDisabled}`);
+    c.check(
+      lic3?.state === 'true',
+      '★ ⑫ 确认过之后勾选框**预先勾上**（只是省一次重复点击）',
+      lic3?.state
+    );
+    c.check(d3.text.includes('你已于'), '⑫b 并显示"已于…确认过"，用户知道它为什么是勾上的');
+    c.check(d3.confirmDisabled === false, '⑫c 预先勾上时确认按钮直接可用');
+  } finally {
+    // ---- 收尾：恢复权重、摘掉注入的脚本、整页刷新 ----
+    // 权重必须还原（**失败也还原**）：这台机器上后面每一个抠图检查都要用它。
+    await undoCatalogPatch().catch(() => {});
+    await removeRecorder().catch(() => {});
+    for (const f of moved) {
+      try {
+        renameSync(join(stash, f), join(modelDir, f));
+      } catch (e) {
+        console.log(`   ⚠️ 还原 ${f} 失败：${e.message}`);
+      }
+    }
+    rmSync(stash, { recursive: true, force: true });
+    await client.send('Page.reload').catch(() => {});
+    await sleep(4000);
+    const models = await client.invoke('models_list').catch(() => []);
+    const m = (models ?? []).find((x) => x.id === 'birefnet-general');
+    c.check(
+      m?.installed === true,
+      '⑬ 收尾：权重已还原、模型重新被认作已安装（这一节不留副作用）',
+      `installed=${m?.installed}`
+    );
+  }
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 
