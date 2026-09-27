@@ -53,7 +53,7 @@
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
 > | 运行时测试总数 | `cargo test --workspace` **286 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **392 项全通过**（【1】–【33】） |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **401 项全通过**（【1】–【34】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **70 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -641,7 +641,7 @@ pnpm build          # tsc --noEmit && vite build
 ### 基线再更新（**当时的值**，保留作历史）
 
 > ⚠️ 下面这组数是**当时**取的，**不是现状**。当前值见本文档开头的「实测数据」表
-> （`cargo test --workspace` **286 passed / 0 failed**、`verify-platform.mjs` **392 项**）。
+> （`cargo test --workspace` **286 passed / 0 failed**、`verify-platform.mjs` **401 项**）。
 > 留在这里是为了保留"那一轮到底测到了什么"。
 
 阻塞 14、15 修复后重新取的一组数（上面那组保留为历史，**不要把两组混用**）：
@@ -795,7 +795,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 >
 > - `image.convert`、`image.resize`、`image.crop`、`image.rotate` **四个节点会真的按 `libvips → ImageMagick → 纯 Rust` 挑后端**，把结果报在节点输出的 **`backend`**（`"libvips"` / `"imagemagick"` / `"rust"`）与一条 debug 日志里。后端可观测是刻意的：不看日志就只能靠猜，而这个项目已经被"文档说有、实际没有"坑过好几次。
 > - `image.rotate` 的任意角度不再是"直接报缺 ImageMagick"：libvips 可用时走 `vips similarity --angle N`，ImageMagick 可用时走 `-rotate N`，**只有纯 Rust 可用时才返回 `EngineMissing`** —— 仍然**不会静默取整**（取整会让用户以为转了 45°，实际拿到没转的图）。
-> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错，【12】号检查把 `engines/libvips` 临时藏起来、断言后端真的切到 ImageMagick。**写下这一条时**整个脚本是 **82 项检查全通过**（【1】–【13】）；当前共 **392 项**（【1】–【33】），见本文档开头的「实测数据」表。
+> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错，【12】号检查把 `engines/libvips` 临时藏起来、断言后端真的切到 ImageMagick。**写下这一条时**整个脚本是 **82 项检查全通过**（【1】–【13】）；当前共 **401 项**（【1】–【34】），见本文档开头的「实测数据」表。
 > - **收益要说准**：libvips 档位带来的是**按质量换体积的能力**（WebP/JPEG 有损编码），纯 Rust 后端的 WebP 只能无损。**但"有损一定更小"是错的**，实测 320×200 合成渐变图：无损 508 字节 vs 有损 1808 字节（所以【6】只断言"确实走了有损编码"，不断言体积）。
 >
 > **本条原来还剩两件事，现在都做完了**：
@@ -1163,7 +1163,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   > ✅ **已决定并执行（见 §3.20）**：选择**采用 rustfmt** —— `cargo fmt --all` 重排了 30 个文件，
   > 并把 `cargo fmt --all --check` 加进 `pnpm check:all` 与 CI。理由：文档里写着"零格式差异"这个验收标准，
   > 要么让它成真、要么把那句话删掉；而这个项目的原则一直是**让声明成真**。
-- 实测：`clippy --workspace --all-targets -- -D warnings` **退出码 0**；`cargo test --workspace` **286 passed / 0 failed**；`cargo check --workspace --all-targets` **0 error / 0 warning**；`verify-platform.mjs` **392 项全通过**。
+- 实测：`clippy --workspace --all-targets -- -D warnings` **退出码 0**；`cargo test --workspace` **286 passed / 0 failed**；`cargo check --workspace --all-targets` **0 error / 0 warning**；`verify-platform.mjs` **401 项全通过**。
   （`cargo fmt --all --check` 当时还不干净 —— 已由 §3.20 处理。）
 
 ### 3.16 把「文档里写的检查点」逐条真的跑一遍（本轮）
@@ -1179,7 +1179,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 静态质量 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 退出码 0 |
 | 类型桥 | `pnpm bindings` **连续两次** | ✅ 第二次之后 `git status` **干净**（32 个命令 + 4 项守卫全过） |
 | 脚本编码 | `pnpm check:encodings` | ✅ 退出码 0（§3.13 新增） |
-| 真机验收 | `node scripts/devtools/verify-platform.mjs` | ✅ **392 项全通过**（【0】+【1】–【33】） |
+| 真机验收 | `node scripts/devtools/verify-platform.mjs` | ✅ **401 项全通过**（【0】+【1】–【34】） |
 | 真机验收（**全部六个脚本**） | `node scripts/devtools/run.mjs` | ✅ **六个脚本全部 exit=0**（inspect / smoke / e2e / verify / verify-platform / verify-runtimes，见 §3.18） |
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | ✅ 两条都是真的了：`typecheck` = `tsc --noEmit`；`lint` = **ESLint 8 + TS/React Hooks/jsx-a11y 规则集，`--max-warnings 0`**（§3.22 之前它是回退成 `tsc` 的空壳，见下） |
 | 格式 | `cargo fmt --all --check`（= `pnpm check:fmt`） | ✅ **零格式差异**（§3.20 完成全仓重排并把这一步接进 CI） |
@@ -1347,7 +1347,7 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 ✅ smoke.mjs            exit=0   路由冒烟（9 个页面逐个走）
 ✅ e2e.mjs              exit=0   端到端任务（真实转换 + 产出校验）
 ✅ verify.mjs           exit=0   验证包（解码 / 多文件扇出 / 恶意插件安全测试）
-✅ verify-platform.mjs  exit=0   平台功能（392 项）
+✅ verify-platform.mjs  exit=0   平台功能（401 项）
 ✅ verify-runtimes.mjs  exit=0   插件运行时（L2 WASM / L3 Python，70 项）
 全部通过。
 ```
@@ -1687,6 +1687,60 @@ let is_sep = c.is_whitespace()
 就是这么来的）。补齐要给 `NodeDescriptor` 加 `values` 字段，会牵动 specta 绑定、
 前后端类型与 UI，是一次独立的改动。
 
+### 3.25 三个图像后端的**结果一致性**：一句写在节点说明里、却只验过一档的话（本轮）
+
+`image.crop` 的节点说明里有一句：「裁剪矩形先算好再交给后端，所以三个后端切出来的
+**位置完全一致**。」而在此之前，这句话**只有 libvips 那一档有证据**
+（§3.23 的【32】里那些像素断言全是在本机有 libvips 的情况下跑的）。
+
+这句话的重点恰恰在"三个"上：如果三档切出来的位置不同，同一份流水线在不同机器上就会
+产出不同的结果 —— 而"我这儿是对的"是最难查的一类 bug。所以本轮新增【34】，
+把三档**真的各跑一遍**再逐像素比：
+
+* 第①档 libvips → 第②档把 `engines/libvips` 临时改名、只剩 ImageMagick →
+  第③档把两个都改名、只剩纯 Rust（改名与还原的做法抄【12】/【13】，
+  `finally` 里必定还原，**失败也还原**，并单独断言两个引擎都回到 `installed`）；
+* **每档都要断言日志里的后端名**。这是本节最容易变成假检查的地方：
+  改名一旦没生效，三次跑的其实都是 libvips，"三档结果一致"就会**毫无意义地通过**。
+  所以"三档确实各走了一次"单列成一条断言；
+* 比对器本身还要一条**反证**：拿两张确实应该不同的图（裁剪产出 vs 旋转产出）去跑同一个
+  比对器，必须报不同 —— 否则"一致"可能只是因为比对器永远返回 same。
+
+**实测结果：三档完全一致。**
+
+| 操作 | 三档产出 | 左上角 | 右下角 | 结论 |
+|---|---|---|---|---|
+| 中心裁剪 32×16 | 全部 32×16 | 都是 `TL` | 都是 `BR` | 位置一致 |
+| 旋转 90° | 全部 64×96 | 都是 `BL` | 都是 `TR` | 尺寸与**方向**都一致 |
+
+顺带确认了一件之前没验过的事：`vips rot d90`、`magick -rotate 90`、`image::rotate90()`
+**三个实现的方向是一致的**（都是顺时针）。这句话此前只是"看起来应该一样"。
+
+#### 途中撞到的一个编码差异（不是缺陷，但值得记）
+
+比对的第一次运行**四条断言全红**，报"解码失败" —— 而**像素其实是一致的**。
+原因是三个后端编出来的 PNG **色彩类型各不相同**：
+
+| 后端 | colorType | 说明 |
+|---|---|---|
+| libvips | **2**（RGB） | 直接真彩色 |
+| 纯 Rust `image` crate | **6**（RGBA） | 总是带 alpha 通道 |
+| ImageMagick | **3**（调色板，位深 2） | 它发现只有 4 种颜色，就转成了调色板 PNG |
+
+而 `cdp.mjs::decodePng` 当时只认 colorType 2 与 6，对调色板**返回 null**
+（那是刻意的：不认识的编码宁可拒绝，也不猜像素）。于是"拒绝读一个合法编码"
+把"一致"误报成了"不一致"。
+
+**修法**：给解码器补上调色板支持（位深 1/2/4/8 + `tRNS`），
+并把 `compare()` 改成比**颜色三元组**而不是比字节 ——
+通道数是**编码**差异，这一节要钉的是**几何**差异，两者不能混。
+（顺带把看到的色彩类型打出来，免得读的人以为三者产出的字节应该一样。）
+
+> 教训与 §3.24 那次同源：**验证工具的失败会长成"结论"的样子**。
+> 四条红断言看着像"三个后端不一致"，实际是"工具读不懂其中一种合法编码"。
+> 差别在于这次留下的是**误报**，而误报的代价在这个项目里被反复强调过 ——
+> 它会让一条检查被当成噪音关掉。
+
 
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
@@ -1954,7 +2008,7 @@ let is_sep = c.is_whitespace()
   - **实测数据（真机，非推断）**：托管 Python **3.11.16 / 145.2 MB / tar.gz 路径**（此前只跑过 zip 路径）；venv 自动装上 `onnxruntime-1.30.0`、`numpy-2.4.6`、`pillow-12.3.0`；对一张 **400×300**（白底 + 一个红椭圆）的测试图输出 **RGBA PNG（colorType 6）、400×300、椭圆中心 alpha 254、角落 alpha 0、前景覆盖 18.87%**（与椭圆真实面积吻合）；**运行时就绪后单张推理约 0.7 秒**（首次含 pip 约 32 秒）。
   - **测试方法上的一个坑**：**显著性模型不能用渐变图测** —— 在没有明显主体的渐变图上，模型正确报告约 0% 覆盖并让节点发一条警告。验收脚本因此改用**有真实主体**的图。
   - 参数现在是 `model` / `mode`（`alpha` | `color`）/ `background` / `threshold` / `feather`；**旧的 `alphaMatting` 已被删除**（它从登记起就没有实现，是个**假参数**）。默认模型从 `u2net`（168 MB）改成 **`u2netp`（4.4 MB）** —— "先让它跑起来"比"一上来就要下 168 MB"重要得多。
-  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（**写下这一条时**整个脚本是 **82 项检查全通过**；当前共 **392 项**，见本文档开头的「实测数据」表）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
+  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（**写下这一条时**整个脚本是 **82 项检查全通过**；当前共 **401 项**，见本文档开头的「实测数据」表）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
   - **配套修掉的一个引擎层缺陷**：`probe()` 原来只对 `install_modes == [Remote]` 的引擎特判，而 `onnx-models` **没有可执行文件**（它只是权重文件的宿主），于是永远探测为 `Missing` —— 结果是这个节点**永远显示不可用，哪怕用户已经把权重下好了**。现在 `probe()` 对它单独判：**至少有一个权重已安装 = 可用**。另外 `EngineInstallRequest` 新增 **`force`** 标志 + 引擎卡片上的「另外安装应用托管版本」按钮：系统 Python 3.14 会被探到、显示可用，却跑不了 `onnxruntime` —— **"探测到可用"不等于"满足这个节点的要求"**。
 - [x] ✅ **AI 超分（`ai.upscale`）—— 已实现，真机跑通**
   - 以前的写法是「🚧 AI 超分（`ai.upscale`，当前 `not_implemented`）」。它曾经是"最有可能接着做的一个"，因为可以照抄抠图那条"模型 + 推理"链 —— 这一轮正是这么做的。
@@ -2117,7 +2171,7 @@ let is_sep = c.is_whitespace()
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | `pnpm typecheck` 退出码 0 ✅；⚠️ **`pnpm lint` 目前回退为 `tsc --noEmit`（本项目刻意不装 ESLint，见 `apps/desktop/.eslintrc.cjs` 头部的说明与安装命令）—— 它不提供 `tsc` 之外的任何检查**。写成"退出码 0"会让人以为有 linter，见 §3.16 |
 | 聚合 | `pnpm check:all` | 退出码 0 |
 | 类型桥 | `pnpm bindings` 连续两次 | 第二次后 `git status` 干净（该命令同时跑 4 项守卫，含 `COMMAND_NAMES` 与注册命令的逐条核对） |
-| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **当前实测 392 项检查全通过**（【1】–【33】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】、**中间档 ImageMagick 后端切换**【12】、**纯 Rust 兜底档**【13】、音视频真实属性【17】、压缩包标准归档【18】、Office → PDF【19】、一句话生成插件闭环【20】、任务取消无孤儿【21】、画布导出跑通【22】、SDK 节点表对账【23】、API Key 生命周期与脱敏【24】、许可证确认与记录【25】、前端能力边界【26】、**「保留源文件」真的在删文件**【27】、**插件参数能不能到达执行器**【28】、**许可证勾选框的 UI 点击穿透**【29】、**权重被截断时不再谎报"已就绪"**【30】；【8】【9】【11】【12】【13】在缺权重 / 缺运行时（或没有可临时藏起的托管引擎）时会显式记为"跳过"而不是"通过"） |
+| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **当前实测 401 项检查全通过**（【1】–【34】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】、**中间档 ImageMagick 后端切换**【12】、**纯 Rust 兜底档**【13】、音视频真实属性【17】、压缩包标准归档【18】、Office → PDF【19】、一句话生成插件闭环【20】、任务取消无孤儿【21】、画布导出跑通【22】、SDK 节点表对账【23】、API Key 生命周期与脱敏【24】、许可证确认与记录【25】、前端能力边界【26】、**「保留源文件」真的在删文件**【27】、**插件参数能不能到达执行器**【28】、**许可证勾选框的 UI 点击穿透**【29】、**权重被截断时不再谎报"已就绪"**【30】；【8】【9】【11】【12】【13】在缺权重 / 缺运行时（或没有可临时藏起的托管引擎）时会显式记为"跳过"而不是"通过"） |
 | 最小闭环 | `pnpm tauri:dev` → 图片转换任务 | 任务完成、输出存在 |
 | 引擎 | `pnpm engines:list` / `engines:install` | 能探测、能安装并通过 SHA-256 校验；**libvips 与 imagemagick 都已实测装成功**（哈希回填的 **7 条**仍限 Windows / Linux；FFmpeg 因本机 `www.gyan.dev` 不可达而未装成，见 §3） |
 | 图标 | `pnpm icons` | 成功（需先补 `assets/icon-source.png`） |
