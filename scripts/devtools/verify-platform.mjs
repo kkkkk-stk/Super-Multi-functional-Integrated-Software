@@ -6748,6 +6748,251 @@ ${withLines}
   }
 }
 
+// ============================================================================
+// 【35】PLUGIN-SDK.md §3.5「产出值」表与 nodes.rs 的实际调用点是否对得上
+// ============================================================================
+//
+// 这是**最后一张没有机械对账的公开契约**。【23】核对的是 §3.1–§3.4 的节点表
+// （名字 / 参数 / 引擎），而 §3.5「哪些节点会产出可供 `${steps.x.y}` 引用的值」
+// 一直没人管 —— 因为节点注册表（`pipeline_nodes` 返回的 `NodeDescriptor`）
+// 里根本没有"我会产出哪些值"这个字段，那些值只存在于
+// `NodeOutput::with_value(...)` 的调用点里。
+//
+// 于是它漂了很久，而且**三个方向同时漂**：
+//   * `image.rotate` 写着产出 `width` / `height`，实际只有 `backend`
+//     （照写的人会得到"模板变量无法解析"）；
+//   * `doc.ocr` 的 `pages` / `rasterizer` 没写；
+//   * **`image.remove-background` 被归进"没有可引用的值"那一行，而它产出 6 个值**
+//     —— 其中 `coveragePercent` 是流程内判断"模型到底找没找到主体"的唯一手段。
+//
+// 这一节的判据与【23】完全同源（都是"文档 vs 代码"，只是代码侧换成**源码扫描**，
+// 因为值没有声明式来源）。为了不误报，两条规则写死：
+//   * 文档里**括号内的内容不算**（`backend（tesseract 或 ai-vision）` 里的
+//     `tesseract` 是说明，不是值名）——【23】对参数列已经是这么做的；
+//   * 「其它（如 …）」那一行是**举例**，不要求它穷举。但**它点名的节点必须真的没有值**
+//     —— `image.remove-background` 当初就是被这一行骗的。
+c.section('【35】PLUGIN-SDK.md 的「产出值」表与 nodes.rs 的实际调用点是否对得上');
+{
+  const NODES_RS = join(REPO_ROOT, 'crates', 'toolforge-engines', 'src', 'nodes.rs');
+  const SDK_MD = join(REPO_ROOT, 'docs', 'PLUGIN-SDK.md');
+
+  const src = readFileSync(NODES_RS, 'utf8');
+  const cut = src.indexOf('\nmod tests {');
+  const code = cut === -1 ? src : src.slice(0, cut);
+
+  /** 取一个顶层函数的函数体；跳过字符串、字符字面量与行注释 */
+  const fnBody = (text, name) => {
+    const prefixes = ['', 'pub ', 'async ', 'pub async ', 'pub(crate) ', 'pub(crate) async '];
+    const needle = `fn ${name}(`;
+    let from = 0;
+    let at = -1;
+    for (;;) {
+      const found = text.indexOf(needle, from);
+      if (found === -1) return null;
+      const lineStart = text.lastIndexOf('\n', found - 1) + 1;
+      if (prefixes.includes(text.slice(lineStart, found).trimStart())) {
+        at = found;
+        break;
+      }
+      from = found + needle.length;
+    }
+    const open = text.indexOf('{', at);
+    if (open === -1) return null;
+    let depth = 0;
+    let inStr = false;
+    for (let i = open; i < text.length; i++) {
+      const c = text[i];
+      if (inStr) {
+        if (c === '\\') {
+          i++;
+          continue;
+        }
+        if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') {
+        inStr = true;
+        continue;
+      }
+      // ⚠️ 字符字面量必须整段跳过：`nodes.rs` 里有一句
+      // `matches!(c, '\\' | '/' | … | '"' | …)` —— 那个**字符**字面量里包着双引号，
+      // 不跳的话会被当成字符串开头，后面的括号配平全错（"找不到函数体"）。
+      if (c === "'") {
+        const n = charLiteralLen(text, i);
+        if (n) {
+          i += n - 1;
+          continue;
+        }
+      }
+      if (c === '/' && text[i + 1] === '/') {
+        while (i < text.length && text[i] !== '\n') i++;
+        continue;
+      }
+      if (c === '{') depth++;
+      else if (c === '}') {
+        depth--;
+        if (depth === 0) return text.slice(open, i + 1);
+      }
+    }
+    return null;
+  };
+
+  /** 字符字面量长度；排除生命周期（`&'a str` 同样是撇号开头，但没有闭合撇号） */
+  const charLiteralLen = (text, i) => {
+    if (text[i] !== "'") return null;
+    if (text[i + 1] === '\\') {
+      for (let len = 3; len <= 12; len++) {
+        if (text[i + len] === "'") return len + 1;
+        if (text[i + len] === undefined) return null;
+      }
+      return null;
+    }
+    if (/[A-Za-z0-9]/.test(text[i + 1] ?? '') && text[i + 2] !== "'") return null;
+    const ch = [...text.slice(i + 1)].slice(0, 1)[0];
+    if (!ch) return null;
+    return text[i + 1 + ch.length] === "'" ? ch.length + 2 : null;
+  };
+
+  // ---- 分发表 ----
+  const runBody = fnBody(code, 'run');
+  const dispatch = new Map();
+  for (const line of (runBody ?? '').split('\n')) {
+    const m = /^\s*"([a-z0-9.\-]+)"\s*=>\s*([A-Za-z0-9_]+)\s*\(/.exec(line);
+    if (m) dispatch.set(m[1], m[2]);
+  }
+
+  // ---- 每个节点实际产出的值 ----
+  // 三种写法都要认（目前只有 `image.probe` 用第三种）：
+  // `with_value("k", …)` / `NodeOutput::value("k", …)` / `out.values.insert("k".into(), …)`
+  const VALUE_RE =
+    /(?:with_value\(|NodeOutput::value\(|values\.insert\()\s*"([A-Za-z0-9_\-.]+)"/g;
+  const produced = new Map(); // **只装真正产出了值的节点**
+  for (const [node, fn] of dispatch) {
+    const body = fnBody(code, fn);
+    if (!body) continue;
+    const keys = new Set();
+    for (const m of body.matchAll(VALUE_RE)) keys.add(m[1]);
+    // 一跳：辅助函数（与 nodes.rs 里那条静态自省守卫同一策略）
+    for (const c of body.matchAll(/\b([a-z_][a-z0-9_]*)\s*\(/g)) {
+      const helper = c[1] === fn ? null : fnBody(code, c[1]);
+      if (helper) for (const m of helper.matchAll(VALUE_RE)) keys.add(m[1]);
+    }
+    // ⚠️ 空的**不入表**：`produced.size` 就是"产出值的节点数"，
+    // 它同时被下面 ① 和 ⑦ 的说明数字用着。第一版漏了这个判断，
+    // 于是 32 个节点全在表里、说明里印出"有值 32 / 无值 0"，
+    // 而真实是 20 / 12 —— 断言本身照样绿（判据用的是 `doc.has`），
+    // 但**打印出来的数字是假的**。这类"绿着骗人"的输出正是这一节要防的东西。
+    if (keys.size) produced.set(node, [...keys].sort());
+  }
+
+  // ---- 文档 §3.5 ----
+  //
+  // 这一节现在是**两段**：一张"产出值的"表 + 一段"不产出任何值的"节点清单。
+  // 两段都要读 —— 而且"不产出值"那一段必须点名到节点，不能只写一句"其它都没有"：
+  // `image.remove-background` 当初就是被那句笼统的话盖住的（它其实产出 6 个值）。
+  const sdk = readFileSync(SDK_MD, 'utf8').split(/\r?\n/);
+  const heading = sdk.findIndex(
+    (l) => l.startsWith('###') && l.includes('哪些节点会产出可供')
+  );
+  const doc = new Map(); // node -> 值名数组（空的表示文档说它没有值）
+  const noValueListed = [];
+  let docRows = 0;
+  if (heading >= 0) {
+    for (let i = heading; i < sdk.length; i++) {
+      const l = sdk[i];
+      if (l.startsWith('###') && i > heading) break;
+      const m = /^\|\s*(.+?)\s*\|(.+?)\|\s*$/.exec(l);
+      if (!m) continue;
+      if (m[1].includes('节点') || /^\|[\s:-]+\|/.test(l)) continue;
+      const names = [...m[1].matchAll(/`([a-z][a-z0-9.\-]*)`/g)].map((x) => x[1]);
+      if (!names.length) continue;
+      docRows++;
+      // 括号里的内容是说明，不是值名（`backend（tesseract 或 ai-vision）`）
+      const cell = m[2].replace(/（[^）]*）/g, '').replace(/\([^)]*\)/g, '');
+      const vals = cell.includes('没有可引用的值')
+        ? []
+        : [...cell.matchAll(/`([A-Za-z][A-Za-z0-9]*)`/g)].map((x) => x[1]);
+      for (const n of names) doc.set(n, vals);
+    }
+    // "不产出任何值的"那段：从标记行往后收集反引号里的节点名
+    const marker = sdk.findIndex((l, i) => i > heading && l.includes('不产出任何值的'));
+    if (marker >= 0) {
+      for (let i = marker; i < Math.min(marker + 12, sdk.length); i++) {
+        if (sdk[i].startsWith('###') || sdk[i].startsWith('>')) break;
+        if (!sdk[i].trim() && noValueListed.length) break;
+        for (const m of sdk[i].matchAll(/`([a-z][a-z0-9.\-]*)`/g)) {
+          noValueListed.push(m[1]);
+          if (!doc.has(m[1])) doc.set(m[1], []);
+        }
+      }
+    }
+  }
+
+  // ---- 解析器自检：认不出东西时必须**大声失败**，而不是"没有漂移" ----
+  c.check(
+    dispatch.size >= 30 && produced.size >= 15,
+    '① 解析器认得清 nodes.rs（分发表了 ≥30 个节点、其中 ≥15 个产出值）',
+    `分发 ${dispatch.size} / 有值 ${produced.size}`
+  );
+  c.check(
+    docRows >= 15 && noValueListed.length >= 8 && heading >= 0,
+    '② 解析器认得清 PLUGIN-SDK §3.5 的**两段**（产出值表 ≥15 行 + 无值清单 ≥8 个节点）',
+    `表 ${docRows} 行 / 无值清单 ${noValueListed.length} 个`
+  );
+  c.check(
+    (produced.get('image.probe') ?? []).length === 4,
+    '★ ③ 解析器认得 `out.values.insert("…")` 这种写法 —— 只有 `image.probe` 用它，漏了就误报成"它不产出任何值"',
+    `image.probe → [${produced.get('image.probe') ?? []}]`
+  );
+
+  // ---- 四个方向的对账 ----
+  const missing = []; // 代码有、文档那行没列
+  const extra = []; // 文档列了、代码没有
+  const undocumented = []; // 代码有值、但文档里根本没有它的行
+  for (const [node, keys] of produced) {
+    if (!doc.has(node)) {
+      if (keys.length) undocumented.push(`${node}（代码产出 ${keys.join('/')}）`);
+      continue;
+    }
+    const d = doc.get(node);
+    const miss = keys.filter((k) => !d.includes(k));
+    const ext = d.filter((k) => !keys.includes(k));
+    if (miss.length) missing.push(`${node}：文档缺 ${miss.join('/')}（文档有 ${d.join('/') || '（无）'}）`);
+    if (ext.length) extra.push(`${node}：文档多出 ${ext.join('/')}（代码只有 ${keys.join('/') || '（无）'}）`);
+  }
+  // "不产出任何值的"那段点名的节点必须真的没有值
+  for (const node of noValueListed) {
+    const keys = produced.get(node) ?? [];
+    if (keys.length) {
+      extra.push(`「不产出任何值的」那段把 ${node} 说成没有值，而它产出 ${keys.join('/')}`);
+    }
+  }
+  // 覆盖：每个节点都必须被"有值表"或"无值清单"覆盖到 ——
+  // 新加一个节点却忘了更新文档时，这条会红（而不是悄悄地谁都不管它）。
+  const uncovered = [...dispatch.keys()].filter((n) => !doc.has(n));
+
+  c.check(
+    missing.length === 0,
+    '★ ④ 文档没有漏掉任何实际产出的值（漏了 = 插件作者不知道能用它）',
+    missing.length ? `\n      ${missing.join('\n      ')}` : '没有漂移'
+  );
+  c.check(
+    extra.length === 0,
+    '★ ⑤ 文档没有写出任何**并不存在**的值（照写的人会得到"模板变量无法解析"）',
+    extra.length ? `\n      ${extra.join('\n      ')}` : '没有漂移'
+  );
+  c.check(
+    undocumented.length === 0,
+    '★ ⑥ 每个实际产出值的节点都在文档里有行（不能只靠一句"其它都没有"兜住）',
+    undocumented.length ? `\n      ${undocumented.join('\n      ')}` : '没有漂移'
+  );
+  c.check(
+    uncovered.length === 0,
+    '★ ⑦ 每个节点都被"有值表"或"无值清单"覆盖（新加节点忘了更新文档时会红）',
+    uncovered.length ? `\n      ${uncovered.join('\n      ')}` : `32 个节点全部覆盖（有值 ${produced.size} / 无值 ${dispatch.size - produced.size}）`
+  );
+}
+
 client.close();
 process.exit(c.summary() ? 0 : 1);
 
