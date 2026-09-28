@@ -1507,6 +1507,206 @@ main()
   }
 
   // ==========================================================================
+  // 【6d】L3 · 进度字段：`currentItem` / `speed` / `etaSeconds` 到底传没传到前端
+  // ==========================================================================
+  //
+  // 这三 个字段在 `JobProgress` 里一直有，L1 的 FFmpeg 进度也一直在填
+  // （"第 3/10 个文件、1.5 MB/s、还剩 12 秒"），而 L3 的桥接**写死了 `None`** ——
+  // 并且这件事被当成既定行为写进了 PLUGIN-SDK 的「通知的字段限制」。
+  // 于是 L3 插件永远只能报"百分之几 + 一句话"，前端只能显示一个不确定态的进度条。
+  //
+  // 这是 L3 与 L1 在进度体验上的**唯一实质差距**，也是 v0.2 清单里
+  // 「补齐进度字段（不一致 6g）」那一条。现在接通了，这一节钉住它。
+  //
+  // 判据落在 **`jobs_get` 返回的载荷**上，而不是"宿主内部某个变量"：
+  // 前端拿到的就是这份 JSON，所以只有它算数。
+  c.section('【6d】L3 · 进度字段（currentItem / speed / etaSeconds）有没有真的传到前端');
+  {
+    const PROG_PROBE = 'com.toolforge.test.progress-probe';
+    const probeDir = join(STAGE, 'progress-probe');
+    rmSync(probeDir, { recursive: true, force: true });
+    mkdirSync(probeDir, { recursive: true });
+    writeFileSync(
+      join(probeDir, 'plugin.yaml'),
+      `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${PROG_PROBE}
+  name: 进度字段探针（测试用）
+  version: 1.0.0
+  description: 仅用于验证 L3 的 progress 通知字段有没有被原样传到前端。
+permissions:
+  capabilities: []
+io:
+  inputs:
+    - id: src
+      label: 任意文本
+      type: text
+      required: true
+  outputs: []
+  params:
+    - id: style
+      label: 字段拼写
+      type: text
+      default: { kind: str, value: camel }
+      description: camel = currentItem/etaSeconds；snake = current_item/eta_seconds。两种都该被接受。
+      required: false
+runtime:
+  kind: python
+  python:
+    entry: main.py
+    pythonVersion: "3.11"
+    requirements: []
+    timeoutMs: 60000
+    workers: 1
+    allowNetwork: false
+`,
+      'utf8'
+    );
+    writeFileSync(
+      join(probeDir, 'main.py'),
+      `"""进度字段探针：发一条带全部五个字段的 progress 通知，然后停一会儿。"""
+import json
+import sys
+import time
+
+
+def _write(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\\n")
+    sys.stdout.flush()
+
+
+def handle_initialize(params):
+    return {"ok": True}
+
+
+def handle_run(params):
+    p = params.get("params") or {}
+    style = (p.get("style") or "camel").strip()
+    stage = "统计中" if style == "camel" else "统计中(snake)"
+    item_key = "currentItem" if style == "camel" else "current_item"
+    eta_key = "etaSeconds" if style == "camel" else "eta_seconds"
+    _write({
+        "jsonrpc": "2.0",
+        "method": "progress",
+        "params": {
+            "value": 0.42,
+            "stage": stage,
+            item_key: "photo-007.png",
+            "speed": "1.5 MB/s",
+            eta_key: 12.5,
+        },
+    })
+    # 留一个窗口，让验证脚本能在任务**运行中**读到这份进度
+    time.sleep(2.5)
+    return {"outputs": {}}
+
+
+def handle_shutdown(params):
+    return {"ok": True}
+
+
+HANDLERS = {"initialize": handle_initialize, "run": handle_run, "shutdown": handle_shutdown}
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        handler = HANDLERS.get(msg.get("method"))
+        if handler is None:
+            continue
+        try:
+            result = handler(msg.get("params") or {})
+            _write({"jsonrpc": "2.0", "id": msg.get("id"), "result": result})
+        except Exception as exc:  # noqa: BLE001
+            _write({"jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32000, "message": str(exc)}})
+
+
+main()
+`,
+      'utf8'
+    );
+
+    await install(PROG_PROBE, probeDir, { executableCode: true });
+    await client.invoke('plugins_set_enabled', { pluginId: PROG_PROBE, enabled: true });
+
+    const outDir = prepareOutDir('out-rt-progress-probe');
+
+    /** 起一次任务，在**运行中**抓一份 `jobs_get`，再等它跑完 */
+    const runAndSnapshot = async (style) => {
+      const sub = await client.invoke('plugins_run', {
+        req: {
+          pluginId: PROG_PROBE,
+          inputs: { src: ['x'] },
+          params: { style: { kind: 'str', value: style } },
+          outputDir: outDir,
+        },
+      });
+      await sleep(1400); // 插件睡 2.5 秒，这个点它一定还在跑
+      const during = await client.invoke('jobs_get', { jobId: sub.jobId });
+      const done = await client.waitJob(sub.jobId, 120, 100);
+      return { during, done };
+    };
+
+    const camel = await runAndSnapshot('camel');
+    console.log(
+      `   运行中的 progress：${JSON.stringify(camel.during?.progress ?? null)}`
+    );
+    c.check(camel.during?.status === 'running', '① 前置：抓快照时任务**正在跑**（否则下面测的是终态）', camel.during?.status);
+    const pg = camel.during?.progress ?? {};
+    c.check(pg.value === 0.42, '② `value` 传到了（老字段，本来就有）', String(pg.value));
+    c.check(pg.stage === '统计中', '③ `stage` 传到了（老字段，本来就有）', String(pg.stage));
+    c.check(
+      pg.currentItem === 'photo-007.png',
+      '★ ④ `currentItem` 传到了 —— 这个字段以前被**写死成 None** 丢掉，前端因此永远显示不出"正在处理哪一个"',
+      String(pg.currentItem)
+    );
+    c.check(pg.speed === '1.5 MB/s', '★ ⑤ `speed` 传到了（速率文本，单位由插件决定）', String(pg.speed));
+    c.check(pg.etaSeconds === 12.5, '★ ⑥ `etaSeconds` 传到了', String(pg.etaSeconds));
+
+    c.check(camel.done?.status === 'succeeded', '⑥b 任务最终成功（进度上报没有把它搞坏）', camel.done?.status);
+    // ---- ⑦ 终态：进度被换成「完成」，**逐项字段被清掉** ----
+    //
+    // ⚠️ 这一条我第一版写反了：当时的期望是"终态快照里仍然保留 currentItem / etaSeconds"，
+    // 结果红了 —— 而**产品是对的**。任务体结尾是
+    // `ctx.progress_now(JobProgress::ratio("完成", total, total))`，
+    // 它构造一个**全新的** `JobProgress`，于是逐项字段归零。
+    // 这是对的：一个**已经完成**的任务还显示「正在处理 photo-007.png · 还剩 12.5 秒」
+    // 是**过期信息**，比没有更糟。所以正确的断言正好相反。
+    const after = camel.done?.progress ?? {};
+    console.log(`   终态 progress：${JSON.stringify(after)}`);
+    c.check(
+      after.value === 1 && after.stage === '完成',
+      '★ ⑦ 终态进度被换成「完成 / 100%」（由命令层 `ctx.progress_now(ratio("完成", …))` 写入）',
+      `${after.value} / ${after.stage}`
+    );
+    c.check(
+      after.currentItem === undefined && after.etaSeconds === undefined && after.speed === undefined,
+      '★ ⑦b 终态**不留逐项残影**：已完成的任务还在说"正在处理 X · 还剩 12 秒"是过期信息，比没有更糟',
+      JSON.stringify(after)
+    );
+
+    // ---- ⑧ snake_case 也要认 ----
+    const snake = await runAndSnapshot('snake');
+    const sg = snake.during?.progress ?? {};
+    console.log(`   snake_case 的 progress：${JSON.stringify(snake.during?.progress ?? null)}`);
+    c.check(
+      sg.currentItem === 'photo-007.png' && sg.etaSeconds === 12.5,
+      '★ ⑧ `current_item` / `eta_seconds` 这两种拼写也被接受（不认的话字段会被**静默忽略**）',
+      `${sg.currentItem} / ${sg.etaSeconds}`
+    );
+
+    await uninstall(PROG_PROBE);
+  }
+
+  // ==========================================================================
   // 【7】收尾：测试插件不能留在用户的插件列表里
   // ==========================================================================
   c.section('【7】测试插件已清理');
@@ -1527,6 +1727,7 @@ main()
       'com.toolforge.test.spin-wasm',
       'com.toolforge.test.spin-wasm-2',
       'com.toolforge.test.spin-wasm-long',
+      'com.toolforge.test.progress-probe',
     ];
     for (const id of all) {
       await uninstall(id);

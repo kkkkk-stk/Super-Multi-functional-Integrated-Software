@@ -292,19 +292,7 @@ fn handle_notification(plugin_id: &str, n: Value, job: &JobCtx) {
     let params = n.get("params").cloned().unwrap_or(Value::Null);
     match method {
         "progress" => {
-            let value = params.get("value").and_then(|v| v.as_f64());
-            let stage = params
-                .get("stage")
-                .and_then(|s| s.as_str())
-                .unwrap_or("处理中")
-                .to_string();
-            job.progress(toolforge_core::job::JobProgress {
-                value,
-                stage,
-                current_item: None,
-                speed: None,
-                eta_seconds: None,
-            });
+            job.progress(progress_from_notification(&params));
         }
         "log" => {
             let level = params
@@ -334,6 +322,46 @@ fn handle_notification(plugin_id: &str, n: Value, job: &JobCtx) {
         _ => {
             tracing::debug!(plugin = %plugin_id, method, "未处理的插件通知");
         }
+    }
+}
+
+/// 把一条 `progress` 通知的 `params` 翻译成宿主侧的 [`JobProgress`]。
+///
+/// 抽成纯函数是为了能**直接断言这个映射**：整条 L3 链路要建 venv、起子进程才能跑，
+/// 而"字段怎么读"这一层不需要任何运行时 —— 也就不该等着真机才能验。
+///
+/// ## 三个曾经被丢弃的字段
+///
+/// `JobProgress` 里一直有 `currentItem` / `speed` / `etaSeconds`，L1 的 ffmpeg 进度
+/// 也在填它们，而 L3 的桥接此前写死 `None`，并把这件事当成既定行为写进了
+/// PLUGIN-SDK 的「通知的字段限制」—— 于是 L3 插件永远只能报"百分之几 + 一句话"，
+/// 前端只能显示一个不确定态的进度条。这是 L3 与 L1 在进度体验上的**唯一实质差距**。
+///
+/// ## 为什么两种拼写都认
+///
+/// 协议里其它字段都是 camelCase（`timeoutMs` / `allowHostFunctions`），
+/// 但 Python 作者的手会自然写出 snake_case。多认一种拼写的代价是零；
+/// 不认的代价是**字段被静默忽略** —— 正是这个项目反复吃亏的那一类。
+/// （`value` / `stage` 两个老字段保持原样：它们从来没有过第二种拼写。）
+fn progress_from_notification(params: &Value) -> toolforge_core::job::JobProgress {
+    let pick_str = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|k| params.get(*k).and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+    };
+    let pick_f64 = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|k| params.get(*k).and_then(|v| v.as_f64()))
+    };
+
+    toolforge_core::job::JobProgress {
+        value: params.get("value").and_then(|v| v.as_f64()),
+        stage: pick_str(&["stage"]).unwrap_or_else(|| "处理中".to_string()),
+        current_item: pick_str(&["currentItem", "current_item"]),
+        speed: pick_str(&["speed"]),
+        eta_seconds: pick_f64(&["etaSeconds", "eta_seconds"]),
     }
 }
 
@@ -634,6 +662,75 @@ fn inject_declared_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `progress` 通知的字段映射 —— 尤其是那三个**曾经被丢弃**的字段。
+    #[test]
+    fn progress_notification_keeps_every_documented_field() {
+        let p = progress_from_notification(&serde_json::json!({
+            "value": 0.42,
+            "stage": "统计中",
+            "currentItem": "photo-007.png",
+            "speed": "1.5 MB/s",
+            "etaSeconds": 12.5,
+        }));
+        assert_eq!(p.value, Some(0.42));
+        assert_eq!(p.stage, "统计中");
+        assert_eq!(
+            p.current_item.as_deref(),
+            Some("photo-007.png"),
+            "★ currentItem 以前是被直接丢掉的（写死 None），这条断言就是那个缺陷的回归"
+        );
+        assert_eq!(p.speed.as_deref(), Some("1.5 MB/s"));
+        assert_eq!(p.eta_seconds, Some(12.5));
+    }
+
+    /// snake_case 也要认 —— 不认的代价是字段被**静默忽略**。
+    #[test]
+    fn progress_notification_accepts_snake_case_too() {
+        let p = progress_from_notification(&serde_json::json!({
+            "value": 0.1,
+            "current_item": "a.png",
+            "eta_seconds": 3.0,
+        }));
+        assert_eq!(p.current_item.as_deref(), Some("a.png"));
+        assert_eq!(p.eta_seconds, Some(3.0));
+        // camelCase 优先（协议的正统写法），但不能因此丢掉 snake_case 的支持
+        let both = progress_from_notification(&serde_json::json!({
+            "currentItem": "camel.png",
+            "current_item": "snake.png",
+        }));
+        assert_eq!(both.current_item.as_deref(), Some("camel.png"));
+    }
+
+    /// 字段缺省时的兜底：老插件只报 `value` / `stage` 也必须照常工作。
+    #[test]
+    fn progress_notification_without_optional_fields_still_works() {
+        let p = progress_from_notification(&serde_json::json!({ "value": 0.5 }));
+        assert_eq!(p.value, Some(0.5));
+        assert_eq!(p.stage, "处理中", "没给 stage 时要有默认文案，不能是空串");
+        assert_eq!(p.current_item, None);
+        assert_eq!(p.speed, None);
+        assert_eq!(p.eta_seconds, None);
+
+        // 完全空的 params 也不能 panic
+        let empty = progress_from_notification(&serde_json::json!({}));
+        assert_eq!(empty.value, None);
+        assert_eq!(empty.stage, "处理中");
+    }
+
+    /// 类型不对的字段要**忽略**而不是猜（`value` 给了字符串就当没给）。
+    #[test]
+    fn wrong_types_are_ignored_not_coerced() {
+        let p = progress_from_notification(&serde_json::json!({
+            "value": "0.9",
+            "etaSeconds": "30",
+            "currentItem": 42,
+        }));
+        assert_eq!(p.value, None);
+        assert_eq!(p.eta_seconds, None);
+        assert_eq!(p.current_item, None);
+        assert_eq!(p.stage, "处理中");
+    }
 
     #[test]
     fn venv_python_path_matches_platform() {

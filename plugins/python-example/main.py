@@ -37,9 +37,10 @@
 
 插件主动发的通知（无 id，宿主不回包）
 ------------------------------------
-``progress``（宿主只读 ``value`` 与 ``stage``，其余字段会被忽略）::
+``progress``（五个字段宿主都读；只有 ``value`` 与 ``stage`` 是必需的）::
 
-    {"jsonrpc":"2.0","method":"progress","params":{"value":0.5,"stage":"正在统计颜色"}}
+    {"jsonrpc":"2.0","method":"progress","params":{"value":0.5,"stage":"正在统计颜色",
+     "currentItem":"photo-007.png","speed":"1.5 MB/s","etaSeconds":12.5}}
 
 ``log``（宿主按 level 映射到任务日志）::
 
@@ -137,11 +138,35 @@ def send_error(req_id, code: int, message: str, data=None) -> None:
     _write_frame({"jsonrpc": PROTOCOL_VERSION, "id": req_id, "error": err})
 
 
-def notify_progress(stage: str, value: float | None = None) -> None:
-    """上报进度通知。宿主只读 `value` 与 `stage`（见 python.rs 的 handle_notification）。"""
+def notify_progress(
+    stage: str,
+    value: float | None = None,
+    current_item: str | None = None,
+    speed: str | None = None,
+    eta_seconds: float | None = None,
+) -> None:
+    """上报进度通知。
+
+    宿主读全部五个字段（见 ``python.rs::progress_from_notification``）：
+
+    * ``value`` —— ``0.0``–``1.0``；**不给**就是不确定进度条；
+    * ``stage`` —— 当前阶段的人类可读描述；
+    * ``currentItem`` —— 正在处理的那一个（前端显示在进度条旁边）；
+    * ``speed`` —— 速率**文本**（单位由插件决定，宿主不换算），例如 ``"1.5 MB/s"``；
+    * ``etaSeconds`` —— 预计剩余秒数。
+
+    ``currentItem`` / ``etaSeconds`` 也接受 snake_case（宿主两种拼写都认），
+    这里统一发 camelCase —— 协议的正统写法。
+    """
     params: dict = {"stage": stage}
     if value is not None:
         params["value"] = max(0.0, min(1.0, float(value)))
+    if current_item is not None:
+        params["currentItem"] = current_item
+    if speed is not None:
+        params["speed"] = speed
+    if eta_seconds is not None:
+        params["etaSeconds"] = float(eta_seconds)
     _write_frame({"jsonrpc": PROTOCOL_VERSION, "method": "progress", "params": params})
 
 
@@ -290,7 +315,9 @@ def extract_palette(src_path: str, count: int, ignore_near_white: bool,
 
     # 1) 解码 + 缩小。缩到最长边 256 是刻意的：主色调统计不需要全分辨率，
     #    而大图全量量化会让这一步从"秒级"变成"分钟级"。
-    notify_progress("正在解码图片", 0.1)
+    #    `currentItem` 报的是**具体那一个文件** —— 批量跑的时候前端就能显示
+    #    "正在解码 photo-007.png"，而不是只有一句阶段描述。
+    notify_progress("正在解码图片", 0.1, current_item=os.path.basename(src_path))
     with Image.open(src_path) as im:
         width, height = im.size
         rgba = im.convert("RGBA")
@@ -356,7 +383,7 @@ def extract_palette(src_path: str, count: int, ignore_near_white: bool,
     swatch_out: str | None = None
     if swatch_path:
         require_capability("fsWrite")
-        notify_progress("正在生成色卡图", 0.85)
+        notify_progress("正在生成色卡图", 0.85, current_item=os.path.basename(src_path))
         band_h = 48
         swatch = Image.new("RGB", (320, band_h * len(colors)), (255, 255, 255))
         for i, color in enumerate(colors):
