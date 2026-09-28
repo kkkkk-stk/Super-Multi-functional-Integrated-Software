@@ -74,6 +74,9 @@ pub const COMMAND_NAMES: &[&str] = &[
     "plugins_set_enabled",
     "plugins_uninstall",
     "plugins_audit",
+    // 诊断包：把"排查需要的环境事实"一键落成 JSON
+    // （两条硬约束"不含文件内容 / 脱敏"写在 `commands::diagnostics_export` 的文档里）
+    "diagnostics_export",
     "plugins_run",
     // 流程
     "pipeline_nodes",
@@ -117,6 +120,7 @@ pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::plugins_set_enabled,
             commands::plugins_uninstall,
             commands::plugins_audit,
+            commands::diagnostics_export,
             commands::plugins_run,
             commands::pipeline_nodes,
             commands::ai_test_connection,

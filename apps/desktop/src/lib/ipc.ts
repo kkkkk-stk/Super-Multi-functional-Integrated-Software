@@ -31,6 +31,7 @@ import type {
   AppInfo,
   AppPathsDto,
   AuditSnapshot,
+  DiagnosticsBundle,
   EngineEntry,
   EngineInstallRequest,
   EngineStatus,
@@ -311,6 +312,16 @@ export const pluginsUninstall = async (pluginId: string): Promise<void> => {
 
 export const pluginsAudit = (limit = 200): Promise<AuditSnapshot> =>
   unwrap(commands.pluginsAudit(limit));
+
+/**
+ * 导出诊断包（一键把"排查需要的环境事实"写成 JSON 文件）。
+ *
+ * 它**不接收任何参数**：收什么、落在哪，全由后端决定 —— 让前端挑"要包含哪些内容"
+ * 会把"不含文件内容 / 脱敏"这两条承诺变成前端的事，而它们是后端的硬约束
+ * （见 `commands::diagnostics_export` 的文档）。
+ */
+export const diagnosticsExport = (): Promise<DiagnosticsBundle> =>
+  unwrap(commands.diagnosticsExport());
 
 /** 运行插件，立即返回 jobId（执行在任务队列里，进度看事件） */
 export const pluginsRun = (req: RunPluginRequest): Promise<RunPluginResponse> =>

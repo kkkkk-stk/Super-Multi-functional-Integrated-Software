@@ -445,6 +445,24 @@ pub struct AuditSnapshot {
     pub dir: String,
 }
 
+/// 诊断包导出结果。
+///
+/// `redactions` 是**兜底那一层**真的抹掉了几处密钥：正常情况下应该是 0
+/// （因为上面根本不收密钥），非 0 就说明某个字段意外带进了它 ——
+/// 界面上要如实显示这个数字，而不是假装什么都没发生。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsBundle {
+    pub path: String,
+    pub size_bytes: u64,
+    /// 按字面量抹掉的密钥出现次数（兜底层生效的次数）
+    pub redactions: u32,
+    /// 收录了多少条审计事件
+    pub audit_events: u32,
+    /// 收录了多少个任务的元信息
+    pub jobs: u32,
+}
+
 // ============================================================================
 // 系统状态
 // ============================================================================

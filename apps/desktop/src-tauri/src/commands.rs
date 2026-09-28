@@ -693,6 +693,220 @@ pub async fn plugins_audit(
     })
 }
 
+/// 诊断包：一键把"排查需要的环境事实"落成一个 JSON 文件。
+///
+/// ## 它解决什么
+///
+/// 用户报问题时的现实是：要来回问"你什么版本""装没装 ffmpeg""模型下全了吗"
+/// "审计里那几条写的是什么"。这些东西**应用自己全知道**，只是没有出口。
+///
+/// ## 两条硬约束（都是承诺，不是尽力而为）
+///
+/// 1. **不含文件内容**。只收录：环境与版本、设置（**不含 Key**）、引擎与权重的**状态**、
+///    插件清单摘要、审计事件摘要、任务**元信息**（id / 类型 / 状态 / 耗时 / 错误码）。
+///    ⚠️ **刻意不收任务日志正文**：插件可以往日志里写任何东西，一旦收进来，
+///    "不含文件内容"就只能靠"希望插件别那么干"维持 —— 那不是承诺。
+///    （审计事件在设计上就只记路径与哈希，见 `AuditEventKind` 的文档。）
+/// 2. **脱敏**。整个 JSON 过一遍 `redact_with(.., api_key)` —— 按**字面量**抹掉密钥，
+///    与它长得像不像 Key 无关；再叠一层 `redact()` 的启发式兜住别的密钥（§24 验过这条路径）。
+///
+/// 顺带把这两条也做成**可验证**的：`verify-platform.mjs`【36】会先塞一个特征串当密钥、
+/// 再造一个内容里有特征串的文件跑一遍任务，然后断言诊断包里**两个都不出现**。
+#[tauri::command]
+#[specta::specta]
+pub async fn diagnostics_export(
+    state: State<'_, Arc<AppState>>,
+) -> ToolforgeResult<DiagnosticsBundle> {
+    let info = app_info().await?;
+    let paths = app_paths(state.clone()).await?;
+
+    // ---- 引擎与权重：只记状态，不记二进制内容 ----
+    let engines: Vec<serde_json::Value> = state
+        .engines
+        .probe_all()
+        .await
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "state": format!("{:?}", s.state),
+                "source": s.source,
+                "version": s.version,
+            })
+        })
+        .collect();
+
+    let models: Vec<serde_json::Value> = engine_catalog()
+        .into_iter()
+        .flat_map(|d| d.models)
+        .map(|m| {
+            let bytes = state
+                .engines
+                .model_path(&m.id)
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|meta| meta.len());
+            serde_json::json!({
+                "id": m.id,
+                // 用与界面**同一个**判据：0 字节 / 不足标称 60% 都算不完整
+                "installed": bytes
+                    .map(|len| toolforge_core::engine::model_size_looks_complete(len, m.approx_size_mb))
+                    .unwrap_or(false),
+                "installedBytes": bytes,
+                "approxSizeMb": m.approx_size_mb,
+                "license": m.license,
+                "commercialUse": m.commercial_use,
+            })
+        })
+        .collect();
+
+    // 用 `PluginSummary`（`plugins_list` 的同一个形状），不逐个拉完整清单：
+    // 诊断要的是"装了哪些、什么运行时、声明与授权了几项、风险几级"，
+    // 而不是每个插件的全部 YAML。少碰一份数据就少一处可能漏内容的入口。
+    let plugins: Vec<serde_json::Value> = state
+        .plugins
+        .list()
+        .into_iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "name": p.name,
+                "version": p.version,
+                "runtimeKind": format!("{:?}", p.runtime_kind),
+                "enabled": p.enabled,
+                "builtin": p.builtin,
+                "aiGenerated": p.ai_generated,
+                "reviewed": p.reviewed,
+                "riskLevel": format!("{:?}", p.risk_level),
+                "permissionCount": p.permission_count,
+                "grantedCount": p.granted_count,
+                "hasPendingPermissions": p.has_pending_permissions,
+            })
+        })
+        .collect();
+
+    let audit: Vec<serde_json::Value> = state
+        .plugins
+        .audit()
+        .tail(300)
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "at": e.at,
+                "kind": format!("{:?}", e.kind),
+                "subject": e.subject,
+                "summary": e.summary,
+            })
+        })
+        .collect();
+
+    // ---- 任务：**只要元信息**，不要日志正文（理由见函数文档） ----
+    let jobs: Vec<serde_json::Value> = state
+        .queue
+        .snapshot(&toolforge_core::job::JobFilter::default())
+        .into_iter()
+        .take(100)
+        .map(|j| {
+            serde_json::json!({
+                "id": j.id.to_string(),
+                "kind": format!("{:?}", j.kind),
+                "title": j.title,
+                "status": format!("{:?}", j.status),
+                "createdAt": j.created_at,
+                "startedAt": j.started_at,
+                "finishedAt": j.finished_at,
+                // 错误**码**足够定位问题；错误**文本**可能带路径，保留它（路径不是内容）
+                "errorCode": j.error.as_ref().map(|e| format!("{:?}", e.code)),
+                "errorMessage": j.error.as_ref().map(|e| e.message.clone()),
+            })
+        })
+        .collect();
+
+    // 先把要给界面看的数字取出来 —— 下面 `audit`/`jobs` 会被移进 JSON
+    let audit_events = audit.len() as u32;
+    let job_count = jobs.len() as u32;
+
+    // 设置只读一次并克隆出来：既省掉多次加锁，也避免在读锁里跨 await
+    let settings = state.settings.read().clone();
+    let has_key = !state.ai_api_key().trim().is_empty();
+
+    let bundle = serde_json::json!({
+        // 版本纪律：诊断包的第一行永远是"这是什么版本产出的"
+        "schemaVersion": 1,
+        "generatedAt": toolforge_core::job::now_iso(),
+        "app": serde_json::to_value(&info).unwrap_or(serde_json::Value::Null),
+        "platform": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        },
+        "paths": serde_json::to_value(&paths).unwrap_or(serde_json::Value::Null),
+        "settings": serde_json::to_value(&settings).unwrap_or(serde_json::Value::Null),
+        // ⚠️ AI 这一段**必须自己算 `hasKey`**，不能直接用 `settings.ai.has_key`。
+        //
+        // `Settings.ai.has_key` **不是持久化字段** —— `settings_get` 每次都是现算的
+        // （`s.ai.has_key = !state.ai_api_key().trim().is_empty()`），
+        // 磁盘上那份里它永远是 `false`。第一版直接序列化了 `Settings`，
+        // 于是"配置了 Key"这件事在诊断包里被报成 `false` ——
+        // **一个专门用来排查问题的文件，自己先报了个错的值**。
+        // （是 `verify-platform.mjs`【36】的 ⑦b 当场抓出来的。）
+        "ai": {
+            "provider": settings.ai.provider.clone(),
+            "baseUrl": settings.ai.base_url.clone(),
+            "model": settings.ai.model.clone(),
+            "temperature": settings.ai.temperature,
+            // 与 `settings_get` 同一个判据
+            "hasKey": has_key,
+            "persistApiKey": settings.ai.persist_api_key,
+        },
+        "engines": engines,
+        "models": models,
+        "plugins": plugins,
+        "audit": audit,
+        "jobs": jobs,
+    });
+
+    let mut text = serde_json::to_string_pretty(&bundle)
+        .map_err(|e| ToolforgeError::internal(format!("诊断包序列化失败：{e}")))?;
+
+    // ★ 脱敏：按字面量抹掉当前密钥，再叠一层启发式。
+    // 即使上面哪个字段意外带进了密钥，这里也会被抹掉 —— 这一层是**兜底**，
+    // 不是"唯一防线"（真正该做的是上面根本不收）。
+    let key = state.ai_api_key();
+    let redactions = if key.trim().is_empty() {
+        0
+    } else {
+        text.matches(key.trim()).count() as u32
+    };
+    text = toolforge_ai::provider::redact_with(&text, &key);
+    text = toolforge_ai::provider::redact(&text);
+
+    let dir = state.paths.root().join("diagnostics");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ToolforgeError::io(format!("创建诊断目录失败：{e}")))?;
+    let path = dir.join(format!("toolforge-diagnostics-{}.json", file_stamp()));
+    std::fs::write(&path, text.as_bytes())
+        .map_err(|e| ToolforgeError::io(format!("写入诊断包失败：{e}")))?;
+
+    Ok(DiagnosticsBundle {
+        path: path.display().to_string(),
+        size_bytes: text.len() as u64,
+        redactions,
+        audit_events,
+        jobs: job_count,
+    })
+}
+
+/// 文件名用的时间戳（unix 秒）。
+///
+/// 刻意**不做时区换算**：文件名只要"能排序、能区分先后"就够了，
+/// 而人类可读的那个时间戳在包里的 `generatedAt`（ISO-8601）里，
+/// 那里才是要跟其它日志对齐的地方。
+fn file_stamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// 运行插件。立即返回 `jobId`。
 ///
 /// ## 多文件输入会真的逐个处理

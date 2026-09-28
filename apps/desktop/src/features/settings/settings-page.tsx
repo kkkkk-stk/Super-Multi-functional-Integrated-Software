@@ -2,6 +2,7 @@ import {
   Bug,
   CheckCircle2,
   Cpu,
+  Download,
   Eye,
   EyeOff,
   FolderOpen,
@@ -30,7 +31,7 @@ import { Select } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { SkeletonCard } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { useAudit } from "@/hooks/use-plugins";
+import { useAudit, useExportDiagnostics } from "@/hooks/use-plugins";
 import { useAiTestConnection, usePatchSettings, useSettings, useSystemStatus } from "@/hooks/use-settings";
 import { ACCENTS, THEME_MODES } from "@/lib/theme";
 import { formatDateTime } from "@/lib/format";
@@ -621,6 +622,7 @@ function AiSection() {
 
 function SecuritySection() {
   const audit = useAudit(300);
+  const diagnostics = useExportDiagnostics();
 
   return (
     <div className="max-w-4xl space-y-6">
@@ -678,6 +680,20 @@ function SecuritySection() {
           >
             <RefreshCw className={audit.isFetching ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
             刷新
+          </Button>
+          {/*
+            诊断包：把"排查需要的环境事实"一键写成 JSON。
+            放在审计区块里是因为它们是同一件事的两端 —— 一个看、一个带走。
+          */}
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 gap-1.5 text-xs"
+            disabled={diagnostics.isPending}
+            onClick={() => diagnostics.mutate()}
+          >
+            <Download className={diagnostics.isPending ? "h-3.5 w-3.5 animate-pulse" : "h-3.5 w-3.5"} />
+            导出诊断包
           </Button>
         </div>
 

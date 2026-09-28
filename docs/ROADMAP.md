@@ -53,7 +53,7 @@
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
 > | 运行时测试总数 | `cargo test --workspace` **290 passed / 0 failed** |
-> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **408 项全通过**（【1】–【35】） |
+> | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **423 项全通过**（【1】–【36】） |
 > | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **106 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
@@ -641,7 +641,7 @@ pnpm build          # tsc --noEmit && vite build
 ### 基线再更新（**当时的值**，保留作历史）
 
 > ⚠️ 下面这组数是**当时**取的，**不是现状**。当前值见本文档开头的「实测数据」表
-> （`cargo test --workspace` **290 passed / 0 failed**、`verify-platform.mjs` **408 项**）。
+> （`cargo test --workspace` **290 passed / 0 failed**、`verify-platform.mjs` **423 项**）。
 > 留在这里是为了保留"那一轮到底测到了什么"。
 
 阻塞 14、15 修复后重新取的一组数（上面那组保留为历史，**不要把两组混用**）：
@@ -795,7 +795,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 >
 > - `image.convert`、`image.resize`、`image.crop`、`image.rotate` **四个节点会真的按 `libvips → ImageMagick → 纯 Rust` 挑后端**，把结果报在节点输出的 **`backend`**（`"libvips"` / `"imagemagick"` / `"rust"`）与一条 debug 日志里。后端可观测是刻意的：不看日志就只能靠猜，而这个项目已经被"文档说有、实际没有"坑过好几次。
 > - `image.rotate` 的任意角度不再是"直接报缺 ImageMagick"：libvips 可用时走 `vips similarity --angle N`，ImageMagick 可用时走 `-rotate N`，**只有纯 Rust 可用时才返回 `EngineMissing`** —— 仍然**不会静默取整**（取整会让用户以为转了 45°，实际拿到没转的图）。
-> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错，【12】号检查把 `engines/libvips` 临时藏起来、断言后端真的切到 ImageMagick。**写下这一条时**整个脚本是 **82 项检查全通过**（【1】–【13】）；当前共 **408 项**（【1】–【35】），见本文档开头的「实测数据」表。
+> - **真机验证**：`scripts/devtools/verify-platform.mjs` 的【6】号检查断言"实际后端与引擎状态一致"并且日志里写明了用的是哪个后端，【7】号检查盯着任意角度旋转的诚实报错，【12】号检查把 `engines/libvips` 临时藏起来、断言后端真的切到 ImageMagick。**写下这一条时**整个脚本是 **82 项检查全通过**（【1】–【13】）；当前共 **423 项**（【1】–【36】），见本文档开头的「实测数据」表。
 > - **收益要说准**：libvips 档位带来的是**按质量换体积的能力**（WebP/JPEG 有损编码），纯 Rust 后端的 WebP 只能无损。**但"有损一定更小"是错的**，实测 320×200 合成渐变图：无损 508 字节 vs 有损 1808 字节（所以【6】只断言"确实走了有损编码"，不断言体积）。
 >
 > **本条原来还剩两件事，现在都做完了**：
@@ -1163,7 +1163,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   > ✅ **已决定并执行（见 §3.20）**：选择**采用 rustfmt** —— `cargo fmt --all` 重排了 30 个文件，
   > 并把 `cargo fmt --all --check` 加进 `pnpm check:all` 与 CI。理由：文档里写着"零格式差异"这个验收标准，
   > 要么让它成真、要么把那句话删掉；而这个项目的原则一直是**让声明成真**。
-- 实测：`clippy --workspace --all-targets -- -D warnings` **退出码 0**；`cargo test --workspace` **290 passed / 0 failed**；`cargo check --workspace --all-targets` **0 error / 0 warning**；`verify-platform.mjs` **408 项全通过**。
+- 实测：`clippy --workspace --all-targets -- -D warnings` **退出码 0**；`cargo test --workspace` **290 passed / 0 failed**；`cargo check --workspace --all-targets` **0 error / 0 warning**；`verify-platform.mjs` **423 项全通过**。
   （`cargo fmt --all --check` 当时还不干净 —— 已由 §3.20 处理。）
 
 ### 3.16 把「文档里写的检查点」逐条真的跑一遍（本轮）
@@ -1179,7 +1179,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 静态质量 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 退出码 0 |
 | 类型桥 | `pnpm bindings` **连续两次** | ✅ 第二次之后 `git status` **干净**（32 个命令 + 4 项守卫全过） |
 | 脚本编码 | `pnpm check:encodings` | ✅ 退出码 0（§3.13 新增） |
-| 真机验收 | `node scripts/devtools/verify-platform.mjs` | ✅ **408 项全通过**（【0】+【1】–【35】） |
+| 真机验收 | `node scripts/devtools/verify-platform.mjs` | ✅ **423 项全通过**（【0】+【1】–【36】） |
 | 真机验收（**全部六个脚本**） | `node scripts/devtools/run.mjs` | ✅ **六个脚本全部 exit=0**（inspect / smoke / e2e / verify / verify-platform / verify-runtimes，见 §3.18） |
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | ✅ 两条都是真的了：`typecheck` = `tsc --noEmit`；`lint` = **ESLint 8 + TS/React Hooks/jsx-a11y 规则集，`--max-warnings 0`**（§3.22 之前它是回退成 `tsc` 的空壳，见下） |
 | 格式 | `cargo fmt --all --check`（= `pnpm check:fmt`） | ✅ **零格式差异**（§3.20 完成全仓重排并把这一步接进 CI） |
@@ -1347,7 +1347,7 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 ✅ smoke.mjs            exit=0   路由冒烟（9 个页面逐个走）
 ✅ e2e.mjs              exit=0   端到端任务（真实转换 + 产出校验）
 ✅ verify.mjs           exit=0   验证包（解码 / 多文件扇出 / 恶意插件安全测试）
-✅ verify-platform.mjs  exit=0   平台功能（408 项）
+✅ verify-platform.mjs  exit=0   平台功能（423 项）
 ✅ verify-runtimes.mjs  exit=0   插件运行时（L2 WASM / L3 Python，106 项）
 全部通过。
 ```
@@ -2078,6 +2078,73 @@ L3 的任务只有一句阶段描述"——而那是因为 L3 的插件报上来
 并在"正在解码图片"与"正在生成色卡图"两处真的带上了 `currentItem`（批量时前端就能显示
 "正在解码 photo-007.png"）—— 示例插件是插件作者抄的第一份模板，它得先把好习惯示范出来。
 
+### 3.30 诊断包：补上"日志可导出"那一半，顺带被自己的检查抓出一个错值（本轮）
+
+v0.5 有一条「日志可导出，且不包含用户文件内容（只记路径与哈希）」，v1.0 有它的正式形态
+「诊断包：一键导出环境信息、版本、引擎状态、审计日志摘要（脱敏，不含文件内容）」。
+**在这之前，两半里的"可导出"那一半是缺的**：审计在设置页能看、还能"在资源管理器中显示"，
+但**没有任何导出动作** —— 用户要把信息交出来，只能自己翻目录、手工拼。
+
+#### 做了个什么
+
+新增命令 `diagnostics_export`（设置 → 审计区块的「导出诊断包」按钮），把
+环境与版本、平台、路径、设置、`ai`（**含 `hasKey` 但不含 Key**）、引擎状态、权重状态、
+插件清单摘要、最近 300 条审计事件、最近 100 个任务的**元信息**写成一个 JSON，
+落在 `<data>/diagnostics/toolforge-diagnostics-<unix秒>.json`。
+
+两条约束写在函数的文档里，因为它们是**承诺**而不是尽力而为：
+
+1. **不含文件内容**。⚠️ 关键是**刻意不收任务日志正文** —— 插件可以往日志里写任何东西，
+   一旦收进来，"不含文件内容"就只能靠"希望插件别那么干"来维持，那不是承诺。
+   所以任务段只收 id / 类型 / 标题 / 状态 / 起止时间 / 错误码 / 错误文本（路径不是内容）。
+2. **脱敏**。整个 JSON 过一遍 `redact_with(.., api_key)`（按**字面量**抹掉，
+   与它长得像不像 Key 无关），再叠一层 `redact()` 的启发式兜住别的密钥。
+   这一层是**兜底**，不是唯一防线 —— 真正该做的是上面根本不收。
+
+#### 验证（【36】，15 条）：两条承诺都能证伪，所以都值得验
+
+判据是"造出一个具体的东西，再看它在不在包里"：
+
+| # | 断言 | 实测 |
+|---|---|---|
+| ①② | **前置**：素材文件里真的有个特征串，且它真的被一个任务处理过 | 38 字节 / `succeeded` |
+| ③ | **前置**：特征串真的作为 API Key 生效了 | `hasKey=true` |
+| ④⑤⑤b⑤c | 包真的落盘、是合法 JSON、**里面有内容**、带版本号 | 12 引擎 / 9 模型 / 8 插件 / 300 审计 |
+| ★⑥ | 包里**没有**那个文件的内容特征串 | 未出现 |
+| ★⑥b | 但能看出**跑过什么任务**（防止"为了不泄漏干脆什么都不记"） | `PluginRun{…batch-rename}/Succeeded` |
+| ★⑦ | 包里**没有**那个 API Key | 未出现 |
+| ★⑦b⑦d | 如实写了"配了 Key"，但 Key 本身两处都没有 | `ai.hasKey=true`，两处 `apiKey=undefined` |
+| ★⑦c | **`redactions` 是 0** | 0 |
+| ★⑧ | 任务段**没有日志正文** | 收录 2 个任务 |
+| ⑨ | 收尾把 Key 状态还原 | `hasKey=false` |
+
+**⑦c 是这一节里设计得最认真的一条**：只看 ⑦（"包里没有 Key"）的话，
+它可能是"收了之后又抹掉"—— 那说明有字段在漏，只是被兜底挡住了。
+`redactions === 0` 才说明**兜底层一次都没用上**，也就是压根没收。
+两条一起看，才能把"没泄漏"和"泄漏了但被挡住"分开。
+
+#### 自己的检查抓出了自己的一个错值（这次是产品侧）
+
+⑦b 第一版**是红的**：诊断包里把"配了 Key"报成了 `false`。
+原因是我直接序列化了 `Settings`，而 `Settings.ai.has_key` **不是持久化字段** ——
+`settings_get` 每次都是现算的（`s.ai.has_key = !state.ai_api_key().trim().is_empty()`），
+磁盘上那份里它永远是 `false`。
+
+> **一个专门用来排查问题的文件，自己先报了个错的值** —— 而且错得有迷惑性：
+> 拿到包的人会据"没有配置 Key"去查网络，而 Key 其实是配着的。
+> 修法是在包里另开一段 `ai`，用**与 `settings_get` 同一个判据**现算 `hasKey`。
+
+#### 也记两处**测试侧**的错（都是"我假设了 JSON 的形状"）
+
+* ⑥b 第一版期望"文件路径应该出现在包里" → 红了，而**产品是对的**：
+  任务段只收元信息，不含输入输出路径。v0.5 那句"只记路径与哈希"说的是
+  "**允许**记路径"，不是"必须记"。断言改成了"包里能看出跑过什么任务"。
+* ⑦b 第二版读的是 `settings.ai.hasKey`，而修好的字段在**顶层** `ai.hasKey` → 又红了一次。
+
+两处都在测试侧，但第一版的产品侧**确实错过一次**，是这一节把它逼出来的。
+这已经是这个项目里反复出现的同一个教训：**断言错了会伪装成产品缺陷** ——
+而"先写个定点探针把真实形状打出来"比猜快得多。
+
 
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
@@ -2405,11 +2472,42 @@ L3 的任务只有一句阶段描述"——而那是因为 L3 的插件报上来
 
 - [x] ✅ 骨架完成：`GenerationRequest` / `AiProviderConfig` / `ChatMessage`、系统提示词（把 32 个**真实**内置节点目录注入提示词，避免模型编造 `uses`）、`parse_model_output`（支持 `path=` 多文件代码块、裸 YAML 容错、缺 `plugin.yaml` 拒绝）
 - [x] ✅ 骨架完成：`review_draft` / `SecurityReview`（能力清单 + 可疑模式 + 风险定级；需要 L3 时直接标 `Critical` 并提示逐行阅读）
-- [ ] 🚧 接真实 provider 并端到端跑通一次生成
-- [ ] 🚧 静态校验：schema 校验、API 版本校验、**节点白名单校验（`UNIMPLEMENTED_NODES` 现在是空的 —— 32 个节点全部有执行器，所以这条目前只挡"节点名不在目录里"，例如已被删除的 `flow.foreach`，由 `STEP_UNKNOWN_NODE` 直接拦掉）**、危险模式检测
-- [ ] 🚧 权限差异检测：对比旧版本能力集合，**任何扩权都必须重新确认**
-- [ ] 🚧 人工 diff 审阅：强制展示差异，未确认不得落盘
-- [ ] 🚧 落盘 + 哈希锁定：生成物记录内容哈希，装载时再校验一次（`store.rs` 已有 `verify_integrity` / `quarantine_if_changed` 可复用）
+- [ ] 🚧 接真实 provider 并端到端跑通一次生成 —— **本机做不了，原因写清楚**：
+  这台机器的 AI 设置指向一个**本地假端点**（`provider: ollama`、`baseUrl: http://127.0.0.1:18123/v1`、
+  `model: mock-vision`、**`hasKey: false`**，没有 `ai-key.txt`），机器上也没有装 Ollama
+  （PATH 里没有，`11434` 端口无响应）。要用真 provider 得满足其一：给一个真实 API Key，
+  或装一个本地模型 —— **两者都属于用户侧的凭据 / 环境决定**，不是代码问题。
+  > **闭环的其余部分全部已验证**：【20】用 `mock-openai.mjs` 走完了
+  > 草稿 → 静态审核 → 用户确认 → 安装 → **真的跑出东西**；【10】验了请求形状（内联 data URL、
+  > 图片转 JPEG 再发、系统提示词、非流式）；【24】验了 Key 的落盘生命周期与脱敏。
+  > 用假端点验请求形状是**刻意**的（真模型不可复现、要花钱），缺的只是"真服务商也吃这套形状"这一次实测。
+- [x] ✅ 静态校验：schema 校验、API 版本校验、**节点白名单校验**、危险模式检测 —— 四样都在：
+  * **schema / API 版本**：`PluginManifest` 的 serde 反序列化 + `apiVersion` 校验；
+  * **节点白名单**：`PipelineDef::validate_into` 报 `STEP_UNKNOWN_NODE`
+    （`UNIMPLEMENTED_NODES` 现在是空的 —— 32 个节点全部有执行器 —— 所以这条只剩"名字不在目录里"一种落点）；
+  * **危险模式检测**：`toolforge-ai/src/review.rs::scan_code` 拿一张 `PATTERNS` 表扫生成的代码，
+    找出**清单没声明却用了**的危险 API（`subprocess` / `os.system` / `os.popen` / `eval(` / `exec(` /
+    `__import__` …），逐条映射到它需要的 `CapabilityNeed`；其中动态代码执行被专门标注为
+    "没有任何能力声明能覆盖它 —— 永远是危险的"。
+  * 同族还有两条机械对账：`validate_param_reachability`（插件参数能不能到达执行器，【28】）
+    与【23】/【35】（PLUGIN-SDK 的节点表 / 产出值表与代码是否一致）。
+- [x] ✅ 权限差异检测：对比旧版本能力集合，**任何扩权都必须重新确认** —— `store.rs` 的权限差异检测报
+  `PrivilegeEscalation`（全仓 3 处写入点）；另有 `quarantine_if_changed`（安装后被改动就隔离）
+  与 `ensure_loaded` 的**装载前内容哈希校验**。边界：这道门在**安装/启用**时生效，
+  不是运行期持续监控（已在 v0.2 那段写清）。
+- [ ] 🚧 人工 diff 审阅：**一半已达成，剩下的一半说准**
+  * ✅ **AI 草稿这一侧已经做到**：`ai-studio.tsx` 把生成出来的**每个文件的全文**铺在可编辑文本框里
+    （"改完点上面的重新审核；安装时使用的是这里的文本"）；`security-review-panel.tsx` 展示整体风险等级、
+    按严重度排序的 findings、以及**逐条**申请的能力；`recommended === false` 时安装还要再勾一次
+    风险自负确认，最后仍然走 `PermissionGate`。所以"未确认不得落盘"是成立的
+    （落盘与拒绝都会记审计：`AiDraftAccepted` / `AiDraftRejected`）。
+  * ❌ **升级场景的"内容差异"没有视图**：对新插件来说"展示差异"就是"展示全文"（没有可比对象），
+    但**插件升级**时应该并排显示"旧清单 vs 新清单 / 旧代码 vs 新代码" —— 现在只有**能力**维度的差异
+    （`PrivilegeEscalation`），**内容**维度的差异要用户自己去比对。这是剩下要做的那一半。
+- [x] ✅ 落盘 + 哈希锁定：生成物记录内容哈希，装载时再校验一次 —— 安装时写 `installed_hash`；
+  `PluginStore::verify_integrity` / `quarantine_if_changed`（单测覆盖）；`PluginRunner::ensure_loaded`
+  在**每次装载前**重新算一遍内容哈希，不一致就拒绝执行并记 `IntegrityFailure` 审计。
+  > 上一轮还补了它的另一半：**进程已死**的缓存实例会在下一次调用前被换掉（§3.27）。
 
 **AI 媒体能力**
 
@@ -2421,7 +2519,7 @@ L3 的任务只有一句阶段描述"——而那是因为 L3 的插件报上来
   - **实测数据（真机，非推断）**：托管 Python **3.11.16 / 145.2 MB / tar.gz 路径**（此前只跑过 zip 路径）；venv 自动装上 `onnxruntime-1.30.0`、`numpy-2.4.6`、`pillow-12.3.0`；对一张 **400×300**（白底 + 一个红椭圆）的测试图输出 **RGBA PNG（colorType 6）、400×300、椭圆中心 alpha 254、角落 alpha 0、前景覆盖 18.87%**（与椭圆真实面积吻合）；**运行时就绪后单张推理约 0.7 秒**（首次含 pip 约 32 秒）。
   - **测试方法上的一个坑**：**显著性模型不能用渐变图测** —— 在没有明显主体的渐变图上，模型正确报告约 0% 覆盖并让节点发一条警告。验收脚本因此改用**有真实主体**的图。
   - 参数现在是 `model` / `mode`（`alpha` | `color`）/ `background` / `threshold` / `feather`；**旧的 `alphaMatting` 已被删除**（它从登记起就没有实现，是个**假参数**）。默认模型从 `u2net`（168 MB）改成 **`u2netp`（4.4 MB）** —— "先让它跑起来"比"一上来就要下 168 MB"重要得多。
-  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（**写下这一条时**整个脚本是 **82 项检查全通过**；当前共 **408 项**，见本文档开头的「实测数据」表）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
+  - 真机验收落在 `verify-platform.mjs` 的**【8】号检查**（**写下这一条时**整个脚本是 **82 项检查全通过**；当前共 **423 项**，见本文档开头的「实测数据」表）。**该检查在缺权重 / 缺运行时会显式记为"跳过"而不是"通过"** —— 那些前置条件要下载，不能算进通过数。
   - **配套修掉的一个引擎层缺陷**：`probe()` 原来只对 `install_modes == [Remote]` 的引擎特判，而 `onnx-models` **没有可执行文件**（它只是权重文件的宿主），于是永远探测为 `Missing` —— 结果是这个节点**永远显示不可用，哪怕用户已经把权重下好了**。现在 `probe()` 对它单独判：**至少有一个权重已安装 = 可用**。另外 `EngineInstallRequest` 新增 **`force`** 标志 + 引擎卡片上的「另外安装应用托管版本」按钮：系统 Python 3.14 会被探到、显示可用，却跑不了 `onnxruntime` —— **"探测到可用"不等于"满足这个节点的要求"**。
 - [x] ✅ **AI 超分（`ai.upscale`）—— 已实现，真机跑通**
   - 以前的写法是「🚧 AI 超分（`ai.upscale`，当前 `not_implemented`）」。它曾经是"最有可能接着做的一个"，因为可以照抄抠图那条"模型 + 推理"链 —— 这一轮正是这么做的。
@@ -2446,16 +2544,41 @@ L3 的任务只有一句阶段描述"——而那是因为 L3 的插件报上来
 - [x] ✅ **模型文件管理（下载 / 校验 / IPC 部分已完成）**：`EngineRegistry.models` 以前是一张**永远空的 map**（只有 `register_model` 能填，而无人调用），于是 UI 列出 6 个模型、每次下载都答「未在注册表里登记」。现在 `EngineRegistry::new` 直接从 `engine_catalog()` 建表（"第二真相来源"已删除），新增 IPC `models_list` / `models_install` / `models_remove`；`EngineModel` 加 `file_name`（GitHub 资产名 ≠ 模型 id，如 `isnet-general` → `isnet-general-use.onnx`），文件落在 `<data_dir>/models/<model_id>/<file_name>`。
   - `u2net` / `u2netp` / `isnet-general` 三个 rembg 权重带**真实下载后算出来的** SHA-256 与固定 tag 直链（`.../rembg/releases/download/v0.0.0/`）；**哈希不匹配就删文件**（`registry.rs::install_model`，`IntegrityCheckFailed`）。
   - 单测 `verified_sources_are_pinned` 强制 url / sha256 / file_name **全有或全无**、哈希为 64 位小写十六进制、`file_name` 不重复。
-- [ ] 🚧 补齐剩余 3 个模型的来源：`birefnet-general` / `modnet-portrait` / `realesrgan-x4plus` **刻意没有 url/hash**（尚未核对），UI 显示「无下载源」并把下载按钮**置灰**——宁可按钮是灰的，也不留一个"点了必然失败"的按钮。补齐必须先真实下载核对哈希。
-- [ ] 🚧 模型下载的 UI 状态与「版本标识」：已装 / 未装 / 下载进度 / 许可证确认（`requiresLicenseAck` 走 `onnx-models` 引擎）。
+- [x] ✅ 补齐剩余 3 个模型的来源 —— **本轮实测：这条已经过期了，9 个模型**全部**有下载源**
+  （`models_list` 逐个回报 `hasSource=true`：`u2netp` / `u2net` / `isnet-general` /
+  `birefnet-general` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` /
+  `realesrgan-anime6b` / `realesrgan-x4plus`）。三条各自补齐，而且都是**真实下载核对过哈希**的：
+  * `birefnet-general`：928 MB，huggingface 主源 + `hf-mirror` 兜底 + sha256；
+  * `modnet-portrait`：25 MB，同上有两源与哈希；
+  * `realesrgan-x4plus`：`engine.rs` 里那段注释记着补齐它的三件事 ——
+    `py/upscale.py` 的边缘补齐 + 裁回、脚本新增的 `seamRatioX/Y` **接缝指标**（外加一条
+    故意错位的**反证**）、以及真实下载后算出的哈希。它是**固定输入**（`[1,3,256,256]`），
+    这一点是拿 onnxruntime 读过输入形状才写进去的，不是"看着像"。
+  > 这条原本的写法（"刻意没有 url/hash（尚未核对）"）会让人以为有三个模型点下载必然失败。
+- [x] ✅ 模型下载的 UI 状态与「版本标识」：`model-panel.tsx` 展示已装 / 未装 / **文件不完整** /
+  下载进度 / 许可证确认（`requiresLicenseAck` 走 `onnx-models` 引擎）；
+  判据是"`installedSizeMb` 这个字段有没有值"而不是"它大不大" —— 0 字节同样要报「文件不完整」
+  （这条是【30】用一次真实事故换来的，见 §3.15/§3.18）。**实测**：【8】逐个已装模型真跑一遍，
+  【30】验截断态在界面上的呈现。
 
 **可视化流程编辑器**
 
-- [ ] 🚧 基于 React Flow（`@xyflow/react`）的节点编辑器
-- [ ] 🚧 节点 = 内置算子 / 插件节点；连线 = 数据流
+- [x] ✅ 基于 React Flow（`@xyflow/react`，**12.12.0**）的节点编辑器 ——
+  `components/pipeline/flow-canvas.tsx` / `node-palette.tsx` / `inspector-panel.tsx` / `toolforge-node.tsx`。
+  **实测**：【22】把画布一路走到 plugin.yaml → 后端校验 → 安装 → **真的跑起来**，
+  并顺手抓到过一个会让导出**必然失败**的缺陷（多节点画布的 4 个成因）。
+- [x] ✅ 节点 = 内置算子 / 插件节点；连线 = 数据流 —— 节点面板从 `pipeline_nodes` 取目录
+  （32 个内置节点按类别分组），连线就是步骤间的 `${steps.<id>.<键>}` 引用
+  （而那张"哪个节点产出哪些键"的表由【35】机械对账）。
 - [x] ✅ **节点灰显机制：现在没有可灰显的节点，但机制要点保留下来**。前端仍从 IPC 的 `NodeCatalogResponse.unimplemented` 取名单（**不硬编**），所以"把未实现节点标灰并给出原因"这套 UI 逻辑**仍然存在**，只是 `UNIMPLEMENTED_NODES` 为空、它永远不会命中。**不要因为名单是空的就把这段逻辑或那个常量删掉** —— 它的用途是"下次加节点却忘了实现执行器"时立刻生效（`nodes::run` 的兜底分支、节点面板灰显、以及那条遍历真实分发表的测试会一起跟上）。
-- [ ] 🚧 保存/加载流程定义，可导出为可复现的流水线描述
-- [ ] 🚧 保存前校验：非法连线、缺失参数、缺失权限
+- [x] ✅ 保存/加载流程定义，可导出为可复现的流水线描述 —— "导出并安装为插件"生成 `plugin.yaml`
+  （**数据不是代码**）。⚠️ 这不是"存成一个 `.toolforge` 工程文件"，**设计上刻意如此**：
+  产物是插件清单，可以直接分享、进 Git、被别人安装，也能被 `plugins_validate` 与 CI 校验。
+- [x] ✅ 保存前校验：非法连线、缺失参数、缺失权限 —— 导出对话框**先调后端校验**
+  （`plugins_validate`；`flow-canvas.tsx` 的注释写着"它不会自动安装：先看校验结果，再逐条确认权限"），
+  结果逐条展示，不通过则安装按钮不可用。**实测**：【22】/【23】/【28】/【35】。
+  > ❌ 明确**没做**的：**画布上的连线类型检查**（例如"把 file 输出接到需要 image 的输入"）
+  > 靠后端校验兜底，前端不做连线时的即时类型提示。那是交互优化，不是正确性缺口。
 - [x] ✅ **批量循环（`flow.foreach`）：结论是「不实现，改为删除节点 + 宿主展开」**
   - 选择删除而不是"留给编辑器当显式循环标记"，理由有两条：① L1 的步骤列表是**平铺的有序列表**，"对剩下的步骤循环 N 次"**没有可定义的语义**（循环体到底含哪几步？循环之后那些只想跑一次的收尾步骤怎么办？）；② 它旧描述里的「宿主会按并发度并行调度」是**假话** —— 宿主不在流水线内部调度。
   - 批量本来就该由宿主做，而且**已经做了**：`commands.rs::expand_batches` 在命令层把多文件输入与**目录输入**扇出成 N 个单文件批次，逐批调用流水线、用 `ctx.step` 上报「处理 3/12」、在批次边界检查取消；清单用 `${batch.index}`（从 1 起）取序号。**拖一个文件夹进去就是逐个处理里面每个文件**，不需要循环节点。
@@ -2464,15 +2587,46 @@ L3 的任务只有一句阶段描述"——而那是因为 L3 的插件报上来
 
 **批量与性能**
 
-- [ ] 🚧 批量并发调度：并发度可配置，受队列与引擎占用约束
-- [ ] 🚧 大批量吞吐目标：1000 张图片批量处理在目标机型上完成时间与内存上限明确化并达成
-- [ ] 🚧 内存上限：大批量处理时进程常驻内存不超过既定阈值，无随任务数线性增长
+- [x] ✅ 批量并发调度：并发度可配置，受队列与引擎占用约束 —— `Settings.concurrency` 在
+  `state.rs` 建队列时生效，`settings_patch` 立刻调 `queue.set_concurrency()`（**改动即刻生效**，
+  不是"下次启动才生效"；§3.11 逐字段核过读取点）；批次由 `expand_batches` 扇出，并发由 `JobQueue::gate` 约束。
+- [ ] 🚧 大批量吞吐目标：1000 张图片批量处理在目标机型上完成时间与内存上限明确化并达成 ——
+  **没有做过任何性能测量**，而且这条的前提（"目标机型"）从来没有被定义过。
+  要做就得先定基准机与基准数据（建议：1000 张 4000×3000 JPEG，跑 `image.resize` 到 1280 宽，
+  记录总时长与峰值 RSS），否则"达成"无从判断。**这是本清单里最需要"先定义、再测量"的一条。**
+- [ ] 🚧 内存上限：大批量处理时进程常驻内存不超过既定阈值，无随任务数线性增长 ——
+  同样从未测量。可以确定的只有**设计上**的两点：队列的历史记录有上限
+  （`Job::LOG_TAIL_LIMIT` + 任务条数上限），批次是**顺序扇出**而不是一次性全部入队
+  （`expand_batches` 上限 5000；`JobQueue::gate` 限并发）。但"常驻内存不随任务数增长"这句话
+  必须**测**才算数。
 
 **审计**
 
 - [x] ✅ 骨架完成：`AuditEventKind`、按日切分的 `AuditLog`、`record_violation` / `record_escalation` / `record_integrity`、`content_hash`
-- [ ] 🚧 审计覆盖到：插件装载、权限授予/撤销、AI 生成、审阅确认、任务执行、引擎调用
-- [ ] 🚧 日志可导出，且不包含用户文件内容（只记路径与哈希）
+- [ ] 🚧 审计覆盖到：插件装载、权限授予/撤销、AI 生成、审阅确认、任务执行、引擎调用 ——
+  **六项里前四项已达成，后两项没有**（本轮逐项核过枚举与写入点）：
+  * ✅ **插件装载**：`Installed`（4 处写入，含 L2 装载时记 `wasmBytes` / `allowedHosts` 这类关键上下文）
+  * ✅ **权限授予 / 撤销**：`PermissionGranted`（3 处）/ `PermissionRevoked`（1 处）
+  * ✅ **AI 生成**：`AiDraftAccepted` / `AiDraftRejected`
+  * ✅ **审阅确认**：`AiDraftAccepted` 的语义就是"通过审核并落盘"，与上一条同源
+  * 另有越权与完整性两条：`CapabilityViolation`（4 处）、`PathEscapeBlocked`、`IntegrityFailure`、
+    `PrivilegeEscalation`（3 处）、`ValidationFailed`、`LicenseAccepted`
+  * ❌ **任务执行**：没有任何审计事件
+  * ❌ **引擎调用**：没有任何审计事件
+  > **为什么后两项不是"补两行"那么简单**：`AuditLog` 住在 `toolforge-plugins`，
+  > 而任务队列在 `toolforge-core` —— 依赖方向是 `plugins → core`，**core 不能反过来依赖它**
+  > （那条约束是刻意的：core 不带 tauri / extism / reqwest）。所以要让队列写审计，
+  > 得先在 core 里开一个**观察者接口**（trait 或事件订阅），再由宿主把审计实现注入进去。
+  > 这是个依赖倒置的小设计，不是补一行 `audit.record(...)`。
+  > 另外 **引擎调用审计会非常吵**（每次 `vips` / `ffmpeg` 调用一条），
+  > 落地前得先想清楚是记"每次调用"还是"每次任务里用了哪些引擎"。
+- [x] ✅ 日志可导出，且不包含用户文件内容（只记路径与哈希）—— **本轮补齐了"可导出"那一半**（`verify-platform.mjs`【36】，15 条）：
+  * ✅ **"不含文件内容"这一半是成立的**：任务日志记的是路径、大小、哈希、引擎输出摘要，
+    没有任何一处把文件内容写进日志（对照实验的做法见验收标准里的说明）。
+  * ✅ **"可导出"这一半本轮补上了**：新增命令 `diagnostics_export`（设置 → 审计区块的「导出诊断包」按钮），
+    把环境与版本、设置（**不含 Key**）、引擎与权重状态、插件清单摘要、最近 300 条审计事件、
+    最近 100 个任务的**元信息**写成一个 JSON，落在 `<data>/diagnostics/`。
+    ⚠️ 在这之前只有"能看 + 能打开目录"，**没有导出动作** —— 用户只能自己去翻目录、手工拼信息。
 
 ### 验收标准
 
@@ -2504,7 +2658,7 @@ L3 的任务只有一句阶段描述"——而那是因为 L3 的插件报上来
 
 **分发与更新**
 
-- [ ] 🚧 安装包：Windows（MSI/NSIS）、macOS（dmg/app）、Linux（AppImage/deb 至少一种）
+- [ ] 🚧 安装包：Windows（MSI/NSIS）、macOS（dmg/app）、Linux（AppImage/deb 至少一种）—— **本轮实测：从来没有打出过安装包**（`bundle/` 目录不存在，机器上也没有任何 `.msi`/`.app`/`.AppImage` 产物）。`tauri.conf.json` 的 `bundle.targets = "all"` 与 `icons/` 都已就位，`pnpm tauri:build` 这条路**没有被跑通过**；而且 Windows 分发还要处理签名证书。
 - [ ] 🚧 自动更新：接入 `tauri-plugin-updater`（`Cargo.toml` 已把它声明为 `optional`，feature 名 `updater`，需在发布构建中打开并配签名私钥）
 - [ ] 🚧 卸载清理：卸载时询问是否保留用户数据、`/models/`、`/engines/`
 - [ ] 🚧 插件市场 / 分发格式：插件包规范冻结（含清单、哈希、签名、能力声明）
@@ -2517,8 +2671,8 @@ L3 的任务只有一句阶段描述"——而那是因为 L3 的插件报上来
 - [ ] 🚧 calibre（GPL-3.0）/ LibreOffice（MPL-2.0）：确定「不随包分发、仅探测复用」的降级策略并写入文档
 - [ ] 🚧 7zip（LGPL-2.1+ 含 unRAR 限制条款）、ImageMagick（本体宽松但 delegate 可能引入 GPL）、tesseract（Apache-2.0，`tessdata` 另有许可）逐个评审
 - [ ] 🚧 **模型权重的许可证单独一条链路**：`engine.rs` 已区分「代码许可 / 权重许可」（U2Net Apache-2.0 可商用、MODNet 权重为学术许可等），分发时必须逐个标注
-- [ ] 🚧 全量依赖许可证清单生成（Rust crates + npm 包 + 引擎二进制 + 模型权重），CI 校验无新增不合规许可
-- [ ] 🚧 应用本体许可证为 MIT（与 `Cargo.toml` 一致），第三方声明文件随包发布
+- [ ] 🚧 全量依赖许可证清单生成（Rust crates + npm 包 + 引擎二进制 + 模型权重），CI 校验无新增不合规许可 —— **本轮实测：仓库里没有任何第三方声明文件**（没有 `NOTICE` / `THIRD-PARTY` / `licenses.json`）。`cargo-about` / `cargo-deny` 都没接。⚠️ 而引擎与模型那两类的许可证**已经逐个写在 `engine.rs` 里**（`license` + `license_note` + `commercial_use`，还有测试守着它们非空）—— 缺的是"把它们汇总成一份可分发的声明文件"这一步。
+- [x] ✅ 应用本体许可证为 MIT（与 `Cargo.toml` 一致）—— 根 `Cargo.toml` 的 `license = "MIT"`、`package.json` 的 `"license": "MIT"`、仓库根有 `LICENSE` 文件，三处一致。
 
 **跨平台验证矩阵**
 
@@ -2529,16 +2683,16 @@ L3 的任务只有一句阶段描述"——而那是因为 L3 的插件报上来
 **可用性与国际化**
 
 - [ ] 🚧 键盘可达性：全部可交互控件可 Tab 到达、焦点可见、对话框焦点陷阱正确
-- [ ] 🚧 屏幕阅读器：关键控件具备可读标签与状态描述
-- [ ] 🚧 对比度满足 WCAG AA（正文与交互元素）
-- [ ] 🚧 国际化：UI 文案外置，至少提供简体中文与英文
-- [ ] 🚧 **L3 隔离强度如实标注**（沿用 v0.2 的约束）：插件详情页必须写明「进程隔离，非内核级沙箱」
+- [ ] 🚧 屏幕阅读器：关键控件具备可读标签与状态描述 —— **部分有机械保障**：`eslint-plugin-jsx-a11y/recommended` 已经接进 `pnpm lint`（§3.22 修掉了它报出的 21 处问题，其中 `label-has-associated-control` 那 10 条是配置误报、`no-noninteractive-tabindex` 那 2 条是真实的可滚动区域键盘可达性问题）。但"读屏软件念出来对不对"只能人听 —— 静态规则查不到。
+- [ ] 🚧 对比度满足 WCAG AA（正文与交互元素）—— 主题是 CSS 变量驱动的（浅色/深色/跟随系统 + 多套强调色），**对比度没有被计算过**。这是可以机械验的（算相对亮度比），但要有确定的配色表；在那之前只能靠肉眼，而肉眼对"深色主题下的次级文字"最不可靠。
+- [ ] 🚧 国际化：UI 文案外置，至少提供简体中文与英文 —— **本轮实测：完全没有 i18n 层**：`apps/desktop` 里搜不到 `react-i18next` / `useTranslation`，没有 `locales/` 目录，`package.json` 的依赖里也没有任何 i18n 库。所有文案目前是**硬编码中文**。这不是"补两个 JSON"的事：要先把散在 9 个页面与 60 多个组件里的字符串抽出来（含复数、插值、日期/数字格式），再决定 key 的命名规范。
+- [x] ✅ **L3 隔离强度如实标注**（沿用 v0.2 的约束）—— **v0.2 那一轮已复核过四处文案**（安装确认页、设置页、插件详情、运行时标签），L3 一律叫「Python 进程」且明说「只能挡住非蓄意的越权，挡不住恶意代码」；L2 叫「沙箱」是**准确**的（`with_wasi(false)` 无文件系统/网络）。见 v0.2 那段。
 
 **稳定性与诊断**
 
-- [ ] 🚧 崩溃恢复：异常退出后重启能恢复队列与未完成任务，不漏产物、不重复产出
-- [ ] 🚧 诊断包：一键导出环境信息、版本、引擎状态、审计日志摘要（脱敏，不含文件内容）
-- [ ] 🚧 首次启动引导：引擎探测结果、需要下载什么、需要确认哪些许可证
+- [ ] 🚧 崩溃恢复：异常退出后重启能恢复队列与未完成任务，不漏产物、不重复产出 —— 现在**没有任何持久化**：`JobQueue` 的 `entries` 是内存里的 map，进程一走队列就空了。要做就得先决定"恢复到什么程度"（只恢复队列条目？还是连中间产物一起续跑？），因为"不重复产出"在**非幂等**任务上是个硬问题（转码到一半的产物要不要删？）。
+- [x] ✅ 诊断包：一键导出环境信息、版本、引擎状态、审计日志摘要（脱敏，不含文件内容）—— **本轮实现并验证**（`verify-platform.mjs`【36】，15 条）。产品侧是 `commands::diagnostics_export` + 设置页「导出诊断包」按钮；两条硬约束写在那个函数的文档里：**不含文件内容**（刻意**不收任务日志正文** —— 插件能往日志里写任何东西，收进来就只能靠"希望它别那么干"）与**脱敏**（整个 JSON 过 `redact_with(.., key)` 按字面量抹掉，再叠一层 `redact()` 启发式）。详见 §3.30。
+- [ ] 🚧 首次启动引导：引擎探测结果、需要下载什么、需要确认哪些许可证 —— **本轮实测：没有引导页**（搜不到 onboarding / welcome / firstRun 之类的组件）。目前这些信息散在「设置 → 引擎管理」里，用户得自己找过去。
 
 ### 验收标准
 
@@ -2584,7 +2738,7 @@ L3 的任务只有一句阶段描述"——而那是因为 L3 的插件报上来
 | 前端质量 | `pnpm typecheck`、`pnpm lint` | `pnpm typecheck` 退出码 0 ✅；⚠️ **`pnpm lint` 目前回退为 `tsc --noEmit`（本项目刻意不装 ESLint，见 `apps/desktop/.eslintrc.cjs` 头部的说明与安装命令）—— 它不提供 `tsc` 之外的任何检查**。写成"退出码 0"会让人以为有 linter，见 §3.16 |
 | 聚合 | `pnpm check:all` | 退出码 0 |
 | 类型桥 | `pnpm bindings` 连续两次 | 第二次后 `git status` 干净（该命令同时跑 4 项守卫，含 `COMMAND_NAMES` 与注册命令的逐条核对） |
-| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **当前实测 408 项检查全通过**（【1】–【35】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】、**中间档 ImageMagick 后端切换**【12】、**纯 Rust 兜底档**【13】、音视频真实属性【17】、压缩包标准归档【18】、Office → PDF【19】、一句话生成插件闭环【20】、任务取消无孤儿【21】、画布导出跑通【22】、SDK 节点表对账【23】、API Key 生命周期与脱敏【24】、许可证确认与记录【25】、前端能力边界【26】、**「保留源文件」真的在删文件**【27】、**插件参数能不能到达执行器**【28】、**许可证勾选框的 UI 点击穿透**【29】、**权重被截断时不再谎报"已就绪"**【30】；【8】【9】【11】【12】【13】在缺权重 / 缺运行时（或没有可临时藏起的托管引擎）时会显式记为"跳过"而不是"通过"） |
+| 真机验收 | `node scripts/devtools/verify-platform.mjs` | **当前实测 423 项检查全通过**（【1】–【36】：覆盖真改名、目录展开、设置落盘、模型清单、图片后端选择、任意角度旋转、**AI 抠图整条 ONNX 链路**【8】、电子书降级与拦停【9】、AI 视觉请求形状【10】、超分倍数【11】、**中间档 ImageMagick 后端切换**【12】、**纯 Rust 兜底档**【13】、音视频真实属性【17】、压缩包标准归档【18】、Office → PDF【19】、一句话生成插件闭环【20】、任务取消无孤儿【21】、画布导出跑通【22】、SDK 节点表对账【23】、API Key 生命周期与脱敏【24】、许可证确认与记录【25】、前端能力边界【26】、**「保留源文件」真的在删文件**【27】、**插件参数能不能到达执行器**【28】、**许可证勾选框的 UI 点击穿透**【29】、**权重被截断时不再谎报"已就绪"**【30】；【8】【9】【11】【12】【13】在缺权重 / 缺运行时（或没有可临时藏起的托管引擎）时会显式记为"跳过"而不是"通过"） |
 | 最小闭环 | `pnpm tauri:dev` → 图片转换任务 | 任务完成、输出存在 |
 | 引擎 | `pnpm engines:list` / `engines:install` | 能探测、能安装并通过 SHA-256 校验；**libvips 与 imagemagick 都已实测装成功**（哈希回填的 **7 条**仍限 Windows / Linux；FFmpeg 因本机 `www.gyan.dev` 不可达而未装成，见 §3） |
 | 图标 | `pnpm icons` | 成功（需先补 `assets/icon-source.png`） |

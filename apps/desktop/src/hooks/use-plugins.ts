@@ -18,6 +18,7 @@ import { toast } from "sonner";
 
 import { capabilityFingerprint } from "@/lib/capability";
 import {
+  diagnosticsExport,
   pluginsAudit,
   pluginsGet,
   pluginsGrant,
@@ -34,6 +35,7 @@ import { queryKeys } from "@/lib/query-client";
 import type {
   AuditSnapshot,
   Capability,
+  DiagnosticsBundle,
   GrantPermissionsRequest,
   InstallPluginRequest,
   InstallReport,
@@ -219,6 +221,29 @@ export function useAudit(limit = 200) {
     queryKey: queryKeys.audit(limit),
     queryFn: (): Promise<AuditSnapshot> => pluginsAudit(limit),
     staleTime: 10_000,
+  });
+}
+
+/**
+ * 导出诊断包。
+ *
+ * 是 mutation 而不是 query：它会**写文件**，而写文件不该由"组件挂载 / 重渲染"触发 ——
+ * 那会让刷新一次页面就多一个文件。用户点一下才导一个。
+ *
+ * 成功时把 `redactions` **如实报出来**：正常情况下它应该是 0（命令压根不收密钥），
+ * 非 0 就说明兜底那一层真的抹掉了东西，用户有权知道数字不是 0。
+ */
+export function useExportDiagnostics() {
+  return useMutation({
+    mutationFn: (): Promise<DiagnosticsBundle> => diagnosticsExport(),
+    onSuccess: (b: DiagnosticsBundle) =>
+      toast.success("诊断包已导出", {
+        description:
+          b.redactions > 0
+            ? `${b.path}（${(b.sizeBytes / 1024).toFixed(1)} KB，已脱敏 ${b.redactions} 处）`
+            : `${b.path}（${(b.sizeBytes / 1024).toFixed(1)} KB）`,
+      }),
+    onError: (e) => toast.error("导出诊断包失败", { description: toToolforgeError(e).fullText }),
   });
 }
 

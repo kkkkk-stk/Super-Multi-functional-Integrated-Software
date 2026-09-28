@@ -5259,19 +5259,43 @@ c.section('【30】权重文件被截断时，应用还会不会声称"已就绪
       `(() => { history.pushState({}, '', '/settings?tab=engines');
                 window.dispatchEvent(new PopStateEvent('popstate')); })()`
     );
-    await sleep(1500);
-    const card = await client.evaluate(`(() => {
-      const holders = [...document.querySelectorAll('*')]
-        .filter((el) => (el.textContent || '').includes('realesr-general-x4v3') && el.querySelector('button'));
-      holders.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
-      const el = holders[0];
-      if (!el) return { found: false };
-      return {
-        found: true,
-        text: (el.innerText || '').replace(/\\s+/g, ' '),
-        buttons: [...el.querySelectorAll('button')].map((b) => (b.textContent || '').trim()),
-      };
-    })()`);
+    // ⚠️ **轮询等卡片出现，不要用固定 sleep。**
+    // 这里原本是 `sleep(1500)` 然后一次性查 —— 2026 这一轮它**偶发地红了**：
+    // 设置页多了几个查询（诊断包那一条）、Vite 又要重新 transform 改动过的模块，
+    // 1.5 秒不够，于是"卡片找不到"被报成产品缺陷，而产品是对的。
+    // 固定 sleep 的失败形态就是这样：**把慢当成错**。所以改成轮询，
+    // 并且超时的时候把页面上**实际有什么**打出来 —— 让下一次失败能自己解释自己。
+    const readCard = () =>
+      client.evaluate(`(() => {
+        const holders = [...document.querySelectorAll('*')]
+          .filter((el) => (el.textContent || '').includes('realesr-general-x4v3') && el.querySelector('button'));
+        holders.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+        const el = holders[0];
+        if (!el) return { found: false };
+        return {
+          found: true,
+          text: (el.innerText || '').replace(/\\s+/g, ' '),
+          buttons: [...el.querySelectorAll('button')].map((b) => (b.textContent || '').trim()),
+        };
+      })()`);
+    let card = await readCard();
+    let waited = 0;
+    while (!card.found && waited < 12000) {
+      await sleep(500);
+      waited += 500;
+      card = await readCard();
+    }
+    if (waited > 0) console.log(`   卡片等了 ${waited}ms 才出现`);
+    if (!card.found) {
+      // 失败也要给出可诊断的信息：页面到底停在哪、有什么按钮
+      const dump = await client.evaluate(`(() => ({
+        url: location.href,
+        hasId: (document.body.innerText || '').includes('realesr-general-x4v3'),
+        buttons: [...document.querySelectorAll('button')].map((b) => (b.textContent || '').trim()).filter(Boolean).slice(0, 24),
+      }))()`);
+      console.log(`   ⚠️ 没找到卡片。url=${dump.url} 页面含模型 id=${dump.hasId}`);
+      console.log(`   ⚠️ 页面上的按钮：${JSON.stringify(dump.buttons)}`);
+    }
     console.log(`   卡片文案：${(card.text ?? '').slice(0, 180)}`);
     console.log(`   卡片按钮：${JSON.stringify(card.buttons ?? [])}`);
     c.check(card.found === true, '③ 截断后模型卡片仍在界面上');
@@ -6991,6 +7015,182 @@ c.section('【35】PLUGIN-SDK.md 的「产出值」表与 nodes.rs 的实际调�
     '★ ⑦ 每个节点都被"有值表"或"无值清单"覆盖（新加节点忘了更新文档时会红）',
     uncovered.length ? `\n      ${uncovered.join('\n      ')}` : `32 个节点全部覆盖（有值 ${produced.size} / 无值 ${dispatch.size - produced.size}）`
   );
+}
+
+// ============================================================================
+// 【36】诊断包：两条承诺（不含文件内容 / 脱敏）是不是真的守住了
+// ============================================================================
+//
+// v0.5 写着「日志可导出，且不包含用户文件内容（只记路径与哈希）」，
+// v1.0 写着「诊断包：一键导出环境信息、版本、引擎状态、审计日志摘要（脱敏，不含文件内容）」。
+// 这一节验的就是新做的 `diagnostics_export` 有没有守住这两条。
+//
+// **两条承诺都能证伪，所以都值得验**：
+// * 「不含文件内容」——造一个内容里有**特征串**的文件，跑一遍任务，
+//   再看诊断包里有没有那个串。少了"文件里真有这个串"这个前置，这条就是空转；
+// * 「脱敏」——先塞一个**特征串当 API Key**，再断言它不出现在包里。
+//
+// ★ 还要看一个数字：`redactions`。正常情况下它必须是 **0** ——
+// 那意味着包里压根没收密钥，而不是"收了以后又抹掉了"。（兜底层非 0 说明有字段在漏。）
+c.section('【36】诊断包：不含文件内容、且真的脱敏了吗');
+{
+  // 两个特征串：一个当"文件内容"，一个当"API Key"。都用不会偶然出现的形状。
+  const CONTENT_MARKER = 'TOOLFORGE-CONTENT-MARKER-9f3ae1';
+  const FAKE_KEY = 'AIzaSyDIAGprobeKEY0123456789abcdef';
+
+  const work = join(REPO_ROOT, '.tools', 'smoke', 'out-diagnostics');
+  rmSync(work, { recursive: true, force: true });
+  mkdirSync(work, { recursive: true });
+
+  const before = await client.invoke('settings_get');
+  const hadKey = Boolean(before?.ai?.hasKey);
+
+  try {
+    // ---- ① 前置：文件内容里**真的**有那个特征串 ----
+    // 用一个 PNG：它的字节里塞不进 ASCII 串（会被 CRC 与压缩吃掉），
+    // 所以用**文本**文件 —— 而文本正是"文件内容泄漏"最容易被看见的形态。
+    const srcDir = join(work, 'in');
+    mkdirSync(srcDir, { recursive: true });
+    const srcFile = join(srcDir, 'notes.txt');
+    writeFileSync(srcFile, `note: ${CONTENT_MARKER}\n`, 'utf8');
+    c.check(
+      readFileSync(srcFile, 'utf8').includes(CONTENT_MARKER),
+      '① 前置：素材文件的内容里确实有特征串（否则"包里没有它"什么也证明不了）',
+      `${readFileSync(srcFile).length} 字节`
+    );
+
+    // ---- ② 前置：真的拿这个文件跑一个任务 ----
+    // 用内置 `batch-rename`：它的流水线会读到这个文件、并把**文件名**与路径写进日志/产出。
+    // （不需要结果有意义，只需要"这个文件被系统处理过"这件事发生。）
+    const outDir = join(work, 'out');
+    mkdirSync(outDir, { recursive: true });
+    const sub = await client.invoke('plugins_run', {
+      req: {
+        pluginId: 'com.toolforge.builtin.batch-rename',
+        inputs: { src: [srcFile] },
+        params: {
+          find: { kind: 'str', value: 'notes' },
+          replace: { kind: 'str', value: 'renamed' },
+        },
+        outputDir: outDir,
+      },
+    });
+    const job = await client.waitJob(sub.jobId, 120, 500);
+    c.check(job.status === 'succeeded', '② 前置：那个文件真的被一个任务处理过', job.status);
+
+    // ---- ③ 塞一个特征串当 API Key ----
+    //
+    // ⚠️ 只设 `aiApiKey`：`SettingsPatch` 里的 AI 配置是**嵌套的 `ai` 对象**
+    // （见【24】的用法），扁平的 `aiProvider` / `aiBaseUrl` **不是它的字段** ——
+    // 第一版写了那两行，它们是**静默无效**的。测试里留一句"看起来在改配置
+    // 其实什么也没改"的代码，比不写更糟：下一个人会以为它有用。
+    await client.invoke('settings_patch', { patch: { aiApiKey: FAKE_KEY } });
+    const withKey = await client.invoke('settings_get');
+    c.check(withKey?.ai?.hasKey === true, '③ 前置：特征串已经作为 API Key 生效（后端承认 hasKey）', String(withKey?.ai?.hasKey));
+
+    // ---- ④ 导出诊断包 ----
+    const bundle = await client.invoke('diagnostics_export');
+    console.log(
+      `   诊断包：${bundle?.path}（${((bundle?.sizeBytes ?? 0) / 1024).toFixed(1)} KB，` +
+        `审计 ${bundle?.auditEvents} 条，任务 ${bundle?.jobs} 个，脱敏 ${bundle?.redactions} 处）`
+    );
+    c.check(
+      Boolean(bundle?.path) && existsSync(bundle.path),
+      '④ 诊断包真的落盘了，并回报了路径',
+      bundle?.path ?? '(无)'
+    );
+
+    if (bundle?.path && existsSync(bundle.path)) {
+      const text = readFileSync(bundle.path, 'utf8');
+
+      // ---- ⑤ 它确实是个能用的包（否则"没有泄漏"可能只是因为包是空的） ----
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        /* 下面那条断言会报 */
+      }
+      c.check(parsed !== null, '⑤ 诊断包是合法 JSON', parsed ? '可解析' : '解析失败');
+      c.check(
+        Array.isArray(parsed?.engines) && parsed.engines.length >= 10 && Array.isArray(parsed?.models),
+        '★ ⑤b 包里**真的有内容**：引擎状态与模型清单都在（12 个引擎 + 9 个模型）',
+        `engines=${parsed?.engines?.length} models=${parsed?.models?.length} plugins=${parsed?.plugins?.length} audit=${parsed?.audit?.length} jobs=${parsed?.jobs?.length}`
+      );
+      c.check(
+        typeof parsed?.app?.version === 'string' && parsed.app.version.length > 0,
+        '★ ⑤c 包里带了版本号（诊断包第一件要回答的事就是"这是什么版本产出的"）',
+        String(parsed?.app?.version ?? '(无)')
+      );
+
+      // ---- ⑥ ★ 承诺一：不含文件内容 ----
+      c.check(
+        !text.includes(CONTENT_MARKER),
+        '★ ⑥ 诊断包里**没有**那个文件的内容特征串 —— 只记路径与元信息，不收文件内容',
+        text.includes(CONTENT_MARKER) ? '★ 泄漏了！' : '未出现'
+      );
+      // ⚠️ 这一条我第一版写错了：当时的期望是"文件路径应该出现在包里"。
+      // 实测发现**路径不在**（任务段只收录 id / 类型 / 标题 / 状态 / 耗时 / 错误码，
+      // 不含输入输出路径），于是它红了 —— 而**这不是缺陷**：
+      // v0.5 那句"只记路径与哈希"说的是"允许记路径"，不是"必须记"。
+      // 诊断要回答的是"什么任务、什么状态、什么错"，而不是"你处理过哪些文件"。
+      // 所以正确的断言是"包里能看出**跑过什么任务**"。
+      c.check(
+        parsed?.jobs?.some?.((j) => j.status === 'Succeeded') && parsed?.jobs?.length >= 1,
+        '★ ⑥b 包里能看出**跑过什么任务**（id / 类型 / 标题 / 状态都有）—— 这一条防止"为了不泄漏干脆什么都不记"',
+        `jobs=${JSON.stringify((parsed?.jobs ?? []).map((j) => `${j.kind}/${j.status}`))}`
+      );
+
+      // ---- ⑦ ★ 承诺二：脱敏 ----
+      c.check(
+        !text.includes(FAKE_KEY),
+        '★ ⑦ 诊断包里**没有**那个 API Key（按字面量抹掉，与它长得像不像 Key 无关）',
+        text.includes(FAKE_KEY) ? '★ 泄漏了！' : '未出现'
+      );
+      // ⚠️ 这一条我第一版也写错了：断言读的是 `settings.ai.hasKey`，而正确的字段在
+      // **顶层** `ai.hasKey`（`Settings.ai.has_key` 不是持久化字段，磁盘上永远是 false，
+      // 所以诊断包自己另算了一份 —— 见 `commands.rs` 里那段注释）。
+      // 两处错误都在**测试侧**，产品侧的形状其实是对的 —— 但第一版的产品侧**确实错过一次**
+      // （直接序列化 `Settings` 就会把 hasKey 报成 false），是这一节把它逼出来的。
+      c.check(
+        parsed?.ai?.hasKey === true,
+        '★ ⑦b 包里如实写了"配了 Key"（顶层 `ai.hasKey`）—— 这一条曾经是红的：第一版直接序列化 `Settings`，于是被报成 false',
+        `ai.hasKey=${parsed?.ai?.hasKey}`
+      );
+      c.check(
+        parsed?.ai?.apiKey === undefined && parsed?.settings?.ai?.apiKey === undefined,
+        '★ ⑦d 但 Key **本身**两处都没有（顶层 `ai` 段与 `settings` 段都不带它）',
+        `ai.apiKey=${String(parsed?.ai?.apiKey)} settings.ai.apiKey=${String(parsed?.settings?.ai?.apiKey)}`
+      );
+      // ★ 最有信息量的一条：兜底层**一次都没用上**
+      c.check(
+        bundle.redactions === 0,
+        '★ ⑦c `redactions` 是 **0** —— 说明包里压根没收密钥，而不是"收了之后又抹掉"（兜底层没被用上才是对的）',
+        `redactions=${bundle.redactions}`
+      );
+
+      // ---- ⑧ 不含任务日志正文（设计上刻意不收）----
+      c.check(
+        parsed?.jobs?.every?.((j) => j.logs === undefined),
+        '★ ⑧ 任务段只有元信息（id / 类型 / 状态 / 耗时 / 错误码），**没有日志正文** —— 插件能往日志里写任何东西',
+        `收录 ${parsed?.jobs?.length} 个任务`
+      );
+    }
+  } finally {
+    // 用户可能本来就有 Key —— 有的话要恢复，没有的话要清掉（别留下我们的探测值）
+    await client
+      .invoke('settings_patch', { patch: { aiApiKey: hadKey ? undefined : '' } })
+      .catch(() => {});
+    // 上面 `undefined` 不会真的清掉，所以再显式清一次（并让 ② 的断言可复现）
+    if (!hadKey) {
+      await client.invoke('settings_patch', { patch: { aiApiKey: '' } }).catch(() => {});
+    }
+    const after = await client.invoke('settings_get').catch(() => null);
+    c.check(
+      Boolean(after?.ai?.hasKey) === hadKey,
+      '⑨ 收尾：API Key 的状态已还原到测试之前',
+      `hasKey=${after?.ai?.hasKey}（原为 ${hadKey}）`
+    );
+  }
 }
 
 client.close();

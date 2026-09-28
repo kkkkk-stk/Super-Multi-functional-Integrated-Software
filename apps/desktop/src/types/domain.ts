@@ -120,6 +120,9 @@ export type {
   PluginCategory,
   RuntimeKind,
   PortType,
+  // 诊断包：字段全是必填（没有 `Option` / `serde(default)`），
+  // 所以 specta **没有**为它生成 `_Serialize` / `_Deserialize` 两个变体，直接导出原名
+  DiagnosticsBundle,
   ParamType,
   ParamOption,
   ParamValue,

@@ -108,6 +108,28 @@ export const commands = {
 	pluginsUninstall: (pluginId: string) => typedError<null, ToolforgeError_Serialize>(__TAURI_INVOKE("plugins_uninstall", { pluginId })),
 	pluginsAudit: (limit: number) => typedError<AuditSnapshot_Serialize, ToolforgeError_Serialize>(__TAURI_INVOKE("plugins_audit", { limit })),
 	/**
+	 *  诊断包：一键把"排查需要的环境事实"落成一个 JSON 文件。
+	 * 
+	 *  ## 它解决什么
+	 * 
+	 *  用户报问题时的现实是：要来回问"你什么版本""装没装 ffmpeg""模型下全了吗"
+	 *  "审计里那几条写的是什么"。这些东西**应用自己全知道**，只是没有出口。
+	 * 
+	 *  ## 两条硬约束（都是承诺，不是尽力而为）
+	 * 
+	 *  1. **不含文件内容**。只收录：环境与版本、设置（**不含 Key**）、引擎与权重的**状态**、
+	 *     插件清单摘要、审计事件摘要、任务**元信息**（id / 类型 / 状态 / 耗时 / 错误码）。
+	 *     ⚠️ **刻意不收任务日志正文**：插件可以往日志里写任何东西，一旦收进来，
+	 *     "不含文件内容"就只能靠"希望插件别那么干"维持 —— 那不是承诺。
+	 *     （审计事件在设计上就只记路径与哈希，见 `AuditEventKind` 的文档。）
+	 *  2. **脱敏**。整个 JSON 过一遍 `redact_with(.., api_key)` —— 按**字面量**抹掉密钥，
+	 *     与它长得像不像 Key 无关；再叠一层 `redact()` 的启发式兜住别的密钥（§24 验过这条路径）。
+	 * 
+	 *  顺带把这两条也做成**可验证**的：`verify-platform.mjs`【36】会先塞一个特征串当密钥、
+	 *  再造一个内容里有特征串的文件跑一遍任务，然后断言诊断包里**两个都不出现**。
+	 */
+	diagnosticsExport: () => typedError<DiagnosticsBundle, ToolforgeError_Serialize>(__TAURI_INVOKE("diagnostics_export")),
+	/**
 	 *  运行插件。立即返回 `jobId`。
 	 * 
 	 *  ## 多文件输入会真的逐个处理
@@ -504,6 +526,24 @@ export type Capability =
 { kind: "ai" } | 
 /**  使用 GPU */
 { kind: "gpu" };
+
+/**
+ *  诊断包导出结果。
+ * 
+ *  `redactions` 是**兜底那一层**真的抹掉了几处密钥：正常情况下应该是 0
+ *  （因为上面根本不收密钥），非 0 就说明某个字段意外带进了它 ——
+ *  界面上要如实显示这个数字，而不是假装什么都没发生。
+ */
+export type DiagnosticsBundle = {
+	path: string,
+	sizeBytes: number,
+	/**  按字面量抹掉的密钥出现次数（兜底层生效的次数） */
+	redactions: number,
+	/**  收录了多少条审计事件 */
+	auditEvents: number,
+	/**  收录了多少个任务的元信息 */
+	jobs: number,
+};
 
 /**  草稿里的一个文件 */
 export type DraftFile = {
