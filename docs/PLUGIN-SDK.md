@@ -977,9 +977,26 @@ runtime:
 | `-32003` | PROCESS_GONE | 进程已退出 |
 | `-32004` | NOT_INITIALIZED | 还没调 `initialize` 就调了 `run` |
 
-**通知的字段限制**：宿主处理 `progress` 时**只读 `value` 与 `stage`**，
-`currentItem` / `speed` / `etaSeconds` 会被忽略（L1 的 `JobProgress` 有这些字段，
-但 L3 的桥接目前没接）。所以**别把重要信息只放在被忽略的字段里**。
+**`progress` 的全部字段**（L2 与 L3 都支持）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `value` | number | `0.0`–`1.0`。**不给就是不确定进度条**（前端会显示成滚动条而不是瞎猜的百分比） |
+| `stage` | string | 当前阶段的人类可读描述，例如"正在统计颜色"。缺省是 `处理中` |
+| `currentItem` | string | **当前正在处理的那一个**（文件名 / 条目名）。前端会把它显示在进度条旁边 |
+| `speed` | string |速率文本（如 `1.5 MB/s`）。**故意是字符串而不是数字**：单位由插件决定，宿主不做换算 |
+| `etaSeconds` | number | 预计剩余秒数 |
+
+`currentItem` 与 `etaSeconds` 另外**也接受 snake_case**（`current_item` / `eta_seconds`）——
+Python 作者的手会自然写出后者，多认一种拼写的代价是零，而不认的代价是字段被**静默忽略**。
+两种都给了时以 camelCase 为准。
+
+> ⚠️ 这段曾经写的是「宿主只读 `value` 与 `stage`，`currentItem` / `speed` / `etaSeconds`
+> 会被忽略」—— 那时它确实是真的，L3 的桥接把这三个字段写死成 `None`。
+> 后果是 L3 插件永远只能报"百分之几 + 一句话"，前端只能显示不确定态的进度条，
+> 而 L1 的 FFmpeg 进度早就能报"第 3/10 个文件、速度、剩余时间"。
+> 现在三个字段都接通了（`verify-runtimes.mjs`【6d】在真机上验证它们在 `jobs_get`
+> 的返回里真的能读到），所以**别再把重要信息只放在 `stage` 里**了。
 
 ### 5.3 完整可运行骨架
 

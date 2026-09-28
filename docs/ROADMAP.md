@@ -52,9 +52,9 @@
 > | 内置节点 | **32 个，全部有执行器**（`UNIMPLEMENTED_NODES` 为空） |
 > | 内置示例插件 | **8 个**（`doc-to-pdf` 是本轮新增的，见 §3.2） |
 > | 引擎下载源 | `engine-sources.json` 共 **14 条**（Windows 7 / Linux 4 / macOS 3），其中 **13 条**的 SHA-256 是真实下载后核对过的；唯一 `sha256: null` 的是 `ffmpeg@macos`（evermeet 取不到字节），`install` 会对它返回 `HashRequired` 而**不放行**。`7zip` 三平台与本轮新增的 `python@macos` / `ffmpeg@linux` / `7zip` 见 §3 |
-> | 运行时测试总数 | `cargo test --workspace` **286 passed / 0 failed** |
+> | 运行时测试总数 | `cargo test --workspace` **290 passed / 0 failed** |
 > | 真机验收 | `scripts/devtools/verify-platform.mjs` 本机实测 **408 项全通过**（【1】–【35】） |
-> | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **95 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
+> | 插件运行时验收 | `scripts/devtools/verify-runtimes.mjs` 本机实测 **106 项全通过**（L2 WASM 纯计算 / L2 net 白名单对照实验 / L2 装载体检 / L3 Python 冷启动 / L3 env 白名单对照实验 / L3 exec 装载期静态门） |
 > | 已装引擎（本机） | libvips 8.18.6、ImageMagick 7.1.2-31、pandoc 3.11、**FFmpeg n8.1.3-20260926（484 MB，应用内一键安装）**、**Poppler 26.09.0（120.7 MB，应用内一键安装）**、托管 Python 3.11.16；ONNX 权重 `u2netp` / `modnet-portrait` / `birefnet-lite` / `realesr-general-x4v3` / `realesrgan-x4plus` |
 >
 > 下面这段原始快照保留原样，**不要据此判断现状**：
@@ -641,7 +641,7 @@ pnpm build          # tsc --noEmit && vite build
 ### 基线再更新（**当时的值**，保留作历史）
 
 > ⚠️ 下面这组数是**当时**取的，**不是现状**。当前值见本文档开头的「实测数据」表
-> （`cargo test --workspace` **286 passed / 0 failed**、`verify-platform.mjs` **408 项**）。
+> （`cargo test --workspace` **290 passed / 0 failed**、`verify-platform.mjs` **408 项**）。
 > 留在这里是为了保留"那一轮到底测到了什么"。
 
 阻塞 14、15 修复后重新取的一组数（上面那组保留为历史，**不要把两组混用**）：
@@ -1163,7 +1163,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
   > ✅ **已决定并执行（见 §3.20）**：选择**采用 rustfmt** —— `cargo fmt --all` 重排了 30 个文件，
   > 并把 `cargo fmt --all --check` 加进 `pnpm check:all` 与 CI。理由：文档里写着"零格式差异"这个验收标准，
   > 要么让它成真、要么把那句话删掉；而这个项目的原则一直是**让声明成真**。
-- 实测：`clippy --workspace --all-targets -- -D warnings` **退出码 0**；`cargo test --workspace` **286 passed / 0 failed**；`cargo check --workspace --all-targets` **0 error / 0 warning**；`verify-platform.mjs` **408 项全通过**。
+- 实测：`clippy --workspace --all-targets -- -D warnings` **退出码 0**；`cargo test --workspace` **290 passed / 0 failed**；`cargo check --workspace --all-targets` **0 error / 0 warning**；`verify-platform.mjs` **408 项全通过**。
   （`cargo fmt --all --check` 当时还不干净 —— 已由 §3.20 处理。）
 
 ### 3.16 把「文档里写的检查点」逐条真的跑一遍（本轮）
@@ -1173,7 +1173,7 @@ AI 图像描述（ai.describe）              →  走假端点：请求形状�
 | 检查点 | 命令 | 实测 |
 |---|---|---|
 | 聚合 | `pnpm check:all` | ✅ 退出码 0（encodings → rust → clippy → web） |
-| 全仓健康 | `cargo test --workspace` | ✅ **286 passed / 0 failed** |
+| 全仓健康 | `cargo test --workspace` | ✅ **290 passed / 0 failed** |
 | 全目标检查 | `cargo check --workspace --all-targets --locked` | ✅ 0 error / 0 warning（`--locked` 也通过，说明 `Cargo.lock` 是完整的） |
 | CI 同款测试 | `cargo test -p <5 个库 crate> --locked` | ✅ 264 passed / 0 failed |
 | 静态质量 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 退出码 0 |
@@ -1348,7 +1348,7 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 ✅ e2e.mjs              exit=0   端到端任务（真实转换 + 产出校验）
 ✅ verify.mjs           exit=0   验证包（解码 / 多文件扇出 / 恶意插件安全测试）
 ✅ verify-platform.mjs  exit=0   平台功能（408 项）
-✅ verify-runtimes.mjs  exit=0   插件运行时（L2 WASM / L3 Python，95 项）
+✅ verify-runtimes.mjs  exit=0   插件运行时（L2 WASM / L3 Python，106 项）
 全部通过。
 ```
 
@@ -1393,7 +1393,7 @@ realesrgan-x4plus     63.9 MB   279da2949cfc  279da2949cfc  ✓ 与预置哈希�
 | 检查 | 结果 |
 |---|---|
 | 行尾没有被换成 CRLF | 抽查 `pipeline.rs`：CRLF 计数 **0**（仓库用 LF，`.gitattributes` 也是这么声明的） |
-| `cargo test --workspace --locked` | **286 passed / 0 failed**（与重排前一致） |
+| `cargo test --workspace --locked` | **290 passed / 0 failed**（与重排前一致） |
 | `cargo check --workspace --all-targets --locked` | **0 error / 0 warning** |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **退出码 0**（含 `#[allow(clippy::vec_init_then_push)]` 那处仍是显式 allow） |
 | `cargo fmt --all --check` | **退出码 0**（重排前后对比见 §3.14 的 271 处） |
@@ -1586,7 +1586,7 @@ node scripts/gen-icon.mjs && pnpm --filter @toolforge/desktop tauri icon ./asset
 少了这条反证，"没死锁"可能只是因为子进程写得太少 —— 那就成了一条永远绿的测试。
 
 实测：`pnpm icons` 退出码 0（两次产出逐字节相同）；`cargo test --workspace --locked`
-**286 passed / 0 failed**；`cargo clippy … -D warnings` 退出码 0；`cargo fmt --all --check` 退出码 0；
+**290 passed / 0 failed**；`cargo clippy … -D warnings` 退出码 0；`cargo fmt --all --check` 退出码 0；
 `node scripts/devtools/run.mjs` 六脚本 exit=0。
 
 ### 3.24 内置节点参数的**静态自省**：一条新守卫当场抓到三条「声明与行为不一致」（本轮）
@@ -1940,7 +1940,7 @@ if self.loaded.lock().contains_key(&id) { return Ok(()); }
 ★ **证伪做了**：把修复临时关掉、重新构建、重跑 —— ⑦ 报 `alive=true`（还在跑那 60 秒的
 sleep）、⑧ 报 `running`（**下一个**调用被卡在那个还在睡的旧进程后面，正是"取消之后下一个
 任务莫名变慢"这个真实症状），而 ④/④b 保持绿。这精确隔离出"取消回收"这一处改动是唯一原因。
-随后恢复并重测：95 项全通过。
+随后恢复并重测：106 项全通过。
 
 ### 3.28 L2 的燃料上限：手工造两个 WASM 模块，把"空转会被拦住"钉成事实（本轮）
 
@@ -2007,6 +2007,77 @@ v0.2 清单里「越权样本测试：尝试文件读取 / 网络访问的 WASM 
 `Plugin::new_from_compiled`（不是常驻进程），所以一个被 trap 掉的实例**不会**污染后续调用；
 而 L3 是常驻进程，取消之后必须显式回收（§3.27）。
 
+### 3.29 L3 的进度字段：两端都做好了，中间那根线没插（本轮）
+
+v0.2 清单里的「补齐进度字段（不一致 6g）」是这么写的：
+
+> `handle_notification` 目前丢弃 `currentItem` / `speed` / `etaSeconds`
+
+而 PLUGIN-SDK 也把这个限制写成了**既定行为**：
+
+> **通知的字段限制**：宿主处理 `progress` 时**只读 `value` 与 `stage`**，
+> `currentItem` / `speed` / `etaSeconds` 会被忽略……所以**别把重要信息只放在被忽略的字段里**。
+
+两边都写得很清楚，读起来像是有意为之的设计取舍。但把链路两端的代码都看一眼，
+会发现它根本不是设计：
+
+| 环节 | 状态 |
+|---|---|
+| `JobProgress`（`job.rs`） | 三个字段**一直有**（`current_item` / `speed` / `eta_seconds`） |
+| 前端 `job-progress.tsx` | **一直在渲染**：「正在处理：{currentItem}」、「{speed}」、`formatEta(etaSeconds)` |
+| 前端 `job-card.tsx` | 也在卡片上内联显示这两项 |
+| specta 绑定 `bindings.ts` | `currentItem?` / `speed?` / `etaSeconds?` **都有** |
+| `lib/format.ts` | 连 `formatEta()`（`etaSeconds` → "还剩 3 分 12 秒"）都写好了 |
+| L1 的 FFmpeg 进度 | **一直在填**（"第 3/10 个文件 · 1.5 MB/s · 还剩 12 秒"） |
+| ★ **L3 的桥接** | **写死 `None`** |
+
+也就是说：**不是缺功能，是两端都做好了、中间那根线没插**。
+用户看到的现象是"同一套进度条，L1 的任务有百分比 + 文件名 + 速率 + 剩余时间，
+L3 的任务只有一句阶段描述"——而那是因为 L3 的插件报上来的东西被丢掉了。
+
+#### 修法
+
+`handle_notification` 的 `progress` 分支读出这三个字段。映射逻辑抽成纯函数
+`progress_from_notification(&Value) -> JobProgress`（与 `sources_to_delete` 同一个手法）：
+整条 L3 链路要建 venv、起子进程才能跑，而"字段怎么读"这一层不需要任何运行时，
+**也就不该等着真机才能验** —— 抽出来之后它有 4 条单测，跑在三个平台的 CI 上。
+
+**两种拼写都认**（`currentItem` 与 `current_item`，`etaSeconds` 与 `eta_seconds`）：
+协议里其它字段都是 camelCase（`timeoutMs` / `allowHostFunctions`），
+但 Python 作者的手会自然写出 snake_case。多认一种拼写的代价是零；
+不认的代价是**字段被静默忽略** —— 正是这个项目反复吃亏的那一类。
+两种都给了时以 camelCase 为准（有单测钉住）。
+
+#### 真机验证（【6d】，11 条）
+
+判据落在 **`jobs_get` 返回的载荷**上，而不是"宿主内部某个变量"：前端拿到的就是这份 JSON。
+
+| # | 断言 | 实测 |
+|---|---|---|
+| ① | 前置：抓快照时任务**正在跑** | `running` |
+| ②③ | `value` / `stage`（老字段，本来就通） | `0.42` / `统计中` |
+| ★④ | `currentItem` 传到了 | `photo-007.png` |
+| ★⑤ | `speed` 传到了（速率**文本**，单位由插件决定） | `1.5 MB/s` |
+| ★⑥ | `etaSeconds` 传到了 | `12.5` |
+| ★⑦ | 终态被换成「完成 / 100%」 | `{"value":1,"stage":"完成"}` |
+| ★⑦b | 终态**不留逐项残影** | 三个字段都被清掉 |
+| ★⑧ | `current_item` / `eta_seconds` 也被接受 | 一样能读到 |
+
+> ⚠️ **⑦ 这一条我第一版写反了**：当时的期望是"终态快照里仍然保留 currentItem / etaSeconds"，
+> 结果红了 —— 而**产品是对的**。任务体结尾是
+> `ctx.progress_now(JobProgress::ratio("完成", total, total))`，
+> 它构造一个**全新的** `JobProgress`，于是逐项字段归零。
+> 一个**已经完成**的任务还在说「正在处理 photo-007.png · 还剩 12.5 秒」是**过期信息**，
+> 比没有更糟。我不是靠猜纠正的：写了个定点探针把两份快照原样打出来
+> （`.tools/probe/probe-progress.mjs`），看到终态是 `{"value":1,"stage":"完成"}` 才改的断言。
+> 教训与 §3.23/§3.24 同源：**断言错了会伪装成产品缺陷**。
+
+#### 顺带
+
+`plugins/python-example/main.py` 的 `notify_progress()` 现在支持全部五个字段，
+并在"正在解码图片"与"正在生成色卡图"两处真的带上了 `currentItem`（批量时前端就能显示
+"正在解码 photo-007.png"）—— 示例插件是插件作者抄的第一份模板，它得先把好习惯示范出来。
+
 
 ### 4. ~~许可证确认：闸门已经有了，记录仍然没有~~ → 见 §3.8（记录已补上）
 
@@ -2056,7 +2127,7 @@ v0.2 清单里「越权样本测试：尝试文件读取 / 网络访问的 WASM 
 | 6 | ~~**`doc.ocr` 的可用性判定严于实现**~~ **已修** | 原来 `requiresEngines` 是 `["python"]`，缺 Python 时整个节点被标灰；但 tesseract 那条路根本不碰 Python。**已改为 `requiresEngines: []` + `optionalEngines: ["tesseract", "ai-provider"]`** | 正是"能用却显示不可用"（这个项目在 `onnx-models` 上踩过反方向的坑） |
 | 7 | ~~**`doc.ocr` 的 AI 路径没有声明 `ai-provider`**~~ **已修** | 现在 `doc.ocr` 的 `optionalEngines` 含 `ai-provider`，`ai-provider.provides` 也含 `doc.ocr`，两个方向都对齐 | 同第 6 条，一并由 `provides_matches_node_declarations` 这条双向测试守住 |
 | 8 | ~~**ImageMagick 档位与 macOS 没有环境基线**~~ → **ImageMagick 档位已关闭，macOS 仍然开着** | 原文：「"只有 ImageMagick 可用"这一档从未被单独测过（本机没装 ImageMagick）。本轮补齐了它的 **Windows 下载源**，并**直接执行**验证了原本有风险的四点（哈希、`tar` 能解 7z、`magick.exe` 可运行、包内无顶层目录 —— 见 §3），但**应用内的安装链路未复验**，所以这一档现在是"可装"，仍不是"测过"」。**现在三件事都做完了**：应用内安装成功（241.5 MB 的 `magick.exe`，版本 7.1.2-31 Q16 x64）、中间档实测走通（藏掉 `engines/libvips` → 后端日志 = ImageMagick（格式最全）、产出有损 VP8 WebP）、`verify-platform.mjs`【12】把这一步固化成检查。**三档现在都有证据：libvips ✓、ImageMagick ✓、纯 Rust ✓。** ⚠️ **macOS 那半条仍然成立**：四条下载源（ffmpeg / libvips / pandoc / python）的 `sha256` 仍是 `null`（没有 macOS 环境核对哈希） | ImageMagick 部分已关闭；macOS 部分仍是"不是没实现，缺的是验证记录" |
-| 9 | **验证脚本的覆盖面仍然是"我们可控的那部分"** | `ai.describe` 用假端点验证请求形状（这是对的，真模型不可复现、要花钱），但它**验不了**"模型答得好不好"；同理【11】验的是倍数与尺寸，不是超分画质 | 这是**刻意的边界**，不是疏漏。写清楚是为了避免有人把"95 项全通过"读成"AI 能力已经验收" |
+| 9 | **验证脚本的覆盖面仍然是"我们可控的那部分"** | `ai.describe` 用假端点验证请求形状（这是对的，真模型不可复现、要花钱），但它**验不了**"模型答得好不好"；同理【11】验的是倍数与尺寸，不是超分画质 | 这是**刻意的边界**，不是疏漏。写清楚是为了避免有人把"106 项全通过"读成"AI 能力已经验收" |
 
 > **一句话总结这一轮**：节点的账已经平了（32/32，`UNIMPLEMENTED_NODES` 为空）。上面这 9 条里，第 2、5、6、7 条都属于**"声明与实现 / UI 之间的小漂移"**，现已全部修掉（5/6/7 是同一类：`doc.ocr` 的声明；2 是 `provides` ↔ 节点声明那 5 处），并且由双向测试守着 —— 这类问题不会让构建变红，只会让用户在看到真实行为时感到意外，比"缺一个功能"更难发现，所以专门列在这里而不是埋进正文。剩下的三类是：**真的还没做**（1 的固定尺寸补边、3 的 PDF 栅格化）、**知情时机**（4）、**还没有验证记录**（8 只剩 macOS 那一半、9 的验证覆盖面边界）—— 第 8 条的 ImageMagick 半边已随本轮真机验证关闭。
 
@@ -2140,7 +2211,7 @@ v0.2 清单里「越权样本测试：尝试文件读取 / 网络访问的 WASM 
 ### 验收标准
 
 1. `cargo test --workspace` 全绿，且 `cargo test -p toolforge-core` 恰好 **61 个测试通过、0 失败**。
-   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace --locked` 合计 **286 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
+   > 注：61 是**写这一条时的目标/快照值**。当前 `cargo test --workspace --locked` 合计 **290 passed / 0 failed**；分 crate 的逐项数字本文档不再维护（维护它只会制造又一处会漂移的常量）。
 2. `cargo clippy --workspace --all-targets -- -D warnings` 无输出（零告警）。**当前实测：全绿**（§3.14 修掉了最后 13 处）。
    `cargo fmt --all --check` **也已经是干净的**，并已接进 `pnpm check:all` 与 CI（§3.20）—— 这条验收标准现在是**可失败的**，不再是一句空话。
 3. `cargo check --workspace --all-targets` 成功（即 `pnpm check:rust` 通过），且 `Cargo.lock` 已生成并入库。
@@ -2237,10 +2308,17 @@ v0.2 清单里「越权样本测试：尝试文件读取 / 网络访问的 WASM 
   > 「之后运行时仍可用」报 `running`（**下一个**调用被卡在那个还在睡的旧进程后面，
   > 正是"取消之后下一个任务莫名变慢"这个真实症状）。而 ④/④b 保持绿，
   > 精确隔离出"取消回收"这一处改动是唯一原因。
-- [ ] 🚧 **补齐进度字段**：`handle_notification` 目前丢弃 `currentItem` / `speed` / `etaSeconds`（不一致 6g）
-  > **本轮复核：仍然是空的**（`runtimes/python.rs` 里 `current_item: None` / `eta_seconds: None`）。
-  > 也就是说 L3 插件报上来的细粒度进度（当前在处理哪个文件、速度、预计剩余）**全部被丢掉**，
-  > 前端只能看到一个不确定态的进度条。这是 L3 与 L1/引擎节点在进度体验上的唯一实质差距。
+- [x] ✅ **补齐进度字段**（不一致 6g）—— **本轮接通并验证**（`verify-runtimes.mjs`【6d】，11 条）：
+  `handle_notification` 曾把 `currentItem` / `speed` / `etaSeconds` **写死成 `None`**，
+  于是 L3 插件永远只能报"百分之几 + 一句话"。现在三个字段都接通，并且**两种拼写都认**
+  （`currentItem` 与 `current_item`）。实测 `jobs_get` 的运行中快照：
+  `{"value":0.42,"stage":"统计中","currentItem":"photo-007.png","speed":"1.5 MB/s","etaSeconds":12.5}`。
+  详见 §3.29。
+  > **这一条的处境值得记**：字段在 `JobProgress` 里一直有、前端的 `job-progress.tsx`
+  > 一直在渲染（「正在处理：X」+ 速率 + `formatEta(etaSeconds)`）、specta 绑定里也有、
+  > L1 的 FFmpeg 进度一直在填 —— **只有 L3 这一段桥没接**。所以它不是"缺功能"，
+  > 是"两端都做好了、中间那根线没插"；而当时它还以「通知的字段限制」的形式
+  > 被写进了 PLUGIN-SDK，读起来像是有意为之的设计。
 - [ ] 🚧 依赖预装与缓存策略（当前只负责建 venv 并调 pip）
 - [x] ✅ `plugins/python-example` 打通端到端调用 —— **实测**：`verify-runtimes.mjs`【5】把
   `plugins/python-example` 暂存后真的装、真的授权、真的跑（venv 冷启动 + `pip install Pillow` +
@@ -2300,7 +2378,7 @@ v0.2 清单里「越权样本测试：尝试文件读取 / 网络访问的 WASM 
 3. **引擎可安装**：12 条源中的每一条在 `sha256` 回填后，`install` 能成功下载、校验、落地；`sha256` 缺失时**拒绝安装**的行为有测试守护。
 4. **许可证确认可验证**：在全新用户数据目录下首次安装/调用需要确认的引擎（如 ffmpeg、calibre、tesseract）前，必须出现许可证确认；拒绝确认时任务**不会**执行，且不留下部分产物；确认记录可在审计日志中查到。
 5. **降级可验证**：分别测「无任何外部引擎」「仅系统安装 ImageMagick」「安装 libvips」三种环境，同一图片转换任务都能完成，输出在尺寸/通道/格式上一致（编码字节允许差异）。
-   > 进度（🚧）：**三档现在都有环境基线了，而且是同一轮在本机测出来的** —— 「安装 libvips」档由 `verify-platform.mjs`【6】断言实际后端与引擎状态一致（后端 = `libvips（快、省内存）`，产出**有损 VP8**）；「仅 ImageMagick」档由【12】断言（临时藏掉 `engines/libvips` → 后端切成 `ImageMagick（格式最全）`，同样产出**有损 VP8** → `finally` 还原）；**「无任何外部引擎」档本轮由【13】补上**（把两个引擎的托管目录**都**藏起来 → 后端 = `纯 Rust image crate（零依赖，能力受限）`、任务**仍然成功**、产出**无损 VP8L**（这既是纯 Rust 后端的指纹，也是它的能力上限）、节点如实提示「只有无损模式」 → `finally` 还原，两个引擎随后都探回 `installed`）。整个脚本 **95 项全通过**。
+   > 进度（🚧）：**三档现在都有环境基线了，而且是同一轮在本机测出来的** —— 「安装 libvips」档由 `verify-platform.mjs`【6】断言实际后端与引擎状态一致（后端 = `libvips（快、省内存）`，产出**有损 VP8**）；「仅 ImageMagick」档由【12】断言（临时藏掉 `engines/libvips` → 后端切成 `ImageMagick（格式最全）`，同样产出**有损 VP8** → `finally` 还原）；**「无任何外部引擎」档本轮由【13】补上**（把两个引擎的托管目录**都**藏起来 → 后端 = `纯 Rust image crate（零依赖，能力受限）`、任务**仍然成功**、产出**无损 VP8L**（这既是纯 Rust 后端的指纹，也是它的能力上限）、节点如实提示「只有无损模式」 → `finally` 还原，两个引擎随后都探回 `installed`）。整个脚本 **106 项全通过**。
    > 历史：这里曾写着"**三档里现在有两档有真机证据** ……**「无任何外部引擎」档仍然没有专门的环境基线** —— 纯 Rust 这条路径每个节点都在走，但「把两档都藏掉」跑一遍还没有做过"。那段现在已经过期（保留作为历史）。**"三档输出一致"也仍然没有测试** —— 三档各自走通，不等于三档的输出可比。
 6. **加速链路真实可用** ✅ **已达成**：有 libvips 的环境下，`image.convert` / `image.resize` / `image.crop` / `image.rotate` 四个节点会真的走 libvips 而非纯 Rust，并**通过节点输出的 `backend` 与一条 debug 日志证实**（`verify-platform.mjs`【6】的核心断言就是"日志里写明了实际使用的图片后端"且"与引擎状态一致"；【12】进一步证实中间档 ImageMagick 也真的会被挑中）。对应「不一致 2」——✅ **已关闭**：那 5 处 `provides` 声明漂移全部改正（撤掉 libvips 多写的 `image.enhance` / `image.strip-metadata`、补上它缺的 `image.crop` / `image.rotate`、撤掉 imagemagick 多写的 `image.strip-metadata`、撤掉 `python` 多写的 `doc.ocr`、补上 `ai-provider` 缺的 `doc.ocr`），并新增双向守卫测试 `provides_matches_node_declarations` 并做过反证。`image.enhance` / `image.strip-metadata` **仍然只有纯 Rust 路径，但那是刻意的**（它们本就该是纯 Rust），而且已经不再声明任何引擎依赖 —— 所以「声明与实现不一致」这件事不存在了。
 7. **L2 沙箱可验证**：尝试文件读取/网络访问的 WASM 插件被拒绝并返回明确错误；分配超限内存或耗尽燃料时被终止，宿主进程存活且后续调用正常。
@@ -2498,7 +2576,7 @@ v0.2 清单里「越权样本测试：尝试文件读取 / 网络访问的 WASM 
 | 检查点 | 命令/动作 | 期望 |
 | --- | --- | --- |
 | 领域层健康 | `cargo test -p toolforge-core` | 61 通过 / 0 失败（**写本文档时的目标值**；当前全仓合计见下一行，不再逐 crate 维护） |
-| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 286 passed / 0 failed** |
+| 全仓健康 | `cargo test --workspace` | 全绿；**当前实测 290 passed / 0 failed** |
 | 全目标检查 | `cargo check --workspace --all-targets` | 退出码 0 |
 | 静态质量 | `cargo clippy --workspace --all-targets -- -D warnings`（= `pnpm check:clippy`） | **当前实测全绿**（§3.14 之前是红的） |
 | 格式 | `cargo fmt --all --check`（= `pnpm check:fmt`） | ✅ **零格式差异**；已接进 `pnpm check:all` 与 CI（见 §3.20） |

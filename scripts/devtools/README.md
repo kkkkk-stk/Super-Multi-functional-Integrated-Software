@@ -42,7 +42,7 @@ node scripts/devtools/smoke.mjs     # 9 个路由逐个走
 node scripts/devtools/e2e.mjs       # 一次真实转换任务
 node scripts/devtools/verify.mjs    # 解码 / 多文件扇出 / 恶意插件安全测试
 node scripts/devtools/verify-platform.mjs   # 平台能力是否真的可用（408 项）
-node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（95 项）
+node scripts/devtools/verify-runtimes.mjs   # 插件运行时：L2 WASM / L3 Python（106 项）
 ```
 
 `pnpm dev:cdp` 与 `pnpm verify:app` 是上面两条命令的简写。
@@ -235,7 +235,7 @@ libvips 只要在，`image.convert` 就永远走它，中间档与兜底档根�
 > **不计入通过**，汇总行形如 `N 通过 / 0 失败 / M 跳过（跳过不计入通过）`。
 > 所以某一次改动让"通过数变少"未必是退步 —— 可能是把以前虚报的那部分扣掉了。
 
-### `verify-runtimes.mjs` —— 三级插件里的 L2 与 L3（95 项）
+### `verify-runtimes.mjs` —— 三级插件里的 L2 与 L3（106 项）
 
 L1（内置流水线）天天在跑，而 **L2（Extism WASM）与 L3（Python 子进程）在写出来之后
 一次都没被执行过**：单元测试、清单校验、`cargo check` 全绿，示例插件也"在仓库里躺着
@@ -251,6 +251,7 @@ L1（内置流水线）天天在跑，而 **L2（Extism WASM）与 L3（Python �
 | 【5】 | L3：venv 冷启动（真的 `pip install Pillow`）→ JSON-RPC 循环 → 色卡图被登记为真实产出 |
 | 【6】 | L3 的 `env` 与 `exec` —— 两个曾经"勾了等于没勾"的能力：env 用对照实验验注入（撤销授权读不到 / 授权后值与宿主一致 / 没声明的仍然读不到）；exec 验**装载期静态门**（没声明 → 拒绝装载、声明了没授权 → 拒绝、声明+授权 → 子进程真的起来并拿到输出） |
 | 【6c】 | **L3 的常驻进程复用，以及"取消能不能真的把子进程收掉"** —— 两件在 v0.2 清单里挂很久、**一条验证都没有**的事。判据全部落在**进程**上而不是"任务显示取消了"：① 连续 100 次调用只用了 **1 个** pid（复用生效）；② ★ **反证**：外部杀掉那个 pid，下一次调用要成功且换成**新** pid（否则"1 个 pid"可能只是宿主把一个常量回显了 100 次）；③ 取消前先断言子进程**还活着**，取消后再断言它**没了**（少了"还活着"，"没了"可能只是它早就死了）。**写这条检查的过程中查出一个真缺陷**：`python.rs::call` 里取消走的是 `job.check()?`，它让任务**立刻**变成"已取消"（用户看到的没错），但那个 Python 进程**没有被杀**，会一直跑到自己结束 —— `Timeout` 那条路一直是杀的，唯独取消漏了。已修（取消与超时同等对待），并顺带补上 `ensure_loaded` 对"进程已死"实例的重新拉起（否则取消一次就等于把插件在本会话里废掉）。★ **做过证伪**：把修复临时关掉重跑，⑦（子进程真的被收掉）与⑧（之后运行时仍可用）如期变红，④/④b 保持绿 —— 精确隔离出"取消回收"这一处改动。详见 `docs/ROADMAP.md` §3.27 |
+| 【6d】 | **L3 的进度字段（`currentItem` / `speed` / `etaSeconds`）** | v0.2 的「补齐进度字段（不一致 6g）」。这一条的处境很特别：字段在 `JobProgress` 里一直有、前端 `job-progress.tsx` **一直在渲染**（「正在处理：X」+ 速率 + `formatEta(etaSeconds)`）、specta 绑定里也有、L1 的 FFmpeg 进度一直在填 —— **只有 L3 的桥接写死成 `None`**。所以它不是"缺功能"，是"两端都做好了、中间那根线没插"；而当时它还以「通知的字段限制」的形式写进 PLUGIN-SDK，读起来像有意为之的设计。判据落在 **`jobs_get` 返回的载荷**上（前端拿到的就是这份 JSON）：运行中快照必须带全部五个字段，**两种拼写都认**（`currentItem` 与 `current_item`）。★ 其中"终态该不该保留逐项字段"那一条**我第一版写反了**（期望保留 → 红了，而产品是对的：任务体结尾 `ctx.progress_now(ratio("完成", …))` 会构造一个全新的 `JobProgress`，已完成的任务还说"正在处理 X · 还剩 12 秒"是**过期信息**，比没有更糟）。不是靠猜纠正的 —— 写了个定点探针把两份快照原样打出来才改的断言。详见 `docs/ROADMAP.md` §3.29 |
 
 **最值得看的是【2】那三行**：
 
