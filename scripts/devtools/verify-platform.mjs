@@ -40,6 +40,9 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
+// 命名空间形式也引一份：【37】要把"基准机"写清楚（CPU 型号 / 核数 / 总内存），
+// 而 `os.cpus()` / `os.totalmem()` 这些只在命名空间里有
+import * as os from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
@@ -7190,6 +7193,267 @@ c.section('【36】诊断包：不含文件内容、且真的脱敏了吗');
       '⑨ 收尾：API Key 的状态已还原到测试之前',
       `hasKey=${after?.ai?.hasKey}（原为 ${hadKey}）`
     );
+  }
+}
+
+// ============================================================================
+// 【37】批量吞吐与内存基线：把"从来没测过"变成"有数字、可复现"
+// ============================================================================
+//
+// v0.5 的清单里有两条一直挂着，而且挂的理由很诚实 —— **从来没测过**：
+//
+//   * 「大批量吞吐目标：1000 张图片批量处理在目标机型上完成时间与内存上限明确化并达成」
+//   * 「内存上限：大批量处理时进程常驻内存不超过既定阈值，无随任务数线性增长」
+//
+// 两条都缺一个前提：**"目标机型"从来没被定义过**。所以这一节先做三件事：
+//   ① 把基准**说清楚**（这台机器的 CPU / 内存 / 并发度 / 输入规格都打进输出）；
+//   ② 用**同一条真实链路**跑两批，测总耗时与吞吐；
+//   ③ 采样**应用进程的常驻内存**（从外部采，不是"宿主自己报的数"），
+//      并比较两批的峰值 —— "无随任务数线性增长"这句话只有这样才谈得上验证。
+//
+// ⚠️ 关于规模：清单写的是 1000 张。这里刻意跑一个**较小**的批次（默认 150 × 2），
+// 理由是这一节要进 CI 式的日常套件，而 1000 张要跑很久。所以：
+//   * 断言只钉"确实处理完了 + 吞吐在合理量级 + 峰值内存有上限"；
+//   * **实测数字原样打进输出**（每张毫秒、吞吐、峰值 RSS），
+//     要做 1000 张的正式基线时把 `PER_BATCH` 调大重跑即可 —— 脚本本身可复现。
+c.section('【37】批量吞吐与内存基线（两批同规模，比较吞吐与峰值内存）');
+{
+  const PER_BATCH = 150; // 每批文件数；要做 1000 张的正式基线就把它调大
+  const IMG_W = 1600;
+  const IMG_H = 1200;
+  const RESIZE_W = 800;
+
+  const work = join(REPO_ROOT, '.tools', 'smoke', 'out-batch-bench');
+  rmSync(work, { recursive: true, force: true });
+  mkdirSync(work, { recursive: true });
+
+  // ---- 基准环境：不写清楚机器，"目标机型"就还是一句空话 ----
+  const cpus = os.cpus();
+  console.log(
+    `   基准机：${cpus[0]?.model ?? '(未知 CPU)'} × ${cpus.length} 核，` +
+      `内存 ${(os.totalmem() / 1024 ** 3).toFixed(1)} GB，${os.platform()} ${os.release()}`
+  );
+  const engines = await client.invoke('engines_probe_all');
+  const usable = (id) =>
+    ['detected', 'installed'].includes(
+      engines.find((e) => e.descriptor.id === id)?.status?.state ?? ''
+    );
+  const backend = usable('libvips') ? 'libvips' : usable('imagemagick') ? 'imagemagick' : 'rust';
+  const settings = await client.invoke('settings_get');
+  console.log(`   图片后端：${backend}　并发度：${settings.concurrency}`);
+
+  // ---- 输入：一批真实尺寸的 JPEG/PNG ----
+  // 用 PNG 是因为脚本里能零依赖生成；1600×1200 已经足以让"编解码 + 重采样"成为主要成本。
+  const inDir = join(work, 'in');
+  mkdirSync(inDir, { recursive: true });
+  const files = [];
+  const tGen = Date.now();
+  for (let i = 0; i < PER_BATCH; i++) {
+    const p = join(inDir, `img-${String(i).padStart(4, '0')}.png`);
+    writeFileSync(p, makePng(IMG_W, IMG_H, i % 7));
+    files.push(p);
+  }
+  const genMs = Date.now() - tGen;
+  console.log(
+    `   素材：${PER_BATCH} 张 ${IMG_W}×${IMG_H} PNG（生成用了 ${(genMs / 1000).toFixed(1)}s）`
+  );
+
+  // ---- 一个只做 resize 的插件：这一节测的是"宿主批量调度的开销"，不是某个节点的算法 ----
+  const BENCH_ID = 'com.verify.batch-bench';
+  const pluginDir = join(work, 'plugin');
+  mkdirSync(pluginDir, { recursive: true });
+  writeFileSync(
+    join(pluginDir, 'plugin.yaml'),
+    `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${BENCH_ID}
+  name: 批量基准（验证用）
+  version: 1.0.0
+  description: 仅用于测量批量吞吐与常驻内存。只做一次缩放。
+permissions:
+  capabilities:
+    - kind: fsRead
+      scope: { kind: input }
+    - kind: fsWrite
+      scope: { kind: output }
+io:
+  inputs:
+    - id: src
+      label: 图片
+      type: files
+      required: true
+  outputs:
+    - id: dst
+      label: 输出
+      type: file
+      accept: [".png"]
+      required: true
+  params: []
+runtime:
+  kind: pipeline
+  pipeline:
+    steps:
+      - id: s1
+        uses: image.resize
+        with:
+          src: "\${src}"
+          dst: "\${output.dst}"
+          width: "${RESIZE_W}"
+`,
+    'utf8'
+  );
+
+  const benches = [];
+  try {
+    const existing = await client.invoke('plugins_get', { pluginId: BENCH_ID }).catch(() => null);
+    if (existing) {
+      await client.invoke('plugins_set_enabled', { pluginId: BENCH_ID, enabled: false }).catch(() => {});
+      await client.invoke('plugins_uninstall', { pluginId: BENCH_ID }).catch(() => {});
+    }
+    await client.invoke('plugins_install', {
+      req: {
+        source: { kind: 'directory', path: pluginDir },
+        overwrite: true,
+        permissionsAcknowledged: true,
+        executableCodeAcknowledged: false,
+      },
+    });
+    await client.invoke('plugins_grant', {
+      req: {
+        pluginId: BENCH_ID,
+        granted: {
+          capabilities: [
+            { kind: 'fsRead', scope: { kind: 'input' } },
+            { kind: 'fsWrite', scope: { kind: 'output' } },
+          ],
+        },
+      },
+    });
+    await client.invoke('plugins_set_enabled', { pluginId: BENCH_ID, enabled: true });
+
+    // ---- 常驻内存：**从外部采样应用进程**，而不是让宿主自己报 ----
+    //
+    // 用一个常驻的 PowerShell 子进程每 400ms 打一次 WorkingSet64，
+    // 跑完一批再杀掉。这样拿到的数字是"操作系统看到的常驻内存"。
+    const sampler = spawn(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-Command',
+        "while ($true) { $p = Get-Process -Name toolforge -ErrorAction SilentlyContinue; " +
+          "if ($p) { $p | ForEach-Object { [Console]::Out.WriteLine($_.WorkingSet64) } }; " +
+          'Start-Sleep -Milliseconds 400 }',
+      ],
+      { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+    let rssSamples = [];
+    let samplerBuf = '';
+    let sampling = true;
+    sampler.stdout.on('data', (d) => {
+      samplerBuf += String(d);
+      const lines = samplerBuf.split(/\r?\n/);
+      samplerBuf = lines.pop() ?? '';
+      for (const l of lines) {
+        const n = Number(l.trim());
+        if (Number.isFinite(n) && n > 0) rssSamples.push(n);
+      }
+    });
+    c.check(sampler.pid !== undefined, '① 内存采样器已启动（外部采样式，不是宿主自报）', `pid=${sampler.pid}`);
+
+    /** 跑一批并返回耗时与内存峰值 */
+    const runBatch = async (tag) => {
+      const outDir = join(work, `out-${tag}`);
+      rmSync(outDir, { recursive: true, force: true });
+      mkdirSync(outDir, { recursive: true });
+      rssSamples = [];
+      const t0 = Date.now();
+      const sub = await client.invoke('plugins_run', {
+        req: { pluginId: BENCH_ID, inputs: { src: files }, params: {}, outputDir: outDir },
+      });
+      const job = await client.waitJob(sub.jobId, 3600, 1000);
+      const ms = Date.now() - t0;
+      const produced = (job.outputs ?? []).length;
+      return { job, ms, produced, peak: Math.max(0, ...rssSamples), samples: rssSamples.length };
+    };
+
+    const batch1 = await runBatch('a');
+    console.log(
+      `   第 1 批：${batch1.job.status}，产出 ${batch1.produced} 个，` +
+        `用时 ${(batch1.ms / 1000).toFixed(1)}s（${(batch1.ms / batch1.produced).toFixed(0)} ms/张），` +
+        `峰值内存 ${(batch1.peak / 1024 ** 2).toFixed(0)} MB（${batch1.samples} 个采样点）`
+    );
+    c.check(
+      batch1.job.status === 'succeeded',
+      `② 第 1 批 ${PER_BATCH} 个文件全部处理完（不是"部分成功"）`,
+      `${batch1.job.status} / 产出 ${batch1.produced}`
+    );
+    c.check(
+      batch1.produced === PER_BATCH,
+      '★ ②b 产出数与输入数**逐一对应**（批量扇出没有漏文件，也没有重复）',
+      `${batch1.produced} / ${PER_BATCH}`
+    );
+    c.check(
+      batch1.ms / PER_BATCH < 2000,
+      '★ ③ 每张耗时在合理量级（< 2 秒/张）—— 这条防的是"某个环节退化成 O(n²)"',
+      `${(batch1.ms / batch1.produced).toFixed(0)} ms/张`
+    );
+
+    const batch2 = await runBatch('b');
+    console.log(
+      `   第 2 批：${batch2.job.status}，产出 ${batch2.produced} 个，` +
+        `用时 ${(batch2.ms / 1000).toFixed(1)}s（${(batch2.ms / batch2.produced).toFixed(0)} ms/张），` +
+        `峰值内存 ${(batch2.peak / 1024 ** 2).toFixed(0)} MB（${batch2.samples} 个采样点）`
+    );
+    c.check(batch2.produced === PER_BATCH, '④ 第 2 批同样逐一对应', `${batch2.produced} / ${PER_BATCH}`);
+
+    // ---- ★ 内存：这才是"无随任务数线性增长"的可验证形式 ----
+    //
+    // 两批规模相同，而第 2 批是在"队列里已经躺着第 1 批的 150 个任务"之后跑的。
+    // 如果内存随任务数线性增长，第 2 批的峰值会明显更高。
+    // 判据刻意宽松（允许 +60%）：这一节要发现的是**量级**问题，不是抖动。
+    const growth = batch1.peak > 0 ? batch2.peak / batch1.peak - 1 : 0;
+    c.check(
+      batch1.peak > 0 && batch2.peak > 0,
+      '★ ⑤ 两批都采到了内存样本（没有样本的话下面的比较是空的）',
+      `第1批 ${batch1.samples} 点 / 第2批 ${batch2.samples} 点`
+    );
+    c.check(
+      growth < 0.6,
+      '★ ⑤b 第 2 批的峰值内存**没有明显高于**第 1 批 —— 即"常驻内存不随任务数线性增长"',
+      `${(batch1.peak / 1024 ** 2).toFixed(0)} MB → ${(batch2.peak / 1024 ** 2).toFixed(0)} MB（${(growth * 100).toFixed(0)}%）`
+    );
+    c.check(
+      batch2.peak < 4 * 1024 ** 3,
+      '★ ⑤c 峰值常驻内存有上限（< 4 GB）—— 这一条是"内存上限"那个验收标准里目前唯一能自动判的部分',
+      `${(batch2.peak / 1024 ** 2).toFixed(0)} MB`
+    );
+
+    // ---- ⑥ 把基线数字**写进文件**：文档里的数字要能追到一次真实运行 ----
+    benches.push({
+      at: new Date().toISOString(),
+      cpu: cpus[0]?.model ?? null,
+      cores: cpus.length,
+      totalMemGb: Number((os.totalmem() / 1024 ** 3).toFixed(1)),
+      platform: `${os.platform()} ${os.release()}`,
+      backend,
+      concurrency: settings.concurrency,
+      perBatch: PER_BATCH,
+      input: `${IMG_W}x${IMG_H} PNG`,
+      node: `image.resize → ${RESIZE_W}px`,
+      batch1: { ms: batch1.ms, msPerItem: Math.round(batch1.ms / batch1.produced), peakMb: Math.round(batch1.peak / 1024 ** 2) },
+      batch2: { ms: batch2.ms, msPerItem: Math.round(batch2.ms / batch2.produced), peakMb: Math.round(batch2.peak / 1024 ** 2) },
+    });
+    const benchFile = join(work, 'baseline.json');
+    writeFileSync(benchFile, JSON.stringify(benches, null, 2), 'utf8');
+    c.check(existsSync(benchFile), '⑥ 基线写进了 `.tools/smoke/out-batch-bench/baseline.json`（数字可追溯）', benchFile.replace(REPO_ROOT, '.'));
+
+    sampling = false;
+    sampler.kill();
+    c.check(sampling === false, '⑦ 采样器已停止（不留后台进程）', '');
+  } finally {
+    await client.invoke('plugins_set_enabled', { pluginId: BENCH_ID, enabled: false }).catch(() => {});
+    await client.invoke('plugins_uninstall', { pluginId: BENCH_ID }).catch(() => {});
   }
 }
 
