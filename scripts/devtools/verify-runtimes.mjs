@@ -116,6 +116,124 @@ async function uninstall(id) {
   await client.invoke('plugins_uninstall', { pluginId: id }).catch(() => {});
 }
 
+// ---------------------------------------------------------------------------
+// 手工构造 WASM 模块（零依赖）
+// ---------------------------------------------------------------------------
+//
+// 为什么不引一个 wat 编译器：这一族检查要验的正是"宿主能不能正确处理**这种**模块"，
+// 用别的工具生成反而把被测对象藏起来了；而且多一个依赖就多一处 CI 会坏的地方。
+// 字节是照着 WASM 1.0 的段格式手写的，每一段都在下面注释清楚了。
+
+/** 单字节 LEB128（测试里的长度都小于 128） */
+const leb = (n) => {
+  if (n >= 0x80) throw new Error('测试里的 LEB128 只用得到单字节');
+  return n;
+};
+
+/** 造一个只有导入段的最小合法 wasm 模块（用来验装载期能不能读懂导入段） */
+const wasmWithImports = (imports) => {
+  const payload = [leb(imports.length)];
+  for (const [mod, field] of imports) {
+    payload.push(leb(mod.length), ...Buffer.from(mod, 'ascii'));
+    payload.push(leb(field.length), ...Buffer.from(field, 'ascii'));
+    payload.push(0x00, 0x00); // kind = func, type index = 0
+  }
+  return Buffer.from([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+    0x02, leb(payload.length), ...payload, // import section
+  ]);
+};
+
+/**
+ * 造一个**完整可用**的模块：导出 `memory` 与 `run`（`() -> ()`），函数体由调用方给。
+ *
+ * 为什么要"完整"：`wasmWithImports` 那几个模块是**故意**缺东西的（缺入口、缺内存），
+ * 用来验装载期拒绝；而燃料那一条要的恰恰相反 —— 模块必须**能装、能跑**，
+ * 只有"函数体在空转"这一处不同。两者的模块形状必须能对照，否则
+ * "它失败了"就可能只是因为模块本身是坏的。
+ *
+ * 段布局：
+ *   type(1)     : 一个类型 `() -> ()`
+ *   func(3)     : 一个函数，类型 0
+ *   memory(5)   : 一页内存（Extism 往插件的线性内存里写输入，所以必须导出 `memory`）
+ *   export(7)   : `memory`(mem 0) + `run`(func 0)
+ *   code(10)    : 函数体（局部变量 0 个 + 调用方给的指令 + `end`）
+ */
+const wasmModule = (bodyBytes) => {
+  const typeSec = [0x01, 0x60, 0x00, 0x00]; // count=1, func, 0 params, 0 results
+  const funcSec = [0x01, 0x00]; // count=1, type 0
+  const memSec = [0x01, 0x00, 0x01]; // count=1, flags=0, min=1 page
+  const runName = [...Buffer.from('run', 'ascii')];
+  const memName = [...Buffer.from('memory', 'ascii')];
+  const exportSec = [
+    0x02, // count=2
+    leb(memName.length), ...memName, 0x02, 0x00, // memory, index 0
+    leb(runName.length), ...runName, 0x00, 0x00, // func, index 0
+  ];
+  const body = [0x00, ...bodyBytes, 0x0b]; // locals=0, 指令, end
+  const codeSec = [0x01, leb(body.length), ...body];
+
+  const sec = (id, payload) => [id, leb(payload.length), ...payload];
+  return Buffer.from([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+    ...sec(0x01, typeSec),
+    ...sec(0x03, funcSec),
+    ...sec(0x05, memSec),
+    ...sec(0x07, exportSec),
+    ...sec(0x0a, codeSec),
+  ]);
+};
+
+/**
+ * 用一个临时插件跑一次，返回任务快照。`wasmBytes` 直接写进暂存目录，
+ * 所以不需要任何构建产物（也就不用等 wasm32 工具链）。
+ */
+const probeWithWasm = async (id, wasmBytes, { timeoutMs = 2000 } = {}) => {
+  const yaml = `apiVersion: toolforge/v1
+kind: Plugin
+metadata:
+  id: ${id}
+  name: wasm 探针
+  version: 1.0.0
+  description: 仅用于验证 L2 的装载期报错与运行期燃料上限。
+permissions:
+  capabilities: []
+io:
+  inputs:
+    - id: text
+      label: 文本
+      type: text
+      required: false
+  outputs: []
+  params: []
+runtime:
+  kind: wasm
+  wasm:
+    path: plugin.wasm
+    entry: run
+    memoryLimitMb: 64
+    timeoutMs: ${timeoutMs}
+    allowHostFunctions: ["log"]
+`;
+  const dir = join(STAGE, id);
+  rmSync(dir, { recursive: true, force: true });
+  cpSync(join(PLUGIN_SRC, 'wasm-example'), dir, {
+    recursive: true,
+    filter: (src) => !src.includes('target') && !src.endsWith('.log'),
+  });
+  writeFileSync(join(dir, 'plugin.yaml'), yaml, 'utf8');
+  writeFileSync(join(dir, 'plugin.wasm'), wasmBytes);
+  try {
+    await install(id, dir);
+    await client.invoke('plugins_set_enabled', { pluginId: id, enabled: true });
+    const { job } = await run(id, { text: ['x'] }, {}, prepareOutDir(`out-rt-${id}`));
+    console.log(`   ${id}: ${job.status} / ${job.error?.code ?? ''} — ${job.error?.message ?? ''}`);
+    return job;
+  } finally {
+    await uninstall(id);
+  }
+};
+
 // ============================================================================
 // 本地 HTTP 服务：L2 联网对照实验的靶子
 // ============================================================================
@@ -432,81 +550,8 @@ runtime:
   // ==========================================================================
   c.section('【4】L2 · 装载非法/错目标的 wasm 时，报错是否可操作');
   {
-    /** 单字节 LEB128（测试里的长度都小于 128） */
-    const leb = (n) => {
-      if (n >= 0x80) throw new Error('测试里的 LEB128 只用得到单字节');
-      return n;
-    };
-
-    /**
-     * 造一个只有导入段的最小合法 wasm 模块。
-     *
-     * 手写字节而不是引用某个构建产物：这一节要验的正是"宿主能不能读懂导入段"，
-     * 用别的工具生成反而把被测对象藏起来了。
-     */
-    const wasmWithImports = (imports) => {
-      const payload = [leb(imports.length)];
-      for (const [mod, field] of imports) {
-        payload.push(leb(mod.length), ...Buffer.from(mod, 'ascii'));
-        payload.push(leb(field.length), ...Buffer.from(field, 'ascii'));
-        payload.push(0x00, 0x00); // kind = func, type index = 0
-      }
-      return Buffer.from([
-        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
-        0x02, leb(payload.length), ...payload, // import section
-      ]);
-    };
-
-    /**
-     * 用一个临时插件跑一次，返回任务快照。
-     *
-     * `wasmBytes` 直接写进暂存目录，所以不需要任何构建产物。
-     */
-    const probeWithWasm = async (id, wasmBytes) => {
-      const yaml = `apiVersion: toolforge/v1
-kind: Plugin
-metadata:
-  id: ${id}
-  name: wasm 装载体检探针
-  version: 1.0.0
-  description: 仅用于验证装载期的报错质量。
-permissions:
-  capabilities: []
-io:
-  inputs:
-    - id: text
-      label: 文本
-      type: text
-      required: false
-  outputs: []
-  params: []
-runtime:
-  kind: wasm
-  wasm:
-    path: plugin.wasm
-    entry: run
-    memoryLimitMb: 64
-    timeoutMs: 2000
-    allowHostFunctions: ["log"]
-`;
-      const dir = join(STAGE, id);
-      rmSync(dir, { recursive: true, force: true });
-      cpSync(join(PLUGIN_SRC, 'wasm-example'), dir, {
-        recursive: true,
-        filter: (src) => !src.includes('target') && !src.endsWith('.log'),
-      });
-      writeFileSync(join(dir, 'plugin.yaml'), yaml, 'utf8');
-      writeFileSync(join(dir, 'plugin.wasm'), wasmBytes);
-      try {
-        await install(id, dir);
-        await client.invoke('plugins_set_enabled', { pluginId: id, enabled: true });
-        const { job } = await run(id, { text: ['x'] }, {}, prepareOutDir(`out-rt-${id}`));
-        console.log(`   ${id}: ${job.status} / ${job.error?.code ?? ''} — ${job.error?.message ?? ''}`);
-        return job;
-      } finally {
-        await uninstall(id);
-      }
-    };
+    // `leb` / `wasmWithImports` / `probeWithWasm` 都已提到模块作用域
+    // （【4c】的燃料检查也要用后者，而它本该只有一份）。
 
     // ---- 4a：根本不是 wasm ----
     const jobGarbage = await probeWithWasm(
@@ -571,6 +616,134 @@ runtime:
     // ---- 4d：应用仍然活着（一个坏插件不该拖垮宿主）----
     const alive = await client.invoke('plugins_list');
     c.check(Array.isArray(alive?.plugins ?? alive), '应用仍然可以响应命令');
+  }
+
+  // ==========================================================================
+  // 【4c】L2 · 燃料耗尽：一个**空转**的插件会不会被 trap 掉，宿主会不会被拖死
+  // ==========================================================================
+  //
+  // 这是 v0.2 清单里「越权样本测试」拆开之后剩下的那一半：
+  // `fuel_for_timeout` 的**换算**早就有单测（1e8 燃料/秒、下限 1e7），
+  // `wasm.rs` 里也早就有识别 `all fuel consumed` 的代码路径 ——
+  // 但**没有任何运行时检查**证明"一个死循环的 WASM 插件真的会被燃料拦住、
+  // 而且宿主还活着"。L2 是唯一一条"插件跑飞了也不会伤到宿主"的边界，
+  // 这条边界值不值得信，就看这一次。
+  //
+  // ⚠️ 关键在于**对照**：单说"这个模块失败了"什么都证明不了 ——
+  // 手搓的字节可能**本来就装不上**（缺入口、缺内存、段格式写错），
+  // 那样"失败"就只是"模块是坏的"。
+  // 所以这里造**两个形状完全相同**的模块，只差函数体：
+  //   * `nop`：`run` 直接返回  → 必须**成功**（证明模块合法、入口协议满足）
+  //   * `spin`：`run` 里 `block br 0` 空转 → 必须因**燃料耗尽**失败
+  // 两者的模块骨架是同一段代码生成的，唯一差别就是那 7 个字节的函数体。
+  c.section('【4c】L2 · 燃料耗尽：空转的 WASM 插件会被 trap 吗、宿主还活着吗');
+  {
+    // `run() { }`：**空函数体**。注意不要再写一个 `0x00` ——
+    // `wasmModule()` 已经把"局部变量个数"那个 `0x00` 放进去了，
+    // 多写一个就成了 `unreachable` 指令（第一版就是这么错的：
+    // 对照模块直接 trap 出 `wasm unreachable instruction executed`）。
+    const NOP = [];
+    // `run() { loop br 0 end }`：死循环。
+    //   bytes: loop(void) br(0) end  +  函数自己的 end
+    //
+    // ⚠️ 必须是 `loop`（0x03），**不能是 `block`（0x02）**：
+    // `br 0` 跳到的是"最内层那个 label 的**结束**位置"，而 `loop` 的 label
+    // 指的是它的**开头** —— 所以 `block br 0` 只是立刻跳出块、函数马上就返回了。
+    // 第一版用了 `block`，于是"空转模块"跑成功了，反而是对照实验把它抓出来的。
+    const SPIN = [0x03, 0x40, 0x0c, 0x00, 0x0b];
+
+    const nopJob = await probeWithWasm(
+      'com.toolforge.test.nop-wasm',
+      wasmModule(NOP),
+      { timeoutMs: 2000 }
+    );
+    c.check(
+      nopJob.status === 'succeeded',
+      '★ ① 前置对照：**同一套骨架**、只是函数体直接返回的模块能装能跑 —— 证明手搓的模块合法、入口协议也满足',
+      `${nopJob.status}${nopJob.error ? ` / ${nopJob.error.code}` : ''}`
+    );
+
+    const t0 = Date.now();
+    const spinJob = await probeWithWasm(
+      'com.toolforge.test.spin-wasm',
+      wasmModule(SPIN),
+      { timeoutMs: 1000 }
+    );
+    const elapsed = Date.now() - t0;
+
+    c.check(spinJob.status === 'failed', '★ ② 空转的插件**失败**了（不是一直挂着，也不是"成功"）', spinJob.status);
+    c.check(
+      String(spinJob.error?.code ?? '') === 'TIMEOUT',
+      '★ ②b 错误码是 TIMEOUT（燃料耗尽走的就是这条路，见 `wasm.rs::map_extism_error`）',
+      String(spinJob.error?.code ?? '')
+    );
+    // 这一条是"失败的原因确实是燃料"而不是"模块坏了"的判据：
+    // 装载期的拒绝会报 PLUGIN_INVALID / PLUGIN_RUNTIME 并提到 entry / import。
+    const msg = String(spinJob.error?.message ?? '');
+    const detail = String(spinJob.error?.detail ?? '');
+    c.check(
+      msg.includes('燃料') || msg.includes('fuel'),
+      '★ ②c 错误信息点名了**燃料耗尽**（而不是"入口找不到""装配失败"这类装载期问题）',
+      msg.slice(0, 90)
+    );
+    c.check(
+      detail.includes('死循环') || detail.includes('复杂度过高'),
+      '★ ②d 详情给出了可操作的猜测（死循环 / 复杂度过高）',
+      detail.slice(0, 60)
+    );
+    // 1 秒的 timeoutMs 换 1e8 燃料。燃料是**按指令数**烧的，所以它应该在
+    // 远小于挂钟超时的时间内烧完 —— 若这里等了几十秒，说明拦住它的是别的东西。
+    c.check(
+      elapsed < 15000,
+      '★ ②e 拦住它的是**燃料**而不是挂钟：整轮（含装载、运行、卸载）用时远小于"死等超时"的量级',
+      `${elapsed}ms`
+    );
+
+    // ---- ③ 宿主还活着（"不影响宿主存活"是这一条的一半）----
+    const aliveAfter = await client.invoke('plugins_list');
+    c.check(
+      Array.isArray(aliveAfter?.plugins ?? aliveAfter),
+      '★ ③ 烧光燃料的插件没有拖垮宿主：应用仍然可以响应命令',
+      ''
+    );
+
+    // ---- ④ 那个插件仍然可以再跑一次（每次都新建 Extism 实例）----
+    // 与 L3 不同：L2 不是常驻进程，`call` 每次 `Plugin::new_from_compiled`，
+    // 所以一个被 trap 掉的实例**不会**污染后续调用。顺带也证明"插件没被隔离掉"。
+    const spinAgain = await probeWithWasm(
+      'com.toolforge.test.spin-wasm-2',
+      wasmModule(SPIN),
+      { timeoutMs: 1000 }
+    );
+    c.check(
+      spinAgain.status === 'failed' && String(spinAgain.error?.code ?? '') === 'TIMEOUT',
+      '★ ④ 换个插件 id 再跑一次空转模块，结果一致（失败是**确定**的，不是偶发）',
+      `${spinAgain.status} / ${spinAgain.error?.code ?? ''}`
+    );
+
+    // ---- ⑤ 配额**随 timeoutMs 缩放** —— 这条才真正把"燃料"和"挂钟"分开 ----
+    //
+    // 前面的 ②e 只能说明"它没有死等到超时"；这一条说明配额**是**由清单里的
+    // `timeoutMs` 换算出来的（`wasm.rs::fuel_for_timeout`），而不是别的什么在兜底。
+    // 4 倍的 timeoutMs 应该给出约 4 倍的可烧指令数 —— 两种情况下报的都是
+    // **宿主内部**测出来的耗时，所以不受验证脚本自身开销的干扰。
+    const msOf = (job) => {
+      const m = /在\s*(\d+)\s*ms\s*内耗尽/.exec(String(job.error?.message ?? ''));
+      return m ? Number(m[1]) : null;
+    };
+    const shortMs = msOf(spinJob);
+    const spinLong = await probeWithWasm(
+      'com.toolforge.test.spin-wasm-long',
+      wasmModule(SPIN),
+      { timeoutMs: 4000 }
+    );
+    const longMs = msOf(spinLong);
+    console.log(`   配额缩放：timeoutMs=1000 烧了 ${shortMs}ms，timeoutMs=4000 烧了 ${longMs}ms`);
+    c.check(
+      longMs !== null && shortMs !== null && longMs > shortMs * 2,
+      '★ ⑤ 燃料配额**随 timeoutMs 缩放**（4000ms 的配额要烧掉远多于 1000ms 的时间）—— 这才证明拦住它的是燃料，而不是别的兜底',
+      `${shortMs}ms → ${longMs}ms`
+    );
   }
 
   // ==========================================================================
@@ -1350,6 +1523,10 @@ main()
       'com.toolforge.test.hostfn-wasm',
       'com.toolforge.test.net-port',
       'com.toolforge.test.proc-probe',
+      'com.toolforge.test.nop-wasm',
+      'com.toolforge.test.spin-wasm',
+      'com.toolforge.test.spin-wasm-2',
+      'com.toolforge.test.spin-wasm-long',
     ];
     for (const id of all) {
       await uninstall(id);
