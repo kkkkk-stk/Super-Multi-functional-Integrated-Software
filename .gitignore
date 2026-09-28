@@ -40,6 +40,13 @@ plugins/**/.venv/
 .tools/
 .cache/
 
+# 本地 AI / 编辑器插件的工作目录（`.workbuddy/memory/*.md` 这类）。
+# 它不是这个项目的产物，也不是任何构建会读的输入 —— 是**某个本地工具**自己写的
+# 笔记（内容是它对这份仓库的评述）。留在工作区里会让 `git status` 一直不干净，
+# 一个 `git add -A` 就会把它混进项目历史，读历史的人会以为它是项目文件。
+# 需要保留的话它仍然在磁盘上，只是不进版本库。
+.workbuddy/
+
 # `pnpm icons` 的移动端产物。本项目是**桌面**应用 —— `bundle.targets = "all"`
 # 指的是 Windows / macOS / Linux 三套**桌面**打包，不含 android / ios，
 # 这两棵树没有任何构建会去读。它们仍会被 `pnpm icons` 照常生成，只是不入库：
